@@ -20,13 +20,16 @@
 	// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing page
 	// (whispyrcrm.com) is a separate static site on Vercel (locked-decisions D-68).
 	"routes": [
-		{ "pattern": "mail.whispyrcrm.com", "custom_domain": true }
+		{
+			"pattern": "mail.whispyrcrm.com",
+			"custom_domain": true
+		}
 	],
 	"d1_databases": [
 		{
 			"binding": "DB",
 			"database_name": "sales_portal_users",
-			"database_id": "REPLACE_WITH_D1_DATABASE_ID",
+			"database_id": "f322fd13-dc49-4390-888c-ff862ca05882",
 			"migrations_dir": "migrations"
 		}
 	],
