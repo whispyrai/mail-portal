@@ -95,6 +95,17 @@ app.get("/api/v1/config", (c) => {
 	return c.json({ domains, emailAddresses });
 });
 
+// Who am I — drives the SPA header (account, admin link, sign out).
+app.get("/api/v1/me", (c: AppContext) => {
+	const session = c.get("session");
+	if (!session) return c.json({ error: "Unauthorized" }, 401);
+	return c.json({
+		email: session.email,
+		role: session.role,
+		mailbox: session.mailbox,
+	});
+});
+
 // -- Mailboxes ------------------------------------------------------
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
@@ -291,6 +302,52 @@ app.post("/api/v1/mailboxes/:mailboxId/threads/:threadId/read", async (c: AppCon
 
 app.post("/api/v1/mailboxes/:mailboxId/emails/:id/reply", handleReplyEmail);
 app.post("/api/v1/mailboxes/:mailboxId/emails/:id/forward", handleForwardEmail);
+
+// -- Bulk send (mail merge, F-06) -----------------------------------
+
+const BulkSendBody = z.object({
+	subject: z.string().min(1),
+	html: z.string().optional(),
+	text: z.string().optional(),
+	recipients: z.array(z.record(z.string())).min(1).max(200),
+});
+
+app.post("/api/v1/mailboxes/:mailboxId/bulk", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	let body: z.infer<typeof BulkSendBody>;
+	try {
+		body = BulkSendBody.parse(await c.req.json());
+	} catch (e) {
+		return c.json({ error: `Invalid bulk request: ${(e as Error).message}` }, 400);
+	}
+	if (!body.html && !body.text) {
+		return c.json({ error: "Provide an HTML or text body." }, 400);
+	}
+	// From-name comes from the mailbox settings; the from-address is the mailbox.
+	const settingsObj = await c.env.BUCKET.get(`mailboxes/${mailboxId}.json`);
+	const settings = settingsObj
+		? await settingsObj.json<{ fromName?: string }>()
+		: {};
+	const fromName = settings.fromName || mailboxId.split("@")[0];
+	try {
+		const result = await c.var.mailboxStub.enqueueBulkJob({
+			fromEmail: mailboxId,
+			fromName,
+			subject: body.subject,
+			html: body.html,
+			text: body.text,
+			recipients: body.recipients,
+		});
+		return c.json(result, 202);
+	} catch (e) {
+		return c.json({ error: (e as Error).message }, 400);
+	}
+});
+
+app.get("/api/v1/mailboxes/:mailboxId/bulk/:jobId", async (c: AppContext) => {
+	const job = await c.var.mailboxStub.getBulkJob(c.req.param("jobId")!);
+	return job ? c.json(job) : c.json({ error: "Job not found" }, 404);
+});
 
 // -- Folders --------------------------------------------------------
 

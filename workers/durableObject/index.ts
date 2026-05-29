@@ -10,6 +10,13 @@ import * as schema from "../db/schema";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { applyMigrations, mailboxMigrations } from "./migrations";
+import { sendEmail } from "../email-sender";
+import {
+	generateMessageId,
+	buildThreadToken,
+	buildThreadingHeaders,
+	escapeHtml,
+} from "../lib/email-helpers";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -97,6 +104,32 @@ interface AttachmentData {
 	size: number;
 	content_id?: string | null;
 	disposition?: string | null;
+}
+
+// ── Bulk send (mail merge, F-06) ───────────────────────────────────
+
+const BULK_MAX_RECIPIENTS = 200; // hard cap per job (locked-decisions F-06)
+const BULK_MIN_DELAY_MS = 1500; // throttle floor between sends
+const BULK_MAX_JITTER_MS = 1000; // added random jitter, so ~1.5–2.5s apart
+const BULK_QUEUE_KEY = "bulk:queue";
+
+type BulkRecipient = Record<string, string>; // must include `email`
+
+interface BulkJob {
+	id: string;
+	status: "queued" | "running" | "done";
+	fromEmail: string;
+	fromName: string;
+	subject: string;
+	html?: string;
+	text?: string;
+	total: number;
+	sent: number;
+	failed: number;
+	cursor: number;
+	errors: { email: string; error: string }[];
+	createdAt: number;
+	updatedAt: number;
 }
 
 export class MailboxDO extends DurableObject<Env> {
@@ -867,6 +900,179 @@ export class MailboxDO extends DurableObject<Env> {
 
 		if (attachments.length > 0) {
 			this.db.insert(schema.attachments).values(attachments).run();
+		}
+	}
+
+	// ── Bulk send (mail merge) — alarm-scheduled, throttled (F-06) ──
+
+	/** Extract {{placeholder}} variable names from a template string. */
+	#extractVars(tpl: string): string[] {
+		const out = new Set<string>();
+		for (const m of tpl.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)) out.add(m[1]);
+		return [...out];
+	}
+
+	/** Substitute {{key}} from the row; HTML-escape values when `escape` is set. */
+	#renderTemplate(tpl: string, row: BulkRecipient, escape: boolean): string {
+		return tpl.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_full, key: string) => {
+			const v = row[key] ?? "";
+			return escape ? escapeHtml(v) : v;
+		});
+	}
+
+	/**
+	 * Enqueue a bulk-send job: validate the template against the CSV columns,
+	 * persist recipients + template, and kick the alarm. The alarm sends one
+	 * message per tick with a randomized throttle, so even a 200-recipient job
+	 * stays well within per-invocation Worker limits and survives restarts.
+	 */
+	async enqueueBulkJob(input: {
+		fromEmail: string;
+		fromName: string;
+		subject: string;
+		html?: string;
+		text?: string;
+		recipients: BulkRecipient[];
+	}): Promise<{ jobId: string; total: number }> {
+		const recipients = input.recipients ?? [];
+		if (recipients.length === 0) throw new Error("No recipients provided.");
+		if (recipients.length > BULK_MAX_RECIPIENTS) {
+			throw new Error(`Too many recipients: max ${BULK_MAX_RECIPIENTS} per job.`);
+		}
+		if (!input.subject.trim()) throw new Error("Subject is required.");
+		if (!input.html && !input.text) throw new Error("Email body is required.");
+
+		for (const r of recipients) {
+			if (!r.email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(r.email)) {
+				throw new Error("Every recipient row needs a valid 'email' column.");
+			}
+		}
+
+		// Every {{var}} in the template must exist as a column in the CSV.
+		const vars = new Set<string>([
+			...this.#extractVars(input.subject),
+			...this.#extractVars(input.html ?? ""),
+			...this.#extractVars(input.text ?? ""),
+		]);
+		const columns = new Set(Object.keys(recipients[0]));
+		const missing = [...vars].filter((v) => !columns.has(v));
+		if (missing.length > 0) {
+			throw new Error(`Template uses columns not in the CSV: ${missing.join(", ")}`);
+		}
+
+		const jobId = `job_${crypto.randomUUID()}`;
+		const now = Date.now();
+		const job: BulkJob = {
+			id: jobId,
+			status: "queued",
+			fromEmail: input.fromEmail.toLowerCase(),
+			fromName: input.fromName,
+			subject: input.subject,
+			html: input.html,
+			text: input.text,
+			total: recipients.length,
+			sent: 0,
+			failed: 0,
+			cursor: 0,
+			errors: [],
+			createdAt: now,
+			updatedAt: now,
+		};
+		await this.ctx.storage.put(`bulk:job:${jobId}`, job);
+		await this.ctx.storage.put(`bulk:rows:${jobId}`, recipients);
+		const queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];
+		queue.push(jobId);
+		await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
+
+		if ((await this.ctx.storage.getAlarm()) === null) {
+			await this.ctx.storage.setAlarm(Date.now() + 100);
+		}
+		return { jobId, total: recipients.length };
+	}
+
+	async getBulkJob(jobId: string): Promise<BulkJob | null> {
+		return (await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`)) ?? null;
+	}
+
+	/** Send the next recipient of the head job, persist progress, reschedule. */
+	async alarm(): Promise<void> {
+		const queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];
+		if (queue.length === 0) return;
+
+		const jobId = queue[0];
+		const job = await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`);
+		const rows = (await this.ctx.storage.get<BulkRecipient[]>(`bulk:rows:${jobId}`)) ?? [];
+
+		// Drop a finished/missing job and move on.
+		if (!job || job.status === "done" || job.cursor >= rows.length) {
+			if (job && job.cursor >= rows.length) {
+				job.status = "done";
+				job.updatedAt = Date.now();
+				await this.ctx.storage.put(`bulk:job:${jobId}`, job);
+			}
+			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
+			queue.shift();
+			await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
+			if (queue.length > 0) await this.ctx.storage.setAlarm(Date.now() + 100);
+			return;
+		}
+
+		if (job.status === "queued") job.status = "running";
+
+		const row = rows[job.cursor];
+		const to = row.email;
+		const subject = this.#renderTemplate(job.subject, row, false)
+			.replace(/[\r\n]+/g, " ")
+			.trim();
+		const html = job.html ? this.#renderTemplate(job.html, row, true) : undefined;
+		const text = job.text ? this.#renderTemplate(job.text, row, false) : undefined;
+
+		const fromDomain = job.fromEmail.split("@")[1] || "";
+		const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
+		const threadToken = buildThreadToken(messageId, fromDomain);
+
+		try {
+			await sendEmail(this.env, {
+				to,
+				from: { email: job.fromEmail, name: job.fromName },
+				subject,
+				html,
+				text,
+				headers: buildThreadingHeaders(null, [], threadToken),
+			});
+			await this.createEmail(
+				Folders.SENT,
+				{
+					id: messageId,
+					subject,
+					sender: job.fromEmail,
+					recipient: to.toLowerCase(),
+					date: new Date().toISOString(),
+					body: html || text || "",
+					thread_id: messageId,
+					message_id: outgoingMessageId,
+				},
+				[],
+			);
+			job.sent += 1;
+		} catch (e) {
+			job.failed += 1;
+			job.errors.push({ email: to, error: (e as Error).message });
+		}
+
+		job.cursor += 1;
+		job.updatedAt = Date.now();
+		if (job.cursor >= rows.length) {
+			job.status = "done";
+			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
+			queue.shift();
+		}
+		await this.ctx.storage.put(`bulk:job:${jobId}`, job);
+		await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
+
+		if (queue.length > 0) {
+			const delay = BULK_MIN_DELAY_MS + Math.floor(Math.random() * BULK_MAX_JITTER_MS);
+			await this.ctx.storage.setAlarm(Date.now() + delay);
 		}
 	}
 }

@@ -12,6 +12,7 @@ import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
+import { bulkPage } from "./routes/bulk";
 import {
 	loginPage,
 	handleLogin,
@@ -157,6 +158,9 @@ app.use("*", async (c, next) => {
 	}
 	return next();
 });
+
+// ── Bulk send (mail merge) page — any authed rep, scoped to own mailbox ──
+app.get("/bulk", bulkPage);
 
 // ── Admin console (ADMIN only; role enforced inside adminApp) ──
 app.route("/admin", adminApp);
