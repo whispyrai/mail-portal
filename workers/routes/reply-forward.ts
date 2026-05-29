@@ -12,6 +12,7 @@ import {
 	generateMessageId,
 	buildReferencesChain,
 	buildThreadingHeaders,
+	buildThreadToken,
 	resolveOriginalEmail,
 } from "../lib/email-helpers";
 import { SendEmailRequestSchema } from "../lib/schemas";
@@ -103,7 +104,7 @@ export async function handleReplyEmail(c: AppContext) {
 				disposition: att.disposition,
 				contentId: att.contentId,
 			})),
-			headers: buildThreadingHeaders(originalMsgId, references),
+			headers: buildThreadingHeaders(originalMsgId, references, buildThreadToken(thread_id, fromDomain)),
 		}).catch((e) => {
 			console.error("Deferred reply delivery failed:", (e as Error).message);
 		}),
@@ -189,6 +190,7 @@ export async function handleForwardEmail(c: AppContext) {
 				disposition: att.disposition,
 				contentId: att.contentId,
 			})),
+			headers: buildThreadingHeaders(null, [], buildThreadToken(messageId, fromDomain)),
 		}).catch((e) => {
 			console.error("Deferred forward delivery failed:", (e as Error).message);
 		}),

@@ -13,6 +13,8 @@ import {
 	SenderValidationError,
 	generateMessageId,
 	buildThreadingHeaders,
+	buildThreadToken,
+	extractThreadToken,
 	listMailboxes,
 } from "./lib/email-helpers";
 import { SendEmailRequestSchema } from "./lib/schemas";
@@ -179,6 +181,8 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	}
 
 	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
+	const storedThreadId = thread_id || in_reply_to || messageId;
+	const threadToken = buildThreadToken(storedThreadId, fromDomain);
 	const stub = c.var.mailboxStub;
 	const rateLimitError = await (stub as any).checkSendRateLimit();
 	if (rateLimitError) return c.json({ error: rateLimitError }, 429);
@@ -190,7 +194,7 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 		bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
 		date: new Date().toISOString(), body: html || text || "",
 		in_reply_to: in_reply_to || null, email_references: references ? JSON.stringify(references) : null,
-		thread_id: thread_id || in_reply_to || messageId, message_id: outgoingMessageId,
+		thread_id: storedThreadId, message_id: outgoingMessageId,
 		raw_headers: JSON.stringify([
 			{ key: "from", value: typeof from === "string" ? from : `${from.name} <${from.email}>` },
 			{ key: "to", value: Array.isArray(to) ? to.join(", ") : to },
@@ -205,7 +209,7 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 		sendEmail(c.env, {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
-			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
+			headers: buildThreadingHeaders(in_reply_to || null, references || [], threadToken),
 		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
 	);
 	return c.json({ id: messageId, status: "sent" }, 202);
@@ -383,9 +387,12 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
 	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
 	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
-	let threadId = emailReferences[0] || inReplyTo || messageId;
+	// Our app-controlled thread token (in References) is the most reliable match:
+	// SES rewrites Message-ID but not References, so replies echo it back to us.
+	const tokenThreadId = extractThreadToken(emailReferences, inReplyTo);
+	let threadId = tokenThreadId || emailReferences[0] || inReplyTo || messageId;
 
-	if (!inReplyTo && emailReferences.length === 0) {
+	if (!tokenThreadId && !inReplyTo && emailReferences.length === 0) {
 		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
 		if (subjectThread) threadId = subjectThread;
 	}

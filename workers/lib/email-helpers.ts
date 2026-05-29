@@ -116,18 +116,54 @@ export function buildReferencesChain(original: EmailFull): {
 }
 
 /**
- * Build threading headers (In-Reply-To + References) for the email binding.
+ * Build an app-controlled thread token that we stamp into the References header
+ * of every outbound message. AWS SES overwrites the Message-ID header (so we
+ * can't rely on it to match replies) but leaves References untouched, so the
+ * recipient's client echoes this token back in their reply. That gives us
+ * deterministic, SES-proof threading. See locked-decisions D-65.
+ */
+export function buildThreadToken(threadId: string, domain: string): string {
+	return `thread-${threadId}@${domain}`;
+}
+
+const THREAD_TOKEN_RE = /^thread-(.+)@/;
+
+/**
+ * Recover our thread id from an inbound message's In-Reply-To / References by
+ * finding the thread token we stamped on the original outbound. Returns null if
+ * no token is present (e.g. a fresh inbound that isn't a reply to us).
+ */
+export function extractThreadToken(
+	references: string[],
+	inReplyTo: string | null,
+): string | null {
+	const candidates = inReplyTo ? [...references, inReplyTo] : references;
+	for (const candidate of candidates) {
+		const match = candidate.match(THREAD_TOKEN_RE);
+		if (match) return match[1];
+	}
+	return null;
+}
+
+/**
+ * Build threading headers (In-Reply-To + References) for an outbound message.
+ * `originalMsgId` is set only for replies. `threadToken` (when provided) is
+ * appended to References so replies thread back to us regardless of SES's
+ * Message-ID rewriting.
  */
 export function buildThreadingHeaders(
-	originalMsgId: string,
+	originalMsgId: string | null,
 	references: string[],
+	threadToken?: string,
 ): Record<string, string> {
-	return {
-		"In-Reply-To": `<${originalMsgId}>`,
-		...(references.length > 0
-			? { References: references.map((r) => `<${r}>`).join(" ") }
-			: {}),
-	};
+	const headers: Record<string, string> = {};
+	if (originalMsgId) headers["In-Reply-To"] = `<${originalMsgId}>`;
+	const refs = [...references];
+	if (threadToken) refs.push(threadToken);
+	if (refs.length > 0) {
+		headers["References"] = refs.map((r) => `<${r}>`).join(" ");
+	}
+	return headers;
 }
 
 // ── Draft-follows-in_reply_to ──────────────────────────────────────
