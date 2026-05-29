@@ -1,13 +1,36 @@
 // Copyright (c) 2026 Cloudflare, Inc.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
+//
+// Top-level Worker: routing + auth. Replaces upstream Agentic Inbox's Cloudflare
+// Access gate with hand-rolled email+password sessions and per-mailbox / role
+// authorization (locked-decisions D-20..25, D-62..64).
 
 import { routeAgentRequest } from "agents";
-import { Hono } from "hono";
-import { jwtVerify, createRemoteJWKSet } from "jose";
+import { Hono, type Context } from "hono";
 import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
+import { adminApp } from "./routes/admin";
+import {
+	loginPage,
+	handleLogin,
+	handleLogout,
+	landingPage,
+} from "./routes/auth-pages";
+import {
+	verifySession,
+	signSession,
+	buildSessionCookie,
+	readCookie,
+	readBearerToken,
+	hashToken,
+	shouldRenewSession,
+	cookieDomainFor,
+	SESSION_COOKIE_NAME,
+	type SessionClaims,
+} from "./lib/auth";
+import { getUserById, getUserByMcpTokenHash } from "./lib/users";
 import type { Env } from "./types";
 
 export { MailboxDO } from "./durableObject";
@@ -28,86 +51,148 @@ const requestHandler = createRequestHandler(
 	import.meta.env.MODE,
 );
 
-function getAccessUrls(teamDomain: string) {
-	const certsPath = "/cdn-cgi/access/certs";
-	const teamUrl = new URL(teamDomain);
-	const issuer = teamUrl.origin;
-	const certsUrl = teamUrl.pathname.endsWith(certsPath)
-		? teamUrl
-		: new URL(certsPath, issuer);
+type AppEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
+const app = new Hono<AppEnv>();
 
-	return { issuer, certsUrl };
+/** The mail app is served on the `mail.` subdomain (and localhost in dev). */
+function isAppHost(host: string): boolean {
+	const h = host.split(":")[0];
+	return (
+		h.startsWith("mail.") || h === "localhost" || /^\d+\.\d+\.\d+\.\d+$/.test(h)
+	);
 }
 
-// Main app that wraps the API and adds React Router fallback
-const app = new Hono<{ Bindings: Env }>();
+/** Paths that never require a session: auth pages and static assets. */
+function isPublicPath(path: string): boolean {
+	return (
+		path === "/login" ||
+		path === "/logout" ||
+		path === "/landing" ||
+		path === "/favicon.ico" ||
+		path === "/favicon.svg" ||
+		path.startsWith("/assets/") ||
+		/\.[a-z0-9]+$/i.test(path)
+	);
+}
 
-// Cloudflare Access JWT validation middleware (production only)
-app.use("*", async (c, next) => {
-	// Skip validation in development
-	if (import.meta.env.DEV) {
-		return next();
+// ── MCP endpoint: per-user bearer-token auth, scoped via props (D-64) ──
+
+const mcpHandler = EmailMCP.serve("/mcp", { binding: "EMAIL_MCP" });
+
+async function handleMcp(c: Context<AppEnv>) {
+	const token = readBearerToken(c.req.header("authorization"));
+	if (!token) {
+		return c.json({ error: "Missing bearer token" }, 401);
 	}
+	const user = await getUserByMcpTokenHash(c.env, await hashToken(token));
+	if (!user || user.is_active !== 1) {
+		return c.json({ error: "Invalid MCP token" }, 401);
+	}
+	// McpAgent.serve() reads ctx.props and exposes it to the DO as this.props.
+	const ctx = c.executionCtx as ExecutionContext & { props?: unknown };
+	ctx.props = {
+		userId: user.id,
+		role: user.role,
+		mailbox: user.mailbox_address,
+	};
+	return mcpHandler.fetch(c.req.raw, c.env, ctx);
+}
 
-	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
+app.all("/mcp", handleMcp);
+app.all("/mcp/*", handleMcp);
 
-	// Fail closed in production if Access is not configured.
-	if (!POLICY_AUD || !TEAM_DOMAIN) {
-		return c.text(
-			"Cloudflare Access must be configured in production. Set POLICY_AUD and TEAM_DOMAIN.",
-			500,
+// ── Public auth pages (registered before the gate) ──
+
+app.get("/login", loginPage);
+app.post("/login", handleLogin);
+app.post("/logout", handleLogout);
+app.get("/landing", landingPage);
+
+// ── Auth gate (cookie session) for everything else ──
+
+app.use("*", async (c, next) => {
+	const url = new URL(c.req.url);
+	const path = url.pathname;
+	const host = c.req.header("host") || url.host;
+
+	if (path === "/mcp" || path.startsWith("/mcp/")) return next();
+	if (isPublicPath(path)) return next();
+	if (path === "/" && !isAppHost(host)) return next(); // apex landing
+
+	const respondUnauthorized = () =>
+		path.startsWith("/api/") || path.startsWith("/agents/")
+			? c.json({ error: "Unauthorized" }, 401)
+			: c.redirect("/login", 302);
+
+	const token = readCookie(c.req.header("cookie"), SESSION_COOKIE_NAME);
+	const claims = token ? await verifySession(token, c.env.JWT_SECRET) : null;
+	if (!claims) return respondUnauthorized();
+
+	// Safety belt: confirm the user still exists and is active (enables
+	// force-logout by deactivating the user). One cheap D1 read per request.
+	const user = await getUserById(c.env, claims.sub);
+	if (!user || user.is_active !== 1) return respondUnauthorized();
+
+	c.set("session", claims);
+
+	// Sliding renewal: refresh the cookie when it's within a day of expiry.
+	const nowSec = Math.floor(Date.now() / 1000);
+	if (shouldRenewSession(claims.exp, nowSec)) {
+		const fresh = await signSession(
+			{
+				sub: claims.sub,
+				email: claims.email,
+				role: claims.role,
+				mailbox: claims.mailbox,
+			},
+			c.env.JWT_SECRET,
+		);
+		c.header(
+			"Set-Cookie",
+			buildSessionCookie(fresh, {
+				secure: url.protocol === "https:",
+				domain: cookieDomainFor(host, c.env.DOMAINS),
+			}),
 		);
 	}
-
-	const token = c.req.header("cf-access-jwt-assertion");
-	if (!token) {
-		return c.text("Missing required CF Access JWT", 403);
-	}
-
-	try {
-		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
-		const JWKS = createRemoteJWKSet(certsUrl);
-		await jwtVerify(token, JWKS, {
-			issuer,
-			audience: POLICY_AUD,
-		});
-	} catch {
-		return c.text("Invalid or expired Access token", 403);
-	}
-
-	// Authorization model note: once a teammate passes the shared Cloudflare
-	// Access policy, they can access all mailboxes in this app by design.
 	return next();
 });
 
-// MCP server endpoint — used by AI coding tools (ProtoAgent, Claude Code, Cursor, etc.)
-// Must be before API routes and React Router catch-all
-const mcpHandler = EmailMCP.serve("/mcp", { binding: "EMAIL_MCP" });
-app.all("/mcp", async (c) => {
-	return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
-});
-app.all("/mcp/*", async (c) => {
-	return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
-});
+// ── Admin console (ADMIN only; role enforced inside adminApp) ──
+app.route("/admin", adminApp);
 
-// Mount the API routes
+// ── API routes (per-mailbox authz enforced in requireMailbox) ──
 app.route("/", apiApp);
 
-// Agent WebSocket routing - must be before React Router catch-all
+// ── Agent WebSocket routing, scoped to the caller's mailbox ──
 app.all("/agents/*", async (c) => {
+	const session = c.get("session");
+	// Agent instances are named by mailbox address: /agents/<class>/<name>/...
+	const segs = new URL(c.req.url).pathname.split("/").filter(Boolean);
+	const agentName = segs[2] ? decodeURIComponent(segs[2]) : "";
+	if (
+		session &&
+		session.role !== "ADMIN" &&
+		agentName &&
+		agentName.toLowerCase() !== session.mailbox.toLowerCase()
+	) {
+		return c.json({ error: "Forbidden" }, 403);
+	}
 	const response = await routeAgentRequest(c.req.raw, c.env);
 	if (response) return response;
 	return c.text("Agent not found", 404);
 });
 
-// React Router catch-all: serves the SPA for all non-API routes
+// ── Catch-all: apex landing page, otherwise the React SPA ──
 app.all("*", (c) => {
+	const host = c.req.header("host") || "";
+	const path = new URL(c.req.url).pathname;
+	if (path === "/" && !isAppHost(host)) return landingPage(c);
 	return requestHandler(c.req.raw, {
 		cloudflare: { env: c.env, ctx: c.executionCtx as ExecutionContext },
 	});
 });
 
-// Export the Hono app as the default export with an email handler
 export default {
 	fetch: app.fetch,
 	async email(
@@ -118,9 +203,12 @@ export default {
 		try {
 			await receiveEmail(event, env, ctx);
 		} catch (e) {
-			console.error("Failed to process incoming email:", (e as Error).message, (e as Error).stack);
-			// Re-throw so Cloudflare's email routing can retry delivery or bounce the message.
-			// Swallowing the error would silently drop the email.
+			console.error(
+				"Failed to process incoming email:",
+				(e as Error).message,
+				(e as Error).stack,
+			);
+			// Re-throw so Cloudflare's email routing can retry delivery or bounce.
 			throw e;
 		}
 	},

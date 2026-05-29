@@ -10,13 +10,21 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
-		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
-		// The worker now fails closed outside local development if Access is not configured.
+		// DOMAINS: the email domain (set to whispyrcrm.com before deploy).
+		// Secrets (set via `wrangler secret put`): AWS_ACCESS_KEY_ID,
+		// AWS_SECRET_ACCESS_KEY, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
 		"DOMAINS": "example.com",
 		"EMAIL_ADDRESSES": [],
 		"AWS_REGION": "eu-west-2"
 	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "sales_portal_users",
+			"database_id": "REPLACE_WITH_D1_DATABASE_ID",
+			"migrations_dir": "migrations"
+		}
+	],
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
