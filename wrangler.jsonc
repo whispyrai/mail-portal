@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "agentic-inbox",
+	"name": "sales-mail-portal",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
 	"observability": {
@@ -10,13 +10,18 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		// DOMAINS: the email domain (set to whispyrcrm.com before deploy).
-		// Secrets (set via `wrangler secret put`): AWS_ACCESS_KEY_ID,
-		// AWS_SECRET_ACCESS_KEY, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
-		"DOMAINS": "example.com",
+		// DOMAINS: the email + session-cookie domain. Secrets (set via
+		// `wrangler secret put`): AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+		// JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
+		"DOMAINS": "whispyrcrm.com",
 		"EMAIL_ADDRESSES": [],
 		"AWS_REGION": "eu-west-2"
 	},
+	// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing page
+	// (whispyrcrm.com) is a separate static site on Vercel (locked-decisions D-68).
+	"routes": [
+		{ "pattern": "mail.whispyrcrm.com", "custom_domain": true }
+	],
 	"d1_databases": [
 		{
 			"binding": "DB",
@@ -28,8 +33,8 @@
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
-			"bucket_name": "agentic-inbox",
-			"preview_bucket_name": "agentic-inbox"
+			"bucket_name": "sales-mail-portal",
+			"preview_bucket_name": "sales-mail-portal"
 		}
 	],
 	"ai": {
