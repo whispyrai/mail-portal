@@ -15,7 +15,7 @@ import {
 import { EnvelopeIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react";
 import { useQuery } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { Link as RouterLink } from "react-router";
+import { Link as RouterLink, Navigate } from "react-router";
 import api from "~/services/api";
 import {
 	useCreateMailbox,
@@ -25,7 +25,7 @@ import {
 import { queryKeys } from "~/queries/keys";
 
 export function meta() {
-	return [{ title: "Agentic Inbox" }];
+	return [{ title: "Whispyr Mail" }];
 }
 
 export default function HomeRoute() {
@@ -39,6 +39,20 @@ export default function HomeRoute() {
 		queryFn: () => api.getConfig(),
 		staleTime: Infinity, // config rarely changes
 	});
+
+	// Identity drives who can manage mailboxes (admins only) and lets us send a
+	// single-mailbox rep straight to their inbox.
+	const { data: me } = useQuery({
+		queryKey: ["me"],
+		queryFn: async () => {
+			const r = await fetch("/api/v1/me", { credentials: "same-origin" });
+			return r.ok
+				? (r.json() as Promise<{ email: string; role: string; mailbox: string }>)
+				: null;
+		},
+		staleTime: Infinity,
+	});
+	const isAdmin = me?.role === "ADMIN";
 
 	const domains = configData?.domains ?? [];
 	const emailAddresses = configData?.emailAddresses ?? [];
@@ -139,13 +153,18 @@ export default function HomeRoute() {
 
 	const isLoading = !configData;
 
+	// Reps have exactly one mailbox — send them straight to their inbox.
+	if (me && !isAdmin && mailboxesFetched && accounts.length === 1) {
+		return <Navigate to={`/mailbox/${accounts[0].id}`} replace />;
+	}
+
 	return (
 		<div className="min-h-screen bg-kumo-recessed">
 			<div className="mx-auto max-w-2xl px-4 py-8 md:px-6 md:py-16">
 				<div className="mb-8">
 					<div className="flex items-center justify-between">
 						<h1 className="text-2xl font-bold text-kumo-default">Mailboxes</h1>
-						{!isConfigured && (
+						{isAdmin && (
 							<Button
 								variant="primary"
 								icon={<PlusIcon size={16} />}
@@ -187,7 +206,7 @@ export default function HomeRoute() {
 										{account.email}
 									</div>
 								</div>
-								{!isConfigured && (
+								{isAdmin && (
 									<Button
 										variant="ghost"
 										size="sm"
@@ -226,7 +245,7 @@ export default function HomeRoute() {
 									? "Your email routing is configured but no mailboxes have been created yet. They will appear here automatically."
 									: "Create a mailbox to start sending and receiving emails with your domain."}
 							</p>
-							{!isConfigured && (
+							{isAdmin && (
 								<Button
 									variant="primary"
 									icon={<PlusIcon size={16} />}
