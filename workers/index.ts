@@ -84,6 +84,7 @@ app.use("/api/*", cors({
 	},
 }));
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
+app.use("/api/v1/mailboxes/:mailboxId", requireMailbox);
 
 // -- Config ---------------------------------------------------------
 
@@ -96,12 +97,24 @@ app.get("/api/v1/config", (c) => {
 
 // -- Mailboxes ------------------------------------------------------
 
-app.get("/api/v1/mailboxes", async (c) => {
+app.get("/api/v1/mailboxes", async (c: AppContext) => {
+	const session = c.get("session");
 	const allMailboxes = await listMailboxes(c.env.BUCKET);
-	return c.json(allMailboxes.map((m) => ({ ...m, name: m.id })));
+	// Reps see only their own mailbox; admins see all.
+	const visible =
+		session && session.role !== "ADMIN"
+			? allMailboxes.filter(
+					(m) => m.id.toLowerCase() === session.mailbox.toLowerCase(),
+				)
+			: allMailboxes;
+	return c.json(visible.map((m) => ({ ...m, name: m.id })));
 });
 
-app.post("/api/v1/mailboxes", async (c) => {
+app.post("/api/v1/mailboxes", async (c: AppContext) => {
+	const session = c.get("session");
+	if (!session || session.role !== "ADMIN") {
+		return c.json({ error: "Forbidden" }, 403);
+	}
 	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
 	const email = rawEmail.toLowerCase();
 	const allowedAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
@@ -134,7 +147,11 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
 });
 
-app.delete("/api/v1/mailboxes/:mailboxId", async (c) => {
+app.delete("/api/v1/mailboxes/:mailboxId", async (c: AppContext) => {
+	const session = c.get("session");
+	if (!session || session.role !== "ADMIN") {
+		return c.json({ error: "Forbidden" }, 403);
+	}
 	const mailboxId = c.req.param("mailboxId")!;
 	const key = `mailboxes/${mailboxId}.json`;
 	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
