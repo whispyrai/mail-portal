@@ -26,42 +26,13 @@ import {
 import { provisionMailbox } from "../lib/mailbox";
 import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
 import { escapeHtml } from "../lib/email-helpers";
+import { pageShell, brandLogo } from "./brand";
 import type { Env } from "../types";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
-const CSS = `
-* { box-sizing: border-box; }
-body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#0b1020; color:#e7ecf5; }
-.wrap { max-width:920px; margin:0 auto; padding:32px 20px 64px; }
-h1 { font-size:22px; letter-spacing:-.02em; }
-a { color:#6ea8fe; }
-.card { background:#141b2e; border:1px solid #243049; border-radius:14px; padding:20px; margin:18px 0; }
-table { width:100%; border-collapse:collapse; font-size:14px; }
-th,td { text-align:left; padding:9px 8px; border-bottom:1px solid #233049; }
-th { color:#9aa7c2; font-weight:600; }
-.badge { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid #2c3958; }
-.badge.admin { color:#ffd479; border-color:#5b4a1f; }
-.badge.off { color:#ff9aa8; border-color:#5b2230; }
-label { display:block; font-size:13px; color:#c4cfe6; margin:12px 0 5px; }
-input,select { width:100%; padding:10px 12px; border-radius:9px; border:1px solid #2c3958; background:#0e1626; color:#e7ecf5; font-size:14px; }
-.row { display:flex; gap:14px; flex-wrap:wrap; }
-.row > div { flex:1; min-width:200px; }
-button { margin-top:16px; padding:10px 16px; border:0; border-radius:9px; background:#3b82f6; color:#fff; font-weight:600; cursor:pointer; }
-button.sm { margin:0; padding:6px 10px; font-size:12px; background:#22304d; }
-button.danger { background:#7a2230; }
-.flash { padding:11px 14px; border-radius:10px; margin-bottom:8px; font-size:13px; }
-.flash.ok { background:#10261b; border:1px solid #1f5b3a; color:#9bf0c4; }
-.flash.err { background:#3a1620; border:1px solid #6b2235; color:#ffb3c1; }
-code { background:#0e1626; border:1px solid #2c3958; padding:3px 7px; border-radius:7px; word-break:break-all; }
-.topbar { display:flex; justify-content:space-between; align-items:center; }
-form.inline { display:inline; margin:0; }
-`;
-
 function shell(body: string): string {
-	return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
-<title>Admin · Whispyr Mail</title><style>${CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
+	return pageShell("Admin · Whispyr Mail", `<div class="wrap">${body}</div>`);
 }
 
 function mcpBaseUrl(c: { req: { url: string }; env: Env }): string {
@@ -119,8 +90,9 @@ adminApp.get("/users", async (c) => {
 
 	return c.html(
 		shell(`
-  <div class="topbar"><h1>User administration</h1>
-    <form class="inline" method="post" action="/logout"><button class="sm" type="submit">Sign out</button></form></div>
+  <div class="brandbar">${brandLogo({ href: "/" })}
+    <form class="inline" method="post" action="/logout"><button class="sm secondary" type="submit">Sign out</button></form></div>
+  <h1 style="margin-top:14px">User administration</h1>
   ${flash}
   <div class="card">
     <h2 style="font-size:16px;margin-top:0">Create a user</h2>

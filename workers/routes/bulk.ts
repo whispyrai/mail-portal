@@ -11,49 +11,21 @@
 
 import type { Context } from "hono";
 import type { SessionClaims } from "../lib/auth";
+import { pageShell, brandLogo } from "./brand";
 import type { Env } from "../types";
 
 type Ctx = Context<{ Bindings: Env; Variables: { session?: SessionClaims } }>;
 
-const CSS = `
-* { box-sizing: border-box; }
-body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#0b1020; color:#e7ecf5; }
-a { color:#6ea8fe; text-decoration:none; }
-.wrap { max-width:860px; margin:0 auto; padding:28px 20px 64px; }
-.topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
-h1 { font-size:22px; letter-spacing:-.02em; margin:0; }
-.muted { color:#8595b5; font-size:13px; }
-.card { background:#141b2e; border:1px solid #243049; border-radius:14px; padding:20px; margin:16px 0; }
-label { display:block; font-size:13px; color:#c4cfe6; margin:0 0 6px; }
-input[type=text], textarea { width:100%; padding:10px 12px; border-radius:9px; border:1px solid #2c3958; background:#0e1626; color:#e7ecf5; font-size:14px; font-family:inherit; }
-textarea { min-height:170px; resize:vertical; line-height:1.5; }
-input[type=file] { color:#c4cfe6; font-size:13px; }
-button { padding:10px 16px; border:0; border-radius:9px; background:#3b82f6; color:#fff; font-weight:600; cursor:pointer; font-size:14px; }
-button.secondary { background:#22304d; }
-button:disabled { opacity:.5; cursor:not-allowed; }
-table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
-th,td { text-align:left; padding:6px 8px; border-bottom:1px solid #233049; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:160px; }
-th { color:#9aa7c2; }
-code { background:#0e1626; border:1px solid #2c3958; padding:2px 6px; border-radius:6px; }
-.pill { color:#9bf0c4; }
-.err { color:#ffb3c1; }
-.preview { background:#0e1626; border:1px solid #2c3958; border-radius:10px; padding:14px; white-space:pre-wrap; font-size:13px; }
-.bar { height:8px; background:#0e1626; border-radius:999px; overflow:hidden; border:1px solid #2c3958; }
-.bar > span { display:block; height:100%; background:#3b82f6; width:0%; transition:width .3s; }
-.hide { display:none; }
-.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-`;
-
 function renderBulk(mailbox: string, apiBase: string): string {
 	// mailbox + apiBase are injected as a JSON island the page script reads.
 	const cfg = JSON.stringify({ mailbox, apiBase }).replace(/</g, "\\u003c");
-	return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
-<title>Bulk send · Whispyr Mail</title><style>${CSS}</style></head><body><div class="wrap">
-  <div class="topbar">
-    <h1>Bulk send</h1>
-    <div class="row"><a href="/">← Inbox</a> <form method="post" action="/logout" style="margin:0"><button class="secondary" type="submit">Sign out</button></form></div>
+	return pageShell(
+		"Bulk send · Whispyr Mail",
+		`<div class="wrap">
+  <div class="brandbar">${brandLogo({ href: "/" })}
+    <div class="row"><a href="/">← Inbox</a> <form method="post" action="/logout" style="margin:0"><button class="sm secondary" type="submit">Sign out</button></form></div>
   </div>
+  <h1 style="margin:0 0 4px">Bulk send</h1>
   <p class="muted">Sending from <code>${mailbox}</code>. Max 200 recipients per job; messages are throttled ~2s apart. Keep daily volume modest while we watch deliverability.</p>
 
   <div class="card">
@@ -187,7 +159,8 @@ $('sendBtn').addEventListener('click', async () => {
   poll(j.jobId);
 });
 </script>
-</div></body></html>`;
+</div>`,
+	);
 }
 
 export function bulkPage(c: Ctx) {

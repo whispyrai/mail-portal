@@ -2,8 +2,20 @@
 @import "@cloudflare/kumo/styles/tailwind";
 @import "tailwindcss";
 
+/* Whispyr brand font — Kamerik 105, self-hosted from /public/fonts. */
+@font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Light.woff2") format("woff2"); font-weight: 300; font-display: swap; }
+@font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Book.woff2") format("woff2"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Bold.woff2") format("woff2"); font-weight: 700; font-display: swap; }
+
+/* Map Tailwind's font-sans token to the brand font so kumo's utilities inherit it. */
+@theme {
+  --font-sans: "Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+html,
 body {
   margin: 0;
+  font-family: "Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
 /* TipTap list styles */
