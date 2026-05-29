@@ -59,7 +59,10 @@ const app = new Hono<AppEnv>();
 function isAppHost(host: string): boolean {
 	const h = host.split(":")[0];
 	return (
-		h.startsWith("mail.") || h === "localhost" || /^\d+\.\d+\.\d+\.\d+$/.test(h)
+		h.startsWith("mail.") ||
+		h.endsWith(".workers.dev") || // the deploy URL serves the app, not the landing
+		h === "localhost" ||
+		/^\d+\.\d+\.\d+\.\d+$/.test(h)
 	);
 }
 
