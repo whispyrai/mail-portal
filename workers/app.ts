@@ -68,6 +68,11 @@ function isAppHost(host: string): boolean {
 
 /** Paths that never require a session: auth pages and static assets. */
 function isPublicPath(path: string): boolean {
+	// API and agent routes are ALWAYS session-gated. Never treat them as public:
+	// a mailbox id in the path is an email address ending in ".com", which would
+	// otherwise match the static-asset extension heuristic below and silently skip
+	// auth — leaving requireMailbox with no session and returning 401.
+	if (path.startsWith("/api/") || path.startsWith("/agents/")) return false;
 	return (
 		path === "/login" ||
 		path === "/logout" ||
