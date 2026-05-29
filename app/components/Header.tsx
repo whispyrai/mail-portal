@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { GearSixIcon, ListIcon, MagnifyingGlassIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
+import { GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, XIcon } from "@phosphor-icons/react";
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useUIStore } from "~/hooks/useUIStore";
@@ -16,6 +16,24 @@ export default function Header() {
 	const location = useLocation();
 	const [searchParams] = useSearchParams();
 	const { toggleSidebar, toggleAgentPanel, isAgentPanelOpen } = useUIStore();
+	const [me, setMe] = useState<{ email: string; role: string } | null>(null);
+
+	// Identify the signed-in user to show the admin link + sign-out (see /api/v1/me).
+	useEffect(() => {
+		fetch("/api/v1/me", { credentials: "same-origin" })
+			.then((r) => (r.ok ? (r.json() as Promise<{ email: string; role: string }>) : null))
+			.then((data) => setMe(data))
+			.catch(() => setMe(null));
+	}, []);
+
+	// /logout is a POST endpoint; submit a throwaway form to hit it.
+	const signOut = () => {
+		const form = document.createElement("form");
+		form.method = "POST";
+		form.action = "/logout";
+		document.body.appendChild(form);
+		form.submit();
+	};
 
 	// Sync search input with URL query param so it stays populated
 	const urlQuery = searchParams.get("q") || "";
@@ -142,6 +160,39 @@ export default function Header() {
 							)
 						}
 						aria-label="Settings"
+					/>
+				</Tooltip>
+				<Tooltip content="Bulk send" side="bottom" asChild>
+					<Button
+						variant="ghost"
+						shape="square"
+						icon={<PaperPlaneTiltIcon size={20} />}
+						onClick={() => {
+							window.location.href = "/bulk";
+						}}
+						aria-label="Bulk send"
+					/>
+				</Tooltip>
+				{me?.role === "ADMIN" && (
+					<Tooltip content="Admin" side="bottom" asChild>
+						<Button
+							variant="ghost"
+							shape="square"
+							icon={<ShieldCheckIcon size={20} />}
+							onClick={() => {
+								window.location.href = "/admin/users";
+							}}
+							aria-label="Admin"
+						/>
+					</Tooltip>
+				)}
+				<Tooltip content={me ? `Sign out (${me.email})` : "Sign out"} side="bottom" asChild>
+					<Button
+						variant="ghost"
+						shape="square"
+						icon={<SignOutIcon size={20} />}
+						onClick={signOut}
+						aria-label="Sign out"
 					/>
 				</Tooltip>
 			</div>
