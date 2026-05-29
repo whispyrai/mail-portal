@@ -34,38 +34,47 @@ function bytesToBase64Url(bytes: Uint8Array): string {
 		.replace(/=+$/, "");
 }
 
-// ── Password hashing (PBKDF2-SHA256) ───────────────────────────────
+// ── Password hashing (keyed HMAC-SHA256 with a server-held pepper) ──
+//
+// Workers Free has a hard 10ms CPU limit per request that is NOT configurable, so
+// a proper slow KDF (PBKDF2 at OWASP iteration counts is ~100ms+ of CPU) blows it
+// and the isolate is killed → 500. On Free we use a keyed hash instead: HMAC-
+// SHA256 over (salt || password) with a server-held pepper (JWT_SECRET, never
+// stored in the DB). Fast (<1ms), and a database dump alone cannot brute-force it
+// without also stealing the Worker secret — an appropriate posture for ~5 internal
+// users with admin-set strong passwords. For a true slow KDF, move to Workers Paid
+// and raise limits.cpu_ms. See locked-decisions D-21 + the 2026-05-29 build log.
 
-const PBKDF2_ITERATIONS = 600_000; // OWASP-recommended for PBKDF2-SHA256 (2023+)
-const DERIVED_KEY_BITS = 256;
 const SALT_BYTES = 16;
 
+async function hmacSha256(pepper: string, message: string): Promise<Uint8Array> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(pepper),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
+	const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+	return new Uint8Array(sig);
+}
+
 /**
- * Derive a PBKDF2-SHA256 hash. Generates a random salt unless one is supplied
- * (supply the stored salt when verifying). Returns base64 hash + salt.
+ * Hash a password as HMAC-SHA256(pepper, "salt:password"). Generates a random
+ * salt unless one is supplied (pass the stored salt when verifying). `pepper` is
+ * the server secret (JWT_SECRET). Returns base64 hash + salt.
  */
 export async function hashPassword(
 	password: string,
+	pepper: string,
 	existingSaltB64?: string,
 ): Promise<{ hash: string; salt: string }> {
 	const salt = existingSaltB64
 		? base64ToBytes(existingSaltB64)
 		: crypto.getRandomValues(new Uint8Array(SALT_BYTES));
-	const keyMaterial = await crypto.subtle.importKey(
-		"raw",
-		new TextEncoder().encode(password),
-		"PBKDF2",
-		false,
-		["deriveBits"],
-	);
-	const derived = await crypto.subtle.deriveBits(
-		// Cast: TS 5.8 types Uint8Array as Uint8Array<ArrayBufferLike>, which the
-		// WebCrypto BufferSource param does not accept directly. The bytes are fine.
-		{ name: "PBKDF2", salt: salt as BufferSource, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
-		keyMaterial,
-		DERIVED_KEY_BITS,
-	);
-	return { hash: bytesToBase64(new Uint8Array(derived)), salt: bytesToBase64(salt) };
+	const saltB64 = bytesToBase64(salt);
+	const digest = await hmacSha256(pepper, `${saltB64}:${password}`);
+	return { hash: bytesToBase64(digest), salt: saltB64 };
 }
 
 /** Constant-time string comparison (equal length assumed for hashes). */
@@ -76,13 +85,14 @@ function timingSafeEqual(a: string, b: string): boolean {
 	return mismatch === 0;
 }
 
-/** Verify a password against a stored salt + hash. */
+/** Verify a password against a stored salt + hash, using the server pepper. */
 export async function verifyPassword(
 	password: string,
 	saltB64: string,
 	expectedHashB64: string,
+	pepper: string,
 ): Promise<boolean> {
-	const { hash } = await hashPassword(password, saltB64);
+	const { hash } = await hashPassword(password, pepper, saltB64);
 	return timingSafeEqual(hash, expectedHashB64);
 }
 

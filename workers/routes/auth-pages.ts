@@ -113,7 +113,7 @@ export async function handleLogin(c: Ctx) {
 					400,
 				);
 			}
-			const { hash, salt } = await hashPassword(password);
+			const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
 			user = await createUser(c.env, {
 				email,
 				passwordHash: hash,
@@ -130,7 +130,7 @@ export async function handleLogin(c: Ctx) {
 	if (!user || user.is_active !== 1) {
 		return c.html(renderLogin({ error: "Invalid email or password." }), 401);
 	}
-	const ok = await verifyPassword(password, user.password_salt, user.password_hash);
+	const ok = await verifyPassword(password, user.password_salt, user.password_hash, c.env.JWT_SECRET);
 	if (!ok) {
 		return c.html(renderLogin({ error: "Invalid email or password." }), 401);
 	}

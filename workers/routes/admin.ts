@@ -162,7 +162,7 @@ adminApp.post("/users", async (c) => {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("A user with that email already exists.")}`, 302);
 	}
 
-	const { hash, salt } = await hashPassword(password);
+	const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
 	await createUser(c.env, {
 		email,
 		passwordHash: hash,
@@ -194,7 +194,7 @@ adminApp.post("/users/:id/password", async (c) => {
 	}
 	const user = await getUserById(c.env, c.req.param("id"));
 	if (!user) return c.redirect(`/admin/users?err=${encodeURIComponent("User not found.")}`, 302);
-	const { hash, salt } = await hashPassword(password);
+	const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
 	await updateUserPassword(c.env, user.id, hash, salt);
 	return c.redirect(`/admin/users?ok=${encodeURIComponent(`Password updated for ${user.email}.`)}`, 302);
 });
