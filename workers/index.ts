@@ -19,6 +19,8 @@ import {
 } from "./lib/email-helpers";
 import { SendEmailRequestSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
+import { draftReplyForEmail } from "./lib/agent-context";
+import { WHISPYR_SYSTEM_PROMPT } from "./lib/whispyr-prompt";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
@@ -134,7 +136,7 @@ app.post("/api/v1/mailboxes", async (c: AppContext) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
+	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" }, agentSystemPrompt: WHISPYR_SYSTEM_PROMPT };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
@@ -302,6 +304,19 @@ app.post("/api/v1/mailboxes/:mailboxId/threads/:threadId/read", async (c: AppCon
 
 app.post("/api/v1/mailboxes/:mailboxId/emails/:id/reply", handleReplyEmail);
 app.post("/api/v1/mailboxes/:mailboxId/emails/:id/forward", handleForwardEmail);
+
+// -- AI reply draft (one-shot, manually invoked from the thread view) -----
+app.post("/api/v1/mailboxes/:mailboxId/ai-draft", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	const { emailId } = (await c.req.json()) as { emailId?: string };
+	if (!emailId) return c.json({ error: "emailId is required" }, 400);
+	try {
+		const draft = await draftReplyForEmail(c.env, mailboxId, emailId);
+		return c.json(draft);
+	} catch (e) {
+		return c.json({ error: (e as Error).message || "AI draft failed" }, 502);
+	}
+});
 
 // -- Bulk send (mail merge, F-06) -----------------------------------
 

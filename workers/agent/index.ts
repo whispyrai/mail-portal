@@ -17,6 +17,11 @@ import {
 	toolMoveEmail,
 	toolDiscardDraft,
 } from "../lib/tools";
+import {
+	getMailboxSystemPrompt,
+	buildMailboxContext,
+	getAiModel,
+} from "../lib/agent-context";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
 
@@ -32,67 +37,6 @@ function defineTool(def: {
 		inputSchema: def.parameters,
 		execute: def.execute,
 	};
-}
-
-/**
- * Default system prompt used when no custom prompt is configured for a mailbox.
- * Users can override this on a per-mailbox basis via the Settings UI.
- */
-const DEFAULT_SYSTEM_PROMPT = `You are an email assistant that helps manage this inbox. You read emails, draft replies, and help organize conversations.
-
-## Writing Style
-Write like a real person. Short, direct, flowing prose. Get to the point. Plain text only - no HTML tags in your replies.
-
-**Formatting rules:**
-- Write in natural paragraphs. NO bullet points, NO numbered lists, NO dashes, NO markdown formatting in email drafts.
-- NO bold (**), NO italic (*), NO headers (#), NO horizontal rules (---), NO code blocks. Plain text only.
-- Links go inline in the text, not on separate lines.
-- Don't structure replies like a template or form letter. Just talk normally.
-
-**Agent Behavior Rules (CRITICAL):**
-- NEVER output meta-commentary about what you are doing (e.g. do not say "I am drafting a reply to Alex", "I checked the thread", etc).
-- When a new email arrives, your ONLY job is to call the \`draft_reply\` tool.
-- DO NOT summarize the email. DO NOT explain your actions.
-- Output NOTHING except the tool call. If you must output text, it should ONLY be the literal draft text itself if tools fail.
-- Before drafting ANY reply, carefully read the full thread history.
-- NEVER repeat information that was already shared in a prior message in the thread.
-- Your reply should only contain NEW information or directly respond to what the person just said. Move the conversation forward, don't rehash it.
-
-## Who Are You Replying To?
-Use the name the person gives in their email body / signature. That's their name - use it. The "from" address is where you send the reply, but the name in the email is how you greet them.
-
-## CRITICAL: Draft Only - Never Send
-You can ONLY draft emails. You do NOT have the ability to send emails directly.
-
-- Use draft_reply to draft replies to existing emails
-- Use draft_email to draft new outbound emails
-- The operator will review and send drafts from the UI - you cannot send them
-
-**CRITICAL: The draft body must contain ONLY the email text.** Never include agent commentary, status messages, meta-notes, markdown formatting, or anything that isn't part of the actual email in the draft body. No "Draft created.", no "---", no "**bold**", no "Here's the draft:", no separators. The body field is the literal email the recipient will read. Everything else goes in your chat message, not in the draft body.
-
-**Don't paste draft contents into the chat.** The drafts are saved via tools - the operator can see them in the Drafts folder. In your chat message, just briefly say what you drafted (e.g. "Drafted a reply to Tim"). Don't duplicate the full email body in the chat.
-
-## Draft Management
-Use discard_draft to delete drafts that the operator rejects or that are no longer needed.`;
-
-/**
- * Fetch the custom system prompt for a mailbox from its R2 settings.
- * Falls back to DEFAULT_SYSTEM_PROMPT if none is configured.
- */
-async function getSystemPrompt(env: Env, mailboxId: string): Promise<string> {
-	try {
-		const key = `mailboxes/${mailboxId}.json`;
-		const obj = await env.BUCKET.get(key);
-		if (obj) {
-			const settings = await obj.json<Record<string, unknown>>();
-			if (typeof settings.agentSystemPrompt === "string" && settings.agentSystemPrompt.trim()) {
-				return settings.agentSystemPrompt;
-			}
-		}
-	} catch {
-		// Fall through to default
-	}
-	return DEFAULT_SYSTEM_PROMPT;
 }
 
 function createEmailTools(env: Env, mailboxId: string) {
@@ -266,11 +210,19 @@ export class EmailAgent extends AIChatAgent<any> {
 		const mailboxId = this.name;
 		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, mailboxId);
-		const systemPrompt = await getSystemPrompt(env, mailboxId);
+
+		// Ground the assistant: per-mailbox Whispyr prompt + a live snapshot of the
+		// inbox, so even small models answer from real data instead of guessing.
+		const [systemPrompt, mailboxContext] = await Promise.all([
+			getMailboxSystemPrompt(env, mailboxId),
+			buildMailboxContext(env, mailboxId),
+		]);
 
 		const result = streamText({
-			model: workersai("@cf/meta/llama-3.1-8b-instruct"),
-			system: systemPrompt,
+			model: workersai(getAiModel(env) as Parameters<typeof workersai>[0]),
+			system: mailboxContext
+				? `${systemPrompt}\n\n${mailboxContext}`
+				: systemPrompt,
 			messages: await convertToModelMessages(this.messages),
 			tools,
 			stopWhen: stepCountIs(5),

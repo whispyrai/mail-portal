@@ -2,12 +2,15 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+import { Button, Tooltip } from "@cloudflare/kumo";
+import { RobotIcon } from "@phosphor-icons/react";
 import { useEffect, useRef } from "react";
 import { Outlet, useParams } from "react-router";
 import AgentSidebar from "~/components/AgentSidebar";
 import ComposeEmail from "~/components/ComposeEmail";
 import Header from "~/components/Header";
 import Sidebar from "~/components/Sidebar";
+import { useMailNotifications } from "~/hooks/useMailNotifications";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
 
@@ -15,14 +18,22 @@ export default function MailboxRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
 	// Prefetch mailbox data for child components
 	useMailbox(mailboxId);
+	// New-mail toasts + unread tab-title counter, scoped to this mailbox.
+	useMailNotifications(mailboxId);
 	const prevMailboxIdRef = useRef<string | undefined>(undefined);
 	const {
 		isSidebarOpen,
 		closeSidebar,
 		isAgentPanelOpen,
+		toggleAgentPanel,
+		hydrateAgentPanel,
 		closePanel,
-		closeComposeModal,
 	} = useUIStore();
+
+	// Load the persisted agent-panel preference once on the client.
+	useEffect(() => {
+		hydrateAgentPanel();
+	}, [hydrateAgentPanel]);
 
 	useEffect(() => {
 		if (
@@ -31,12 +42,11 @@ export default function MailboxRoute() {
 			prevMailboxIdRef.current !== mailboxId
 		) {
 			closePanel();
-			closeComposeModal();
 			closeSidebar();
 		}
 
 		prevMailboxIdRef.current = mailboxId;
-	}, [mailboxId, closeComposeModal, closePanel, closeSidebar]);
+	}, [mailboxId, closePanel, closeSidebar]);
 
 	return (
 		<div className="flex h-screen overflow-hidden">
@@ -69,10 +79,23 @@ export default function MailboxRoute() {
 				</main>
 			</div>
 
-			{/* Agent + MCP sidebar -- togglable on desktop */}
-			{isAgentPanelOpen && (
-				<div className="hidden lg:flex w-[380px] shrink-0 border-l border-kumo-line flex-col bg-kumo-base overflow-hidden">
+			{/* Agent + MCP sidebar -- collapsible on desktop */}
+			{isAgentPanelOpen ? (
+				<div className="hidden lg:flex w-[360px] shrink-0 border-l border-kumo-line flex-col bg-kumo-base overflow-hidden">
 					<AgentSidebar />
+				</div>
+			) : (
+				// Slim re-open rail so the assistant is always one click away.
+				<div className="hidden lg:flex w-11 shrink-0 border-l border-kumo-line flex-col items-center bg-kumo-base pt-3">
+					<Tooltip content="Open AI assistant" side="left" asChild>
+						<Button
+							variant="ghost"
+							shape="square"
+							icon={<RobotIcon size={20} />}
+							onClick={toggleAgentPanel}
+							aria-label="Open AI assistant"
+						/>
+					</Tooltip>
 				</div>
 			)}
 

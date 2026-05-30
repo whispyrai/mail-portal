@@ -14,6 +14,8 @@ export function useFolders(mailboxId: string | undefined) {
 			: ["folders", "_disabled"],
 		queryFn: () => api.listFolders(mailboxId!) as Promise<Folder[]>,
 		enabled: !!mailboxId,
+		// Poll so unread badges + the tab-title counter stay fresh, not just on mutation.
+		refetchInterval: 30_000,
 	});
 }
 

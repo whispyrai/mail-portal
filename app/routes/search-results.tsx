@@ -33,7 +33,7 @@ export default function SearchResultsRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
 	const [searchParams] = useSearchParams();
 	const navigate = useNavigate();
-	const { selectedEmailId, isComposing, selectEmail, closePanel } = useUIStore();
+	const { selectedEmailId, selectEmail, closePanel } = useUIStore();
 	const updateEmail = useUpdateEmail();
 	const urlQuery = searchParams.get("q") || "";
 	const [page, setPage] = useState(1);
@@ -62,7 +62,7 @@ export default function SearchResultsRoute() {
 	);
 	const results = searchData?.results ?? [];
 	const totalCount = searchData?.totalCount ?? 0;
-	const isPanelOpen = selectedEmailId !== null || isComposing;
+	const isPanelOpen = selectedEmailId !== null;
 
 	const handleRowClick = (email: Email) => { selectEmail(email.id); if (!email.read && mailboxId) updateEmail.mutate({ mailboxId, id: email.id, data: { read: true } }); };
 	const folderDisplayName = (name: string | null | undefined): string => { if (!name) return ""; const map: Record<string, string> = { inbox: "Inbox", sent: "Sent", draft: "Drafts", archive: "Archive", trash: "Trash" }; return map[name.toLowerCase()] || name; };
@@ -70,7 +70,6 @@ export default function SearchResultsRoute() {
 	return (
 		<MailboxSplitView
 			selectedEmailId={selectedEmailId}
-			isComposing={isComposing}
 		>
 			<>
 				<div className="flex items-center gap-2 px-4 py-3.5 border-b border-kumo-line shrink-0 md:px-5">

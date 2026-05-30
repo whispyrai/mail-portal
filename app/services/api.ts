@@ -146,6 +146,11 @@ const api = {
 		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email),
 	forwardEmail: (mailboxId: string, emailId: string, email: unknown) =>
 		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/forward`, email),
+	aiDraftReply: (mailboxId: string, emailId: string) =>
+		post<{ to: string; subject: string; body: string }>(
+			`/api/v1/mailboxes/${mailboxId}/ai-draft`,
+			{ emailId },
+		),
 
 	// Folders
 	listFolders: (mailboxId: string) =>

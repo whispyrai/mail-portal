@@ -15,6 +15,7 @@ import {
 	FolderSimpleIcon,
 	PaperPlaneTiltIcon,
 	PencilSimpleIcon,
+	SparkleIcon,
 	StarIcon,
 	TrashIcon,
 	XIcon,
@@ -26,6 +27,7 @@ interface EmailPanelToolbarProps {
 	mailboxId?: string;
 	isDraftFolder: boolean;
 	isSending: boolean;
+	isDrafting: boolean;
 	moveToFolders: Folder[];
 	lastReceivedMessage?: Email;
 	onBack: () => void;
@@ -34,6 +36,7 @@ interface EmailPanelToolbarProps {
 	onReply: () => void;
 	onReplyAll: () => void;
 	onForward: () => void;
+	onAiDraft: () => void;
 	onToggleStar: () => void;
 	onToggleRead: () => void;
 	onMove: (folderId: string) => void;
@@ -46,6 +49,7 @@ export default function EmailPanelToolbar({
 	mailboxId,
 	isDraftFolder,
 	isSending,
+	isDrafting,
 	moveToFolders,
 	onBack,
 	onSendDraft,
@@ -53,6 +57,7 @@ export default function EmailPanelToolbar({
 	onReply,
 	onReplyAll,
 	onForward,
+	onAiDraft,
 	onToggleStar,
 	onToggleRead,
 	onMove,
@@ -122,6 +127,19 @@ export default function EmailPanelToolbar({
 							onClick={onForward}
 							aria-label="Forward"
 						/>
+					</Tooltip>
+					<div className="h-5 w-px bg-kumo-fill mx-0.5" />
+					<Tooltip content="Draft a reply with AI" side="bottom" asChild>
+						<Button
+							variant="secondary"
+							size="sm"
+							icon={<SparkleIcon size={16} weight="fill" />}
+							onClick={onAiDraft}
+							loading={isDrafting}
+							disabled={isDrafting}
+						>
+							{isDrafting ? "Drafting…" : "AI Reply"}
+						</Button>
 					</Tooltip>
 				</>
 			)}

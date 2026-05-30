@@ -2,9 +2,10 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { Loader } from "@cloudflare/kumo";
-import { PlugsIcon, RobotIcon } from "@phosphor-icons/react";
+import { Button, Loader, Tooltip } from "@cloudflare/kumo";
+import { CaretDoubleRightIcon, PlugsIcon, RobotIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
+import { useUIStore } from "~/hooks/useUIStore";
 import MCPPanel from "./MCPPanel";
 
 function LazyAgentPanel() {
@@ -42,6 +43,7 @@ function LazyAgentPanel() {
 
 export default function AgentSidebar() {
 	const [activeTab, setActiveTab] = useState<"agent" | "mcp">("agent");
+	const { toggleAgentPanel } = useUIStore();
 
 	return (
 		<div className="flex flex-col h-full">
@@ -57,7 +59,7 @@ export default function AgentSidebar() {
 					}`}
 				>
 					<RobotIcon size={14} weight={activeTab === "agent" ? "fill" : "regular"} />
-					Agent
+					Assistant
 				</button>
 				<button
 					type="button"
@@ -71,6 +73,18 @@ export default function AgentSidebar() {
 					<PlugsIcon size={14} weight={activeTab === "mcp" ? "fill" : "regular"} />
 					MCP
 				</button>
+				<div className="ml-auto pr-1.5">
+					<Tooltip content="Collapse panel" side="bottom" asChild>
+						<Button
+							variant="ghost"
+							shape="square"
+							size="sm"
+							icon={<CaretDoubleRightIcon size={16} />}
+							onClick={toggleAgentPanel}
+							aria-label="Collapse assistant panel"
+						/>
+					</Tooltip>
+				</div>
 			</div>
 
 			{/* Tab content — keep agent mounted so chat isn't lost */}

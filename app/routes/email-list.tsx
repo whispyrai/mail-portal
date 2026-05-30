@@ -147,7 +147,6 @@ export default function EmailListRoute() {
 	}>();
 	const {
 		selectedEmailId,
-		isComposing,
 		selectEmail,
 		closePanel,
 		startCompose,
@@ -184,7 +183,7 @@ export default function EmailListRoute() {
 		return folder ? folder.charAt(0).toUpperCase() + folder.slice(1) : "Inbox";
 	}, [folders, folder]);
 
-	const isPanelOpen = selectedEmailId !== null || isComposing;
+	const isPanelOpen = selectedEmailId !== null;
 
 	// Track folder identity to detect folder changes vs page changes
 	const prevFolderRef = useRef<string | undefined>(undefined);
@@ -271,7 +270,6 @@ export default function EmailListRoute() {
 	return (
 		<MailboxSplitView
 			selectedEmailId={selectedEmailId}
-			isComposing={isComposing}
 		>
 				{/* Folder header */}
 				<div className="flex items-center justify-between px-4 py-3.5 border-b border-kumo-line shrink-0 md:px-5">

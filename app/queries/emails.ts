@@ -277,3 +277,14 @@ export function useForwardEmail() {
 		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),
 	});
 }
+
+/** One-shot AI reply draft for an email/thread. Returns { to, subject, body } to seed the composer. */
+export function useAiDraftReply() {
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			emailId,
+		}: { mailboxId: string; emailId: string }) =>
+			api.aiDraftReply(mailboxId, emailId),
+	});
+}

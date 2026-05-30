@@ -14,6 +14,8 @@ export interface ComposeOptions {
 	draftEmail?: Email | null;
 }
 
+const AGENT_PANEL_STORAGE_KEY = "whispyr.agentPanelOpen";
+
 interface UIState {
 	// Side panel state
 	selectedEmailId: string | null;
@@ -33,14 +35,21 @@ interface UIState {
 	closeSidebar: () => void;
 	toggleSidebar: () => void;
 
-	// Agent panel
+	// Agent panel (collapsible + persisted; see hydrateAgentPanel for SSR-safe load)
 	isAgentPanelOpen: boolean;
 	toggleAgentPanel: () => void;
+	setAgentPanelOpen: (open: boolean) => void;
+	hydrateAgentPanel: () => void;
+}
 
-	// Legacy dialog support (kept for non-split views)
-	isComposeModalOpen: boolean;
-	openComposeModal: (options?: ComposeOptions) => void;
-	closeComposeModal: () => void;
+/** Persist the agent-panel open/closed choice so it survives reloads. */
+function persistAgentPanel(open: boolean) {
+	if (typeof window === "undefined") return;
+	try {
+		window.localStorage.setItem(AGENT_PANEL_STORAGE_KEY, open ? "1" : "0");
+	} catch {
+		// localStorage unavailable (private mode etc.) — non-fatal.
+	}
 }
 
 export const useUIStore = create<UIState>((set, get) => ({
@@ -48,9 +57,11 @@ export const useUIStore = create<UIState>((set, get) => ({
 	isComposing: false,
 	_previousEmailId: null,
 	composeOptions: { mode: "new", originalEmail: null },
-	isComposeModalOpen: false,
 	isSidebarOpen: false,
-	isAgentPanelOpen: true,
+	// Start collapsed so the panel never hides content on first paint. The real
+	// preference is loaded client-side via hydrateAgentPanel() to avoid an SSR
+	// hydration mismatch.
+	isAgentPanelOpen: false,
 
 	selectEmail: (id) => set({ selectedEmailId: id, isComposing: false }),
 
@@ -61,7 +72,7 @@ export const useUIStore = create<UIState>((set, get) => ({
 			return {
 				isComposing: true,
 				_previousEmailId: state.selectedEmailId,
-				// Keep selectedEmailId when replying/forwarding so the thread stays visible
+				// Keep selectedEmailId when replying/forwarding so the thread stays visible behind the modal
 				selectedEmailId: isReplyOrForward ? state.selectedEmailId : null,
 				composeOptions: options || { mode: "new", originalEmail: null },
 				isSidebarOpen: false,
@@ -82,17 +93,26 @@ export const useUIStore = create<UIState>((set, get) => ({
 	closeSidebar: () => set({ isSidebarOpen: false }),
 	toggleSidebar: () => set({ isSidebarOpen: !get().isSidebarOpen }),
 
-	toggleAgentPanel: () => set({ isAgentPanelOpen: !get().isAgentPanelOpen }),
-
-	openComposeModal: (options) =>
-		set({
-			composeOptions: options || { mode: "new", originalEmail: null },
-			isComposeModalOpen: true,
+	toggleAgentPanel: () =>
+		set(() => {
+			const next = !get().isAgentPanelOpen;
+			persistAgentPanel(next);
+			return { isAgentPanelOpen: next };
 		}),
 
-	closeComposeModal: () =>
-		set({
-			isComposeModalOpen: false,
-			composeOptions: { mode: "new", originalEmail: null },
+	setAgentPanelOpen: (open) =>
+		set(() => {
+			persistAgentPanel(open);
+			return { isAgentPanelOpen: open };
 		}),
+
+	hydrateAgentPanel: () => {
+		if (typeof window === "undefined") return;
+		try {
+			const stored = window.localStorage.getItem(AGENT_PANEL_STORAGE_KEY);
+			if (stored !== null) set({ isAgentPanelOpen: stored === "1" });
+		} catch {
+			// ignore
+		}
+	},
 }));

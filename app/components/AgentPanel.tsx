@@ -337,9 +337,9 @@ function AgentChatConnected({
 	};
 
 	const suggestedPrompts = [
-		"Show me the latest inbox emails",
-		"Any unread emails?",
-		"Draft a response to the latest email",
+		"Summarize my unread emails",
+		"Which prospects are waiting on a reply?",
+		"Draft a reply to the latest email",
 	];
 
 	return (
@@ -349,7 +349,7 @@ function AgentChatConnected({
 				<div className="flex items-center gap-2">
 					<Badge variant="beta">AI</Badge>
 					<span className="text-xs text-kumo-subtle">
-						Email Agent
+						Whispyr Assistant
 					</span>
 				</div>
 				<div className="flex items-center gap-1">
@@ -385,8 +385,9 @@ function AgentChatConnected({
 							/>
 						</div>
 						<p className="text-xs text-kumo-subtle text-center leading-relaxed px-4">
-							I can read emails, search conversations, and draft
-							replies.
+							I can read your inbox, summarize conversations, find
+							prospects waiting on you, and draft replies in your
+							voice.
 						</p>
 						<div className="flex flex-col gap-1.5 w-full">
 							{suggestedPrompts.map((prompt) => (
