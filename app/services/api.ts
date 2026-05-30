@@ -151,6 +151,11 @@ const api = {
 			`/api/v1/mailboxes/${mailboxId}/ai-draft`,
 			{ emailId },
 		),
+	aiDraftCompose: (mailboxId: string, prompt: string) =>
+		post<{ subject: string; body: string }>(
+			`/api/v1/mailboxes/${mailboxId}/ai-compose`,
+			{ prompt },
+		),
 
 	// Folders
 	listFolders: (mailboxId: string) =>

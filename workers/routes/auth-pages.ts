@@ -18,17 +18,25 @@ import {
 import { getUserByEmail, countUsers, createUser } from "../lib/users";
 import { provisionMailbox } from "../lib/mailbox";
 import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
+import { escapeHtml } from "../lib/email-helpers";
+import { safeAuthorizeReturnTo } from "../lib/auth";
 import { pageShell, brandLogo } from "./brand";
 import type { Env } from "../types";
 
 type Ctx = Context<{ Bindings: Env; Variables: { session?: SessionClaims } }>;
 
-function renderLogin(opts: { error?: string; bootstrap?: boolean } = {}): string {
+function renderLogin(
+	opts: { error?: string; bootstrap?: boolean; returnTo?: string | null } = {},
+): string {
 	const errorBlock = opts.error ? `<div class="err">${opts.error}</div>` : "";
 	const heading = opts.bootstrap ? "Create the first admin" : "Sign in";
 	const sub = opts.bootstrap
 		? "No users exist yet. Sign in with the bootstrap email to create the admin account."
 		: "Whispyr sales mail portal";
+	// Carried through login so an OAuth connect flow resumes at /authorize afterward.
+	const returnToField = opts.returnTo
+		? `<input type="hidden" name="returnTo" value="${escapeHtml(opts.returnTo)}">`
+		: "";
 	return pageShell(
 		"Sign in · Whispyr Mail",
 		`<div class="wrap--center">
@@ -38,6 +46,7 @@ function renderLogin(opts: { error?: string; bootstrap?: boolean } = {}): string
     <h2>${heading}</h2>
     ${errorBlock}
     <form method="post" action="/login" autocomplete="off">
+      ${returnToField}
       <label for="email">Email</label>
       <input id="email" name="email" type="email" required autocapitalize="off" spellcheck="false" placeholder="you@whispyrcrm.com">
       <label for="password">Password</label>
@@ -53,20 +62,25 @@ function renderLogin(opts: { error?: string; bootstrap?: boolean } = {}): string
 export async function loginPage(c: Ctx) {
 	const bootstrap =
 		(await countUsers(c.env)) === 0 && Boolean(c.env.ADMIN_BOOTSTRAP_EMAIL);
-	return c.html(renderLogin({ bootstrap }));
+	const returnTo = safeAuthorizeReturnTo(c.req.query("returnTo"));
+	return c.html(renderLogin({ bootstrap, returnTo }));
 }
 
 export async function handleLogin(c: Ctx) {
 	const form = await c.req.parseBody();
 	const email = String(form.email || "").trim().toLowerCase();
 	const password = String(form.password || "");
+	const returnTo = safeAuthorizeReturnTo(String(form.returnTo || ""));
 	const url = new URL(c.req.url);
 	const host = c.req.header("host") || url.host;
 	const secure = url.protocol === "https:";
 	const domain = cookieDomainFor(host, c.env.DOMAINS);
 
 	if (!email || !password) {
-		return c.html(renderLogin({ error: "Email and password are required." }), 400);
+		return c.html(
+			renderLogin({ error: "Email and password are required.", returnTo }),
+			400,
+		);
 	}
 
 	let user = await getUserByEmail(c.env, email);
@@ -81,6 +95,7 @@ export async function handleLogin(c: Ctx) {
 					renderLogin({
 						error: "Choose a password of at least 12 characters.",
 						bootstrap: true,
+						returnTo,
 					}),
 					400,
 				);
@@ -100,11 +115,17 @@ export async function handleLogin(c: Ctx) {
 	}
 
 	if (!user || user.is_active !== 1) {
-		return c.html(renderLogin({ error: "Invalid email or password." }), 401);
+		return c.html(
+			renderLogin({ error: "Invalid email or password.", returnTo }),
+			401,
+		);
 	}
 	const ok = await verifyPassword(password, user.password_salt, user.password_hash, c.env.JWT_SECRET);
 	if (!ok) {
-		return c.html(renderLogin({ error: "Invalid email or password." }), 401);
+		return c.html(
+			renderLogin({ error: "Invalid email or password.", returnTo }),
+			401,
+		);
 	}
 
 	const jwt = await signSession(
@@ -112,7 +133,8 @@ export async function handleLogin(c: Ctx) {
 		c.env.JWT_SECRET,
 	);
 	c.header("Set-Cookie", buildSessionCookie(jwt, { secure, domain }));
-	return c.redirect("/", 302);
+	// Resume an OAuth connect flow if we came from /authorize; otherwise the inbox.
+	return c.redirect(returnTo ?? "/", 302);
 }
 
 export async function handleLogout(c: Ctx) {

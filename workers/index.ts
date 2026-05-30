@@ -19,7 +19,7 @@ import {
 } from "./lib/email-helpers";
 import { SendEmailRequestSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
-import { draftReplyForEmail } from "./lib/agent-context";
+import { draftReplyForEmail, draftNewEmail } from "./lib/agent-context";
 import { WHISPYR_SYSTEM_PROMPT } from "./lib/whispyr-prompt";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
@@ -315,6 +315,19 @@ app.post("/api/v1/mailboxes/:mailboxId/ai-draft", async (c: AppContext) => {
 		return c.json(draft);
 	} catch (e) {
 		return c.json({ error: (e as Error).message || "AI draft failed" }, 502);
+	}
+});
+
+// -- AI compose draft (one-shot, for brand-new outbound emails) -----------
+app.post("/api/v1/mailboxes/:mailboxId/ai-compose", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	const { prompt } = (await c.req.json()) as { prompt?: string };
+	if (!prompt?.trim()) return c.json({ error: "prompt is required" }, 400);
+	try {
+		const draft = await draftNewEmail(c.env, mailboxId, prompt.trim());
+		return c.json(draft);
+	} catch (e) {
+		return c.json({ error: (e as Error).message || "AI compose failed" }, 502);
 	}
 });
 

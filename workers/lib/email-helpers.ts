@@ -200,14 +200,24 @@ export function escapeHtml(text: string): string {
 }
 
 /**
- * Convert plain text to a simple HTML block with preserved whitespace.
- * Uses both `white-space:pre-wrap` (modern clients) and `<br>` tags
- * (clients that strip inline styles, e.g. Outlook) as a belt-and-suspenders approach.
+ * Convert plain text to HTML suitable for TipTap's setContent().
+ * Paragraph breaks (2+ newlines) become separate <p> elements; single
+ * newlines within a paragraph become <br> hard-breaks. This is the shape
+ * TipTap's ProseMirror parser natively understands, so spacing, greetings,
+ * and sign-offs survive the round-trip into the editor.
  */
 export function textToHtml(text: string): string {
 	if (!text) return "";
-	const escaped = escapeHtml(text).replace(/\n/g, "<br>");
-	return `<div style="white-space:pre-wrap">${escaped}</div>`;
+	const paragraphs = text.split(/\n{2,}/);
+	return paragraphs
+		.map((p) => {
+			const trimmed = p.trim();
+			if (!trimmed) return "";
+			const escaped = escapeHtml(trimmed).replace(/\n/g, "<br>");
+			return `<p>${escaped}</p>`;
+		})
+		.filter(Boolean)
+		.join("");
 }
 
 /**

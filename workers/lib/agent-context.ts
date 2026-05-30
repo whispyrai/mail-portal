@@ -127,10 +127,13 @@ export async function draftReplyForEmail(
 	const systemPrompt = await getMailboxSystemPrompt(env, mailboxId);
 	const model = getAiModel(env);
 
+	const repRaw = mailboxId.split("@")[0].split(".")[0];
+	const repFirstName = repRaw.charAt(0).toUpperCase() + repRaw.slice(1);
+
 	const messages = [
 		{
 			role: "system",
-			content: `${systemPrompt}\n\nYou are drafting a reply on behalf of the rep (${mailboxId}). Output ONLY the plain-text body of the reply — no subject line, no "To:" line, no commentary, and do NOT include the quoted original message. Write natural paragraphs.`,
+			content: `${systemPrompt}\n\nYou are drafting a reply on behalf of the rep (${mailboxId}). Output ONLY the plain-text body of the reply — no subject line, no "To:" line, no commentary, and do NOT include the quoted original message.\n\nStructure the reply as a proper email:\n- Open with a natural greeting using the sender's first name (e.g. "Hi Ahmed,")\n- Write the reply in clear, well-spaced paragraphs\n- Close with a professional sign-off (e.g. "Best regards,") on its own line, followed by the rep's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
 		},
 		{
 			role: "user",
@@ -160,4 +163,60 @@ export async function draftReplyForEmail(
 		subject,
 		body: textToHtml(text),
 	};
+}
+
+/**
+ * One-shot compose draft for a brand-new outbound email. The rep provides a
+ * plain-language prompt describing what they want to write; the model returns
+ * a subject line and a full email body (greeting → paragraphs → sign-off).
+ */
+export async function draftNewEmail(
+	env: Env,
+	mailboxId: string,
+	prompt: string,
+): Promise<{ subject: string; body: string }> {
+	const systemPrompt = await getMailboxSystemPrompt(env, mailboxId);
+	const model = getAiModel(env);
+
+	const repRaw = mailboxId.split("@")[0].split(".")[0];
+	const repFirstName = repRaw.charAt(0).toUpperCase() + repRaw.slice(1);
+
+	const messages = [
+		{
+			role: "system",
+			content: `${systemPrompt}\n\nYou are composing a brand-new outbound email on behalf of the rep whose mailbox is ${mailboxId}.\n\nOutput your response in exactly this format — nothing else:\nSUBJECT: <concise subject line>\n\n<full email body>\n\nThe body MUST:\n- Open with a natural greeting (e.g. "Hi [Name]," or "Dear [Name],")\n- Contain clear, well-spaced paragraphs conveying the message\n- Close with a professional sign-off (e.g. "Best regards,") on its own line followed by the rep's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
+		},
+		{
+			role: "user",
+			content: prompt,
+		},
+	];
+
+	const ai = env.AI as unknown as {
+		run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
+	};
+	const res = (await ai.run(model, {
+		messages,
+		max_tokens: 1024,
+		temperature: 0.6,
+	})) as { response?: string };
+
+	const text = (res?.response || "").trim();
+	if (!text) throw new Error("The model returned an empty draft. Please try again.");
+
+	// Parse "SUBJECT: ..." from the first matching line; everything after is the body.
+	const lines = text.split("\n");
+	const subjectIdx = lines.findIndex((l) =>
+		l.trimStart().toUpperCase().startsWith("SUBJECT:"),
+	);
+	let subject = "New email";
+	let bodyStart = 0;
+	if (subjectIdx !== -1) {
+		subject = lines[subjectIdx].replace(/^SUBJECT:\s*/i, "").trim() || "New email";
+		bodyStart = subjectIdx + 1;
+		while (bodyStart < lines.length && !lines[bodyStart].trim()) bodyStart++;
+	}
+	const bodyText = lines.slice(bodyStart).join("\n").trim();
+
+	return { subject, body: textToHtml(bodyText) };
 }

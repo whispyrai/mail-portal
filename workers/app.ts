@@ -9,6 +9,7 @@
 import { routeAgentRequest } from "agents";
 import { Hono, type Context } from "hono";
 import { createRequestHandler } from "react-router";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
@@ -20,18 +21,22 @@ import {
 	landingPage,
 } from "./routes/auth-pages";
 import {
+	authorizeGet,
+	authorizePost,
+	resolveLegacyBearer,
+	MCP_SCOPES,
+} from "./oauth/consent";
+import {
 	verifySession,
 	signSession,
 	buildSessionCookie,
 	readCookie,
-	readBearerToken,
-	hashToken,
 	shouldRenewSession,
 	cookieDomainFor,
 	SESSION_COOKIE_NAME,
 	type SessionClaims,
 } from "./lib/auth";
-import { getUserById, getUserByMcpTokenHash } from "./lib/users";
+import { getUserById } from "./lib/users";
 import type { Env } from "./types";
 
 export { MailboxDO } from "./durableObject";
@@ -84,33 +89,19 @@ function isPublicPath(path: string): boolean {
 	);
 }
 
-// ── MCP endpoint: per-user bearer-token auth, scoped via props (D-64) ──
+// ── OAuth authorize endpoint + public auth pages (before the gate) ──
+//
+// /mcp is no longer handled here. It is wrapped by OAuthProvider (see the export at
+// the bottom), which validates the access token, sets ctx.props from the grant, and
+// forwards to EmailMCP.serve(). The legacy static bearer token still works via the
+// provider's resolveExternalToken hook (resolveLegacyBearer in ./oauth/consent).
+//
+// /authorize is the one OAuth surface the provider delegates back to us — the
+// consent UI. It sits in front of the session gate so it can run its own login
+// bounce (D-20..25 session reused for OAuth consent).
 
-const mcpHandler = EmailMCP.serve("/mcp", { binding: "EMAIL_MCP" });
-
-async function handleMcp(c: Context<AppEnv>) {
-	const token = readBearerToken(c.req.header("authorization"));
-	if (!token) {
-		return c.json({ error: "Missing bearer token" }, 401);
-	}
-	const user = await getUserByMcpTokenHash(c.env, await hashToken(token));
-	if (!user || user.is_active !== 1) {
-		return c.json({ error: "Invalid MCP token" }, 401);
-	}
-	// McpAgent.serve() reads ctx.props and exposes it to the DO as this.props.
-	const ctx = c.executionCtx as ExecutionContext & { props?: unknown };
-	ctx.props = {
-		userId: user.id,
-		role: user.role,
-		mailbox: user.mailbox_address,
-	};
-	return mcpHandler.fetch(c.req.raw, c.env, ctx);
-}
-
-app.all("/mcp", handleMcp);
-app.all("/mcp/*", handleMcp);
-
-// ── Public auth pages (registered before the gate) ──
+app.get("/authorize", authorizeGet);
+app.post("/authorize", authorizePost);
 
 app.get("/login", loginPage);
 app.post("/login", handleLogin);
@@ -124,7 +115,6 @@ app.use("*", async (c, next) => {
 	const path = url.pathname;
 	const host = c.req.header("host") || url.host;
 
-	if (path === "/mcp" || path.startsWith("/mcp/")) return next();
 	if (isPublicPath(path)) return next();
 	if (path === "/" && !isAppHost(host)) return next(); // apex landing
 
@@ -205,8 +195,71 @@ app.all("*", (c) => {
 	});
 });
 
+// ── OAuth-wrapped entrypoint ─────────────────────────────────────────
+//
+// OAuthProvider owns the OAuth surface: it serves the RFC 9728 / RFC 8414 discovery
+// metadata, RFC 7591 dynamic client registration (/register), the /token endpoint,
+// PKCE, and the 401 WWW-Authenticate challenge on /mcp. A /mcp request with a valid
+// token is forwarded to EmailMCP.serve() with ctx.props set from the grant; every
+// other request falls through to the Hono `app` (defaultHandler).
+
+const oauthProvider = new OAuthProvider<Env>({
+	apiHandlers: {
+		"/mcp": EmailMCP.serve("/mcp", { binding: "EMAIL_MCP" }),
+	},
+	defaultHandler: {
+		fetch: (request: Request, env: Env, ctx: ExecutionContext) =>
+			app.fetch(request, env, ctx),
+	},
+	authorizeEndpoint: "/authorize",
+	tokenEndpoint: "/token",
+	clientRegistrationEndpoint: "/register",
+	scopesSupported: MCP_SCOPES,
+	// OAuth 2.1: S256-only PKCE (reject the legacy `plain` method).
+	allowPlainPKCE: false,
+	// Claude sends a path-aware resource (…/mcp) at token exchange while the metadata
+	// advertises the origin; origin-only matching keeps the audiences consistent.
+	resourceMatchOriginOnly: true,
+	resourceMetadata: { resource_name: "Whispyr Mail" },
+	// Keep the admin-issued static bearer token working for CLI / non-OAuth clients.
+	resolveExternalToken: resolveLegacyBearer,
+});
+
+/**
+ * Best-effort connector branding. The OAuth discovery metadata is the most reliable
+ * place a client may read a server logo from today, but the library exposes no
+ * logo_uri option — so inject one into the well-known documents on the way out.
+ * Harmless to spec-compliant clients (unknown fields are ignored).
+ */
+async function fetchWithBranding(
+	request: Request,
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<Response> {
+	const res = await oauthProvider.fetch(request, env, ctx);
+	const path = new URL(request.url).pathname;
+	// Match both the bare docs and the RFC-9728 path-aware variant Claude actually
+	// fetches (/.well-known/oauth-protected-resource/mcp).
+	if (
+		res.ok &&
+		(path.startsWith("/.well-known/oauth-authorization-server") ||
+			path.startsWith("/.well-known/oauth-protected-resource"))
+	) {
+		try {
+			const meta = (await res.clone().json()) as Record<string, unknown>;
+			meta.logo_uri = `${new URL(request.url).origin}/icon-512.png`;
+			const headers = new Headers(res.headers);
+			headers.delete("content-length");
+			return new Response(JSON.stringify(meta), { status: res.status, headers });
+		} catch {
+			return res;
+		}
+	}
+	return res;
+}
+
 export default {
-	fetch: app.fetch,
+	fetch: fetchWithBranding,
 	async email(
 		event: { raw: ReadableStream; rawSize: number },
 		env: Env,

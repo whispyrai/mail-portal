@@ -76,8 +76,25 @@ const MAILBOX_ARG_DESCRIPTION =
  */
 export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 	server = new McpServer({
-		name: "agentic-inbox",
+		name: "whispyr-mail",
 		version: "1.0.0",
+		title: "Whispyr Mail",
+		websiteUrl: "https://whispyrai.com",
+		// MCP-native server icons (spec 2025-11-25). Best-effort connector branding:
+		// clients that honor serverInfo.icons show the Whispyr mark. Absolute https
+		// URLs on the prod host; PNG first (universally supported) then SVG fallback.
+		icons: [
+			{
+				src: "https://mail.whispyrcrm.com/icon-512.png",
+				mimeType: "image/png",
+				sizes: ["512x512"],
+			},
+			{
+				src: "https://mail.whispyrcrm.com/whispyr-mark.svg",
+				mimeType: "image/svg+xml",
+				sizes: ["any"],
+			},
+		],
 	});
 
 	/**

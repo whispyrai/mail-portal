@@ -40,6 +40,15 @@
 			"preview_bucket_name": "sales-mail-portal"
 		}
 	],
+	// Backs @cloudflare/workers-oauth-provider (OAuth grants, registered clients,
+	// access/refresh tokens) for the MCP connector. Created via
+	// `wrangler kv namespace create OAUTH_KV`.
+	"kv_namespaces": [
+		{
+			"binding": "OAUTH_KV",
+			"id": "cd541026bdf949d9ac63b3b5fdff4969"
+		}
+	],
 	"ai": {
 		"binding": "AI"
 	},

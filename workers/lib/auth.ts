@@ -230,6 +230,55 @@ export function readBearerToken(authHeader: string | null | undefined): string |
 	return match ? match[1].trim() : null;
 }
 
+// ── OAuth authorize transaction (consent CSRF + tamper protection) ──
+
+/**
+ * Sign the parsed OAuth authorize request into a short-lived JWT carried through
+ * the consent screen as a hidden field. Verified on POST /authorize so the
+ * request parameters cannot be tampered with, and — together with the
+ * SameSite=Strict session cookie that a cross-site attacker cannot send —
+ * protects the consent POST against CSRF.
+ */
+export async function signAuthTxn(
+	req: unknown,
+	secret: string,
+): Promise<string> {
+	const key = new TextEncoder().encode(secret);
+	return new SignJWT({ req: req as Record<string, unknown> })
+		.setProtectedHeader({ alg: "HS256", typ: "JWT" })
+		.setIssuedAt()
+		.setExpirationTime("10m")
+		.sign(key);
+}
+
+/** Verify an authorize-transaction JWT; returns the embedded request or null. */
+export async function verifyAuthTxn<T = unknown>(
+	txn: string,
+	secret: string,
+): Promise<T | null> {
+	try {
+		const key = new TextEncoder().encode(secret);
+		const { payload } = await jwtVerify(txn, key);
+		return (payload.req as T) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Validate a post-login redirect target. Only honors a root-relative path to the
+ * OAuth authorize endpoint, so a malicious `returnTo` can't turn login into an
+ * open redirect.
+ */
+export function safeAuthorizeReturnTo(
+	raw: string | null | undefined,
+): string | null {
+	if (!raw) return null;
+	if (!raw.startsWith("/") || raw.startsWith("//")) return null; // not protocol-relative
+	const path = raw.split("?")[0];
+	return path === "/authorize" ? raw : null;
+}
+
 // ── Cookie scope ───────────────────────────────────────────────────
 
 /**

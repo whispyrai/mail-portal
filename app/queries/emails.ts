@@ -288,3 +288,14 @@ export function useAiDraftReply() {
 			api.aiDraftReply(mailboxId, emailId),
 	});
 }
+
+/** One-shot AI compose draft for a new email. Returns { subject, body } to seed the composer. */
+export function useAiDraftCompose() {
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			prompt,
+		}: { mailboxId: string; prompt: string }) =>
+			api.aiDraftCompose(mailboxId, prompt),
+	});
+}

@@ -3,10 +3,12 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Banner, Button, Dialog, Input } from "@cloudflare/kumo";
-import { FloppyDiskIcon, PaperPlaneTiltIcon, XIcon } from "@phosphor-icons/react";
+import { FloppyDiskIcon, PaperPlaneTiltIcon, SparkleIcon, XIcon } from "@phosphor-icons/react";
+import { useState } from "react";
 import { useParams } from "react-router";
 import { useComposeForm } from "~/hooks/useComposeForm";
 import { useUIStore } from "~/hooks/useUIStore";
+import { useAiDraftCompose } from "~/queries/emails";
 import RichTextEditor from "./RichTextEditor";
 
 /**
@@ -21,7 +23,11 @@ export default function ComposeEmail() {
 		folder: string;
 	}>();
 
-	const { isComposing, closeCompose } = useUIStore();
+	const { isComposing, closeCompose, composeOptions } = useUIStore();
+	const aiComposeMut = useAiDraftCompose();
+	const [showAiPrompt, setShowAiPrompt] = useState(false);
+	const [aiPrompt, setAiPrompt] = useState("");
+	const isNewCompose = composeOptions.mode === "new" && !composeOptions.draftEmail;
 
 	const {
 		to,
@@ -43,6 +49,19 @@ export default function ComposeEmail() {
 		handleSaveDraft,
 		handleSend,
 	} = useComposeForm(mailboxId, folder);
+
+	const handleAiGenerate = async () => {
+		if (!mailboxId || !aiPrompt.trim()) return;
+		try {
+			const draft = await aiComposeMut.mutateAsync({ mailboxId, prompt: aiPrompt.trim() });
+			if (draft.subject) setSubject(draft.subject);
+			if (draft.body) setBody(draft.body);
+			setShowAiPrompt(false);
+			setAiPrompt("");
+		} catch {
+			// error surfaced via mutation.error
+		}
+	};
 
 	return (
 		<Dialog.Root
@@ -126,6 +145,65 @@ export default function ComposeEmail() {
 							onChange={(e) => setSubject(e.target.value)}
 							required
 						/>
+
+						{/* AI compose — only for brand-new emails */}
+						{isNewCompose && (
+							<div>
+								{!showAiPrompt ? (
+									<button
+										type="button"
+										onClick={() => setShowAiPrompt(true)}
+										className="flex items-center gap-1.5 text-sm text-kumo-link hover:text-kumo-link-hover font-medium"
+									>
+										<SparkleIcon size={15} weight="fill" />
+										Generate with AI
+									</button>
+								) : (
+									<div className="rounded-lg border border-kumo-line bg-kumo-recessed p-3 space-y-2">
+										<p className="text-xs font-medium text-kumo-subtle">What should this email be about?</p>
+										<textarea
+											autoFocus
+											value={aiPrompt}
+											onChange={(e) => setAiPrompt(e.target.value)}
+											onKeyDown={(e) => {
+												if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleAiGenerate();
+												if (e.key === "Escape") setShowAiPrompt(false);
+											}}
+											placeholder="e.g. Introduce Whispyr to Ahmed at ABC Realty who asked about pricing, offer a 20-min demo"
+											rows={2}
+											className="w-full resize-none rounded border border-kumo-line bg-white px-3 py-2 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:outline-none focus:ring-2 focus:ring-kumo-focus"
+										/>
+										<div className="flex items-center gap-2">
+											<Button
+												type="button"
+												variant="primary"
+												size="sm"
+												loading={aiComposeMut.isPending}
+												disabled={!aiPrompt.trim() || aiComposeMut.isPending}
+												icon={<SparkleIcon size={14} weight="fill" />}
+												onClick={handleAiGenerate}
+											>
+												{aiComposeMut.isPending ? "Generating…" : "Generate"}
+											</Button>
+											<Button
+												type="button"
+												variant="ghost"
+												size="sm"
+												disabled={aiComposeMut.isPending}
+												onClick={() => { setShowAiPrompt(false); setAiPrompt(""); }}
+											>
+												Cancel
+											</Button>
+											{aiComposeMut.isError && (
+												<span className="text-xs text-red-500 ml-1">
+													{(aiComposeMut.error as Error)?.message || "Generation failed"}
+												</span>
+											)}
+										</div>
+									</div>
+								)}
+							</div>
+						)}
 
 						{/* Body */}
 						<div className="h-[42vh] min-h-[280px]">
