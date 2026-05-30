@@ -25,7 +25,7 @@ function highlightTerms(text: string, query: string): React.ReactNode {
 		// Use case-insensitive string comparison instead of regex.test() with g flag,
 		// which has stateful lastIndex causing alternating true/false results.
 		const lowerEscaped = escaped.toLowerCase();
-		return parts.map((part, i) => part.toLowerCase() === lowerEscaped ? <mark key={i} className="bg-kumo-warning-muted text-kumo-default rounded-sm px-0.5">{part}</mark> : part);
+		return parts.map((part, i) => part.toLowerCase() === lowerEscaped ? <mark key={i} className="bg-kumo-warning-tint text-kumo-default rounded-sm px-0.5">{part}</mark> : part);
 	} catch { return text; }
 }
 

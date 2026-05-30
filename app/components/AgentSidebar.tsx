@@ -26,7 +26,7 @@ function LazyAgentPanel() {
 	if (loadError) {
 		return (
 			<div className="flex items-center justify-center h-full">
-				<span className="text-xs text-kumo-error">{loadError}</span>
+				<span className="text-xs text-kumo-danger">{loadError}</span>
 			</div>
 		);
 	}

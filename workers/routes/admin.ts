@@ -110,8 +110,8 @@ adminApp.get("/users", async (c) => {
   </div>
   <div class="card">
     <h2 style="font-size:16px;margin-top:0">Users</h2>
-    <table><thead><tr><th>User</th><th>Mailbox</th><th>MCP</th><th>Actions</th></tr></thead>
-    <tbody>${rows || `<tr><td colspan="4">No users yet.</td></tr>`}</tbody></table>
+    <div class="tablewrap"><table><thead><tr><th>User</th><th>Mailbox</th><th>MCP</th><th>Actions</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="4">No users yet.</td></tr>`}</tbody></table></div>
   </div>`),
 	);
 });
@@ -185,7 +185,7 @@ adminApp.post("/users/:id/mcp-token", async (c) => {
     <p>User: <strong>${escapeHtml(user.email)}</strong> (${user.role})</p>
     <p>Token:</p><p><code>${escapeHtml(token)}</code></p>
     <p>Endpoint:</p><p><code>${escapeHtml(base)}</code></p>
-    <p style="color:#8595b5;font-size:13px">Connect an MCP client with header
+    <p style="color:var(--muted);font-size:13px">Connect an MCP client with header
       <code>Authorization: Bearer &lt;token&gt;</code>. ${user.role === "ADMIN"
 				? "As ADMIN it can read all mailboxes; it sends only from this user's address."
 				: "It can read and send only from this user's mailbox."}</p>

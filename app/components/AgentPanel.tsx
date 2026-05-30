@@ -549,7 +549,7 @@ export default function AgentPanel() {
 	if (loadError) {
 		return (
 			<div className="flex flex-col items-center justify-center h-full gap-2 px-4 text-center">
-				<span className="text-xs text-kumo-error">{loadError}</span>
+				<span className="text-xs text-kumo-danger">{loadError}</span>
 			</div>
 		);
 	}

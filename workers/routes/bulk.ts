@@ -32,7 +32,7 @@ function renderBulk(mailbox: string, apiBase: string): string {
     <label>1. Recipients CSV <span class="muted">(must include an <code>email</code> column; other columns become <code>{{placeholders}}</code>)</span></label>
     <input type="file" id="csv" accept=".csv,text/csv">
     <p id="csvInfo" class="muted" style="margin-top:10px"></p>
-    <div id="csvPreview"></div>
+    <div id="csvPreview" style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:10px"></div>
   </div>
 
   <div class="card">

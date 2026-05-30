@@ -53,7 +53,7 @@ export default function MailboxRoute() {
 			{/* Mobile sidebar overlay backdrop */}
 			{isSidebarOpen && (
 				<div
-					className="fixed inset-0 z-30 bg-black/30 md:hidden"
+					className="fixed inset-0 z-30 bg-kumo-contrast/30 md:hidden"
 					onClick={closeSidebar}
 					onKeyDown={(e) => e.key === "Escape" && closeSidebar()}
 					role="button"
@@ -79,13 +79,25 @@ export default function MailboxRoute() {
 				</main>
 			</div>
 
-			{/* Agent + MCP sidebar -- collapsible on desktop */}
+			{/* Agent + MCP sidebar — inline collapsible rail on desktop, full-height
+			    right drawer (with backdrop) on mobile / tablet. */}
 			{isAgentPanelOpen ? (
-				<div className="hidden lg:flex w-[360px] shrink-0 border-l border-kumo-line flex-col bg-kumo-base overflow-hidden">
-					<AgentSidebar />
-				</div>
+				<>
+					{/* Mobile/tablet backdrop */}
+					<div
+						className="fixed inset-0 z-30 bg-kumo-contrast/30 lg:hidden"
+						onClick={toggleAgentPanel}
+						onKeyDown={(e) => e.key === "Escape" && toggleAgentPanel()}
+						role="button"
+						tabIndex={-1}
+						aria-label="Close AI assistant"
+					/>
+					<div className="fixed inset-y-0 right-0 z-40 flex w-full max-w-[420px] shrink-0 flex-col border-l border-kumo-line bg-kumo-base overflow-hidden lg:static lg:z-0 lg:w-[360px] lg:max-w-none">
+						<AgentSidebar />
+					</div>
+				</>
 			) : (
-				// Slim re-open rail so the assistant is always one click away.
+				// Slim re-open rail so the assistant is always one click away (desktop).
 				<div className="hidden lg:flex w-11 shrink-0 border-l border-kumo-line flex-col items-center bg-kumo-base pt-3">
 					<Tooltip content="Open AI assistant" side="left" asChild>
 						<Button

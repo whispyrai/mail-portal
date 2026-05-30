@@ -7,14 +7,102 @@
 @font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Book.woff2") format("woff2"); font-weight: 400; font-display: swap; }
 @font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Bold.woff2") format("woff2"); font-weight: 700; font-display: swap; }
 
-/* Map Tailwind's font-sans token to the brand font so kumo's utilities inherit it. */
+/* ============================================================
+   Whispyr enterprise theme
+   White-dominant surfaces, charcoal text + primary actions, warm-tan
+   interaction tint. Re-skins @cloudflare/kumo to match the Whispyr CRM
+   dashboard (interior app, not the marketing site). Forced warm-light:
+   the OS dark scheme never wins.
+   ============================================================ */
 @theme {
+  /* Map Tailwind's font-sans token to the brand font so kumo inherits it. */
   --font-sans: "Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* Radius — kumo runs one step tight; lift to the dashboard scale
+     (sm .5 / md .625 / lg .75 / xl 1rem). */
+  --radius-sm: 0.5rem;
+  --radius-md: 0.625rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  /* Elevation — flatten toward the dashboard's ring-first, near-flat look. */
+  --shadow-xs: 0 1px 2px rgba(26, 26, 26, 0.05);
+  --shadow-sm: 0 1px 2px rgba(26, 26, 26, 0.06);
+  --shadow-md: 0 6px 16px rgba(26, 26, 26, 0.08);
+  --shadow-lg: 0 16px 40px rgba(26, 26, 26, 0.10);
+
+  /* Warm neutral ramp — several kumo surface tokens derive from this. */
+  --color-kumo-neutral-25: #ffffff;
+  --color-kumo-neutral-50: #fbfaf8;
+  --color-kumo-neutral-75: #f7f3ec;
+  --color-kumo-neutral-150: #efe9df;
+  --color-kumo-neutral-450: #b6ad9f;
+  --color-kumo-neutral-850: #2a2723;
+  --color-kumo-neutral-925: #201e1b;
+  --color-kumo-neutral-975: #1a1a1a;
+}
+
+/* Semantic kumo tokens. Declared on :root AND :root[data-mode="light"] so
+   they outrank kumo's own [data-mode] / [data-theme] blocks regardless of
+   source order. */
+:root,
+:root[data-mode="light"] {
+  color-scheme: light;
+
+  /* Surfaces — white dominant, barely-warm canvas behind white panels. */
+  --color-kumo-surface: #ffffff;
+  --color-kumo-base: #ffffff;
+  --color-kumo-recessed: #fbfaf8;
+  --color-kumo-elevated: #ffffff;
+  --color-kumo-overlay: #ffffff;
+  --color-kumo-control: #ffffff;
+
+  /* Interaction tint — warm tan, hover → selected. */
+  --color-kumo-tint: #f7f3ec;
+  --color-kumo-fill: #f1ebe1;
+  --color-kumo-fill-hover: #ece4d7;
+  --color-kumo-interact: #e6dece;
+  --color-kumo-contrast: #1a1a1a;
+
+  /* Brand → charcoal (primary actions). */
+  --color-kumo-brand: #1a1a1a;
+  --color-kumo-brand-hover: #000000;
+
+  /* Hairlines + focus ring. */
+  --color-kumo-line: rgba(26, 26, 26, 0.12);
+  --color-kumo-ring: rgba(26, 26, 26, 0.32);
+
+  /* Text. */
+  --text-color-kumo-default: #1a1a1a;
+  --text-color-kumo-strong: #3a352f;
+  --text-color-kumo-subtle: #6b6b6b;
+  --text-color-kumo-inactive: #a39a8b;
+  --text-color-kumo-inverse: #ffffff;
+  --text-color-kumo-brand: #1a1a1a;
+  --text-color-kumo-link: #1a1a1a;
+
+  /* Semantic — muted, enterprise. */
+  --color-kumo-success: #1e6b43;
+  --color-kumo-success-tint: #d9ece0;
+  --color-kumo-danger: #b42318;
+  --color-kumo-danger-tint: #f7ded9;
+  --color-kumo-warning: #b7791f;
+  --color-kumo-warning-tint: #f3e6cb;
+  --color-kumo-info: #3a352f;
+  --color-kumo-info-tint: #ece8e2;
+  --text-color-kumo-success: #1e6b43;
+  --text-color-kumo-danger: #b42318;
+  --text-color-kumo-warning: #b7791f;
+
+  /* Tooltip surface. */
+  --color-kumo-tip-shadow: rgba(26, 26, 26, 0.12);
+  --color-kumo-tip-stroke: rgba(26, 26, 26, 0.08);
 }
 
 html,
 body {
   margin: 0;
+  color-scheme: light;
   font-family: "Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 

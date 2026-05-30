@@ -92,7 +92,7 @@ export default function ComposeEmail() {
 								<button
 									type="button"
 									onClick={() => setShowCcBcc(true)}
-									className="shrink-0 pb-2.5 text-sm text-kumo-link hover:text-kumo-link-hover font-medium"
+									className="shrink-0 pb-2.5 text-sm text-kumo-link hover:underline font-medium"
 								>
 									Cc / Bcc
 								</button>

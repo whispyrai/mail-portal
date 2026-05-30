@@ -326,9 +326,9 @@ export default function EmailListRoute() {
 												handleRowClick(email);
 											}
 										}}
-										className={`group flex items-center gap-3 w-full text-left cursor-pointer transition-colors border-b border-kumo-line px-4 py-2.5 md:px-6 md:py-3 ${
+										className={`group flex items-center gap-3 w-full text-left cursor-pointer transition-colors border-b border-kumo-line border-s-2 px-4 py-2.5 md:px-6 md:py-3 ${
 											isPanelOpen ? "md:px-4 md:py-2.5" : ""
-										} ${isSelected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}
+										} ${isSelected ? "bg-kumo-fill border-s-kumo-brand" : "border-s-transparent hover:bg-kumo-tint"}`}
 									>
 										{/* Unread dot */}
 										<div className="w-2.5 shrink-0 flex justify-center">
@@ -371,7 +371,7 @@ export default function EmailListRoute() {
 													</span>
 												)}
 												{email.has_draft && (
-													<span className="shrink-0 text-xs text-kumo-destructive font-medium">
+													<span className="shrink-0 text-xs text-kumo-danger font-medium">
 														Draft
 													</span>
 												)}
