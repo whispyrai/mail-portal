@@ -4,7 +4,7 @@
 
 import type { Context } from "hono";
 import { sendEmail } from "../email-sender";
-import { storeAttachments } from "../lib/attachments";
+import { resolveAndPromoteAttachments } from "../lib/attachments";
 import type { EmailFull } from "../lib/schemas";
 import {
 	validateSender,
@@ -54,7 +54,14 @@ export async function handleReplyEmail(c: AppContext) {
 		return c.json({ error: rateLimitError }, 429);
 	}
 
-	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
+	const resolved = await resolveAndPromoteAttachments(
+		c.env.BUCKET, stub, mailboxId, messageId, attachments,
+	).then(
+		(r) => ({ ok: true as const, ...r }),
+		(e) => ({ ok: false as const, error: (e as Error).message }),
+	);
+	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	const { sesAttachments, storedMetadata } = resolved;
 
 	await stub.createEmail(
 		Folders.SENT,
@@ -83,7 +90,7 @@ export async function handleReplyEmail(c: AppContext) {
 				...(references.length > 0 ? [{ key: "references", value: references.map((r: string) => `<${r}>`).join(" ") }] : []),
 			]),
 		},
-		attachmentData,
+		storedMetadata,
 	);
 
 	await stub.markThreadRead(thread_id);
@@ -97,13 +104,7 @@ export async function handleReplyEmail(c: AppContext) {
 			subject,
 			html,
 			text,
-			attachments: attachments?.map((att) => ({
-				content: att.content,
-				filename: att.filename,
-				type: att.type,
-				disposition: att.disposition,
-				contentId: att.contentId,
-			})),
+			attachments: sesAttachments,
 			headers: buildThreadingHeaders(originalMsgId, references, buildThreadToken(thread_id, fromDomain)),
 		}).catch((e) => {
 			console.error("Deferred reply delivery failed:", (e as Error).message);
@@ -144,7 +145,14 @@ export async function handleForwardEmail(c: AppContext) {
 		return c.json({ error: rateLimitError }, 429);
 	}
 
-	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
+	const resolved = await resolveAndPromoteAttachments(
+		c.env.BUCKET, stub, mailboxId, messageId, attachments,
+	).then(
+		(r) => ({ ok: true as const, ...r }),
+		(e) => ({ ok: false as const, error: (e as Error).message }),
+	);
+	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	const { sesAttachments, storedMetadata } = resolved;
 
 	await stub.createEmail(
 		Folders.SENT,
@@ -171,7 +179,7 @@ export async function handleForwardEmail(c: AppContext) {
 				{ key: "message-id", value: `<${outgoingMessageId}>` },
 			]),
 		},
-		attachmentData,
+		storedMetadata,
 	);
 
 	c.executionCtx.waitUntil(
@@ -183,13 +191,7 @@ export async function handleForwardEmail(c: AppContext) {
 			subject,
 			html,
 			text,
-			attachments: attachments?.map((att) => ({
-				content: att.content,
-				filename: att.filename,
-				type: att.type,
-				disposition: att.disposition,
-				contentId: att.contentId,
-			})),
+			attachments: sesAttachments,
 			headers: buildThreadingHeaders(null, [], buildThreadToken(messageId, fromDomain)),
 		}).catch((e) => {
 			console.error("Deferred forward delivery failed:", (e as Error).message);

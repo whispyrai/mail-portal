@@ -11,6 +11,7 @@
  * Zod schemas: used across route handlers to eliminate duplication.
  */
 import { z } from "zod";
+import { ATTACHMENT_LIMITS } from "../../shared/attachments";
 
 // ── TypeScript Interfaces ──────────────────────────────────────────
 
@@ -58,6 +59,24 @@ export const ErrorResponseSchema = z.object({
 	error: z.string(),
 });
 
+/**
+ * A reference to a file to attach (the upload-first model). The client sends
+ * these instead of the bytes; the server resolves them from R2 at send time.
+ */
+export const AttachmentRefSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("upload"),
+		uploadId: z.string().min(1),
+		disposition: z.enum(["attachment", "inline"]).optional(),
+	}),
+	z.object({
+		kind: z.literal("existing"),
+		emailId: z.string().min(1),
+		attachmentId: z.string().min(1),
+		disposition: z.enum(["attachment", "inline"]).optional(),
+	}),
+]);
+
 export const SendEmailRequestSchema = z
 	.object({
 		to: RecipientFieldSchema,
@@ -70,17 +89,7 @@ export const SendEmailRequestSchema = z
 		subject: z.string(),
 		html: z.string().optional(),
 		text: z.string().optional(),
-		attachments: z
-			.array(
-				z.object({
-					content: z.string(), // base64 encoded
-					filename: z.string(),
-					type: z.string(),
-					disposition: z.enum(["attachment", "inline"]),
-					contentId: z.string().optional(),
-				}),
-			)
-			.optional(),
+		attachments: z.array(AttachmentRefSchema).max(ATTACHMENT_LIMITS.maxFiles).optional(),
 		in_reply_to: z.string().optional(),
 		references: z.array(z.string()).optional(),
 		thread_id: z.string().optional(),

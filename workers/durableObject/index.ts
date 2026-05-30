@@ -17,6 +17,8 @@ import {
 	buildThreadingHeaders,
 	escapeHtml,
 } from "../lib/email-helpers";
+import { arrayBufferToBase64, uploadKey } from "../lib/attachments";
+import { validateAttachmentSet } from "../../shared/attachments";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -115,6 +117,14 @@ const BULK_QUEUE_KEY = "bulk:queue";
 
 type BulkRecipient = Record<string, string>; // must include `email`
 
+/** One shared attachment for a bulk job: its base64 lives at `key` in R2. */
+interface BulkAttachment {
+	key: string; // R2 key holding the base64-encoded content
+	filename: string;
+	type: string;
+	size: number;
+}
+
 interface BulkJob {
 	id: string;
 	status: "queued" | "running" | "done";
@@ -130,6 +140,8 @@ interface BulkJob {
 	errors: { email: string; error: string }[];
 	createdAt: number;
 	updatedAt: number;
+	/** Shared attachments delivered to every recipient (manifest only; bytes in R2). */
+	attachments?: BulkAttachment[];
 }
 
 export class MailboxDO extends DurableObject<Env> {
@@ -933,6 +945,7 @@ export class MailboxDO extends DurableObject<Env> {
 		html?: string;
 		text?: string;
 		recipients: BulkRecipient[];
+		attachmentUploadIds?: string[];
 	}): Promise<{ jobId: string; total: number }> {
 		const recipients = input.recipients ?? [];
 		if (recipients.length === 0) throw new Error("No recipients provided.");
@@ -961,6 +974,44 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 
 		const jobId = `job_${crypto.randomUUID()}`;
+
+		// Resolve the shared attachments once: read each staged upload, enforce the
+		// limits, and stash the base64 SES needs under the job so the alarm streams
+		// it to every recipient with no per-send re-encoding.
+		const attachments: BulkAttachment[] = [];
+		const uploadIds = input.attachmentUploadIds ?? [];
+		if (uploadIds.length > 0) {
+			const staged: { bytes: ArrayBuffer; filename: string; type: string; srcKey: string }[] = [];
+			for (const uploadId of uploadIds) {
+				const srcKey = uploadKey(input.fromEmail, uploadId);
+				const obj = await this.env.BUCKET.get(srcKey);
+				if (!obj) {
+					throw new Error("An attachment upload was not found or has expired. Re-attach and try again.");
+				}
+				const meta = obj.customMetadata ?? {};
+				staged.push({
+					bytes: await obj.arrayBuffer(),
+					filename: (meta.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_"),
+					type: meta.type || obj.httpMetadata?.contentType || "application/octet-stream",
+					srcKey,
+				});
+			}
+			const setError = validateAttachmentSet(
+				staged.map((s) => ({ filename: s.filename, size: s.bytes.byteLength })),
+			);
+			if (setError) throw new Error(setError);
+			for (let i = 0; i < staged.length; i++) {
+				const s = staged[i];
+				const key = `bulk-attachments/${jobId}/${i}`;
+				await this.env.BUCKET.put(key, arrayBufferToBase64(s.bytes), {
+					customMetadata: { filename: s.filename, type: s.type },
+				});
+				attachments.push({ key, filename: s.filename, type: s.type, size: s.bytes.byteLength });
+			}
+			// Staging copies are no longer needed now the encoded job copies exist.
+			await Promise.all(staged.map((s) => this.env.BUCKET.delete(s.srcKey).catch(() => {})));
+		}
+
 		const now = Date.now();
 		const job: BulkJob = {
 			id: jobId,
@@ -977,6 +1028,7 @@ export class MailboxDO extends DurableObject<Env> {
 			errors: [],
 			createdAt: now,
 			updatedAt: now,
+			attachments: attachments.length > 0 ? attachments : undefined,
 		};
 		await this.ctx.storage.put(`bulk:job:${jobId}`, job);
 		await this.ctx.storage.put(`bulk:rows:${jobId}`, recipients);
@@ -992,6 +1044,12 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async getBulkJob(jobId: string): Promise<BulkJob | null> {
 		return (await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`)) ?? null;
+	}
+
+	/** Delete a finished job's stashed attachment objects from R2. */
+	async #deleteBulkAttachments(job: BulkJob | undefined): Promise<void> {
+		if (!job?.attachments?.length) return;
+		await this.env.BUCKET.delete(job.attachments.map((a) => a.key)).catch(() => {});
 	}
 
 	/** Send the next recipient of the head job, persist progress, reschedule. */
@@ -1010,6 +1068,7 @@ export class MailboxDO extends DurableObject<Env> {
 				job.updatedAt = Date.now();
 				await this.ctx.storage.put(`bulk:job:${jobId}`, job);
 			}
+			await this.#deleteBulkAttachments(job ?? undefined);
 			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
 			queue.shift();
 			await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
@@ -1032,12 +1091,29 @@ export class MailboxDO extends DurableObject<Env> {
 		const threadToken = buildThreadToken(messageId, fromDomain);
 
 		try {
+			// Re-read the stashed base64 per recipient (one tick = one recipient);
+			// the encoded copy was produced once at enqueue time.
+			const sesAttachments = job.attachments?.length
+				? await Promise.all(
+						job.attachments.map(async (a) => {
+							const o = await this.env.BUCKET.get(a.key);
+							if (!o) throw new Error(`Attachment "${a.filename}" is no longer available.`);
+							return {
+								content: await o.text(),
+								filename: a.filename,
+								type: a.type,
+								disposition: "attachment" as const,
+							};
+						}),
+					)
+				: undefined;
 			await sendEmail(this.env, {
 				to,
 				from: { email: job.fromEmail, name: job.fromName },
 				subject,
 				html,
 				text,
+				attachments: sesAttachments,
 				headers: buildThreadingHeaders(null, [], threadToken),
 			});
 			await this.createEmail(
@@ -1064,6 +1140,7 @@ export class MailboxDO extends DurableObject<Env> {
 		job.updatedAt = Date.now();
 		if (job.cursor >= rows.length) {
 			job.status = "done";
+			await this.#deleteBulkAttachments(job);
 			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
 			queue.shift();
 		}

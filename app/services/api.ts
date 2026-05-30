@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import type { Email, Folder, Mailbox } from "~/types";
+import type { Email, Folder, Mailbox, AttachmentRef } from "~/types";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -129,6 +129,31 @@ const api = {
 		post<void>(`/api/v1/mailboxes/${mailboxId}/threads/${threadId}/read`),
 	getAttachment: (mailboxId: string, emailId: string, attachmentId: string) =>
 		get<Blob>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/attachments/${attachmentId}`, { responseType: "blob" }),
+	// Upload a file to staging; returns a reference to carry into a send/reply/draft.
+	// Raw-body POST (not the JSON helper) with no artificial timeout, since large
+	// files on slow links can exceed the default request timeout.
+	uploadAttachment: async (
+		mailboxId: string,
+		file: File,
+	): Promise<{ uploadId: string; filename: string; mimetype: string; size: number }> => {
+		const params = new URLSearchParams({
+			filename: file.name,
+			type: file.type || "application/octet-stream",
+		});
+		const res = await fetch(
+			`/api/v1/mailboxes/${mailboxId}/attachments?${params.toString()}`,
+			{
+				method: "POST",
+				body: file,
+				headers: { "Content-Type": file.type || "application/octet-stream" },
+			},
+		);
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			throw new ApiError(res.status, body as Record<string, unknown>);
+		}
+		return res.json() as Promise<{ uploadId: string; filename: string; mimetype: string; size: number }>;
+	},
 	saveDraft: (
 		mailboxId: string,
 		draft: {
@@ -140,6 +165,7 @@ const api = {
 			in_reply_to?: string;
 			thread_id?: string;
 			draft_id?: string;
+			attachments?: AttachmentRef[];
 		},
 	) => post<{ draft_id: string }>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
 	replyToEmail: (mailboxId: string, emailId: string, email: unknown) =>

@@ -10,6 +10,7 @@ import { useComposeForm } from "~/hooks/useComposeForm";
 import { useUIStore } from "~/hooks/useUIStore";
 import { useAiDraftCompose } from "~/queries/emails";
 import RichTextEditor from "./RichTextEditor";
+import ComposeAttachments from "./ComposeAttachments";
 
 /**
  * The composer. A single roomy centered modal used for new mail, replies,
@@ -48,6 +49,10 @@ export default function ComposeEmail() {
 		formTitle,
 		handleSaveDraft,
 		handleSend,
+		attachments,
+		addFiles,
+		removeAttachment,
+		isUploading,
 	} = useComposeForm(mailboxId, folder);
 
 	const handleAiGenerate = async () => {
@@ -209,6 +214,14 @@ export default function ComposeEmail() {
 						<div className="h-[42vh] min-h-[280px]">
 							<RichTextEditor value={body} onChange={setBody} />
 						</div>
+
+						{/* Attachments */}
+						<ComposeAttachments
+							attachments={attachments}
+							onAddFiles={addFiles}
+							onRemove={removeAttachment}
+							disabled={isSending}
+						/>
 					</div>
 
 					{/* Footer actions */}
@@ -226,7 +239,7 @@ export default function ComposeEmail() {
 								type="button"
 								variant="secondary"
 								loading={isSavingDraft}
-								disabled={isSending}
+								disabled={isSending || isUploading}
 								icon={<FloppyDiskIcon size={16} />}
 								onClick={handleSaveDraft}
 							>
@@ -236,10 +249,10 @@ export default function ComposeEmail() {
 								type="submit"
 								variant="primary"
 								loading={isSending}
-								disabled={isSavingDraft || isSending}
+								disabled={isSavingDraft || isSending || isUploading}
 								icon={<PaperPlaneTiltIcon size={16} />}
 							>
-								{isSending ? "Sending…" : "Send"}
+								{isSending ? "Sending…" : isUploading ? "Uploading…" : "Send"}
 							</Button>
 						</div>
 					</div>

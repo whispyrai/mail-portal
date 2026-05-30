@@ -7,7 +7,19 @@ import { cors } from "hono/cors";
 import PostalMime from "postal-mime";
 import { z } from "zod";
 import { sendEmail } from "./email-sender";
-import { storeAttachments, type StoredAttachment } from "./lib/attachments";
+import {
+	resolveAndPromoteAttachments,
+	uploadKey,
+	sanitizeFilename,
+	attachmentKey,
+	type StoredAttachment,
+} from "./lib/attachments";
+import {
+	ATTACHMENT_LIMITS,
+	validateSingleFile,
+	isBlockedAttachment,
+	attachmentExtension,
+} from "../shared/attachments";
 import {
 	validateSender,
 	SenderValidationError,
@@ -17,7 +29,7 @@ import {
 	extractThreadToken,
 	listMailboxes,
 } from "./lib/email-helpers";
-import { SendEmailRequestSchema } from "./lib/schemas";
+import { SendEmailRequestSchema, AttachmentRefSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { draftReplyForEmail, draftNewEmail } from "./lib/agent-context";
 import { WHISPYR_SYSTEM_PROMPT } from "./lib/whispyr-prompt";
@@ -44,6 +56,7 @@ const DraftBody = z.object({
 	in_reply_to: z.string().optional(),
 	thread_id: z.string().optional(),
 	draft_id: z.string().optional(),
+	attachments: z.array(AttachmentRefSchema).max(ATTACHMENT_LIMITS.maxFiles).optional(),
 });
 
 // -- Helpers --------------------------------------------------------
@@ -216,7 +229,15 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	const stub = c.var.mailboxStub;
 	const rateLimitError = await (stub as any).checkSendRateLimit();
 	if (rateLimitError) return c.json({ error: rateLimitError }, 429);
-	const attachmentData = await storeAttachments(c.env.BUCKET, messageId, attachments);
+
+	const resolved = await resolveAndPromoteAttachments(
+		c.env.BUCKET, stub, mailboxId, messageId, attachments,
+	).then(
+		(r) => ({ ok: true as const, ...r }),
+		(e) => ({ ok: false as const, error: (e as Error).message }),
+	);
+	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	const { sesAttachments, storedMetadata } = resolved;
 
 	await stub.createEmail(Folders.SENT, {
 		id: messageId, subject, sender: fromEmail, recipient: toStr,
@@ -233,12 +254,12 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 			{ key: "subject", value: subject }, { key: "date", value: new Date().toISOString() },
 			{ key: "message-id", value: `<${outgoingMessageId}>` },
 		]),
-	}, attachmentData);
+	}, storedMetadata);
 
 	c.executionCtx.waitUntil(
 		sendEmail(c.env, {
 			to, cc, bcc, from, subject, html, text,
-			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
+			attachments: sesAttachments,
 			headers: buildThreadingHeaders(in_reply_to || null, references || [], threadToken),
 		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
 	);
@@ -247,17 +268,39 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 
 app.post("/api/v1/mailboxes/:mailboxId/drafts", async (c: AppContext) => {
 	const mailboxId = c.req.param("mailboxId")!;
-	const { to, cc, bcc, subject, body, in_reply_to, thread_id, draft_id } = DraftBody.parse(await c.req.json());
+	const { to, cc, bcc, subject, body, in_reply_to, thread_id, draft_id, attachments } = DraftBody.parse(await c.req.json());
 	const stub = c.var.mailboxStub;
-	if (draft_id) await stub.deleteEmail(draft_id); // not atomic — create-then-delete would be safer
-	const messageId = crypto.randomUUID();
+	// Reuse the draft id on overwrite. This keeps the draft's attachments under a
+	// stable key so `existing` references survive repeated saves (and avoids the
+	// orphan-draft rows the previous new-id-per-save approach accumulated).
+	const messageId = draft_id || crypto.randomUUID();
+
+	// Promote attachments to the (re)new draft FIRST: `existing` refs may still
+	// point at the draft we're about to overwrite, which must exist to resolve them.
+	const resolved = await resolveAndPromoteAttachments(
+		c.env.BUCKET, stub, mailboxId, messageId, attachments,
+	).then(
+		(r) => ({ ok: true as const, ...r }),
+		(e) => ({ ok: false as const, error: (e as Error).message }),
+	);
+	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+
+	// Drop the previous draft row + its now-orphaned R2 objects. The cascade
+	// clears old attachment rows; we just-promoted copies live under fresh ids.
+	if (draft_id) {
+		const old = await stub.deleteEmail(draft_id);
+		if (old && old.length > 0) {
+			await c.env.BUCKET.delete(old.map((a) => attachmentKey(draft_id, a.id, a.filename)));
+		}
+	}
+
 	const now = new Date().toISOString();
 	await stub.createEmail(Folders.DRAFT, {
 		id: messageId, subject: subject || "", sender: mailboxId.toLowerCase(),
 		recipient: (to || "").toLowerCase(), cc: cc?.toLowerCase() || null, bcc: bcc?.toLowerCase() || null,
 		date: now, body, in_reply_to: in_reply_to || null, email_references: null,
 		thread_id: thread_id || in_reply_to || messageId,
-	}, []);
+	}, resolved.storedMetadata);
 	return c.json({ id: messageId, status: "draft", subject: subject || "", recipient: to || "", date: now }, 201);
 });
 
@@ -338,6 +381,8 @@ const BulkSendBody = z.object({
 	html: z.string().optional(),
 	text: z.string().optional(),
 	recipients: z.array(z.record(z.string())).min(1).max(200),
+	// Optional shared attachment(s), uploaded once and attached to every recipient.
+	attachmentUploadIds: z.array(z.string().min(1)).max(ATTACHMENT_LIMITS.maxFiles).optional(),
 });
 
 app.post("/api/v1/mailboxes/:mailboxId/bulk", async (c: AppContext) => {
@@ -365,6 +410,7 @@ app.post("/api/v1/mailboxes/:mailboxId/bulk", async (c: AppContext) => {
 			html: body.html,
 			text: body.text,
 			recipients: body.recipients,
+			attachmentUploadIds: body.attachmentUploadIds,
 		});
 		return c.json(result, 202);
 	} catch (e) {
@@ -416,6 +462,37 @@ app.get("/api/v1/mailboxes/:mailboxId/search", async (c: AppContext) => {
 });
 
 // -- Attachments ----------------------------------------------------
+
+// Upload a file to R2 staging (upload-first model). Returns an `uploadId` the
+// client carries as a reference into send/reply/forward/draft/bulk. The raw
+// file is the request body; filename + type ride in query params. Behind
+// `requireMailbox`, so the upload is scoped to the caller's own mailbox.
+app.post("/api/v1/mailboxes/:mailboxId/attachments", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	const filename = (c.req.query("filename") || "untitled").slice(0, 255);
+	const type = (c.req.query("type") || "application/octet-stream").slice(0, 78);
+
+	if (isBlockedAttachment(filename)) {
+		return c.json({ error: `.${attachmentExtension(filename) || "this"} files can't be emailed.` }, 400);
+	}
+	// Reject oversize before buffering the whole body into memory.
+	const declared = Number(c.req.header("content-length"));
+	if (Number.isFinite(declared) && declared > ATTACHMENT_LIMITS.maxFileBytes) {
+		return c.json({ error: `File is over the ${Math.round(ATTACHMENT_LIMITS.maxFileBytes / (1024 * 1024))} MB per-file limit.` }, 413);
+	}
+
+	const buf = await c.req.arrayBuffer();
+	const sizeError = validateSingleFile({ filename, size: buf.byteLength });
+	if (sizeError) return c.json({ error: sizeError }, 400);
+
+	const uploadId = crypto.randomUUID();
+	const safe = sanitizeFilename(filename);
+	await c.env.BUCKET.put(uploadKey(mailboxId, uploadId), buf, {
+		httpMetadata: { contentType: type },
+		customMetadata: { filename: safe, type, size: String(buf.byteLength) },
+	});
+	return c.json({ uploadId, filename: safe, mimetype: type, size: buf.byteLength }, 201);
+});
 
 app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId", async (c: AppContext) => {
 	const emailId = c.req.param("emailId")!;

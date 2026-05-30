@@ -11,7 +11,7 @@ import EmailPanelHeader from "~/components/email-panel/EmailPanelHeader";
 import EmailPanelToolbar from "~/components/email-panel/EmailPanelToolbar";
 import SingleMessageView from "~/components/email-panel/SingleMessageView";
 import ThreadMessage from "~/components/email-panel/ThreadMessage";
-import { buildQuotedReplyBlock, splitEmailList, toEmailListValue } from "~/lib/utils";
+import { splitEmailList, toEmailListValue, getNonInlineAttachments } from "~/lib/utils";
 import api from "~/services/api";
 import { useAiDraftReply, useDeleteEmail, useEmail, useMoveEmail, useReplyToEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
@@ -120,6 +120,10 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
 			const from = fromName && fromName !== currentMailbox.email ? { email: currentMailbox.email, name: fromName } : currentMailbox.email;
 			const originalEmail = target.in_reply_to ? allMessages.find((msg) => msg.id === target.in_reply_to) : undefined;
+			// Carry the draft's stored attachments through as existing references.
+			const attachmentRefs = getNonInlineAttachments(target.attachments).map(
+				(a) => ({ kind: "existing" as const, emailId: target.id, attachmentId: a.id }),
+			);
 			const emailData = {
 				to: toEmailListValue(toRecipients),
 				cc: toEmailListValue(splitEmailList(target.cc)),
@@ -128,6 +132,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				subject: target.subject || "(no subject)",
 				html: target.body || "",
 				text: target.body ? target.body.replace(/<[^>]*>/g, "").trim() : "",
+				attachments: attachmentRefs,
 			};
 			if (originalEmail) await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
 			await deleteEmailMut.mutateAsync({ mailboxId, id: target.id });
@@ -146,7 +151,6 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		setIsDrafting(true);
 		try {
 			const draft = await aiDraftMut.mutateAsync({ mailboxId, emailId: target.id });
-			const quoted = buildQuotedReplyBlock(target.date, target.sender, target.body || "");
 			const subject =
 				draft.subject ||
 				(target.subject?.startsWith("Re:")
@@ -163,7 +167,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 					date: new Date().toISOString(),
 					read: true,
 					starred: false,
-					body: `${draft.body || ""}${quoted}`,
+					body: draft.body || "",
 					in_reply_to: target.id,
 					thread_id: target.thread_id ?? null,
 				} as Email,

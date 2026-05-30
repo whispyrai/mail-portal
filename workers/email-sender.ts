@@ -111,10 +111,15 @@ function buildSimpleContent(params: SendEmailParams): Record<string, unknown> {
 
 	if (params.attachments && params.attachments.length > 0) {
 		simple.Attachments = params.attachments.map((att) => ({
-			RawContent: att.content, // already base64; SES re-encodes into the MIME
+			RawContent: att.content, // base64 over the wire (HTTPS interface); SES decodes it
 			FileName: att.filename,
 			ContentType: att.type,
-			ContentDisposition: att.disposition,
+			// SES's enum is UPPERCASE (`ATTACHMENT | INLINE`); a lowercase value is
+			// not a valid enum and is rejected/ignored.
+			ContentDisposition: att.disposition === "inline" ? "INLINE" : "ATTACHMENT",
+			// Force base64 in the MIME SES assembles. The default (SEVEN_BIT) mangles
+			// any non-7-bit payload — i.e. every PDF, image, or office document.
+			ContentTransferEncoding: "BASE64",
 			...(att.contentId ? { ContentId: att.contentId } : {}),
 		}));
 	}

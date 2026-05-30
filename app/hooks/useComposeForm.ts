@@ -5,7 +5,6 @@
 import { useKumoToastManager } from "@cloudflare/kumo";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-	buildQuotedReplyBlock,
 	escapeHtml,
 	formatComposeDate,
 	getSignatureBlock,
@@ -17,6 +16,7 @@ import {
 import { useDeleteEmail, useForwardEmail, useReplyToEmail, useSaveDraft, useSendEmail } from "~/queries/emails";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
+import { useAttachments, attachmentsToRefs } from "~/hooks/useAttachments";
 
 function appendUniqueAddress(
 	addresses: string[],
@@ -129,12 +129,15 @@ function buildInitialComposeFields(
 		};
 	}
 
+	// Replies open with a clean body (signature only). The original message stays
+	// visible in the thread view behind the composer; it is deliberately NOT
+	// quoted into the reply body.
 	if (mode === "reply") {
 		return {
 			...EMPTY_FIELDS,
 			to: original.sender,
 			subject: getPrefixedSubject(original.subject, "Re"),
-			body: `<p><br></p>${sigBlock ? `${sigBlock}<br>` : ""}${buildQuotedReplyBlock(original.date, original.sender, original.body || "")}`,
+			body: sigBlock ? `<p><br></p>${sigBlock}` : "",
 		};
 	}
 
@@ -144,7 +147,7 @@ function buildInitialComposeFields(
 			...EMPTY_FIELDS,
 			...recipients,
 			subject: getPrefixedSubject(original.subject, "Re"),
-			body: `<p><br></p>${sigBlock ? `${sigBlock}<br>` : ""}${buildQuotedReplyBlock(original.date, original.sender, original.body || "")}`,
+			body: sigBlock ? `<p><br></p>${sigBlock}` : "",
 		};
 	}
 
@@ -171,6 +174,15 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 	const replyMutation = useReplyToEmail();
 	const forwardMutation = useForwardEmail();
 	const deleteEmailMutation = useDeleteEmail();
+	const {
+		attachments,
+		addFiles,
+		removeAttachment,
+		hydrateFromDraft,
+		reset: resetAttachments,
+		isUploading,
+		hasError: hasAttachmentError,
+	} = useAttachments(mailboxId);
 
 	const [to, setTo] = useState("");
 	const [cc, setCc] = useState("");
@@ -207,7 +219,12 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 		setShowCcBcc(initialFields.showCcBcc);
 		setSubject(initialFields.subject);
 		setBody(initialFields.body);
-	}, [composeOptions, currentMailbox?.email, sigBlock]);
+
+		// Seed attachment chips from a real draft (id-bearing); clear otherwise.
+		const draftToHydrate = composeOptions.draftEmail;
+		if (draftToHydrate?.id) hydrateFromDraft(draftToHydrate.id, draftToHydrate.attachments);
+		else resetAttachments();
+	}, [composeOptions, currentMailbox?.email, sigBlock, hydrateFromDraft, resetAttachments]);
 
 	const handleSaveDraft = async () => {
 		if (!mailboxId || isSending) return; setIsSavingDraft(true); setError(null);
@@ -221,6 +238,7 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 				in_reply_to: composeOptions.originalEmail?.id || composeOptions.draftEmail?.in_reply_to || undefined,
 				thread_id: composeOptions.originalEmail?.thread_id || composeOptions.draftEmail?.thread_id || undefined,
 				draft_id: composeOptions.draftEmail?.id || undefined,
+				attachments: attachmentsToRefs(attachments),
 			} });
 			toastManager.add({ title: "Draft saved!" });
 		}
@@ -237,6 +255,7 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 		if (!currentMailbox || !mailboxId) { setError("No mailbox selected."); return; }
 		const toRecipients = splitEmailList(to);
 		if (toRecipients.length === 0) { setError("Add at least one recipient."); return; }
+		if (isUploading) { setError("Wait for attachments to finish uploading."); return; }
 		const ccRecipients = splitEmailList(cc); const bccRecipients = splitEmailList(bcc);
 		const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
 		const from = fromName && fromName !== currentMailbox.email ? { email: currentMailbox.email, name: fromName } : currentMailbox.email;
@@ -248,6 +267,7 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 			subject,
 			html: body,
 			text: htmlToPlainText(body),
+			attachments: attachmentsToRefs(attachments),
 		};
 		const draftId = composeOptions.draftEmail?.id; const mode = composeOptions.mode; const originalId = composeOptions.originalEmail?.id || composeOptions.draftEmail?.in_reply_to;
 		setIsSending(true); toastManager.add({ title: "Sending email..." });
@@ -262,5 +282,5 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 		finally { setIsSending(false); }
 	};
 
-	return { to, setTo, cc, setCc, bcc, setBcc, showCcBcc, setShowCcBcc, subject, setSubject, body, setBody, error, setError, isSavingDraft, isSending, formTitle, handleSaveDraft, handleSend, closeCompose, closePanel };
+	return { to, setTo, cc, setCc, bcc, setBcc, showCcBcc, setShowCcBcc, subject, setSubject, body, setBody, error, setError, isSavingDraft, isSending, formTitle, handleSaveDraft, handleSend, closeCompose, closePanel, attachments, addFiles, removeAttachment, isUploading, hasAttachmentError };
 }

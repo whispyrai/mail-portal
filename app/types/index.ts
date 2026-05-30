@@ -59,6 +59,15 @@ export interface Attachment {
 	disposition?: string;
 }
 
+/**
+ * A reference to a file to attach, sent to the server instead of the bytes
+ * (upload-first model): a freshly uploaded staging file, or a file already
+ * stored against another email (e.g. a draft being sent).
+ */
+export type AttachmentRef =
+	| { kind: "upload"; uploadId: string }
+	| { kind: "existing"; emailId: string; attachmentId: string };
+
 export interface Folder {
 	id: string;
 	name: string;
