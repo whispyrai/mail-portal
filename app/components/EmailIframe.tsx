@@ -5,6 +5,24 @@
 import DOMPurify from "dompurify";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+// Force every link in rendered email HTML to open in a new tab. Email anchors
+// usually carry no `target`, so inside the sandboxed iframe a click would
+// navigate the iframe's own browsing context — replacing the email with the
+// linked page. Stamp target + rel on every <a> so links escape the iframe.
+// Registered once (module-scoped flag) and only on the client, since the hook
+// touches the DOM.
+let linkTargetHookRegistered = false;
+function ensureLinkTargetHook() {
+	if (linkTargetHookRegistered) return;
+	linkTargetHookRegistered = true;
+	DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+		if (node.nodeName === "A") {
+			node.setAttribute("target", "_blank");
+			node.setAttribute("rel", "noopener noreferrer");
+		}
+	});
+}
+
 interface EmailIframeProps {
 	body: string;
 	/** When true, iframe auto-sizes to content height instead of filling parent */
@@ -59,6 +77,8 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 		const iframe = iframeRef.current;
 		if (!iframe || !body) return;
 
+		ensureLinkTargetHook();
+
 		const cleanBody = DOMPurify.sanitize(body, {
 			USE_PROFILES: { html: true },
 			FORBID_TAGS: ["style"],
@@ -89,6 +109,7 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 		iframe.srcdoc = `<!DOCTYPE html>
 <html>
 <head>
+<base target="_blank">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid: https:; script-src 'unsafe-inline';">
