@@ -44,6 +44,12 @@ interface EmailIframeProps {
  *   the opaque-origin sandbox cannot access anything useful.
  * - A strict CSP meta tag blocks external resource loads inside the
  *   iframe as a defense-in-depth layer.
+ * - `allow-popups-to-escape-sandbox` lets links the user clicks open as
+ *   normal, full-origin tabs. Without it, popups inherit this iframe's
+ *   sandbox (no `allow-same-origin` -> opaque "null" origin) and the
+ *   destination app crashes reading cookies/localStorage. This flag only
+ *   affects newly-opened tabs; the email body itself stays fully
+ *   sandboxed with no same-origin access to the parent page.
  */
 export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 	const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -165,7 +171,7 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 			ref={iframeRef}
 			className="block w-full border-0"
 			style={autoSize ? { height: `${height}px` } : { height: "100%" }}
-			sandbox="allow-scripts allow-popups allow-top-navigation-by-user-activation"
+			sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
 			title="Email content"
 		/>
 	);
