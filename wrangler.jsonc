@@ -15,7 +15,8 @@
 		// JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
 		"DOMAINS": "whispyrcrm.com",
 		"EMAIL_ADDRESSES": [],
-		"AWS_REGION": "eu-west-2"
+		"AWS_REGION": "eu-west-2",
+		"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 	},
 	// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing page
 	// (whispyrcrm.com) is a separate static site on Vercel (locked-decisions D-68).

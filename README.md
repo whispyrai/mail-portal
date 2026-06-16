@@ -13,7 +13,7 @@ A fork of [cloudflare/agentic-inbox](https://github.com/cloudflare/agentic-inbox
 | Auth | Cloudflare Access | **Email + password**, hand-rolled (PBKDF2 + JWT cookie via `jose`), roles `AGENT`/`ADMIN` |
 | Authorization | None (any authed user → any mailbox) | **Per-mailbox**: a rep sees only their mailbox; an admin sees all |
 | Users | implicit (Access) | **D1 `users` table** + `/admin/users` console |
-| AI model | Kimi K2.5 | `@cf/meta/llama-3.1-8b-instruct`, **manual-only** (auto-draft removed) |
+| AI model | Kimi K2.5 | `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, **manual-only** (auto-draft removed) |
 | MCP (`/mcp`) | open to any authed user | **per-user bearer token**; reads admin=all/agent=own, writes own-only |
 | Bulk send | — | **CSV mail merge** with a DO alarm scheduler (`/bulk`) |
 | Apex landing | — | separate static site on Vercel (this Worker serves `mail.` only) |

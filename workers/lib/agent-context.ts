@@ -18,9 +18,8 @@ import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 
 /** Default Workers AI model. Override per-deployment by setting an `AI_MODEL`
- *  var/secret (e.g. `@cf/meta/llama-3.3-70b-instruct-fp8-fast` for stronger
- *  tool-calling). Kept at 8B by default per locked-decisions D-42. */
-const DEFAULT_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+ *  var/secret. Llama 3.1 8B was deprecated by Cloudflare on 2026-05-30. */
+const DEFAULT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 export function getAiModel(env: Env): string {
 	const override = (env as { AI_MODEL?: string }).AI_MODEL;
