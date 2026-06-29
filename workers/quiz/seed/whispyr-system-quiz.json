@@ -24,7 +24,7 @@
       },
       "prompt": {
         "en": "A brokerage owner asks: \"If I give someone a title, how much can they see?\" Which description of Whispyr visibility is most accurate?",
-        "ar": "صاحب شركة وساطة عقارية بيسأل: \"لو أديت لحد منصب، هو يقدر يشوف قد إيه؟\" أي وصف لإمكانية الرؤية في Whispyr هو الأدق؟"
+        "ar": "صاحب بروكراج بيسأل: \"لو أديت لحد منصب، هو يقدر يشوف قد إيه؟\" أي وصف لإمكانية الرؤية في Whispyr هو الأدق؟"
       },
       "options": [
         {
@@ -94,8 +94,8 @@
         "b"
       ],
       "explanation": {
-        "en": "An individual agent sees only their own assigned leads. Team-wide visibility starts at team leader, not agent. This is a common thing reps get wrong in a demo.",
-        "ar": "المندوب الفرد بيشوف بس الليدات المعيّنة ليه. الرؤية على مستوى الفريق بتبدأ من قائد الفريق، مش من المندوب. دي حاجة كتير من المندوبين بيغلطوا فيها في الديمو."
+        "en": "An individual agent sees only their own assigned leads. Team-wide visibility starts at team leader, not agent. This is a common thing Whispyr salespeople get wrong in a demo.",
+        "ar": "المندوب الفرد بيشوف بس الليدات المعيّنة ليه. الرؤية على مستوى الفريق بتبدأ من قائد الفريق، مش من المندوب. دي حاجة كتير من مناديب Whispyr بيغلطوا فيها في الديمو."
       }
     },
     {
@@ -149,8 +149,8 @@
         "ar": "مقعد التيليسيلز"
       },
       "prompt": {
-        "en": "A brokerage asks what a Telesales user can do. What should the rep say?",
-        "ar": "شركة وساطة بتسأل مستخدم التيليسيلز (مندوب الاتصالات) يقدر يعمل إيه. المندوب يقول إيه؟"
+        "en": "A brokerage asks what a Telesales user can do. What should the Whispyr salesperson say?",
+        "ar": "بروكراج بيسأل مستخدم التيليسيلز (مندوب الاتصالات) يقدر يعمل إيه. مندوب Whispyr يقول إيه؟"
       },
       "options": [
         {
@@ -458,8 +458,8 @@
         "ar": "إيه اللي بيشغّل التدوير"
       },
       "prompt": {
-        "en": "How should a rep explain automatic lead rotation?",
-        "ar": "المندوب يشرح التدوير التلقائي لليدات إزاي؟"
+        "en": "How should a Whispyr salesperson explain automatic lead rotation?",
+        "ar": "مندوب Whispyr يشرح التدوير التلقائي لليدات إزاي؟"
       },
       "options": [
         {
@@ -587,7 +587,7 @@
       },
       "prompt": {
         "en": "What is the cleanest way to explain the Lead Pool to a brokerage owner?",
-        "ar": "إيه أوضح طريقة تشرح بيها مجمّع الليدات (Lead Pool) لصاحب شركة وساطة؟"
+        "ar": "إيه أوضح طريقة تشرح بيها مجمّع الليدات (Lead Pool) لصاحب بروكراج؟"
       },
       "options": [
         {
@@ -628,8 +628,8 @@
         "ar": "المراحل مقابل الوسوم"
       },
       "prompt": {
-        "en": "A manager asks whether Tags can just replace the pipeline stages. What should the rep say?",
-        "ar": "مدير بيسأل هل الوسوم (التاجات) ممكن تحل محل مراحل المسار. المندوب يقول إيه؟"
+        "en": "A manager asks whether Tags can just replace the pipeline stages. What should the Whispyr salesperson say?",
+        "ar": "مدير بيسأل هل الوسوم (التاجات) ممكن تحل محل مراحل المسار. مندوب Whispyr يقول إيه؟"
       },
       "options": [
         {
@@ -671,7 +671,7 @@
       },
       "prompt": {
         "en": "A brokerage owner asks: \"Is Whispyr's WhatsApp the official WhatsApp Business API?\" What is the honest answer?",
-        "ar": "صاحب شركة وساطة عقارية بيسأل: «واتساب في Whispyr ده هو واتساب بزنس API الرسمي؟» إيه الإجابة الصادقة؟"
+        "ar": "صاحب بروكراج بيسأل: «واتساب في Whispyr ده هو واتساب بزنس API الرسمي؟» إيه الإجابة الصادقة؟"
       },
       "options": [
         {
@@ -713,7 +713,7 @@
       },
       "prompt": {
         "en": "How does a brokerage connect WhatsApp in Whispyr?",
-        "ar": "إزاي شركة الوساطة بتربط الواتساب في Whispyr؟"
+        "ar": "إزاي البروكراج بيربط الواتساب في Whispyr؟"
       },
       "options": [
         {
@@ -790,8 +790,8 @@
         "c"
       ],
       "explanation": {
-        "en": "The recipient list is a snapshot taken at creation, capped at 100. Options D and E describe features that do not exist, so a rep should not promise growing audiences or one-click redo.",
-        "ar": "قائمة المستلمين لقطة بتتاخد وقت الإنشاء، بحد أقصى 100. الخيارين D وE بيوصفوا خصائص مش موجودة، فالمندوب ميوعدش بجمهور بيكبر لوحده ولا إعادة بضغطة واحدة."
+        "en": "The recipient list is a snapshot taken at creation, capped at 100. Options D and E describe features that do not exist, so a Whispyr salesperson should not promise growing audiences or one-click redo.",
+        "ar": "قائمة المستلمين لقطة بتتاخد وقت الإنشاء، بحد أقصى 100. الخيارين D وE بيوصفوا خصائص مش موجودة، فمندوب Whispyr ميوعدش بجمهور بيكبر لوحده ولا إعادة بضغطة واحدة."
       }
     },
     {
@@ -853,8 +853,8 @@
         "ar": "الإرسال بأمان"
       },
       "prompt": {
-        "en": "A prospect wants to blast every lead at 2am, as fast as possible. What should the rep say?",
-        "ar": "عميل محتمل عايز يبعت لكل الليدات الساعة 2 بالليل، وبأسرع ما يمكن. المندوب يقول إيه؟"
+        "en": "A prospect wants to blast every lead at 2am, as fast as possible. What should the Whispyr salesperson say?",
+        "ar": "عميل محتمل عايز يبعت لكل الليدات الساعة 2 بالليل، وبأسرع ما يمكن. مندوب Whispyr يقول إيه؟"
       },
       "options": [
         {
@@ -896,7 +896,7 @@
       },
       "prompt": {
         "en": "A brokerage asks how Meta (Facebook and Instagram) lead ads connect to Whispyr. Which answer is most accurate?",
-        "ar": "شركة وساطة بتسأل إزاي إعلانات الليدات من Meta (فيسبوك وإنستجرام) بتتربط بـ Whispyr. أنهي إجابة أدق؟"
+        "ar": "بروكراج بيسأل إزاي إعلانات الليدات من Meta (فيسبوك وإنستجرام) بتتربط بـ Whispyr. أنهي إجابة أدق؟"
       },
       "options": [
         {
@@ -937,8 +937,8 @@
         "ar": "إيه اللي بيجي مع ليد من Meta"
       },
       "prompt": {
-        "en": "What should a rep correctly say about the information that arrives with a Meta lead?",
-        "ar": "المندوب يقول إيه صح عن المعلومات اللي بتوصل مع ليد من Meta؟"
+        "en": "What should a Whispyr salesperson correctly say about the information that arrives with a Meta lead?",
+        "ar": "مندوب Whispyr يقول إيه صح عن المعلومات اللي بتوصل مع ليد من Meta؟"
       },
       "options": [
         {
@@ -987,8 +987,8 @@
         "ar": "Whispyr AI بيعمل إيه فعلاً"
       },
       "prompt": {
-        "en": "A brokerage owner asks: \"Can your AI read my leads and tell my reps what to say to each one?\" What is the honest answer?",
-        "ar": "صاحب شركة وساطة بيسأل: «الذكاء الاصطناعي بتاعكم يقدر يقرا ليداتي ويقول لمناديبي يقولوا إيه لكل واحد؟» إيه الإجابة الصادقة؟"
+        "en": "A brokerage owner asks: \"Can your AI read my leads and tell my agents what to say to each one?\" What is the honest answer?",
+        "ar": "صاحب بروكراج بيسأل: «الذكاء الاصطناعي بتاعكم يقدر يقرا ليداتي ويقول لمناديبي يقولوا إيه لكل واحد؟» إيه الإجابة الصادقة؟"
       },
       "options": [
         {
@@ -1029,8 +1029,8 @@
         "ar": "مطابقة العقارات بالذكاء الاصطناعي"
       },
       "prompt": {
-        "en": "A rep is demoing inside a lead. What does \"AI Property Matching\" actually give them?",
-        "ar": "مندوب بيعمل عرض توضيحي جوه ليد. «مطابقة العقارات بالذكاء الاصطناعي» بتديله إيه فعلاً؟"
+        "en": "A Whispyr salesperson is demoing inside a lead. What does \"AI Property Matching\" actually give them?",
+        "ar": "مندوب Whispyr بيعمل عرض توضيحي جوه ليد. «مطابقة العقارات بالذكاء الاصطناعي» بتديله إيه فعلاً؟"
       },
       "options": [
         {
@@ -1040,8 +1040,8 @@
         },
         {
           "id": "b",
-          "en": "The rep enters criteria, such as budget, area, property type, and bedrooms, and gets back a ranked list of recommended projects and units, each with a match score and a short reason, drawn from the Whispyr catalog.",
-          "ar": "المندوب بيدخّل معايير زي الميزانية والمنطقة ونوع العقار وعدد الغرف، وبيرجعله قائمة مرتّبة بمشاريع ووحدات مرشّحة، كل واحدة بنسبة تطابق وسبب قصير، مسحوبة من كتالوج Whispyr."
+          "en": "The Whispyr salesperson enters criteria, such as budget, area, property type, and bedrooms, and gets back a ranked list of recommended projects and units, each with a match score and a short reason, drawn from the Whispyr catalog.",
+          "ar": "مندوب Whispyr بيدخّل معايير زي الميزانية والمنطقة ونوع العقار وعدد الغرف، وبيرجعله قائمة مرتّبة بمشاريع ووحدات مرشّحة، كل واحدة بنسبة تطابق وسبب قصير، مسحوبة من كتالوج Whispyr."
         },
         {
           "id": "c",
@@ -1130,8 +1130,8 @@
         "ar": "ربط الواتساب، بصراحة"
       },
       "prompt": {
-        "en": "A brokerage owner asks: \"Is this the official WhatsApp Business API? How does connecting actually work, and is my number safe?\" Write the honest answer a rep should give.",
-        "ar": "صاحب شركة وساطة بيسأل: «ده واتساب بزنس API الرسمي؟ الربط بيشتغل إزاي فعلاً، ورقمي آمن؟» اكتب الإجابة الصادقة اللي المندوب لازم يقولها."
+        "en": "A brokerage owner asks: \"Is this the official WhatsApp Business API? How does connecting actually work, and is my number safe?\" Write the honest answer a Whispyr salesperson should give.",
+        "ar": "صاحب بروكراج بيسأل: «ده واتساب بزنس API الرسمي؟ الربط بيشتغل إزاي فعلاً، ورقمي آمن؟» اكتب الإجابة الصادقة اللي مندوب Whispyr لازم يقولها."
       },
       "rubric": {
         "en": "Scoring rubric:\n\n- 3 points: Clearly says it is not the official WhatsApp Business API; explains that you connect your existing number by scanning a QR code, like WhatsApp Web; that you can connect a company number and each agent can connect a personal number; names the upside (keep your number, no Meta approval) and the trade-offs (the session can drop and need re-scanning, and the brokerage carries the usual WhatsApp account-safety risk); and explains that pacing, daily send windows, and AI message variation reduce ban risk but cannot eliminate it.\n- 2 points: Says it is a QR/WhatsApp Web style connection and mentions company vs personal, but oversells safety or skips the drop/ban-risk honesty.\n- 1 point: Vague or only half-right, for example \"you just connect WhatsApp.\"\n- 0 points: Claims it is the official WhatsApp Business API, or promises no bans and guaranteed delivery.",
@@ -1148,7 +1148,7 @@
       },
       "prompt": {
         "en": "A brokerage wants to create a WhatsApp campaign for a developer launch. Explain the main choices they will make.",
-        "ar": "شركة وساطة عايزة تعمل حملة واتساب لإطلاق مشروع مطوّر. اشرح الاختيارات الأساسية اللي هياخدوها."
+        "ar": "بروكراج عايز يعمل حملة واتساب لإطلاق مشروع مطوّر. اشرح الاختيارات الأساسية اللي هياخدوها."
       },
       "rubric": {
         "en": "Scoring rubric:\n\n- 3 points: Covers choosing recipients (from leads or an uploaded list, locked in at creation, up to 100 per campaign); the message plus optional media and an optional project link; Name and Mr/Mrs personalization (and that Mr/Mrs needs AI variations on); AI message variations to avoid looking like a blast; the daily send window and timezone, pacing in small batches, and the option to review and approve messages before sending; and that replies can automatically create and assign a lead.\n- 2 points: Covers recipients and message plus some controls, but misses review-before-send, pacing, personalization limits, or reply handling.\n- 1 point: Says only \"upload numbers and send a message.\"\n- 0 points: Promises unsafe blasting, unlimited custom personalization fields, growing audiences, or guaranteed replies.",
@@ -1164,8 +1164,8 @@
         "ar": "شرح الذكاء الاصطناعي بتاع Whispyr من غير مبالغة"
       },
       "prompt": {
-        "en": "A brokerage owner asks: \"What does your AI actually do? Can it read my leads, tell my reps what to say, score my pipeline, and find my buyers the right property?\" Write the honest answer.",
-        "ar": "صاحب شركة وساطة بيسأل: «الذكاء الاصطناعي بتاعكم بيعمل إيه فعلاً؟ يقدر يقرا ليداتي، ويقول لمناديبي يقولوا إيه، ويقيّم مسار مبيعاتي، ويلاقي لمشترييني العقار المناسب؟» اكتب الإجابة الصادقة."
+        "en": "A brokerage owner asks: \"What does your AI actually do? Can it read my leads, tell my agents what to say, score my pipeline, and find my buyers the right property?\" Write the honest answer.",
+        "ar": "صاحب بروكراج بيسأل: «الذكاء الاصطناعي بتاعكم بيعمل إيه فعلاً؟ يقدر يقرا ليداتي، ويقول لمناديبي يقولوا إيه، ويقيّم مسار مبيعاتي، ويلاقي لمشترييني العقار المناسب؟» اكتب الإجابة الصادقة."
       },
       "rubric": {
         "en": "Scoring rubric:\n\n- 3 points: Separates the three real AI capabilities clearly: (1) Whispyr AI, a market assistant that answers questions about developers, projects, and units from the catalog and explicitly cannot read leads, chats, or performance; (2) AI Property Matching inside a lead, which turns a buyer's criteria into ranked project and unit recommendations with a score and reason from the catalog; (3) AI message variations that personalize a campaign message per recipient. Also states plainly what is not built today: reading individual leads, writing a reply for a specific lead, and lead scoring.\n- 2 points: Describes one or two of the real capabilities accurately but blurs the boundary or implies the AI sees lead data.\n- 1 point: Generic \"we have AI\" answer with no specifics.\n- 0 points: Claims the AI reads leads, writes per-lead replies, scores the pipeline, or otherwise promises capabilities that do not exist.",
