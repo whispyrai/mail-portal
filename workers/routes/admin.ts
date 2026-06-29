@@ -27,6 +27,7 @@ import { provisionMailbox } from "../lib/mailbox";
 import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
 import { escapeHtml } from "../lib/email-helpers";
 import { pageShell, brandLogo } from "./brand";
+import { adminQuizApp } from "../quiz/admin-routes";
 import type { Env } from "../types";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
@@ -50,6 +51,10 @@ adminApp.use("*", async (c, next) => {
 	if (session.role !== "ADMIN") return c.text("Forbidden", 403);
 	return next();
 });
+
+// Quiz admin console (open/close, edit questions, grade, results, seed). Mounted
+// inside adminApp so it inherits the ADMIN-only guard above.
+adminApp.route("/quizzes", adminQuizApp);
 
 adminApp.get("/users", async (c) => {
 	const users = await listUsers(c.env);

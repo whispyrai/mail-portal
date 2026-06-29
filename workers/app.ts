@@ -14,6 +14,7 @@ import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
 import { bulkPage } from "./routes/bulk";
+import { quizApp } from "./quiz/rep-routes";
 import {
 	loginPage,
 	handleLogin,
@@ -159,6 +160,9 @@ app.use("*", async (c, next) => {
 
 // ── Bulk send (mail merge) page — any authed rep, scoped to own mailbox ──
 app.get("/bulk", bulkPage);
+
+// ── Quiz tool (any authed rep; role-gating for admin routes lives in adminApp) ──
+app.route("/quizzes", quizApp);
 
 // ── Admin console (ADMIN only; role enforced inside adminApp) ──
 app.route("/admin", adminApp);
