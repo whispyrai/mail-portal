@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, XIcon } from "@phosphor-icons/react";
+import { ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, XIcon } from "@phosphor-icons/react";
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useUIStore } from "~/hooks/useUIStore";
@@ -160,6 +160,19 @@ export default function Header() {
 							)
 						}
 						aria-label="Settings"
+					/>
+				</Tooltip>
+				<Tooltip content="Quizzes" side="bottom" asChild>
+					<Button
+						variant="ghost"
+						shape="square"
+						icon={<ExamIcon size={20} />}
+						onClick={() => {
+							// Worker-rendered pages (outside the SPA) — full-page nav. Admins land on
+							// the management console; everyone else on their quiz list.
+							window.location.href = me?.role === "ADMIN" ? "/admin/quizzes" : "/quizzes";
+						}}
+						aria-label="Quizzes"
 					/>
 				</Tooltip>
 				<Tooltip content="Bulk send" side="bottom" asChild>
