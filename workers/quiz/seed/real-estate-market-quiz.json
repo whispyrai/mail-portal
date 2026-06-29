@@ -1,0 +1,1236 @@
+{
+  "key": "real-estate-market",
+  "title": {
+    "en": "Real Estate Market Quiz",
+    "ar": "اختبار سوق العقارات"
+  },
+  "description": {
+    "en": "Tests how well a Whispyr salesperson understands how an Egyptian real estate brokerage actually operates — not trivia, but the judgment to sit with an owner or sales manager and connect their world to Whispyr.",
+    "ar": "يقيس مدى فهم مندوب مبيعات Whispyr لكيفية عمل شركة الوساطة العقارية في السوق المصري فعليًا — ليس معلومات نظرية، بل القدرة على الجلوس مع صاحب الشركة أو مدير المبيعات وربط واقعه بـ Whispyr."
+  },
+  "scoring": {
+    "total": 40,
+    "mcq": 25,
+    "short": 15
+  },
+  "questions": [
+    {
+      "position": 1,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Owner Pain Translation",
+        "ar": "ترجمة وجع صاحب الشركة"
+      },
+      "prompt": {
+        "en": "A brokerage owner with 25 agents says: \"I do not actually know what happens after leads arrive. The managers tell me one thing, the agents tell me another, and every week we argue about whether the leads are bad.\" What problem is the owner most likely describing?",
+        "ar": "صاحب شركة وساطة عقارية لديه 25 مندوبًا يقول: «أنا فعليًا لا أعرف ماذا يحدث بعد وصول الليدات. المديرون يخبرونني بشيء، والمندوبون يخبرونني بشيء آخر، وكل أسبوع نتجادل حول ما إذا كانت الليدات سيئة.» ما المشكلة التي يصفها صاحب الشركة على الأرجح؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "The owner only needs cheaper ads, because lead cost is always the root problem.",
+          "ar": "صاحب الشركة يحتاج فقط إلى إعلانات أرخص، لأن تكلفة الليد دائمًا هي المشكلة الجذرية."
+        },
+        {
+          "id": "b",
+          "en": "The brokerage lacks one trusted operating view across source, assignment, contact attempts, follow-up, meetings, stage movement, and ownership.",
+          "ar": "شركة الوساطة تفتقر إلى رؤية تشغيلية موحّدة وموثوقة تغطّي المصدر، والتوزيع، ومحاولات التواصل، والمتابعة، والاجتماعات، وحركة المراحل، والملكية."
+        },
+        {
+          "id": "c",
+          "en": "The brokerage should stop using WhatsApp because informal channels are the whole problem.",
+          "ar": "يجب على شركة الوساطة التوقف عن استخدام واتساب لأن القنوات غير الرسمية هي المشكلة كلها."
+        },
+        {
+          "id": "d",
+          "en": "The owner needs an accounting system first, because commissions are the only proof that sales work happened.",
+          "ar": "صاحب الشركة يحتاج إلى نظام محاسبة أولًا، لأن العمولات هي الدليل الوحيد على أن عمل المبيعات قد تم."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "The owner is describing a trust and visibility gap across the sales operation. Lead quality may be part of it, but the deeper issue is not knowing what happened between lead arrival and outcome.",
+        "ar": "صاحب الشركة يصف فجوة في الثقة والوضوح عبر عملية المبيعات بالكامل. جودة الليد قد تكون جزءًا من الأمر، لكن المشكلة الأعمق هي عدم معرفة ما الذي حدث بين وصول الليد والنتيجة."
+      }
+    },
+    {
+      "position": 2,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Mapping The Real Org",
+        "ar": "رسم الهيكل الحقيقي للشركة"
+      },
+      "prompt": {
+        "en": "During discovery, a rep wants to understand the brokerage hierarchy without forcing a textbook org chart. Which question is strongest?",
+        "ar": "أثناء مرحلة الاستكشاف، يريد المندوب أن يفهم هيكل شركة الوساطة دون فرض هيكل تنظيمي نظري جاهز. أي سؤال هو الأقوى؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "\"Who is officially called team leader, sales manager, and sales director in your company?\"",
+          "ar": "«من الذي يحمل رسميًا لقب قائد الفريق، ومدير المبيعات، ومدير المبيعات العام في شركتك؟»"
+        },
+        {
+          "id": "b",
+          "en": "\"Who decides where new leads go, who checks follow-up, who coaches agents, and who has the authority to change the sales process?\"",
+          "ar": "«من الذي يقرر إلى أين تذهب الليدات الجديدة، ومن الذي يتابع المتابعة، ومن الذي يدرّب المندوبين، ومن الذي يملك صلاحية تغيير عملية المبيعات؟»"
+        },
+        {
+          "id": "c",
+          "en": "\"Do all agents report directly to the owner, or do you have a standard three-layer hierarchy?\"",
+          "ar": "«هل كل المندوبين يتبعون صاحب الشركة مباشرة، أم لديك هيكل قياسي من ثلاث طبقات؟»"
+        },
+        {
+          "id": "d",
+          "en": "\"Which CRM role names do you want copied into Whispyr?\"",
+          "ar": "«ما أسماء الأدوار في نظام إدارة العملاء التي تريد نسخها داخل Whispyr؟»"
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "Real brokerages often have informal responsibility. The rep should map how work and accountability actually flow, not only titles.",
+        "ar": "شركات الوساطة الحقيقية غالبًا ما يكون فيها توزيع غير رسمي للمسؤوليات. على المندوب أن يرسم كيف يتدفّق العمل والمساءلة فعليًا، وليس الألقاب فقط."
+      }
+    },
+    {
+      "position": 3,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Partial Hierarchy",
+        "ar": "هيكل جزئي"
+      },
+      "prompt": {
+        "en": "A brokerage has one owner, one sales director, two sales managers, 18 agents, and no formal team leaders. What should the rep do in the sales conversation?",
+        "ar": "شركة وساطة لديها صاحب واحد، ومدير مبيعات عام واحد، ومديرا مبيعات، و18 مندوبًا، وبدون قادة فرق رسميين. ماذا ينبغي أن يفعل المندوب في حوار المبيعات؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Tell them Whispyr only works after they create team leaders.",
+          "ar": "أن يخبرهم بأن Whispyr لا يعمل إلا بعد أن يُنشئوا قادة فرق."
+        },
+        {
+          "id": "b",
+          "en": "Map the current operating chain, then explain how Whispyr can reflect the structure they actually use.",
+          "ar": "أن يرسم سلسلة التشغيل الحالية، ثم يشرح كيف يمكن لـ Whispyr أن يعكس الهيكل الذي يستخدمونه فعليًا."
+        },
+        {
+          "id": "c",
+          "en": "Treat all 18 agents as independent freelancers because there are no team leaders.",
+          "ar": "أن يتعامل مع الـ18 مندوبًا جميعًا كأنهم مستقلون عاملون بشكل حر لأنه لا يوجد قادة فرق."
+        },
+        {
+          "id": "d",
+          "en": "Avoid hierarchy and pitch only WhatsApp campaigns.",
+          "ar": "أن يتجنّب موضوع الهيكل ويعرض فقط حملات واتساب."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "A good rep should understand the live operating structure and show that Whispyr can support responsibility, visibility, and assignment without pretending every brokerage has the same layers.",
+        "ar": "المندوب الجيد يفهم الهيكل التشغيلي الفعلي ويُظهر أن Whispyr يدعم المسؤولية والوضوح والتوزيع دون أن يفترض أن كل شركات الوساطة لها نفس الطبقات."
+      }
+    },
+    {
+      "position": 4,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Owner, Manager, Agent",
+        "ar": "صاحب الشركة، المدير، المندوب"
+      },
+      "prompt": {
+        "en": "In a brokerage sale, which role-to-pain matches are realistic?",
+        "ar": "في بيع لشركة وساطة عقارية، أي من مطابقات الدور بالوجع تُعدّ واقعية؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Owner: wants control, visibility, ROI, and confidence that the team is not leaking opportunities.",
+          "ar": "صاحب الشركة: يريد التحكّم والوضوح وعائد الاستثمار والاطمئنان إلى أن الفريق لا يهدر الفرص."
+        },
+        {
+          "id": "b",
+          "en": "Sales manager: wants to know who worked what, which agents are stuck, and which follow-ups or meetings need intervention.",
+          "ar": "مدير المبيعات: يريد أن يعرف من عمل على ماذا، وأي المندوبين متعثّرون، وأي المتابعات أو الاجتماعات تحتاج إلى تدخّل."
+        },
+        {
+          "id": "c",
+          "en": "Agent: wants lead ownership protected, less pointless admin work, and a clearer path to closing.",
+          "ar": "المندوب: يريد حماية ملكيته للّيد، وعملًا إداريًا أقل بلا فائدة، ومسارًا أوضح للإغلاق."
+        },
+        {
+          "id": "d",
+          "en": "Admin: may care about clean assignment, data entry, importing, and process consistency.",
+          "ar": "الموظف الإداري: قد يهتم بنظافة التوزيع، وإدخال البيانات، والاستيراد، واتساق العملية."
+        },
+        {
+          "id": "e",
+          "en": "Owner: usually cares only about screen colors and not about commercial outcomes.",
+          "ar": "صاحب الشركة: عادةً ما يهتم فقط بألوان الشاشة وليس بالنتائج التجارية."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "explanation": {
+        "en": "The same brokerage problem looks different by role. Good salespeople can shift language between owner-level control, manager-level execution, and agent-level adoption.",
+        "ar": "نفس مشكلة شركة الوساطة تبدو مختلفة حسب الدور. مندوبو المبيعات الجيدون يستطيعون تغيير لغتهم بين تحكّم صاحب الشركة، وتنفيذ المدير، وتبنّي المندوب."
+      }
+    },
+    {
+      "position": 5,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Primary Versus Resale",
+        "ar": "البيع الأساسي مقابل إعادة البيع"
+      },
+      "prompt": {
+        "en": "Which distinction matters most operationally when comparing primary sales to resale sales?",
+        "ar": "أي تمييز هو الأهم تشغيليًا عند المقارنة بين البيع الأساسي (الأولي) وإعادة البيع؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Primary usually means developer inventory, payment plans, launch stages, and developer-paid commission; resale usually means a specific owner/seller, negotiated terms, and less control over availability.",
+          "ar": "البيع الأساسي عادةً يعني مخزون المطوّر العقاري، وخطط السداد، ومراحل الإطلاق، وعمولة يدفعها المطوّر؛ بينما إعادة البيع عادةً تعني مالكًا/بائعًا محددًا، وشروطًا متفاوضًا عليها، وتحكّمًا أقل في توافر الوحدات."
+        },
+        {
+          "id": "b",
+          "en": "Primary is always easier because developer inventory never changes and buyers never negotiate.",
+          "ar": "البيع الأساسي دائمًا أسهل لأن مخزون المطوّر لا يتغير أبدًا والمشترون لا يتفاوضون أبدًا."
+        },
+        {
+          "id": "c",
+          "en": "Resale is not brokerage work because only developers pay commissions.",
+          "ar": "إعادة البيع ليست عمل شركات الوساطة لأن المطوّرين فقط هم من يدفعون العمولات."
+        },
+        {
+          "id": "d",
+          "en": "Primary leads do not need qualification because payment plans solve affordability automatically.",
+          "ar": "ليدات البيع الأساسي لا تحتاج إلى تأهيل لأن خطط السداد تحلّ مسألة القدرة على الشراء تلقائيًا."
+        }
+      ],
+      "correct": [
+        "a"
+      ],
+      "explanation": {
+        "en": "Primary versus resale changes inventory control, payment discussion, urgency, commission flow, negotiation, and follow-up.",
+        "ar": "الفرق بين البيع الأساسي وإعادة البيع يغيّر التحكّم في المخزون، ونقاش السداد، ودرجة الإلحاح، وتدفّق العمولة، والتفاوض، والمتابعة."
+      }
+    },
+    {
+      "position": 6,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Commission Incentives And CRM Resistance",
+        "ar": "حوافز العمولة ومقاومة نظام إدارة العملاء"
+      },
+      "prompt": {
+        "en": "An owner says: \"My agents hate logging. They say the CRM is just spying on them.\" Which underlying concerns might be real in a commission-driven brokerage?",
+        "ar": "صاحب شركة يقول: «مندوبيّ يكرهون تسجيل البيانات. يقولون إن نظام إدارة العملاء مجرد وسيلة للتجسس عليهم.» أي من المخاوف الكامنة قد تكون حقيقية في شركة وساطة تعتمد على العمولة؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Agents may fear losing ownership of leads they worked.",
+          "ar": "قد يخشى المندوبون فقدان ملكية الليدات التي عملوا عليها."
+        },
+        {
+          "id": "b",
+          "en": "Agents may see logging as admin work that does not help them close.",
+          "ar": "قد يرى المندوبون أن تسجيل البيانات عمل إداري لا يساعدهم على الإغلاق."
+        },
+        {
+          "id": "c",
+          "en": "Agents may worry managers will use partial activity data unfairly.",
+          "ar": "قد يقلق المندوبون من أن المديرين سيستخدمون بيانات نشاط جزئية بشكل غير عادل."
+        },
+        {
+          "id": "d",
+          "en": "Agents are always indifferent to commission because salaries are the only real motivator.",
+          "ar": "المندوبون دائمًا غير مبالين بالعمولة لأن الرواتب هي المحفّز الحقيقي الوحيد."
+        },
+        {
+          "id": "e",
+          "en": "Agents may cherry-pick leads they believe can convert faster.",
+          "ar": "قد ينتقي المندوبون الليدات التي يعتقدون أنها قد تتحول إلى صفقات أسرع."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "e"
+      ],
+      "explanation": {
+        "en": "Commission creates motivation, but it can also create defensiveness around ownership, reporting, and effort allocation.",
+        "ar": "العمولة تخلق الدافع، لكنها قد تخلق أيضًا موقفًا دفاعيًا تجاه الملكية، والتقارير، وتوزيع الجهد."
+      }
+    },
+    {
+      "position": 7,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Commission Flow",
+        "ar": "تدفّق العمولة"
+      },
+      "prompt": {
+        "en": "A new rep says: \"If a primary deal closes, the buyer pays the agent directly, then the agent pays the brokerage.\" What is the best correction?",
+        "ar": "مندوب جديد يقول: «إذا أُغلقت صفقة بيع أساسي، يدفع المشتري للمندوب مباشرة، ثم يدفع المندوب لشركة الوساطة.» ما أفضل تصحيح؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "In primary deals, the developer usually pays the brokerage commission after the sale, and the brokerage then pays the agent according to its internal scheme.",
+          "ar": "في صفقات البيع الأساسي، عادةً ما يدفع المطوّر العقاري عمولة شركة الوساطة بعد البيع، ثم تدفع شركة الوساطة للمندوب وفقًا لنظامها الداخلي."
+        },
+        {
+          "id": "b",
+          "en": "The buyer always pays the full agent commission separately before reservation.",
+          "ar": "المشتري دائمًا يدفع كامل عمولة المندوب بشكل منفصل قبل الحجز."
+        },
+        {
+          "id": "c",
+          "en": "The agent always gets paid directly by the developer and the brokerage has no role.",
+          "ar": "المندوب دائمًا يتقاضى أجره مباشرة من المطوّر العقاري وليس لشركة الوساطة أي دور."
+        },
+        {
+          "id": "d",
+          "en": "Commission flow is irrelevant to CRM adoption.",
+          "ar": "تدفّق العمولة لا علاقة له بتبنّي نظام إدارة العملاء."
+        }
+      ],
+      "correct": [
+        "a"
+      ],
+      "explanation": {
+        "en": "Understanding money flow helps reps understand why brokerages care about lead ownership, deal attribution, and agent accountability.",
+        "ar": "فهم تدفّق الأموال يساعد المندوبين على فهم لماذا تهتم شركات الوساطة بملكية الليد، ونسب الصفقات لأصحابها، ومساءلة المندوب."
+      }
+    },
+    {
+      "position": 8,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Developer Trust Signals",
+        "ar": "إشارات الثقة في المطوّر"
+      },
+      "prompt": {
+        "en": "A sales manager asks how agents should judge whether a project is easier or harder to sell. Which developer or launch signals should raise concern?",
+        "ar": "مدير مبيعات يسأل كيف ينبغي للمندوبين الحكم على ما إذا كان المشروع أسهل أم أصعب في البيع. أي إشارات من المطوّر أو الإطلاق ينبغي أن تثير القلق؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Repeated delivery delays with weak explanations.",
+          "ar": "تأخّرات متكررة في التسليم مع تبريرات ضعيفة."
+        },
+        {
+          "id": "b",
+          "en": "Too many launches relative to visible execution capacity.",
+          "ar": "عدد كبير جدًا من الإطلاقات مقارنة بالقدرة الفعلية الظاهرة على التنفيذ."
+        },
+        {
+          "id": "c",
+          "en": "Vague handover dates, confusing pricing, or hard-to-explain payment terms.",
+          "ar": "مواعيد تسليم غامضة، أو تسعير مُربك، أو شروط سداد يصعب شرحها."
+        },
+        {
+          "id": "d",
+          "en": "Strong delivery history and strong buyer trust.",
+          "ar": "سجل تسليم قوي وثقة قوية من المشترين."
+        },
+        {
+          "id": "e",
+          "en": "Cash-pressure behavior that pushes aggressive selling without clear proof.",
+          "ar": "سلوك ناتج عن ضغط السيولة يدفع نحو بيع عدواني دون دليل واضح."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "e"
+      ],
+      "explanation": {
+        "en": "Developer strength is about delivery, financing discipline, trust, demand, and clarity. A famous name alone is not enough.",
+        "ar": "قوة المطوّر تتعلق بالتسليم، وانضباط التمويل، والثقة، والطلب، والوضوح. الاسم الشهير وحده لا يكفي."
+      }
+    },
+    {
+      "position": 9,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Mature Developer Evaluation",
+        "ar": "تقييم ناضج للمطوّر"
+      },
+      "prompt": {
+        "en": "Which agent answer best shows mature developer evaluation?",
+        "ar": "أي إجابة من المندوب تُظهر بشكل أفضل تقييمًا ناضجًا للمطوّر؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "\"If the developer is famous, the project is automatically safe.\"",
+          "ar": "«إذا كان المطوّر مشهورًا، فالمشروع آمن تلقائيًا.»"
+        },
+        {
+          "id": "b",
+          "en": "\"I would look at delivery history, financing strength, launch discipline, real demand, buyer trust, and whether the sales story can be explained clearly.\"",
+          "ar": "«سأنظر إلى سجل التسليم، وقوة التمويل، وانضباط الإطلاق، والطلب الحقيقي، وثقة المشترين، وما إذا كان من الممكن شرح قصة البيع بوضوح.»"
+        },
+        {
+          "id": "c",
+          "en": "\"The strongest project is the one with the highest commission this month.\"",
+          "ar": "«أقوى مشروع هو الذي يحقق أعلى عمولة هذا الشهر.»"
+        },
+        {
+          "id": "d",
+          "en": "\"Developer strength does not matter if the brokerage has enough leads.\"",
+          "ar": "«قوة المطوّر لا تهم إذا كان لدى شركة الوساطة ما يكفي من الليدات.»"
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "A mature agent judges whether the developer can deliver and whether the brokerage can sell with trust, not only name recognition or commission.",
+        "ar": "المندوب الناضج يحكم على ما إذا كان المطوّر قادرًا على التسليم وما إذا كانت شركة الوساطة قادرة على البيع بثقة، وليس فقط على شهرة الاسم أو العمولة."
+      }
+    },
+    {
+      "position": 10,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Launch Readiness",
+        "ar": "الجاهزية للإطلاق"
+      },
+      "prompt": {
+        "en": "A developer launch starts this week. Before pushing leads hard, what should a brokerage coordinate internally?",
+        "ar": "إطلاق لمطوّر عقاري يبدأ هذا الأسبوع. قبل الدفع بقوة على الليدات، ما الذي ينبغي أن تنسّقه شركة الوساطة داخليًا؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Updated inventory, prices, payment plans, and delivery dates.",
+          "ar": "مخزون محدّث، وأسعار، وخطط سداد، ومواعيد تسليم."
+        },
+        {
+          "id": "b",
+          "en": "Which buyer segments fit the launch and which objections are likely.",
+          "ar": "أي شرائح من المشترين تناسب الإطلاق وأي اعتراضات محتملة."
+        },
+        {
+          "id": "c",
+          "en": "Lead routing, response expectations, and follow-up ownership.",
+          "ar": "توجيه الليدات، وتوقّعات سرعة الرد، وملكية المتابعة."
+        },
+        {
+          "id": "d",
+          "en": "EOI or reservation rules, including who can collect, approve, and confirm them.",
+          "ar": "قواعد إبداء الاهتمام (EOI) أو الحجز، بما في ذلك من يمكنه تحصيلها واعتمادها وتأكيدها."
+        },
+        {
+          "id": "e",
+          "en": "A shared explanation of urgency tied to real stock and pricing, not fake pressure.",
+          "ar": "شرح موحّد لدرجة الإلحاح مرتبط بالمخزون والتسعير الحقيقي، وليس بضغط مفتعل."
+        },
+        {
+          "id": "f",
+          "en": "Only the post-closing commission distribution.",
+          "ar": "فقط توزيع العمولة بعد الإغلاق."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e"
+      ],
+      "explanation": {
+        "en": "Launch pressure affects knowledge, messaging, routing, follow-up, EOI handling, and urgency. Commission matters, but it cannot be the only coordination point.",
+        "ar": "ضغط الإطلاق يؤثر على المعرفة، والرسائل، والتوجيه، والمتابعة، والتعامل مع إبداء الاهتمام، ودرجة الإلحاح. العمولة مهمة، لكنها لا يمكن أن تكون نقطة التنسيق الوحيدة."
+      }
+    },
+    {
+      "position": 11,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Stepped Pricing And Honest Urgency",
+        "ar": "التسعير المتدرّج والإلحاح الصادق"
+      },
+      "prompt": {
+        "en": "How should an agent use stepped pricing in a credible client conversation?",
+        "ar": "كيف ينبغي للمندوب استخدام التسعير المتدرّج في حوار موثوق مع العميل؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Claim prices will always rise tomorrow, regardless of project stage or demand.",
+          "ar": "أن يدّعي أن الأسعار سترتفع غدًا دائمًا، بغضّ النظر عن مرحلة المشروع أو الطلب."
+        },
+        {
+          "id": "b",
+          "en": "Explain that prices can move across launch, demand, construction, and delivery stages, then connect urgency to real availability and client fit.",
+          "ar": "أن يشرح أن الأسعار قد تتحرك عبر مراحل الإطلاق والطلب والبناء والتسليم، ثم يربط الإلحاح بالتوافر الحقيقي ومدى ملاءمة العميل."
+        },
+        {
+          "id": "c",
+          "en": "Avoid discussing pricing movement because it sounds like pressure.",
+          "ar": "أن يتجنّب مناقشة حركة الأسعار لأنها تبدو وكأنها ضغط."
+        },
+        {
+          "id": "d",
+          "en": "Say stepped pricing matters only in resale, not primary launches.",
+          "ar": "أن يقول إن التسعير المتدرّج يهم فقط في إعادة البيع، وليس في إطلاقات البيع الأساسي."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "The skill is not fake scarcity. It is explaining how timing, stock, demand, and construction stage can affect price.",
+        "ar": "المهارة ليست في افتعال الندرة. بل في شرح كيف يمكن للتوقيت والمخزون والطلب ومرحلة البناء أن تؤثر على السعر."
+      }
+    },
+    {
+      "position": 12,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Area Knowledge",
+        "ar": "معرفة المنطقة"
+      },
+      "prompt": {
+        "en": "Why does area knowledge matter when an agent qualifies a buyer in Egypt?",
+        "ar": "لماذا تهم معرفة المنطقة عندما يؤهّل المندوب مشتريًا في مصر؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Area affects budget realism, lifestyle fit, commute, school/family needs, investment thesis, and available developers.",
+          "ar": "المنطقة تؤثر على واقعية الميزانية، وملاءمة نمط الحياة، والمسافة اليومية، واحتياجات المدارس/العائلة، وفكرة الاستثمار، والمطوّرين المتاحين."
+        },
+        {
+          "id": "b",
+          "en": "Area preference helps separate a real buyer from someone who is still browsing vaguely.",
+          "ar": "تفضيل المنطقة يساعد على التمييز بين مشترٍ حقيقي وشخص لا يزال يتصفّح بشكل غير محدد."
+        },
+        {
+          "id": "c",
+          "en": "Area knowledge helps the agent suggest alternatives when the buyer's first request does not fit their budget.",
+          "ar": "معرفة المنطقة تساعد المندوب على اقتراح بدائل عندما لا يتناسب طلب المشتري الأول مع ميزانيته."
+        },
+        {
+          "id": "d",
+          "en": "Area does not matter if the client has money.",
+          "ar": "المنطقة لا تهم إذا كان لدى العميل مال."
+        },
+        {
+          "id": "e",
+          "en": "Area can affect whether the conversation should focus on end-use, investment, delivery timing, or resale liquidity.",
+          "ar": "المنطقة قد تؤثر على ما إذا كان ينبغي للحوار أن يركّز على الاستخدام الشخصي، أو الاستثمار، أو توقيت التسليم، أو سيولة إعادة البيع."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "e"
+      ],
+      "explanation": {
+        "en": "Area is not just a location filter. It is one of the fastest ways to understand intent, budget fit, and the right sales path.",
+        "ar": "المنطقة ليست مجرد عامل تصفية للموقع. إنها واحدة من أسرع الطرق لفهم النية، وملاءمة الميزانية، والمسار البيعي الصحيح."
+      }
+    },
+    {
+      "position": 13,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Qualification Framework",
+        "ar": "إطار التأهيل"
+      },
+      "prompt": {
+        "en": "Which four areas should a rep expect agents to clarify before treating a buyer as properly qualified?",
+        "ar": "أي أربعة مجالات ينبغي للمندوب أن يتوقّع من المندوبين توضيحها قبل اعتبار المشتري مؤهّلًا بشكل صحيح؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Money or budget.",
+          "ar": "المال أو الميزانية."
+        },
+        {
+          "id": "b",
+          "en": "Area or location preference.",
+          "ar": "تفضيل المنطقة أو الموقع."
+        },
+        {
+          "id": "c",
+          "en": "Need or reason for buying.",
+          "ar": "الحاجة أو سبب الشراء."
+        },
+        {
+          "id": "d",
+          "en": "Timeline for buying, moving, investing, or reserving.",
+          "ar": "الإطار الزمني للشراء، أو الانتقال، أو الاستثمار، أو الحجز."
+        },
+        {
+          "id": "e",
+          "en": "Agent authority over the brokerage commission split.",
+          "ar": "صلاحية المندوب على توزيع عمولة شركة الوساطة."
+        },
+        {
+          "id": "f",
+          "en": "Whether the buyer likes the agent personally.",
+          "ar": "ما إذا كان المشتري يحب المندوب شخصيًا."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "explanation": {
+        "en": "A buyer is not qualified just because they answered the phone. Budget, area, need, and timeline create a useful sales next step.",
+        "ar": "المشتري ليس مؤهّلًا لمجرد أنه ردّ على الهاتف. الميزانية، والمنطقة، والحاجة، والإطار الزمني تخلق خطوة بيعية تالية مفيدة."
+      }
+    },
+    {
+      "position": 14,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Conditional Qualification",
+        "ar": "التأهيل المشروط"
+      },
+      "prompt": {
+        "en": "A client says they have a clear budget, prefer New Cairo, and want a family home, but they are unsure whether they can buy this quarter or after school admissions are settled. What is the best classification?",
+        "ar": "عميل يقول إن لديه ميزانية واضحة، ويفضّل القاهرة الجديدة (New Cairo)، ويريد منزلًا عائليًا، لكنه غير متأكد مما إذا كان يستطيع الشراء هذا الربع أم بعد أن تُحسم قبولات المدارس. ما أفضل تصنيف؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Disqualified, because no timeline means no value.",
+          "ar": "غير مؤهّل، لأن عدم وجود إطار زمني يعني عدم وجود قيمة."
+        },
+        {
+          "id": "b",
+          "en": "Conditionally qualified, because three major qualification areas are clear and the missing timeline can be recovered with follow-up.",
+          "ar": "مؤهّل بشكل مشروط، لأن ثلاثة من مجالات التأهيل الرئيسية واضحة، والإطار الزمني المفقود يمكن استرجاعه بالمتابعة."
+        },
+        {
+          "id": "c",
+          "en": "Done deal, because budget and area are enough.",
+          "ar": "صفقة مكتملة، لأن الميزانية والمنطقة كافيتان."
+        },
+        {
+          "id": "d",
+          "en": "Unreachable, because the client has not committed to a visit.",
+          "ar": "غير قابل للوصول، لأن العميل لم يلتزم بزيارة."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "The rep should recognize useful intent while still respecting that timeline is unresolved.",
+        "ar": "ينبغي للمندوب أن يدرك وجود نية مفيدة مع احترام أن الإطار الزمني لا يزال غير محسوم."
+      }
+    },
+    {
+      "position": 15,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Cold Signals",
+        "ar": "الإشارات الباردة"
+      },
+      "prompt": {
+        "en": "Which answers from a buyer should make an agent cautious before treating them as a hot opportunity?",
+        "ar": "أي إجابات من المشتري ينبغي أن تجعل المندوب حذرًا قبل التعامل معه كفرصة ساخنة؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "\"Any area is fine.\"",
+          "ar": "«أي منطقة مناسبة.»"
+        },
+        {
+          "id": "b",
+          "en": "\"I want anything cheap.\"",
+          "ar": "«أريد أي شيء رخيص.»"
+        },
+        {
+          "id": "c",
+          "en": "\"Maybe next year, I am just checking prices.\"",
+          "ar": "«ربما العام القادم، أنا فقط أستطلع الأسعار.»"
+        },
+        {
+          "id": "d",
+          "en": "\"I have a down payment ready and need something near my children's school.\"",
+          "ar": "«لديّ مقدّم جاهز وأحتاج شيئًا قريبًا من مدرسة أطفالي.»"
+        },
+        {
+          "id": "e",
+          "en": "\"I am comparing installments but not sure what I can afford yet.\"",
+          "ar": "«أنا أقارن بين الأقساط لكنني لست متأكدًا بعد مما يمكنني تحمّله.»"
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "e"
+      ],
+      "explanation": {
+        "en": "Vague area, vague budget, distant timeline, and unclear affordability are cold or incomplete signals. Option D shows stronger need and readiness.",
+        "ar": "المنطقة الغامضة، والميزانية الغامضة، والإطار الزمني البعيد، والقدرة المالية غير الواضحة هي إشارات باردة أو غير مكتملة. الخيار (د) يُظهر حاجة وجاهزية أقوى."
+      }
+    },
+    {
+      "position": 16,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "\"Bad Leads\" Diagnosis",
+        "ar": "تشخيص \"الليدات الوحشة\""
+      },
+      "prompt": {
+        "en": "A sales manager says: \"The campaign is terrible. Agents call 100 leads and barely get real conversations.\" What should the rep diagnose first?",
+        "ar": "يقول مدير المبيعات: \"الحملة سيئة جدًا. المندوبون يتصلون بـ 100 ليد وبالكاد يحصلون على محادثات حقيقية.\" ما الذي يجب أن يشخّصه مندوب Whispyr أولًا؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Whether the issue is answer rate, opening quality, speed-to-lead, number quality, targeting, call timing, or agent follow-up before declaring all leads bad.",
+          "ar": "ما إذا كانت المشكلة في معدل الرد، أو جودة الافتتاحية، أو سرعة التواصل مع الليد، أو جودة الأرقام، أو الاستهداف، أو توقيت المكالمات، أو متابعة المندوب، قبل الحكم على كل الليدات بأنها سيئة."
+        },
+        {
+          "id": "b",
+          "en": "Tell the manager to stop buying leads immediately.",
+          "ar": "إخبار المدير بأن يوقف شراء الليدات فورًا."
+        },
+        {
+          "id": "c",
+          "en": "Tell the owner to fire the marketing agency without checking the funnel.",
+          "ar": "إخبار صاحب الشركة بأن يطرد وكالة التسويق دون فحص القمع البيعي (الفانل)."
+        },
+        {
+          "id": "d",
+          "en": "Assume the agents are lying because agents always blame marketing.",
+          "ar": "افتراض أن المندوبين يكذبون لأن المندوبين دائمًا يلقون اللوم على التسويق."
+        }
+      ],
+      "correct": [
+        "a"
+      ],
+      "explanation": {
+        "en": "\"Bad leads\" can mean different bottlenecks. A good rep breaks the funnel into measurable stages before blaming one actor.",
+        "ar": "\"الليدات الوحشة\" يمكن أن تعني اختناقات مختلفة. المندوب الجيد يقسّم القمع البيعي إلى مراحل قابلة للقياس قبل إلقاء اللوم على طرف واحد."
+      }
+    },
+    {
+      "position": 17,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Daily Funnel Math",
+        "ar": "حسابات القمع البيعي اليومية"
+      },
+      "prompt": {
+        "en": "An agent makes 100 cold calls in a day. Around 30 answer, around 12 become real conversations, and around 3 are genuinely qualified. What is the best interpretation?",
+        "ar": "يجري المندوب 100 مكالمة باردة في اليوم. يرد منها حوالي 30، ويتحول حوالي 12 إلى محادثات حقيقية، ويكون حوالي 3 منها مؤهلين فعليًا. ما هو أفضل تفسير؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "The agent failed because 3 qualified leads from 100 calls is automatically unacceptable.",
+          "ar": "المندوب فشل لأن 3 ليدات مؤهلة من 100 مكالمة أمر غير مقبول تلقائيًا."
+        },
+        {
+          "id": "b",
+          "en": "The useful question is which stage is weakest: answer rate, first 15 seconds, qualification quality, or next-step conversion.",
+          "ar": "السؤال المفيد هو أي مرحلة هي الأضعف: معدل الرد، أم أول 15 ثانية، أم جودة التأهيل، أم التحويل إلى الخطوة التالية."
+        },
+        {
+          "id": "c",
+          "en": "The brokerage should count all 100 numbers as qualified leads.",
+          "ar": "يجب على شركة الوساطة العقارية أن تحتسب كل الـ 100 رقم كليدات مؤهلة."
+        },
+        {
+          "id": "d",
+          "en": "The agent should only report the 3 qualified leads and hide the rest.",
+          "ar": "يجب على المندوب أن يبلّغ فقط عن الـ 3 ليدات المؤهلة ويخفي الباقي."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "Funnel math is useful because it shows where the operation is breaking, not because one raw number tells the full story.",
+        "ar": "حسابات القمع البيعي مفيدة لأنها تُظهر أين تتعطل العملية، وليس لأن رقمًا واحدًا خامًا يحكي القصة كاملة."
+      }
+    },
+    {
+      "position": 18,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "The First 15 Seconds",
+        "ar": "أول 15 ثانية"
+      },
+      "prompt": {
+        "en": "Many answered calls die in the first few seconds. Which coaching response is strongest?",
+        "ar": "كثير من المكالمات التي يُرد عليها تنتهي في الثواني القليلة الأولى. أي استجابة تدريبية هي الأقوى؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Increase the number of calls and ignore openings.",
+          "ar": "زيادة عدد المكالمات وتجاهل الافتتاحيات."
+        },
+        {
+          "id": "b",
+          "en": "Improve the opening line, relevance, timing, and first-question quality so more answered calls become real conversations.",
+          "ar": "تحسين جملة الافتتاح، والملاءمة، والتوقيت، وجودة أول سؤال حتى يتحول مزيد من المكالمات المُجاب عليها إلى محادثات حقيقية."
+        },
+        {
+          "id": "c",
+          "en": "Stop tracking answered calls because only closed deals matter.",
+          "ar": "التوقف عن تتبع المكالمات المُجاب عليها لأن الصفقات المكتملة فقط هي المهمة."
+        },
+        {
+          "id": "d",
+          "en": "Send every lead the same long WhatsApp message before calling.",
+          "ar": "إرسال نفس رسالة واتساب الطويلة لكل ليد قبل الاتصال."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "The first seconds decide whether the buyer gives the agent permission to continue. This is a real coaching and conversion point.",
+        "ar": "الثواني الأولى تحدد ما إذا كان المشتري سيمنح المندوب الإذن للاستمرار. هذه نقطة حقيقية للتدريب وللتحويل."
+      }
+    },
+    {
+      "position": 19,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Pipeline Lag",
+        "ar": "تأخر خط الأنابيب البيعي (Pipeline)"
+      },
+      "prompt": {
+        "en": "At the end of Month 1, a new agent has many qualified leads and several visits arranged, but no closed deal yet. What is the most mature manager interpretation?",
+        "ar": "في نهاية الشهر الأول، لدى مندوب جديد كثير من الليدات المؤهلة وعدة معاينات مرتبة، لكن لا توجد صفقة مكتملة بعد. ما هو أنضج تفسير من المدير؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "The agent is useless because no closed deal after one month always means failure.",
+          "ar": "المندوب عديم الفائدة لأن عدم وجود صفقة مكتملة بعد شهر يعني الفشل دائمًا."
+        },
+        {
+          "id": "b",
+          "en": "Check leading indicators and pipeline age before judging, because real estate deals often close after a lag.",
+          "ar": "فحص المؤشرات الاستباقية وعمر خط الأنابيب البيعي قبل الحكم، لأن الصفقات العقارية غالبًا ما تُغلق بعد فترة تأخر."
+        },
+        {
+          "id": "c",
+          "en": "Ignore the agent's activity forever because deals take time.",
+          "ar": "تجاهل نشاط المندوب إلى الأبد لأن الصفقات تأخذ وقتًا."
+        },
+        {
+          "id": "d",
+          "en": "Count every visit arranged as a closed deal.",
+          "ar": "احتساب كل معاينة مرتبة على أنها صفقة مكتملة."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "A manager should understand deal-cycle lag while still inspecting the quality of leading indicators.",
+        "ar": "يجب على المدير أن يفهم تأخر دورة الصفقة مع استمراره في فحص جودة المؤشرات الاستباقية."
+      }
+    },
+    {
+      "position": 20,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Meeting No-Shows",
+        "ar": "عدم حضور الاجتماعات"
+      },
+      "prompt": {
+        "en": "If a brokerage schedules many meetings but many clients do not show up, what should the sales manager investigate?",
+        "ar": "إذا حجزت شركة الوساطة العقارية كثيرًا من الاجتماعات لكن كثيرًا من العملاء لا يحضرون، فما الذي يجب أن يحقق فيه مدير المبيعات؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Whether the buyer was truly qualified before the meeting.",
+          "ar": "ما إذا كان المشتري مؤهلًا فعلًا قبل الاجتماع."
+        },
+        {
+          "id": "b",
+          "en": "Whether confirmation calls and WhatsApp reminders happened.",
+          "ar": "ما إذا كانت مكالمات التأكيد وتذكيرات واتساب قد تمت."
+        },
+        {
+          "id": "c",
+          "en": "Whether the meeting had a clear agenda, location, and reason to attend.",
+          "ar": "ما إذا كان للاجتماع أجندة واضحة، وموقع، وسبب للحضور."
+        },
+        {
+          "id": "d",
+          "en": "Whether agents are logging cancellations and no-shows honestly.",
+          "ar": "ما إذا كان المندوبون يسجّلون الإلغاءات وحالات عدم الحضور بأمانة."
+        },
+        {
+          "id": "e",
+          "en": "Whether the brokerage should stop scheduling meetings entirely.",
+          "ar": "ما إذا كان على شركة الوساطة العقارية أن توقف حجز الاجتماعات نهائيًا."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "explanation": {
+        "en": "No-shows can come from weak qualification, weak confirmation, poor logistics, or poor logging. The answer is diagnosis, not giving up on meetings.",
+        "ar": "عدم الحضور قد ينتج عن ضعف التأهيل، أو ضعف التأكيد، أو سوء التنظيم اللوجستي، أو سوء التسجيل. الحل هو التشخيص، وليس التخلي عن الاجتماعات."
+      }
+    },
+    {
+      "position": 21,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Source ROI",
+        "ar": "عائد المصدر"
+      },
+      "prompt": {
+        "en": "Source A generates 500 leads, 20 meetings, and 1 deal. Source B generates 120 leads, 18 meetings, and 3 deals. What should a manager conclude?",
+        "ar": "المصدر A يولّد 500 ليد، و20 اجتماعًا، وصفقة واحدة. المصدر B يولّد 120 ليد، و18 اجتماعًا، و3 صفقات. ما الذي يجب أن يستنتجه المدير؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Source A is automatically better because lead volume is higher.",
+          "ar": "المصدر A أفضل تلقائيًا لأن حجم الليدات أعلى."
+        },
+        {
+          "id": "b",
+          "en": "Source B may be commercially stronger despite lower volume, because meeting and deal conversion matter.",
+          "ar": "قد يكون المصدر B أقوى تجاريًا رغم انخفاض الحجم، لأن تحويل الاجتماعات والصفقات هو ما يهم."
+        },
+        {
+          "id": "c",
+          "en": "Both sources are equal because both produced leads.",
+          "ar": "المصدران متساويان لأن كليهما أنتج ليدات."
+        },
+        {
+          "id": "d",
+          "en": "Source B should be ignored because it creates less agent activity.",
+          "ar": "يجب تجاهل المصدر B لأنه يخلق نشاطًا أقل للمندوبين."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "Brokerages should judge sources by conversion through the funnel, not lead count alone.",
+        "ar": "يجب على شركات الوساطة العقارية أن تحكم على المصادر من خلال التحويل عبر القمع البيعي، وليس بعدد الليدات وحده."
+      }
+    },
+    {
+      "position": 22,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Lead Ownership Conflict",
+        "ar": "نزاع ملكية الليد"
+      },
+      "prompt": {
+        "en": "Two agents claim they were working the same buyer: one first called the lead, the other says the buyer later came through their personal referral. Why does this matter operationally?",
+        "ar": "مندوبان يدّعيان أنهما كانا يعملان على نفس المشتري: أحدهما اتصل بالليد أولًا، والآخر يقول إن المشتري جاء لاحقًا عن طريق ترشيح شخصي منه. لماذا يهم هذا تشغيليًا؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "It affects trust, commission fairness, manager intervention, and whether the brokerage has a reliable record of who did what.",
+          "ar": "إنه يؤثر على الثقة، وعدالة العمولة، وتدخل المدير، وما إذا كان لدى شركة الوساطة العقارية سجل موثوق لمن فعل ماذا."
+        },
+        {
+          "id": "b",
+          "en": "It does not matter because all agents should split every commission equally.",
+          "ar": "لا يهم لأن جميع المندوبين يجب أن يتقاسموا كل عمولة بالتساوي."
+        },
+        {
+          "id": "c",
+          "en": "It means the buyer should be deleted from the CRM.",
+          "ar": "يعني أنه يجب حذف المشتري من نظام إدارة العلاقات (CRM)."
+        },
+        {
+          "id": "d",
+          "en": "It proves the brokerage should stop accepting referrals.",
+          "ar": "يثبت أنه يجب على شركة الوساطة العقارية أن توقف قبول الترشيحات."
+        }
+      ],
+      "correct": [
+        "a"
+      ],
+      "explanation": {
+        "en": "Ownership disputes are a normal brokerage pain. Good systems reduce argument by preserving source, assignment, timeline, and activity evidence.",
+        "ar": "نزاعات الملكية هي وجع طبيعي في شركات الوساطة العقارية. الأنظمة الجيدة تقلّل الخلاف بالحفاظ على المصدر، والإسناد، والخط الزمني، وأدلة النشاط."
+      }
+    },
+    {
+      "position": 23,
+      "type": "multi",
+      "points": 1,
+      "title": {
+        "en": "Brokerage Value",
+        "ar": "قيمة شركة الوساطة العقارية"
+      },
+      "prompt": {
+        "en": "What real value does a brokerage add beyond simply forwarding unit options?",
+        "ar": "ما هي القيمة الحقيقية التي تضيفها شركة الوساطة العقارية بما يتجاوز مجرد تمرير خيارات الوحدات؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "Qualifying buyers and matching them to realistic projects.",
+          "ar": "تأهيل المشترين ومطابقتهم بمشاريع واقعية."
+        },
+        {
+          "id": "b",
+          "en": "Explaining areas, developers, payment plans, delivery, and trade-offs.",
+          "ar": "شرح المناطق، والمطوّرين العقاريين، وخطط السداد، والتسليم، والمفاضلات."
+        },
+        {
+          "id": "c",
+          "en": "Managing follow-up, visits, negotiation, and reservation steps.",
+          "ar": "إدارة المتابعة، والمعاينات، والتفاوض، وخطوات الحجز."
+        },
+        {
+          "id": "d",
+          "en": "Using developer relationships and market knowledge to create trust.",
+          "ar": "استخدام العلاقات مع المطوّرين العقاريين ومعرفة السوق لبناء الثقة."
+        },
+        {
+          "id": "e",
+          "en": "Replacing the developer entirely and guaranteeing the project will deliver.",
+          "ar": "استبدال المطوّر العقاري بالكامل وضمان أن المشروع سيُسلَّم."
+        }
+      ],
+      "correct": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "explanation": {
+        "en": "A brokerage's value is advice, trust, access, follow-up, negotiation, and execution. It should not pretend to control everything a developer controls.",
+        "ar": "قيمة شركة الوساطة العقارية هي المشورة، والثقة، والوصول، والمتابعة، والتفاوض، والتنفيذ. ولا ينبغي أن تدّعي السيطرة على كل ما يسيطر عليه المطوّر العقاري."
+      }
+    },
+    {
+      "position": 24,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "Agent Adoption",
+        "ar": "تبنّي المندوب للنظام"
+      },
+      "prompt": {
+        "en": "An agent says: \"Logging only helps management, not me.\" Which answer is most likely to reduce resistance?",
+        "ar": "يقول مندوب: \"التسجيل يفيد الإدارة فقط، لا يفيدني أنا.\" أي إجابة هي الأرجح في تقليل المقاومة؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "\"You are right, it only helps management, but you have to do it.\"",
+          "ar": "\"أنت محق، إنه يفيد الإدارة فقط، لكن عليك أن تفعله.\""
+        },
+        {
+          "id": "b",
+          "en": "\"Good logging protects your ownership, helps you remember context, makes follow-up easier, and gives your manager evidence to support you instead of guessing.\"",
+          "ar": "\"التسجيل الجيد يحمي ملكيتك للليدات، ويساعدك على تذكر السياق، ويسهّل المتابعة، ويعطي مديرك أدلة لدعمك بدلًا من التخمين.\""
+        },
+        {
+          "id": "c",
+          "en": "\"Agents should not care about ownership if they are loyal.\"",
+          "ar": "\"يجب ألا يهتم المندوبون بالملكية إذا كانوا مخلصين.\""
+        },
+        {
+          "id": "d",
+          "en": "\"We will hide all agent activity from managers.\"",
+          "ar": "\"سنخفي كل نشاط المندوبين عن المديرين.\""
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "Adoption improves when the agent sees the system as a tool that protects their work and helps them close, not only as surveillance.",
+        "ar": "يتحسن تبنّي النظام عندما يرى المندوب أنه أداة تحمي عمله وتساعده على الإغلاق، وليس مجرد وسيلة للمراقبة."
+      }
+    },
+    {
+      "position": 25,
+      "type": "single",
+      "points": 1,
+      "title": {
+        "en": "EOI, Reservation, Done Deal",
+        "ar": "إبداء الاهتمام (EOI) والحجز والصفقة المكتملة"
+      },
+      "prompt": {
+        "en": "Which statement best reflects real brokerage pipeline discipline?",
+        "ar": "أي عبارة تعكس بشكل أفضل الانضباط الحقيقي في خط الأنابيب البيعي لشركة الوساطة العقارية؟"
+      },
+      "options": [
+        {
+          "id": "a",
+          "en": "EOI, reservation, and done deal are all the same stage because the client showed interest.",
+          "ar": "إبداء الاهتمام (EOI)، والحجز، والصفقة المكتملة كلها نفس المرحلة لأن العميل أبدى اهتمامًا."
+        },
+        {
+          "id": "b",
+          "en": "EOI can be a serious buying signal, reservation is stronger, and done deal should be treated as closed only when the brokerage's closing criteria are truly met.",
+          "ar": "إبداء الاهتمام (EOI) يمكن أن يكون إشارة شراء جادة، والحجز أقوى، والصفقة المكتملة يجب أن تُعامل كمغلقة فقط عندما تتحقق فعليًا معايير الإغلاق لدى شركة الوساطة العقارية."
+        },
+        {
+          "id": "c",
+          "en": "EOI means the buyer has paid the full unit price.",
+          "ar": "إبداء الاهتمام (EOI) يعني أن المشتري دفع كامل سعر الوحدة."
+        },
+        {
+          "id": "d",
+          "en": "The pipeline should skip EOI because only calls and deals matter.",
+          "ar": "يجب أن يتخطى خط الأنابيب البيعي مرحلة إبداء الاهتمام (EOI) لأن المكالمات والصفقات فقط هي ما يهم."
+        }
+      ],
+      "correct": [
+        "b"
+      ],
+      "explanation": {
+        "en": "These stages communicate different levels of commitment. Collapsing them hides pipeline quality and creates false confidence.",
+        "ar": "هذه المراحل تعبّر عن مستويات التزام مختلفة. دمجها معًا يخفي جودة خط الأنابيب البيعي ويخلق ثقة زائفة."
+      }
+    },
+    {
+      "position": 26,
+      "type": "short",
+      "points": 3,
+      "title": {
+        "en": "Brokerage Map",
+        "ar": "خريطة شركة الوساطة العقارية"
+      },
+      "prompt": {
+        "en": "You are meeting a 20-agent brokerage for the first time. Write the 5-7 things you would want to understand about how the brokerage operates before you demo Whispyr.",
+        "ar": "أنت تقابل شركة وساطة عقارية بها 20 مندوبًا لأول مرة. اكتب الـ 5 إلى 7 أشياء التي تريد أن تفهمها عن طريقة عمل شركة الوساطة العقارية قبل أن تعرض Whispyr."
+      },
+      "rubric": {
+        "en": "Scoring rubric:\n\n- 3 points: Covers roles/hierarchy, lead sources, assignment/routing, qualification, follow-up, meetings/visits, pipeline stages, owner/manager visibility, and agent adoption or commission concerns.\n- 2 points: Covers several operational areas but misses one or two important brokerage realities.\n- 1 point: Gives generic discovery questions with little brokerage specificity.\n- 0 points: Does not answer the question or jumps straight into features.",
+        "ar": "معايير التقييم:\n\n- 3 نقاط: يغطي الأدوار/التسلسل الهرمي، ومصادر الليدات، والإسناد/التوجيه، والتأهيل، والمتابعة، والاجتماعات/المعاينات، ومراحل خط الأنابيب البيعي، ووضوح الرؤية لدى صاحب الشركة/المدير، وتبنّي المندوبين أو مخاوف العمولة.\n- نقطتان: يغطي عدة مجالات تشغيلية لكنه يغفل واحدة أو اثنتين من حقائق شركة الوساطة العقارية المهمة.\n- نقطة واحدة: يقدّم أسئلة استكشاف عامة دون خصوصية تتعلق بشركة الوساطة العقارية.\n- 0 نقطة: لا يجيب على السؤال أو يقفز مباشرة إلى المزايا."
+      }
+    },
+    {
+      "position": 27,
+      "type": "short",
+      "points": 3,
+      "title": {
+        "en": "\"Bad Leads\" Diagnosis",
+        "ar": "تشخيص \"الليدات الوحشة\""
+      },
+      "prompt": {
+        "en": "An owner says: \"The leads are bad.\" Give a structured diagnostic response before agreeing or disagreeing.",
+        "ar": "يقول صاحب الشركة: \"الليدات وحشة.\" قدّم استجابة تشخيصية منظمة قبل أن توافق أو تعترض."
+      },
+      "rubric": {
+        "en": "Scoring rubric:\n\n- 3 points: Breaks the issue into source quality, speed-to-lead, answer rate, first conversation quality, qualification, follow-up, meetings, no-shows, and close rate; asks for evidence before blaming marketing or agents.\n- 2 points: Mentions some funnel stages but does not fully separate lead quality from sales execution.\n- 1 point: Gives a shallow answer such as \"check the ads\" or \"train agents.\"\n- 0 points: Accepts the claim blindly or blames one team without diagnosis.",
+        "ar": "معايير التقييم:\n\n- 3 نقاط: يقسّم المشكلة إلى جودة المصدر، وسرعة التواصل مع الليد، ومعدل الرد، وجودة المحادثة الأولى، والتأهيل، والمتابعة، والاجتماعات، وحالات عدم الحضور، ومعدل الإغلاق؛ ويطلب أدلة قبل إلقاء اللوم على التسويق أو المندوبين.\n- نقطتان: يذكر بعض مراحل القمع البيعي لكنه لا يفصل تمامًا بين جودة الليد وتنفيذ المبيعات.\n- نقطة واحدة: يقدّم إجابة سطحية مثل \"افحص الإعلانات\" أو \"درّب المندوبين.\"\n- 0 نقطة: يقبل الادعاء بشكل أعمى أو يلقي اللوم على فريق واحد دون تشخيص."
+      }
+    },
+    {
+      "position": 28,
+      "type": "short",
+      "points": 3,
+      "title": {
+        "en": "Launch Plan",
+        "ar": "خطة الإطلاق (اللانش)"
+      },
+      "prompt": {
+        "en": "A developer launch is happening next week. What should the brokerage prepare operationally?",
+        "ar": "هناك إطلاق (لانش) لمطوّر عقاري الأسبوع القادم. ما الذي يجب أن تجهّزه شركة الوساطة العقارية تشغيليًا؟"
+      },
+      "rubric": {
+        "en": "Scoring rubric:\n\n- 3 points: Mentions inventory, prices, payment plans, delivery dates, target buyers, objections, routing, follow-up ownership, EOI/reservation rules, launch urgency, and manager visibility.\n- 2 points: Covers product knowledge and follow-up but misses ownership, EOI/reservation, or internal coordination.\n- 1 point: Mostly says \"call leads\" or \"send messages\" without launch operations.\n- 0 points: Gives an irrelevant answer.",
+        "ar": "معايير التقييم:\n\n- 3 نقاط: يذكر المخزون، والأسعار، وخطط السداد، وتواريخ التسليم، والمشترين المستهدفين، والاعتراضات، والتوجيه، وملكية المتابعة، وقواعد إبداء الاهتمام (EOI)/الحجز، وإلحاحية الإطلاق، ووضوح الرؤية لدى المدير.\n- نقطتان: يغطي معرفة المنتج والمتابعة لكنه يغفل الملكية، أو إبداء الاهتمام (EOI)/الحجز، أو التنسيق الداخلي.\n- نقطة واحدة: يقول في الغالب \"اتصل بالليدات\" أو \"أرسل رسائل\" دون عمليات تشغيلية للإطلاق.\n- 0 نقطة: يقدّم إجابة غير ذات صلة."
+      }
+    },
+    {
+      "position": 29,
+      "type": "short",
+      "points": 3,
+      "title": {
+        "en": "Agent Resistance",
+        "ar": "مقاومة المندوبين"
+      },
+      "prompt": {
+        "en": "An owner wants Whispyr for control, but agents fear it will be used only to monitor them. How should a salesperson explain the adoption problem?",
+        "ar": "يريد صاحب الشركة Whispyr من أجل السيطرة، لكن المندوبين يخشون أن يُستخدم فقط لمراقبتهم. كيف ينبغي لمندوب المبيعات أن يشرح مشكلة التبنّي؟"
+      },
+      "rubric": {
+        "en": "Scoring rubric:\n\n- 3 points: Acknowledges commission-driven fear, lead ownership, unfair evaluation risk, and admin burden; reframes CRM discipline as protecting agent work, improving follow-up, and creating fairer evidence for managers.\n- 2 points: Mentions agent fear and management visibility but does not fully connect to commission or ownership.\n- 1 point: Says agents should just comply.\n- 0 points: Dismisses agents or frames Whispyr mainly as surveillance.",
+        "ar": "معايير التقييم:\n\n- 3 نقاط: يقرّ بالخوف المدفوع بالعمولة، وملكية الليد، وخطر التقييم غير العادل، والعبء الإداري؛ ويعيد تأطير الانضباط في نظام إدارة العلاقات (CRM) على أنه حماية لعمل المندوب، وتحسين للمتابعة، وخلق أدلة أكثر عدالة للمديرين.\n- نقطتان: يذكر خوف المندوبين ووضوح الرؤية للإدارة لكنه لا يربطه تمامًا بالعمولة أو الملكية.\n- نقطة واحدة: يقول إن على المندوبين أن يمتثلوا فقط.\n- 0 نقطة: يتجاهل المندوبين أو يصوّر Whispyr بأنه أداة مراقبة في المقام الأول."
+      }
+    },
+    {
+      "position": 30,
+      "type": "short",
+      "points": 3,
+      "title": {
+        "en": "Market-Literate Whispyr Explanation",
+        "ar": "شرح Whispyr بلغة السوق العقاري"
+      },
+      "prompt": {
+        "en": "In 4-6 sentences, explain Whispyr to a brokerage owner using real brokerage language rather than generic software language.",
+        "ar": "في 4 إلى 6 جمل، اشرح Whispyr لصاحب شركة وساطة عقارية باستخدام لغة شركات الوساطة العقارية الحقيقية بدلًا من لغة البرمجيات العامة."
+      },
+      "rubric": {
+        "en": "Scoring rubric:\n\n- 3 points: Connects Whispyr to lead intake, assignment, follow-up, WhatsApp, timeline, manager visibility, source accountability, pipeline discipline, and owner control without promising guaranteed deals.\n- 2 points: Explains Whispyr reasonably but stays too feature-led or too generic.\n- 1 point: Describes Whispyr as only a CRM, only WhatsApp, or only reports.\n- 0 points: Makes inaccurate claims or promises guaranteed leads/deals.",
+        "ar": "معايير التقييم:\n\n- 3 نقاط: يربط Whispyr باستقبال الليدات، والإسناد، والمتابعة، وواتساب، والخط الزمني، ووضوح الرؤية لدى المدير، ومساءلة المصدر، والانضباط في خط الأنابيب البيعي، وسيطرة صاحب الشركة، دون الوعد بصفقات مضمونة.\n- نقطتان: يشرح Whispyr بشكل معقول لكنه يظل مدفوعًا بالمزايا أكثر من اللازم أو عامًا أكثر من اللازم.\n- نقطة واحدة: يصف Whispyr بأنه مجرد نظام إدارة علاقات (CRM)، أو مجرد واتساب، أو مجرد تقارير.\n- 0 نقطة: يقدّم ادعاءات غير دقيقة أو يعد بليدات/صفقات مضمونة."
+      }
+    }
+  ]
+}
