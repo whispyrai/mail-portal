@@ -48,8 +48,8 @@ button:hover,.btn:hover{background:#000;border-color:#000;text-decoration:none}
 a.btn{color:#fff}
 a.btn.secondary{color:var(--charcoal)}
 button.block{width:100%;margin-top:22px}
-button.secondary{background:transparent;color:var(--charcoal);border-color:var(--line-strong)}
-button.secondary:hover{background:var(--tint)}
+.btn.secondary,button.secondary{background:transparent;color:var(--charcoal);border-color:var(--line-strong)}
+.btn.secondary:hover,button.secondary:hover{background:var(--tint);border-color:var(--ring)}
 button.sm{padding:7px 11px;font-size:12px;border-radius:10px}
 button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
 button.danger:hover{background:#9a1d14;border-color:#9a1d14}
