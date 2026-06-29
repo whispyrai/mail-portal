@@ -8,13 +8,7 @@ import type { SessionClaims } from "../lib/auth";
 import { escapeHtml } from "../lib/email-helpers";
 import type { Env } from "../types";
 import type { QuizAnswerRow, QuizQuestionRow, QuizRow } from "../db/quiz-schema";
-import {
-	bi,
-	biBlock,
-	quizShell,
-	TIMER_SCRIPT,
-	BLANK_NUDGE_SCRIPT,
-} from "./render";
+import { bi, biBlock, quizShell, TIMER_SCRIPT, TAKE_SCRIPT } from "./render";
 import {
 	getAttempt,
 	getAnswers,
@@ -32,16 +26,16 @@ type QuizEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 const quizApp = new Hono<QuizEnv>();
 
 function notAvailable(c: Context<QuizEnv>, quiz?: QuizRow) {
-	const t = quiz
-		? bi(quiz.title_en, quiz.title_ar)
-		: bi("This quiz", "هذا الاختبار");
+	const t = quiz ? bi(quiz.title_en, quiz.title_ar) : bi("This quiz", "هذا الاختبار");
 	return c.html(
 		quizShell(
 			"Not available",
-			`<div class="qcard"><h1>${bi("Not available", "غير متاح")}</h1>
-       <p>${t} ${bi("is not open right now.", "مش مفتوح دلوقتي.")}</p>
-       <a class="btn secondary" href="/quizzes">${bi("Back to quizzes", "ارجع للاختبارات")}</a></div>`,
-			{ backHref: "/quizzes" },
+			`<div class="qcard qempty">
+        <h2>${bi("Not open right now", "مش مفتوح دلوقتي")}</h2>
+        <p>${t} ${bi("isn't open at the moment. Check back once it's opened, or pick another from the list.", "مش مفتوح حاليًا. ارجع لما يتفتح، أو اختار واحد تاني من القايمة.")}</p>
+        <div style="margin-top:16px"><a class="btn secondary" href="/quizzes">${bi("Back to quizzes", "ارجع للاختبارات")}</a></div>
+      </div>`,
+			{ backHref: "/quizzes", backLabelEn: "Quizzes", backLabelAr: "الاختبارات" },
 		),
 		200,
 	);
@@ -56,26 +50,31 @@ quizApp.get("/", async (c) => {
 		quizzes.map(async (q) => {
 			const attempt = await getAttempt(c.env, q.id, session.sub);
 			const status = attempt?.status; // undefined | submitted | graded
-			const statusLabel = !status
-				? bi("Not started", "لسه مبدأتش")
+			const pill = !status
+				? `<span class="tag">${bi("Not started", "لسه مبدأتش")}</span>`
 				: status === "graded"
-					? bi("Graded", "اتصحّح")
-					: bi("Submitted", "اتسلّم");
+					? `<span class="tag ok">${bi("Graded", "اتصحّح")}</span>`
+					: `<span class="tag wait">${bi("Submitted", "اتسلّم")}</span>`;
 			const action = !status
-				? `<a class="btn" href="/quizzes/${q.id}/take">${bi("Take quiz", "ابدأ الاختبار")}</a>`
-				: `<a class="btn secondary" href="/quizzes/${q.id}/result">${bi("Review", "مراجعة")}</a>`;
+				? `<a class="btn" href="/quizzes/${q.id}/take">${bi("Start quiz", "ابدأ الاختبار")} →</a>`
+				: `<a class="btn secondary" href="/quizzes/${q.id}/result">${bi("Review results", "شوف النتيجة")}</a>`;
 			return `<div class="qcard">
-        <div class="qtitle">${statusLabel}</div>
-        <h2 style="margin:.1em 0 .3em">${bi(q.title_en, q.title_ar)}</h2>
-        ${biBlock(q.description_en, q.description_ar, "muted")}
-        <div style="margin-top:14px">${action}</div>
+        <div class="qrow-split">${pill}</div>
+        <h2>${bi(q.title_en, q.title_ar)}</h2>
+        <div class="grow">${biBlock(q.description_en, q.description_ar, "qlede")}</div>
+        <div class="acts">${action}</div>
       </div>`;
 		}),
 	);
 
-	const body = `<h1>${bi("Quizzes", "الاختبارات")}</h1>
-    ${cards.join("") || `<div class="qcard">${bi("No open quizzes right now.", "مفيش اختبارات مفتوحة دلوقتي.")}</div>`}`;
-	return c.html(quizShell("Quizzes", body));
+	const body = `<h1 class="qhead">${bi("Quizzes", "الاختبارات")}</h1>
+    <p class="qlede">${bi("Your assessments. Each one is a single attempt — take your time, your answers are saved as you go.", "اختباراتك. كل واحد محاولة واحدة بس — خد وقتك، إجاباتك بتتحفظ أول بأول.")}</p>
+    ${
+			cards.length
+				? `<div class="qlist">${cards.join("")}</div>`
+				: `<div class="qcard qempty"><h2>${bi("Nothing open yet", "مفيش حاجة مفتوحة")}</h2><p>${bi("There are no open quizzes right now. You'll see them here as soon as they're opened.", "مفيش اختبارات مفتوحة دلوقتي. هتلاقيهم هنا أول ما يتفتحوا.")}</p></div>`
+		}`;
+	return c.html(quizShell("Quizzes", body, { stagger: true }));
 });
 
 // ── GET /quizzes/:quizId/take — the quiz (NO answer key in payload) ──
@@ -92,36 +91,50 @@ quizApp.get("/:quizId/take", async (c) => {
 	const total = questions.length;
 	const cards = questions.map((q, i) => renderTakeQuestion(q, i + 1, total)).join("");
 
-	const body = `<h1>${bi(quiz.title_en, quiz.title_ar)}</h1>
-    ${biBlock(quiz.description_en, quiz.description_ar, "muted")}
-    <p class="qhint">${bi("One attempt. Multiple-choice is auto-graded; short answers are graded by the admin.", "محاولة واحدة. الاختيارات بتتصحّح تلقائيًا؛ والأسئلة المقالية بيصحّحها الأدمن.")}</p>
-    <form id="quizform" method="post" action="/quizzes/${quiz.id}/submit">
+	const progress = `<div class="qprog">
+      <div class="qprog-top">
+        <span class="qprog-label">${bi("Answered", "اتجاوب")} <span class="qprog-count" id="qprogcount">0 / ${total}</span></span>
+        <span class="qprog-meta">
+          <span class="savechip" id="qsave"
+            data-saved-en="Saved" data-saved-ar="اتحفظ"
+            data-restored-en="Draft restored" data-restored-ar="رجّعنا مسوّدتك"></span>
+          <span>${bi("Time", "الوقت")} <span class="timer" id="elapsed" data-quiz="${quiz.id}">0:00</span></span>
+        </span>
+      </div>
+      <div class="qprog-track"><span class="qprog-fill" id="qprogfill"></span></div>
+    </div>`;
+
+	const body = `<h1 class="qhead">${bi(quiz.title_en, quiz.title_ar)}</h1>
+    ${biBlock(quiz.description_en, quiz.description_ar, "qlede")}
+    <p class="qhint">${bi("One attempt. Multiple-choice is graded automatically; short answers are graded by the admin. Your progress is saved on this device as you go.", "محاولة واحدة. الاختيارات بتتصحّح تلقائيًا؛ والأسئلة المقالية بيصحّحها الأدمن. تقدّمك بيتحفظ على الجهاز ده أول بأول.")}</p>
+    ${progress}
+    <form id="quizform" method="post" action="/quizzes/${quiz.id}/submit" data-autosave="1" data-quiz="${quiz.id}" data-user="${escapeHtml(session.sub)}">
       ${cards}
-      <div class="qcard" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-        <span class="muted">${bi("Make sure you answered everything before submitting.", "اتأكد إنك جاوبت على كل حاجة قبل ما تسلّم.")}</span>
+      <div class="qcard qfooter">
+        <span class="muted">${bi("Make sure you've answered everything before submitting — you only get one attempt.", "اتأكد إنك جاوبت على كل حاجة قبل ما تسلّم — عندك محاولة واحدة بس.")}</span>
         <button type="submit">${bi("Submit quiz", "سلّم الاختبار")}</button>
       </div>
     </form>`;
 
-	const headerExtra = `<span class="muted">${bi("Elapsed", "الوقت")}: <span id="elapsed" class="timer">0:00</span></span>`;
 	return c.html(
 		quizShell(quiz.title_en, body, {
-			headerExtra,
 			backHref: "/quizzes",
-			scripts: [TIMER_SCRIPT, BLANK_NUDGE_SCRIPT],
+			backLabelEn: "Quizzes",
+			backLabelAr: "الاختبارات",
+			scripts: [TIMER_SCRIPT, TAKE_SCRIPT],
 		}),
 	);
 });
 
 /** A single question on the take page. Renders both languages; NEVER the answer key. */
 function renderTakeQuestion(q: QuizQuestionRow, n: number, total: number): string {
-	const head = `<div class="qnum">${bi(`Question ${n} of ${total}`, `سؤال ${n} من ${total}`)}</div>
+	const head = `<div class="qindex">${bi("Question", "سؤال")} <b>${n}</b> ${bi(`of ${total}`, `من ${total}`)}</div>
     ${q.title_en || q.title_ar ? `<div class="qtitle">${bi(q.title_en, q.title_ar)}</div>` : ""}
     <div class="qprompt">${bi(q.prompt_en, q.prompt_ar)}</div>`;
 
 	let inputs = "";
 	if (q.type === "short") {
-		inputs = `<textarea name="q_${q.id}" placeholder=""></textarea>`;
+		inputs = `<textarea name="q_${q.id}" placeholder="${escapeHtml("…")}"></textarea>`;
 	} else {
 		const inputType = q.type === "multi" ? "checkbox" : "radio";
 		const hint =
@@ -135,7 +148,7 @@ function renderTakeQuestion(q: QuizQuestionRow, n: number, total: number): strin
             <span class="otext">${bi(o.en, o.ar)}</span></label>`,
 			)
 			.join("");
-		inputs = `${hint}${opts}`;
+		inputs = `${hint}<div class="optset">${opts}</div>`;
 	}
 
 	return `<div class="qcard" data-qgroup>${head}${inputs}</div>`;
@@ -166,8 +179,7 @@ quizApp.post("/:quizId/submit", async (c) => {
 		}
 	}
 
-	const result = await submitAttempt(c.env, quiz, session.sub, selectedByQuestion, textByQuestion);
-	if (!result.ok) return c.redirect(`/quizzes/${quiz.id}/result`, 302);
+	await submitAttempt(c.env, quiz, session.sub, selectedByQuestion, textByQuestion);
 	return c.redirect(`/quizzes/${quiz.id}/result`, 302);
 });
 
@@ -187,19 +199,41 @@ quizApp.get("/:quizId/result", async (c) => {
 	const graded = attempt.status === "graded";
 	const rows = questions.map((q) => renderReviewRow(q, ansByQ.get(q.id))).join("");
 
+	const mcqScore = attempt.mcq_score ?? 0;
+	const mcqMax = attempt.mcq_max ?? 0;
+	const totalScore = attempt.total_score ?? 0;
+	const totalMax = attempt.total_max ?? 0;
+	// The ring shows the final % once graded, otherwise the MCQ % so far.
+	const pctScore = graded ? totalScore : mcqScore;
+	const pctMax = graded ? totalMax : mcqMax;
+	const pct = pctMax > 0 ? Math.round((pctScore / pctMax) * 100) : 0;
+
 	const totalLine = graded
-		? `<div>${bi("Final total", "الإجمالي النهائي")}: <span class="scorebig">${attempt.total_score ?? 0} / ${attempt.total_max ?? 0}</span></div>`
-		: `<div class="muted">${bi("Short answers are awaiting admin grading; your final total appears once graded.", "الأسئلة المقالية لسه بتتصحّح من الأدمن؛ إجماليك النهائي هيظهر بعد التصحيح.")}</div>`;
+		? `<div class="scoreline"><span class="lbl">${bi("Final total", "الإجمالي النهائي")}</span><span class="scorebig">${totalScore} / ${totalMax}</span></div>`
+		: `<div class="scoreline"><span class="lbl">${bi("Final total", "الإجمالي النهائي")}</span><span class="muted" style="text-align:right">${bi("Pending short-answer grading", "بانتظار تصحيح المقالي")}</span></div>`;
 
-	const body = `<h1>${bi(quiz.title_en, quiz.title_ar)} — ${bi("Results", "النتيجة")}</h1>
-    <div class="qcard">
-      <div>${bi("Multiple-choice score", "درجة الاختيارات")}: <span class="scorebig">${attempt.mcq_score ?? 0} / ${attempt.mcq_max ?? 0}</span></div>
-      <div style="margin-top:8px">${totalLine}</div>
+	const body = `<h1 class="qhead">${bi(quiz.title_en, quiz.title_ar)}</h1>
+    <p class="qlede">${
+			graded
+				? bi("Graded — here's your full breakdown and what the right answers were.", "اتصحّح — دي تفاصيل درجاتك والإجابات الصح.")
+				: bi("Submitted. Your multiple-choice score is below; short answers are with the admin.", "اتسلّم. درجة الاختيارات تحت؛ والمقالي مع الأدمن.")
+		}</p>
+    <div class="qcard qhero-card">
+      <div class="qhero">
+        <div class="ring" style="--p:${pct}"><div class="inner"><div class="pct">${pct}%</div><div class="of">${graded ? bi("final", "نهائي") : bi("so far", "للحين")}</div></div></div>
+        <div class="breakdown">
+          <div class="scoreline"><span class="lbl">${bi("Multiple-choice", "الاختيارات")}</span><span class="scorebig">${mcqScore} / ${mcqMax}</span></div>
+          ${totalLine}
+        </div>
+      </div>
     </div>
+    <h2 style="margin:calc(var(--q-gap) + 4px) 0 0">${bi("Review", "المراجعة")}</h2>
     ${rows}
-    <div style="margin-top:16px"><a class="btn secondary" href="/quizzes">${bi("Back to quizzes", "ارجع للاختبارات")}</a></div>`;
+    <div style="margin-top:18px"><a class="btn secondary" href="/quizzes">${bi("Back to quizzes", "ارجع للاختبارات")}</a></div>`;
 
-	return c.html(quizShell(quiz.title_en, body, { backHref: "/quizzes" }));
+	return c.html(
+		quizShell(quiz.title_en, body, { backHref: "/quizzes", backLabelEn: "Quizzes", backLabelAr: "الاختبارات" }),
+	);
 });
 
 /** A review row: the rep's answer + the correct answer + the "Why" (MCQ), or their
@@ -207,7 +241,7 @@ quizApp.get("/:quizId/result", async (c) => {
  * shown here — that's the intended post-submission behaviour. */
 function renderReviewRow(q: QuizQuestionRow, ans: QuizAnswerRow | undefined): string {
 	const head = `${q.title_en || q.title_ar ? `<div class="qtitle">${bi(q.title_en, q.title_ar)}</div>` : ""}
-    <div class="qprompt">${bi(q.prompt_en, q.prompt_ar)}</div>`;
+    <div class="qprompt" style="margin-bottom:6px">${bi(q.prompt_en, q.prompt_ar)}</div>`;
 
 	if (q.type === "short") {
 		const text = ans?.text_answer ?? "";
@@ -215,11 +249,11 @@ function renderReviewRow(q: QuizQuestionRow, ans: QuizAnswerRow | undefined): st
 		const note = ans?.grader_note;
 		const mark =
 			awarded === null || awarded === undefined
-				? `<span class="tag">${bi("Awaiting grading", "في انتظار التصحيح")}</span>`
+				? `<span class="tag wait">${bi("Awaiting grading", "في انتظار التصحيح")}</span>`
 				: `<span class="tag ok">${awarded} / ${q.points}</span>`;
 		return `<div class="review-row">${head}
-      <div class="qtitle">${bi("Your answer", "إجابتك")} ${mark}</div>
-      <div class="preview" style="margin-top:6px;white-space:pre-wrap">${escapeHtml(text) || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>
+      <div class="qrow-split"><span class="ans-lbl">${bi("Your answer", "إجابتك")}</span> ${mark}</div>
+      <div class="ans-line" style="white-space:pre-wrap">${escapeHtml(text) || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>
       ${note ? `<div class="why"><b>${bi("Note", "ملاحظة")}:</b> ${escapeHtml(note)}</div>` : ""}
     </div>`;
 	}
@@ -233,16 +267,20 @@ function renderReviewRow(q: QuizQuestionRow, ans: QuizAnswerRow | undefined): st
 	const correct = parseCorrect(q);
 	const isCorrect = ans?.is_correct === 1;
 
+	const sep = `<span class="muted">، </span>`;
 	const yours = selected.length
-		? selected.map(label).join(`<span class="muted">، </span>`)
+		? selected.map(label).join(sep)
 		: `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`;
-	const right = correct.map(label).join(`<span class="muted">، </span>`);
+	const right = correct.map(label).join(sep);
 
 	return `<div class="review-row ${isCorrect ? "correct" : "wrong"}">${head}
-    <div class="qtitle">${bi("Your answer", "إجابتك")} ${isCorrect ? `<span class="tag ok">${bi("Correct", "صح")}</span>` : `<span class="tag no">${bi("Incorrect", "غلط")}</span>`}</div>
-    <div style="margin:4px 0 8px">${yours}</div>
-    <div class="qtitle">${bi("Correct answer", "الإجابة الصحيحة")}</div>
-    <div style="margin:4px 0">${right}</div>
+    <div class="qrow-split"><span class="ans-lbl">${bi("Your answer", "إجابتك")}</span> ${isCorrect ? `<span class="tag ok">${bi("Correct", "صح")}</span>` : `<span class="tag no">${bi("Incorrect", "غلط")}</span>`}</div>
+    <div class="ans-line">${yours}</div>
+    ${
+			isCorrect
+				? ""
+				: `<div class="ans-lbl">${bi("Correct answer", "الإجابة الصحيحة")}</div><div class="ans-line">${right}</div>`
+		}
     ${q.explanation_en || q.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(q.explanation_en, q.explanation_ar)}</div>` : ""}
   </div>`;
 }
