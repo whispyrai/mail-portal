@@ -90,7 +90,7 @@ function renderOptionReadout(q: QuizQuestionRow, selected: string[]): string {
 	return optionReadout(parseOptions(q), parseCorrect(q), selected);
 }
 
-/** The award (0–points, 0.5 steps) + note inputs for one answer. `idable` gives the
+/** The award (0–points, any decimal) + note inputs for one answer. `idable` gives the
  * award input an id so the per-attempt "Accept" button can target it; the by-question
  * screen leaves it off and posts each row on its own. */
 function awardFields(
@@ -104,7 +104,7 @@ function awardFields(
 	const id = opts.idable ? ` id="${namePrefix}_${qid}"` : "";
 	return {
 		award: `<label>${bi("Award", "الدرجة")} (0–${points})</label>
-      <input${id} class="awardin" type="number" inputmode="decimal" name="${namePrefix}_${qid}" min="0" max="${points}" step="0.5" value="${awarded ?? ""}" placeholder="0–${points}">`,
+      <input${id} class="awardin" type="number" inputmode="decimal" name="${namePrefix}_${qid}" min="0" max="${points}" step="any" value="${awarded ?? ""}" placeholder="0–${points}">`,
 		note: `<label>${bi("Note to rep", "ملاحظة للمندوب")}</label>
       <input name="note_${qid}" value="${escapeHtml(note ?? "")}" placeholder="${escapeHtml("…")}">`,
 	};
@@ -572,6 +572,42 @@ function renderMcqTally(q: QuizQuestionRow, subs: QuestionSubmissionRow[]): stri
 	return `<div class="qcard" style="margin-top:0">${optRows}${blankRow}</div>`;
 }
 
+/** Per-rep MCQ score adjustment for the tally view: name + what they chose + the auto
+ * result + an award input (any decimal) + note, with a one-click "Full marks". Lets the
+ * admin override one rep's MCQ score without leaving the submissions view. */
+function renderMcqGradeRow(
+	quiz: QuizRow,
+	q: QuizQuestionRow,
+	s: QuestionSubmissionRow,
+	opts: { fromAll?: boolean } = {},
+): string {
+	const fromField = opts.fromAll ? `<input type="hidden" name="from" value="all">` : "";
+	const auto =
+		s.isCorrect === 1
+			? `<span class="tag ok plain">${bi("Auto: correct", "تلقائي: صح")}</span>`
+			: `<span class="tag no plain">${bi("Auto: incorrect", "تلقائي: غلط")}</span>`;
+	const awardedChip = `<span class="tag ${s.awarded == null ? "wait" : "ok"} plain awarded-chip">${fmtAward(s.awarded)} / ${q.points}</span>`;
+	const chose = s.selected.length
+		? escapeHtml(s.selected.join(", "))
+		: `<span class="muted">${bi("blank", "فاضي")}</span>`;
+	const inputId = `mk-${s.answerId}`;
+	return `<div class="qcard" id="sub-${s.answerId}">
+    <div class="qrow-split">
+      <div class="qindex" style="margin:0" title="${escapeHtml(s.email)}">${escapeHtml(repName(s))} · <span class="muted">${bi("chose", "اختار")} ${chose}</span></div>
+      <div class="editbtns">${auto} ${awardedChip} ${statusBadge(s.status)}</div>
+    </div>
+    <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">${fromField}
+      <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
+        <input id="${inputId}" class="awardin" type="number" inputmode="decimal" name="points" min="0" max="${q.points}" step="any" value="${s.awarded ?? ""}" placeholder="0–${q.points}"></div>
+      <div><label>${bi("Note to rep", "ملاحظة للمندوب")}</label><input name="note" value="${escapeHtml(s.note ?? "")}" placeholder="${escapeHtml("…")}"></div>
+      <div class="editbtns">
+        <button type="button" class="btn secondary sm" onclick="var e=document.getElementById('${inputId}');e.value='${q.points}';e.focus();">${bi("Full marks", "الدرجة كاملة")}</button>
+        <button type="submit" class="sm">${bi("Save", "حفظ")}</button>
+      </div>
+    </form>
+  </div>`;
+}
+
 /** One short answer with an inline award + note form that posts on its own (so the same
  * question can be graded across the whole team from one screen). `fromAll` tags the
  * form so its save returns to the all-questions scroll page (scrolled back to this
@@ -593,7 +629,7 @@ function renderShortSubmission(
     <div class="preview" style="margin-top:6px">${escapeHtml(s.textAnswer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>
     <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">${fromField}
       <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
-        <input class="awardin" type="number" inputmode="decimal" name="points" min="0" max="${q.points}" step="0.5" value="${s.awarded ?? ""}" placeholder="0–${q.points}"></div>
+        <input class="awardin" type="number" inputmode="decimal" name="points" min="0" max="${q.points}" step="any" value="${s.awarded ?? ""}" placeholder="0–${q.points}"></div>
       <div><label>${bi("Note to rep", "ملاحظة للمندوب")}</label><input name="note" value="${escapeHtml(s.note ?? "")}" placeholder="${escapeHtml("…")}"></div>
       <div><button type="submit" class="sm">${bi("Save", "حفظ")}</button></div>
     </form>
@@ -614,7 +650,11 @@ function renderQuestionBlock(
 		const rows = subs.map((s) => renderShortSubmission(quiz, q, s, opts)).join("");
 		return `${panel}${rows || `<div class="qcard qempty" style="margin-top:0"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
 	}
-	return `${panel}${renderMcqTally(q, subs)}`;
+	// MCQ: the tally (options once, who picked what) + a per-rep score adjuster.
+	const adjust = subs.length
+		? `<div class="ans-lbl" style="margin:18px 0 2px">${bi("Adjust scores", "ظبط الدرجات")}</div>${subs.map((s) => renderMcqGradeRow(quiz, q, s, opts)).join("")}`
+		: "";
+	return `${panel}${renderMcqTally(q, subs)}${adjust}`;
 }
 
 // ── GET /admin/quizzes/:quizId/submissions — ALL questions, each with its

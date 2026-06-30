@@ -52,13 +52,14 @@ assert.equal(gf.shortMax, 15, "full shortMax");
 assert.equal(gf.totalMax, 40, "full totalMax");
 assert.equal(gf.mcqScore, 0, "no answers → 0 mcqScore");
 
-// ── clampAward: admin overrides snap to [0, max] in 0.5 steps ──
+// ── clampAward: admin overrides clamp to [0, max], 2-decimal precision ──
 assert.equal(clampAward(0.5, 1), 0.5, "half point allowed");
+assert.equal(clampAward(0.25, 1), 0.25, "quarter point allowed (no 0.5 snapping)");
+assert.equal(clampAward(0.1, 1), 0.1, "tenth allowed");
 assert.equal(clampAward(1, 1), 1, "full point allowed");
 assert.equal(clampAward(2, 1), 1, "above max clamps to max");
 assert.equal(clampAward(-1, 3), 0, "below zero clamps to 0");
-assert.equal(clampAward(0.7, 3), 0.5, "snaps to nearest 0.5 (down)");
-assert.equal(clampAward(0.8, 3), 1, "snaps to nearest 0.5 (up)");
+assert.equal(clampAward(0.125, 3), 0.13, "rounds to 2 decimals");
 assert.equal(clampAward(Number.NaN, 3), 0, "NaN → 0");
 
 // ── scoreFromAwards: MCQ overrides + partial credit flow into the total ──
@@ -79,5 +80,10 @@ assert.equal(partial.allShortGraded, false, "one short ungraded ⇒ not fully gr
 const done = scoreFromAwards(sq, { m1: 0, m2: 1, s1: 3, s2: 1.5 });
 assert.equal(done.totalScore, 5.5, "fully graded total = 0 + 1 + 3 + 1.5");
 assert.equal(done.allShortGraded, true, "all short graded");
+
+// Quarter-credit awards survive (no 0.5 snapping) and sum cleanly.
+const quarters = scoreFromAwards(sq, { m1: 0.25, m2: 0.75, s1: 2.25, s2: 1.5 });
+assert.equal(quarters.mcqScore, 1, "0.25 + 0.75 = 1");
+assert.equal(quarters.totalScore, 4.75, "0.25 + 0.75 + 2.25 + 1.5 = 4.75");
 
 console.log("grading.test.ts: all assertions passed");

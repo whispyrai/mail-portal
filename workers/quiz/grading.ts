@@ -39,8 +39,8 @@ export function gradeMcqAnswer(
  */
 export function clampAward(raw: number, max: number): number {
 	if (!Number.isFinite(raw)) return 0;
-	const snapped = Math.round(raw * 2) / 2;
-	return Math.min(max, Math.max(0, snapped));
+	const rounded = Math.round(raw * 100) / 100; // 2 decimals — allows 0.25, 0.1, …
+	return Math.min(max, Math.max(0, rounded));
 }
 
 export interface GradedAnswer {
@@ -134,7 +134,7 @@ export function scoreFromAwards(
 		}
 	}
 
-	const round = (n: number) => Math.round(n * 2) / 2;
+	const round = (n: number) => Math.round(n * 100) / 100; // 2 dp, kills float drift
 	mcqScore = round(mcqScore);
 	shortScore = round(shortScore);
 	return {
