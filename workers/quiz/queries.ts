@@ -477,6 +477,33 @@ export interface QuestionSubmissionRow {
 	isCorrect: number | null;
 	note: string | null;
 	status: string;
+	display?: string; // resolved by the route (see getDisplayNames); name or email local part
+}
+
+/**
+ * Resolve display names for a set of mailbox addresses from the R2 mailbox profiles
+ * (`mailboxes/<addr>.json` → `fromName`, set at user creation — see lib/mailbox.ts).
+ * Returns addr(lowercased) → name only for profiles that have a non-empty name; the
+ * caller falls back to the email's local part. Distinct addrs are read once, in
+ * parallel — a handful of cheap R2 gets per page for the ~5-rep team.
+ */
+export async function getDisplayNames(env: Env, addrs: string[]): Promise<Map<string, string>> {
+	const distinct = [...new Set(addrs.map((a) => a.toLowerCase()))];
+	const out = new Map<string, string>();
+	await Promise.all(
+		distinct.map(async (addr) => {
+			try {
+				const obj = await env.BUCKET.get(`mailboxes/${addr}.json`);
+				if (!obj) return;
+				const profile = (await obj.json()) as { fromName?: string };
+				const name = profile.fromName?.trim();
+				if (name) out.set(addr, name);
+			} catch {
+				// Unreadable/malformed profile → caller uses the email local part.
+			}
+		}),
+	);
+	return out;
 }
 
 /** Every rep's answer to one question, for grading the same question across the team

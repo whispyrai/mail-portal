@@ -18,6 +18,7 @@ import {
 	finalizeGrading,
 	getAnswers,
 	getAttemptById,
+	getDisplayNames,
 	getQuestion,
 	getQuizById,
 	gradeAnswer,
@@ -75,6 +76,12 @@ function fmtAward(n: number | null | undefined): string {
 /** Clip a prompt for a compact list cell. */
 function clip(s: string, n = 90): string {
 	return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+/** The rep's shown identifier: their profile name (resolved into `display` by the
+ * route), else the email's local part (strip everything from "@" on). */
+function repName(s: QuestionSubmissionRow): string {
+	return s.display?.trim() || s.email.split("@")[0];
 }
 
 /** Read-out of an MCQ's options for the admin: each option marked correct (✓) and/or
@@ -516,6 +523,8 @@ adminQuizApp.get("/:quizId/questions/:questionId/submissions", async (c) => {
 		return c.redirect(`/admin/quizzes/${quiz.id}/questions?err=${encodeURIComponent("Question not found.")}`, 302);
 	}
 	const subs = await listQuestionSubmissions(c.env, question.id);
+	const names = await getDisplayNames(c.env, subs.map((s) => s.mailbox));
+	for (const s of subs) s.display = names.get(s.mailbox.toLowerCase());
 
 	const body = `<h1 class="qhead">${bi("Submissions", "الإجابات")}</h1>
     <p class="qlede">${subs.length} ${bi("reps answered this question.", "مندوب جاوبوا السؤال ده.")} · <a href="/admin/quizzes/${quiz.id}/submissions">${bi("View all questions on one page", "اعرض كل الأسئلة في صفحة واحدة")} →</a></p>
@@ -546,7 +555,7 @@ function renderMcqTally(q: QuizQuestionRow, subs: QuestionSubmissionRow[]): stri
 		}
 	}
 	const chip = (s: QuestionSubmissionRow) =>
-		`<span class="namechip" title="${escapeHtml(s.email)}">${escapeHtml(s.email)}</span>`;
+		`<span class="namechip" title="${escapeHtml(s.email)}">${escapeHtml(repName(s))}</span>`;
 	const optRows = parseOptions(q)
 		.map((o) => {
 			const pickers = byOption.get(o.id) ?? [];
@@ -577,7 +586,7 @@ function renderShortSubmission(
 	const fromField = opts.fromAll ? `<input type="hidden" name="from" value="all">` : "";
 	return `<div class="qcard" id="sub-${s.answerId}">
     <div class="qrow-split">
-      <div class="qindex" style="margin:0">${escapeHtml(s.email)} · ${escapeHtml(s.mailbox)}</div>
+      <div class="qindex" style="margin:0" title="${escapeHtml(s.email)}">${escapeHtml(repName(s))}</div>
       <div class="editbtns">${awardedChip} ${statusBadge(s.status)}</div>
     </div>
     <div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
@@ -618,6 +627,9 @@ adminQuizApp.get("/:quizId/submissions", async (c) => {
 	if (!quiz) return c.redirect(`/admin/quizzes?err=${encodeURIComponent("Quiz not found.")}`, 302);
 	const questions = await listQuestions(c.env, quiz.id);
 	const subsByQ = await Promise.all(questions.map((q) => listQuestionSubmissions(c.env, q.id)));
+	const allSubs = subsByQ.flat();
+	const names = await getDisplayNames(c.env, allSubs.map((s) => s.mailbox));
+	for (const s of allSubs) s.display = names.get(s.mailbox.toLowerCase());
 
 	const jump = questions.map((q) => `<a href="#q-${q.id}">${q.position}</a>`).join("");
 	const sections = questions
