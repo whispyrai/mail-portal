@@ -201,6 +201,14 @@ details.qedit[open]>summary::before{content:"–"}
 .awarded-chip{font-variant-numeric:tabular-nums}
 @media (max-width:640px){.gradebar{grid-template-columns:1fr}}
 
+/* The question card above its stacked submissions: a leading accent (logical prop, so
+ * it flips to the right edge in RTL) marks where each question group starts. */
+.qcard.qpanel{border-inline-start:3px solid var(--q-accent)}
+/* Sticky "jump to question" strip on the all-submissions scroll page. */
+.qjump{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 var(--q-gap);padding:10px 14px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:saturate(1.2) blur(8px);-webkit-backdrop-filter:saturate(1.2) blur(8px);border:1px solid var(--line);border-radius:14px;font-size:12.5px;color:var(--muted)}
+.qjump a{display:inline-grid;place-content:center;min-width:26px;height:26px;padding:0 6px;border:1px solid var(--line-strong);border-radius:8px;color:var(--slate);font-weight:600;font-variant-numeric:tabular-nums}
+.qjump a:hover{background:var(--tint);border-color:var(--ring);text-decoration:none}
+
 /* Empty states */
 .qempty{text-align:center;padding:38px 24px}
 .qempty h2{font-size:17px;margin:0 0 6px}

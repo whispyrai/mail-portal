@@ -132,6 +132,7 @@ adminQuizApp.get("/", async (c) => {
           <div class="editbtns">
             <a class="btn secondary sm" href="/admin/quizzes/${q.id}/questions">${bi("Edit questions", "تعديل الأسئلة")}</a>
             <a class="btn secondary sm" href="/admin/quizzes/${q.id}/grade">${bi("Grade", "تصحيح")}</a>
+            <a class="btn secondary sm" href="/admin/quizzes/${q.id}/submissions">${bi("All submissions", "كل الإجابات")}</a>
             <a class="btn secondary sm" href="/admin/quizzes/${q.id}/results">${bi("Results", "النتائج")}</a>
           </div>
         </div>
@@ -402,8 +403,9 @@ adminQuizApp.get("/:quizId/grade", async (c) => {
     <div class="qcard"><h2 style="margin-top:0">${bi("Already graded", "اتصحّح")}</h2>
       <div class="tablewrap"><table>${tableHead}
       <tbody>${graded || `<tr><td colspan="4"><span class="muted">${bi("None yet.", "لسه ولا واحد.")}</span></td></tr>`}</tbody></table></div></div>
-    <div class="qcard"><h2 style="margin-top:0">${bi("Grade by question", "التصحيح بالسؤال")}</h2>
-      <p class="qlede">${bi("Open one question to see and grade every rep's answer side-by-side.", "افتح سؤال واحد عشان تشوف وتصحّح إجابات كل المناديب جنب بعض.")}</p>
+    <div class="qcard"><div class="qrow-split"><h2 style="margin:0">${bi("Grade by question", "التصحيح بالسؤال")}</h2>
+        <a class="btn secondary sm" href="/admin/quizzes/${quiz.id}/submissions">${bi("Open all on one page", "افتح الكل في صفحة")} →</a></div>
+      <p class="qlede">${bi("Open one question to see and grade every rep's answer side-by-side — or open them all on one scrollable page.", "افتح سؤال واحد عشان تشوف وتصحّح إجابات كل المناديب جنب بعض — أو افتحهم كلهم في صفحة واحدة بسكرول.")}</p>
       <div class="tablewrap"><table>
       <tbody>${byQuestion || `<tr><td><span class="muted">${bi("No questions yet.", "مفيش أسئلة لسه.")}</span></td></tr>`}</tbody></table></div></div>`;
 	return c.html(quizShell("Grade", body, { backHref: "/admin/quizzes", backLabelEn: "All quizzes", backLabelAr: "كل الاختبارات" }));
@@ -496,6 +498,24 @@ adminQuizApp.post("/:quizId/grade/:attemptId", async (c) => {
 	return c.redirect(`/admin/quizzes/${quizId}/results?ok=${encodeURIComponent("Attempt graded.")}`, 302);
 });
 
+/** The question card shown above its submissions (anchor target for the scroll page's
+ * jump nav): index/type/points, title, prompt, and the answer key (correct options or
+ * rubric). Shared by the single-question page and the all-questions scroll page. */
+function renderQuestionPanel(q: QuizQuestionRow): string {
+	const keyBlock =
+		q.type === "short"
+			? `<div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(q.rubric_en, q.rubric_ar, "qlede")}`
+			: `<div class="ans-lbl">${bi("Correct answer", "الإجابة الصحيحة")}</div>
+        <div class="ans-line">${parseCorrect(q).map((id) => optLabel(q, id)).join('<span class="muted">، </span>') || "—"}</div>
+        ${q.explanation_en || q.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(q.explanation_en, q.explanation_ar)}</div>` : ""}`;
+	return `<div class="qcard qpanel" id="q-${q.id}">
+    <div class="qindex">#${q.position} · ${escapeHtml(q.type)} · ${q.points} ${bi("pt", "نقطة")}</div>
+    ${q.title_en || q.title_ar ? `<div class="qtitle">${bi(q.title_en, q.title_ar)}</div>` : ""}
+    <div class="qprompt">${bi(q.prompt_en, q.prompt_ar)}</div>
+    ${keyBlock}
+  </div>`;
+}
+
 // ── GET /admin/quizzes/:quizId/questions/:questionId/submissions ─────
 // One question, every rep's answer side-by-side, each gradable inline (design: the
 // "view a question and see all its submissions at once" surface).
@@ -507,24 +527,11 @@ adminQuizApp.get("/:quizId/questions/:questionId/submissions", async (c) => {
 		return c.redirect(`/admin/quizzes/${quiz.id}/questions?err=${encodeURIComponent("Question not found.")}`, 302);
 	}
 	const subs = await listQuestionSubmissions(c.env, question.id);
-
-	const keyBlock =
-		question.type === "short"
-			? `<div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(question.rubric_en, question.rubric_ar, "qlede")}`
-			: `<div class="ans-lbl">${bi("Correct answer", "الإجابة الصحيحة")}</div>
-        <div class="ans-line">${parseCorrect(question).map((id) => optLabel(question, id)).join('<span class="muted">، </span>') || "—"}</div>
-        ${question.explanation_en || question.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(question.explanation_en, question.explanation_ar)}</div>` : ""}`;
-
 	const rows = subs.map((s) => renderSubmissionRow(quiz, question, s)).join("");
 
 	const body = `<h1 class="qhead">${bi("Submissions", "الإجابات")}</h1>
-    <p class="qlede">${subs.length} ${bi("reps answered this question.", "مندوب جاوبوا السؤال ده.")}</p>
-    <div class="qcard">
-      <div class="qindex">#${question.position} · ${escapeHtml(question.type)} · ${question.points} ${bi("pt", "نقطة")}</div>
-      ${question.title_en || question.title_ar ? `<div class="qtitle">${bi(question.title_en, question.title_ar)}</div>` : ""}
-      <div class="qprompt">${bi(question.prompt_en, question.prompt_ar)}</div>
-      ${keyBlock}
-    </div>
+    <p class="qlede">${subs.length} ${bi("reps answered this question.", "مندوب جاوبوا السؤال ده.")} · <a href="/admin/quizzes/${quiz.id}/submissions">${bi("View all questions on one page", "اعرض كل الأسئلة في صفحة واحدة")} →</a></p>
+    ${renderQuestionPanel(question)}
     ${flash(c)}
     ${rows || `<div class="qcard qempty"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
 	return c.html(
@@ -537,8 +544,15 @@ adminQuizApp.get("/:quizId/questions/:questionId/submissions", async (c) => {
 });
 
 /** One rep's answer to a question, with an inline award + note form that posts on its
- * own (so the same question can be graded across the whole team from one screen). */
-function renderSubmissionRow(quiz: QuizRow, q: QuizQuestionRow, s: QuestionSubmissionRow): string {
+ * own (so the same question can be graded across the whole team from one screen).
+ * `fromAll` tags the form so its save returns to the all-questions scroll page (and
+ * scrolls back to this row) instead of the single-question page. */
+function renderSubmissionRow(
+	quiz: QuizRow,
+	q: QuizQuestionRow,
+	s: QuestionSubmissionRow,
+	opts: { fromAll?: boolean } = {},
+): string {
 	let answerHtml: string;
 	let resultChip = "";
 	if (q.type === "short") {
@@ -552,15 +566,16 @@ function renderSubmissionRow(quiz: QuizRow, q: QuizQuestionRow, s: QuestionSubmi
 				: `<span class="tag no plain">${bi("Auto: incorrect", "تلقائي: غلط")}</span>`;
 	}
 	const awardedChip = `<span class="tag ${s.awarded == null ? "wait" : "ok"} plain awarded-chip">${fmtAward(s.awarded)} / ${q.points}</span>`;
+	const fromField = opts.fromAll ? `<input type="hidden" name="from" value="all">` : "";
 
-	return `<div class="qcard">
+	return `<div class="qcard" id="sub-${s.answerId}">
     <div class="qrow-split">
       <div class="qindex" style="margin:0">${escapeHtml(s.email)} · ${escapeHtml(s.mailbox)}</div>
       <div class="editbtns">${resultChip} ${awardedChip} ${statusBadge(s.status)}</div>
     </div>
     <div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
     ${answerHtml}
-    <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">
+    <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">${fromField}
       <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
         <input class="awardin" type="number" inputmode="decimal" name="points" min="0" max="${q.points}" step="0.5" value="${s.awarded ?? ""}" placeholder="0–${q.points}"></div>
       <div><label>${bi("Note to rep", "ملاحظة للمندوب")}</label><input name="note" value="${escapeHtml(s.note ?? "")}" placeholder="${escapeHtml("…")}"></div>
@@ -569,25 +584,64 @@ function renderSubmissionRow(quiz: QuizRow, q: QuizQuestionRow, s: QuestionSubmi
   </div>`;
 }
 
+// ── GET /admin/quizzes/:quizId/submissions — ALL questions, each with its
+// submissions stacked, gradable inline. The scroll-through alternative to clicking
+// into one question at a time. ponytail: 1 query per question (parallel) and the whole
+// quiz × all reps rendered at once — fine for the ~5-rep internal team; if the roster
+// grows large, paginate by question or lazy-load each group.
+adminQuizApp.get("/:quizId/submissions", async (c) => {
+	const quiz = await getQuizById(c.env, c.req.param("quizId"));
+	if (!quiz) return c.redirect(`/admin/quizzes?err=${encodeURIComponent("Quiz not found.")}`, 302);
+	const questions = await listQuestions(c.env, quiz.id);
+	const subsByQ = await Promise.all(questions.map((q) => listQuestionSubmissions(c.env, q.id)));
+
+	const jump = questions.map((q) => `<a href="#q-${q.id}">${q.position}</a>`).join("");
+	const sections = questions
+		.map((q, i) => {
+			const rows = subsByQ[i].map((s) => renderSubmissionRow(quiz, q, s, { fromAll: true })).join("");
+			return `${renderQuestionPanel(q)}${rows || `<div class="qcard qempty" style="margin-top:0"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
+		})
+		.join("");
+
+	const body = `<h1 class="qhead">${bi(quiz.title_en, quiz.title_ar)}</h1>
+    <p class="qlede">${bi("Every question with all of its submissions, gradable inline. Scroll through, or jump to a question.", "كل سؤال وكل إجاباته، وتقدر تصحّح في مكانك. اعمل سكرول، أو اقفز لسؤال.")}</p>
+    ${flash(c)}
+    ${questions.length ? `<div class="qjump">${bi("Jump", "اقفز")}: ${jump}</div>` : ""}
+    ${sections || `<div class="qcard qempty"><p>${bi("No questions yet.", "مفيش أسئلة لسه.")}</p></div>`}`;
+	return c.html(
+		quizShell("All submissions", body, {
+			backHref: `/admin/quizzes/${quiz.id}/grade`,
+			backLabelEn: "Back to grading",
+			backLabelAr: "ارجع للتصحيح",
+		}),
+	);
+});
+
 // ── POST /admin/quizzes/:quizId/answers/:answerId/award — grade one ──
-// Single-answer override (by-question screen). gradeAnswer clamps + recomputes the
-// owning attempt; redirect back to the same question's submissions list.
+// Single-answer override (by-question + all-questions screens). gradeAnswer clamps +
+// recomputes the owning attempt; redirect back to wherever the form was submitted
+// from (all-questions scroll vs single question), scrolled to this row.
 adminQuizApp.post("/:quizId/answers/:answerId/award", async (c) => {
 	const quizId = c.req.param("quizId");
+	const answerId = c.req.param("answerId");
 	const form = await c.req.parseBody();
 	const res = await gradeAnswer(
 		c.env,
-		c.req.param("answerId"),
+		answerId,
 		Number.parseFloat(String(form.points ?? "")),
 		String(form.note ?? ""),
 	);
 	if (!res.ok) {
 		return c.redirect(`/admin/quizzes/${quizId}/results?err=${encodeURIComponent("Answer not found.")}`, 302);
 	}
-	return c.redirect(
-		`/admin/quizzes/${quizId}/questions/${res.question.id}/submissions?ok=${encodeURIComponent("Saved.")}`,
-		302,
-	);
+	const ok = encodeURIComponent("Saved.");
+	const anchor = `#sub-${answerId}`;
+	// `from` is a known discriminator, not a user-supplied URL — no open-redirect.
+	const dest =
+		String(form.from ?? "") === "all"
+			? `/admin/quizzes/${quizId}/submissions?ok=${ok}${anchor}`
+			: `/admin/quizzes/${quizId}/questions/${res.question.id}/submissions?ok=${ok}${anchor}`;
+	return c.redirect(dest, 302);
 });
 
 // ── GET /admin/quizzes/:quizId/results — reps × scores ──────────────
