@@ -556,10 +556,14 @@ function renderSubmissionRow(
 	let answerHtml: string;
 	let resultChip = "";
 	if (q.type === "short") {
-		answerHtml = `<div class="preview" style="margin-top:6px">${escapeHtml(s.textAnswer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
+		answerHtml = `<div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
+    <div class="preview" style="margin-top:6px">${escapeHtml(s.textAnswer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
 	} else {
-		const chosen = s.selected.map((id) => optLabel(q, id)).join('<span class="muted">، </span>');
-		answerHtml = `<div class="ans-line">${chosen || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
+		// Full option list, exactly as the rep saw it: every option shown, their pick
+		// marked, the correct option(s) green. (Not just the chosen labels.)
+		answerHtml = `<div class="ans-lbl">${bi("Their answer · ✓ correct · their pick highlighted", "إجابته · ✓ الصح · اختياره مظلّل")}</div>
+    ${optionReadout(parseOptions(q), parseCorrect(q), s.selected, { en: "their pick", ar: "اختياره" })}
+    ${s.selected.length === 0 ? `<div class="ans-line"><span class="muted">${bi("Left blank.", "سابها فاضية.")}</span></div>` : ""}`;
 		resultChip =
 			s.isCorrect === 1
 				? `<span class="tag ok plain">${bi("Auto: correct", "تلقائي: صح")}</span>`
@@ -573,7 +577,6 @@ function renderSubmissionRow(
       <div class="qindex" style="margin:0">${escapeHtml(s.email)} · ${escapeHtml(s.mailbox)}</div>
       <div class="editbtns">${resultChip} ${awardedChip} ${statusBadge(s.status)}</div>
     </div>
-    <div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
     ${answerHtml}
     <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">${fromField}
       <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
