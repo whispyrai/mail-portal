@@ -208,6 +208,11 @@ details.qedit[open]>summary::before{content:"–"}
 .qjump{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 var(--q-gap);padding:10px 14px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:saturate(1.2) blur(8px);-webkit-backdrop-filter:saturate(1.2) blur(8px);border:1px solid var(--line);border-radius:14px;font-size:12.5px;color:var(--muted)}
 .qjump a{display:inline-grid;place-content:center;min-width:26px;height:26px;padding:0 6px;border:1px solid var(--line-strong);border-radius:8px;color:var(--slate);font-weight:600;font-variant-numeric:tabular-nums}
 .qjump a:hover{background:var(--tint);border-color:var(--ring);text-decoration:none}
+/* MCQ tally row: option shown once, name-chips of who picked it stacked beneath. */
+.opt-read.opt-tally{display:block}
+.opt-tally .opt-read-head{display:flex;gap:10px;align-items:flex-start}
+.opt-tally .pickers{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-inline-start:28px}
+.namechip{display:inline-flex;align-items:center;font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:999px;border:1px solid var(--line-strong);background:var(--surface);color:var(--slate);white-space:nowrap}
 
 /* Empty states */
 .qempty{text-align:center;padding:38px 24px}

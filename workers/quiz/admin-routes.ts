@@ -72,12 +72,6 @@ function fmtAward(n: number | null | undefined): string {
 	return n === null || n === undefined ? "—" : String(n);
 }
 
-/** Bilingual label for one option id within a question (falls back to the raw id). */
-function optLabel(q: QuizQuestionRow, id: string): string {
-	const o = parseOptions(q).find((x) => x.id === id);
-	return o ? bi(o.en, o.ar) : escapeHtml(id);
-}
-
 /** Clip a prompt for a compact list cell. */
 function clip(s: string, n = 90): string {
 	return s.length > n ? `${s.slice(0, n - 1)}…` : s;
@@ -498,21 +492,16 @@ adminQuizApp.post("/:quizId/grade/:attemptId", async (c) => {
 	return c.redirect(`/admin/quizzes/${quizId}/results?ok=${encodeURIComponent("Attempt graded.")}`, 302);
 });
 
-/** The question card shown above its submissions (anchor target for the scroll page's
- * jump nav): index/type/points, title, prompt, and the answer key (correct options or
- * rubric). Shared by the single-question page and the all-questions scroll page. */
+/** Panel header above a question's submissions (anchor target for the jump nav):
+ * index/title/prompt, plus the rubric for short answers. The MCQ answer key is shown by
+ * the tally below (the correct option goes green), so it isn't repeated here. */
 function renderQuestionPanel(q: QuizQuestionRow): string {
-	const keyBlock =
-		q.type === "short"
-			? `<div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(q.rubric_en, q.rubric_ar, "qlede")}`
-			: `<div class="ans-lbl">${bi("Correct answer", "الإجابة الصحيحة")}</div>
-        <div class="ans-line">${parseCorrect(q).map((id) => optLabel(q, id)).join('<span class="muted">، </span>') || "—"}</div>
-        ${q.explanation_en || q.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(q.explanation_en, q.explanation_ar)}</div>` : ""}`;
 	return `<div class="qcard qpanel" id="q-${q.id}">
     <div class="qindex">#${q.position} · ${escapeHtml(q.type)} · ${q.points} ${bi("pt", "نقطة")}</div>
     ${q.title_en || q.title_ar ? `<div class="qtitle">${bi(q.title_en, q.title_ar)}</div>` : ""}
     <div class="qprompt">${bi(q.prompt_en, q.prompt_ar)}</div>
-    ${keyBlock}
+    ${q.type === "short" ? `<div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(q.rubric_en, q.rubric_ar, "qlede")}` : ""}
+    ${q.type !== "short" && (q.explanation_en || q.explanation_ar) ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(q.explanation_en, q.explanation_ar)}</div>` : ""}
   </div>`;
 }
 
@@ -527,13 +516,11 @@ adminQuizApp.get("/:quizId/questions/:questionId/submissions", async (c) => {
 		return c.redirect(`/admin/quizzes/${quiz.id}/questions?err=${encodeURIComponent("Question not found.")}`, 302);
 	}
 	const subs = await listQuestionSubmissions(c.env, question.id);
-	const rows = subs.map((s) => renderSubmissionRow(quiz, question, s)).join("");
 
 	const body = `<h1 class="qhead">${bi("Submissions", "الإجابات")}</h1>
     <p class="qlede">${subs.length} ${bi("reps answered this question.", "مندوب جاوبوا السؤال ده.")} · <a href="/admin/quizzes/${quiz.id}/submissions">${bi("View all questions on one page", "اعرض كل الأسئلة في صفحة واحدة")} →</a></p>
-    ${renderQuestionPanel(question)}
     ${flash(c)}
-    ${rows || `<div class="qcard qempty"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
+    ${renderQuestionBlock(quiz, question, subs)}`;
 	return c.html(
 		quizShell("Submissions", body, {
 			backHref: `/admin/quizzes/${quiz.id}/questions`,
@@ -543,41 +530,58 @@ adminQuizApp.get("/:quizId/questions/:questionId/submissions", async (c) => {
 	);
 });
 
-/** One rep's answer to a question, with an inline award + note form that posts on its
- * own (so the same question can be graded across the whole team from one screen).
- * `fromAll` tags the form so its save returns to the all-questions scroll page (and
- * scrolls back to this row) instead of the single-question page. */
-function renderSubmissionRow(
+/** MCQ tally: the option list shown ONCE — correct option(s) green with a ✓ — and on
+ * each option the name-chips of the reps who picked it (plus an "unanswered" row). The
+ * compact alternative to repeating the whole option list per rep. */
+function renderMcqTally(q: QuizQuestionRow, subs: QuestionSubmissionRow[]): string {
+	const correct = new Set(parseCorrect(q));
+	const byOption = new Map<string, QuestionSubmissionRow[]>();
+	const unanswered: QuestionSubmissionRow[] = [];
+	for (const s of subs) {
+		if (s.selected.length === 0) unanswered.push(s);
+		for (const id of s.selected) {
+			const list = byOption.get(id) ?? [];
+			list.push(s);
+			byOption.set(id, list);
+		}
+	}
+	const chip = (s: QuestionSubmissionRow) =>
+		`<span class="namechip" title="${escapeHtml(s.email)}">${escapeHtml(s.email)}</span>`;
+	const optRows = parseOptions(q)
+		.map((o) => {
+			const pickers = byOption.get(o.id) ?? [];
+			const isC = correct.has(o.id);
+			return `<div class="opt-read opt-tally${isC ? " correct" : ""}">
+        <div class="opt-read-head"><span class="slot">${escapeHtml(o.id)}</span><span class="otext">${bi(o.en, o.ar)}</span>${isC ? `<span class="mark">✓</span>` : ""}</div>
+        <div class="pickers">${pickers.map(chip).join("") || `<span class="muted">—</span>`}</div>
+      </div>`;
+		})
+		.join("");
+	const blankRow = unanswered.length
+		? `<div class="opt-read opt-tally"><div class="opt-read-head"><span class="otext muted">${bi("No answer", "مفيش إجابة")}</span></div><div class="pickers">${unanswered.map(chip).join("")}</div></div>`
+		: "";
+	return `<div class="qcard" style="margin-top:0">${optRows}${blankRow}</div>`;
+}
+
+/** One short answer with an inline award + note form that posts on its own (so the same
+ * question can be graded across the whole team from one screen). `fromAll` tags the
+ * form so its save returns to the all-questions scroll page (scrolled back to this
+ * row). Short answers are per-rep; MCQ uses renderMcqTally instead. */
+function renderShortSubmission(
 	quiz: QuizRow,
 	q: QuizQuestionRow,
 	s: QuestionSubmissionRow,
 	opts: { fromAll?: boolean } = {},
 ): string {
-	let answerHtml: string;
-	let resultChip = "";
-	if (q.type === "short") {
-		answerHtml = `<div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
-    <div class="preview" style="margin-top:6px">${escapeHtml(s.textAnswer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
-	} else {
-		// Full option list, exactly as the rep saw it: every option shown, their pick
-		// marked, the correct option(s) green. (Not just the chosen labels.)
-		answerHtml = `<div class="ans-lbl">${bi("Their answer · ✓ correct · their pick highlighted", "إجابته · ✓ الصح · اختياره مظلّل")}</div>
-    ${optionReadout(parseOptions(q), parseCorrect(q), s.selected, { en: "their pick", ar: "اختياره" })}
-    ${s.selected.length === 0 ? `<div class="ans-line"><span class="muted">${bi("Left blank.", "سابها فاضية.")}</span></div>` : ""}`;
-		resultChip =
-			s.isCorrect === 1
-				? `<span class="tag ok plain">${bi("Auto: correct", "تلقائي: صح")}</span>`
-				: `<span class="tag no plain">${bi("Auto: incorrect", "تلقائي: غلط")}</span>`;
-	}
 	const awardedChip = `<span class="tag ${s.awarded == null ? "wait" : "ok"} plain awarded-chip">${fmtAward(s.awarded)} / ${q.points}</span>`;
 	const fromField = opts.fromAll ? `<input type="hidden" name="from" value="all">` : "";
-
 	return `<div class="qcard" id="sub-${s.answerId}">
     <div class="qrow-split">
       <div class="qindex" style="margin:0">${escapeHtml(s.email)} · ${escapeHtml(s.mailbox)}</div>
-      <div class="editbtns">${resultChip} ${awardedChip} ${statusBadge(s.status)}</div>
+      <div class="editbtns">${awardedChip} ${statusBadge(s.status)}</div>
     </div>
-    ${answerHtml}
+    <div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
+    <div class="preview" style="margin-top:6px">${escapeHtml(s.textAnswer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>
     <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">${fromField}
       <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
         <input class="awardin" type="number" inputmode="decimal" name="points" min="0" max="${q.points}" step="0.5" value="${s.awarded ?? ""}" placeholder="0–${q.points}"></div>
@@ -585,6 +589,23 @@ function renderSubmissionRow(
       <div><button type="submit" class="sm">${bi("Save", "حفظ")}</button></div>
     </form>
   </div>`;
+}
+
+/** A question + its submissions, by type: MCQ → one option tally with name-chips on the
+ * picked rows; short → per-rep cards with inline grading. Used by the single-question
+ * page and the all-questions scroll page. */
+function renderQuestionBlock(
+	quiz: QuizRow,
+	q: QuizQuestionRow,
+	subs: QuestionSubmissionRow[],
+	opts: { fromAll?: boolean } = {},
+): string {
+	const panel = renderQuestionPanel(q);
+	if (q.type === "short") {
+		const rows = subs.map((s) => renderShortSubmission(quiz, q, s, opts)).join("");
+		return `${panel}${rows || `<div class="qcard qempty" style="margin-top:0"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
+	}
+	return `${panel}${renderMcqTally(q, subs)}`;
 }
 
 // ── GET /admin/quizzes/:quizId/submissions — ALL questions, each with its
@@ -600,10 +621,7 @@ adminQuizApp.get("/:quizId/submissions", async (c) => {
 
 	const jump = questions.map((q) => `<a href="#q-${q.id}">${q.position}</a>`).join("");
 	const sections = questions
-		.map((q, i) => {
-			const rows = subsByQ[i].map((s) => renderSubmissionRow(quiz, q, s, { fromAll: true })).join("");
-			return `${renderQuestionPanel(q)}${rows || `<div class="qcard qempty" style="margin-top:0"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
-		})
+		.map((q, i) => renderQuestionBlock(quiz, q, subsByQ[i], { fromAll: true }))
 		.join("");
 
 	const body = `<h1 class="qhead">${bi(quiz.title_en, quiz.title_ar)}</h1>
