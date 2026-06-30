@@ -16,7 +16,12 @@ import type {
 } from "../db/quiz-schema";
 import type { Env } from "../types";
 import { SEED_QUIZZES, type SeedOption } from "./seed";
-import { gradeSubmission, type GradableQuestion } from "./grading";
+import {
+	gradeSubmission,
+	clampAward,
+	scoreFromAwards,
+	type GradableQuestion,
+} from "./grading";
 
 const { quizzes, quizQuestions, quizAttempts, quizAnswers } = quizSchema;
 
@@ -46,14 +51,19 @@ export function parseCorrect(row: QuizQuestionRow): string[] {
 	}
 }
 
-export function parseSelected(row: QuizAnswerRow): string[] {
-	if (!row.selected_json) return [];
+/** Parse a JSON string-array column ('["a","c"]') into ids; [] on null/garbage. */
+function jsonIds(json: string | null): string[] {
+	if (!json) return [];
 	try {
-		const v = JSON.parse(row.selected_json);
+		const v = JSON.parse(json);
 		return Array.isArray(v) ? v.map(String) : [];
 	} catch {
 		return [];
 	}
+}
+
+export function parseSelected(row: QuizAnswerRow): string[] {
+	return jsonIds(row.selected_json);
 }
 
 function gradable(q: QuizQuestionRow): GradableQuestion {
@@ -208,6 +218,10 @@ export async function getAnswers(env: Env, attemptId: string): Promise<QuizAnswe
 	return db(env).select().from(quizAnswers).where(eq(quizAnswers.attempt_id, attemptId)).all();
 }
 
+export async function getAnswerById(env: Env, id: string): Promise<QuizAnswerRow | undefined> {
+	return db(env).select().from(quizAnswers).where(eq(quizAnswers.id, id)).get();
+}
+
 export type SubmitResult =
 	| { ok: true; attemptId: string }
 	| { ok: false; reason: "already_submitted" };
@@ -305,9 +319,48 @@ export async function attemptCounts(env: Env, quizId: string): Promise<AttemptCo
 }
 
 /**
- * Finalize short-answer grading: write each short answer's awarded points + note,
- * then set short_score (sum of short awarded), total_score (mcq + short), and
- * status='graded'. `marks` maps a question id → { awarded, note }.
+ * Recompute an attempt's score columns + status from the *current* per-answer awards.
+ * This is the single recompute path; every grading action (batch finalize, single
+ * answer override via UI or MCP) ends here, so MCQ overrides and short marks always
+ * agree with the stored totals. The attempt is 'graded' once every short answer has a
+ * non-null award (MCQ are auto-awarded at submit). Maxes are re-summed from the
+ * current questions so the math survives question edits.
+ */
+export async function recomputeAttempt(env: Env, attemptId: string): Promise<void> {
+	const attempt = await getAttemptById(env, attemptId);
+	if (!attempt) return;
+	const questions = await listQuestions(env, attempt.quiz_id);
+	const answers = await getAnswers(env, attemptId);
+	const awardByQ: Record<string, number | null> = {};
+	for (const a of answers) awardByQ[a.question_id] = a.awarded_points;
+
+	const score = scoreFromAwards(
+		questions.map((q) => ({ id: q.id, type: q.type, points: q.points })),
+		awardByQ,
+	);
+
+	await db(env)
+		.update(quizAttempts)
+		.set({
+			mcq_score: score.mcqScore,
+			mcq_max: score.mcqMax,
+			short_score: score.shortScore,
+			short_max: score.shortMax,
+			total_score: score.totalScore,
+			total_max: score.totalMax,
+			status: score.allShortGraded ? "graded" : "submitted",
+			updated_at: Date.now(),
+		})
+		.where(eq(quizAttempts.id, attemptId))
+		.run();
+}
+
+/**
+ * Finalize grading for one attempt: write the award (clamped to each question's max)
+ * + note for every question in `marks` — MCQ *and* short, so partial credit and
+ * "accept anyway" overrides persist — then recompute the attempt. `marks` maps a
+ * question id → { awarded, note }; a question absent from `marks` keeps its stored
+ * award.
  */
 export async function finalizeGrading(
 	env: Env,
@@ -317,31 +370,61 @@ export async function finalizeGrading(
 	const attempt = await getAttemptById(env, attemptId);
 	if (!attempt) return;
 	const questions = await listQuestions(env, attempt.quiz_id);
-	const shortIds = new Set(questions.filter((q) => q.type === "short").map((q) => q.id));
+	const byId = new Map(questions.map((q) => [q.id, q]));
 	const now = Date.now();
 
-	let shortScore = 0;
-	for (const qid of shortIds) {
-		const mark = marks[qid];
-		const awarded = mark ? mark.awarded : 0;
-		shortScore += awarded;
+	for (const [qid, mark] of Object.entries(marks)) {
+		const q = byId.get(qid);
+		if (!q) continue;
 		await db(env)
 			.update(quizAnswers)
-			.set({ awarded_points: awarded, grader_note: mark?.note?.trim() || null, updated_at: now })
+			.set({
+				awarded_points: clampAward(mark.awarded, q.points),
+				grader_note: mark.note?.trim() || null,
+				updated_at: now,
+			})
 			.where(and(eq(quizAnswers.attempt_id, attemptId), eq(quizAnswers.question_id, qid)))
 			.run();
 	}
 
+	await recomputeAttempt(env, attemptId);
+}
+
+export type GradeAnswerResult =
+	| { ok: false }
+	| { ok: true; question: QuizQuestionRow; attempt: QuizAttemptRow };
+
+/**
+ * Grade ONE answer in isolation (the by-question screen and the MCP `quiz_grade_answer`
+ * tool): clamp the award to the question's max, write it + the note, recompute the
+ * owning attempt, and return the question + refreshed attempt for the redirect / tool
+ * response. Returns { ok: false } if the answer or its question is gone.
+ */
+export async function gradeAnswer(
+	env: Env,
+	answerId: string,
+	rawPoints: number,
+	note: string,
+): Promise<GradeAnswerResult> {
+	const answer = await getAnswerById(env, answerId);
+	if (!answer) return { ok: false };
+	const question = await getQuestion(env, answer.question_id);
+	if (!question) return { ok: false };
+
 	await db(env)
-		.update(quizAttempts)
+		.update(quizAnswers)
 		.set({
-			short_score: shortScore,
-			total_score: (attempt.mcq_score ?? 0) + shortScore,
-			status: "graded",
-			updated_at: now,
+			awarded_points: clampAward(rawPoints, question.points),
+			grader_note: note.trim() || null,
+			updated_at: Date.now(),
 		})
-		.where(eq(quizAttempts.id, attemptId))
+		.where(eq(quizAnswers.id, answerId))
 		.run();
+
+	await recomputeAttempt(env, answer.attempt_id);
+	const attempt = await getAttemptById(env, answer.attempt_id);
+	if (!attempt) return { ok: false };
+	return { ok: true, question, attempt };
 }
 
 // ── Results table (admin) ──────────────────────────────────────────
@@ -378,6 +461,65 @@ export async function listResults(env: Env, quizId: string): Promise<ResultRow[]
 		.where(eq(quizAttempts.quiz_id, quizId))
 		.all();
 	return rows.sort((a, b) => a.email.localeCompare(b.email));
+}
+
+// ── One question across all attempts (admin "by question" view + MCP) ──
+
+export interface QuestionSubmissionRow {
+	answerId: string;
+	attemptId: string;
+	userId: string;
+	email: string;
+	mailbox: string;
+	selected: string[]; // chosen option ids (MCQ); [] for short
+	textAnswer: string | null;
+	awarded: number | null;
+	isCorrect: number | null;
+	note: string | null;
+	status: string;
+}
+
+/** Every rep's answer to one question, for grading the same question across the team
+ * in a single screen. Sorted by email for a stable order. */
+export async function listQuestionSubmissions(
+	env: Env,
+	questionId: string,
+): Promise<QuestionSubmissionRow[]> {
+	const rows = await db(env)
+		.select({
+			answerId: quizAnswers.id,
+			attemptId: quizAttempts.id,
+			userId: users.id,
+			email: users.email,
+			mailbox: users.mailbox_address,
+			selected_json: quizAnswers.selected_json,
+			text_answer: quizAnswers.text_answer,
+			awarded: quizAnswers.awarded_points,
+			isCorrect: quizAnswers.is_correct,
+			note: quizAnswers.grader_note,
+			status: quizAttempts.status,
+		})
+		.from(quizAnswers)
+		.innerJoin(quizAttempts, eq(quizAnswers.attempt_id, quizAttempts.id))
+		.innerJoin(users, eq(quizAttempts.user_id, users.id))
+		.where(eq(quizAnswers.question_id, questionId))
+		.all();
+
+	return rows
+		.map((r) => ({
+			answerId: r.answerId,
+			attemptId: r.attemptId,
+			userId: r.userId,
+			email: r.email,
+			mailbox: r.mailbox,
+			selected: jsonIds(r.selected_json),
+			textAnswer: r.text_answer,
+			awarded: r.awarded,
+			isCorrect: r.isCorrect,
+			note: r.note,
+			status: r.status,
+		}))
+		.sort((a, b) => a.email.localeCompare(b.email));
 }
 
 // ── Seed ───────────────────────────────────────────────────────────

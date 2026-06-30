@@ -19,6 +19,42 @@ export function biBlock(en: string, ar: string, cls = ""): string {
 	return `<div class="only-en${c}">${escapeHtml(en)}</div><div class="only-ar${c}" dir="rtl">${escapeHtml(ar)}</div>`;
 }
 
+export interface ReadoutOption {
+	id: string;
+	en: string;
+	ar: string;
+}
+
+/**
+ * Read-only option list for review/grading: every option on its OWN row, with the
+ * correct answer(s) marked (✓ + green) and the picked option(s) marked (charcoal ring
+ * + a label). Shared by the rep's post-submit review and the admin grade screens.
+ * Replaces comma-joining the chosen option *texts* into a single line — fine for short
+ * labels, an unreadable wall once options are full sentences. `pickedLabel` adapts the
+ * voice ("your pick" for the rep, "chose" for an admin reading someone else's answer).
+ */
+export function optionReadout(
+	options: ReadoutOption[],
+	correctIds: string[],
+	selectedIds: string[],
+	pickedLabel: { en: string; ar: string } = { en: "chose", ar: "اختار" },
+): string {
+	const correct = new Set(correctIds);
+	const chosen = new Set(selectedIds);
+	return options
+		.map((o) => {
+			const isC = correct.has(o.id);
+			const isPick = chosen.has(o.id);
+			return `<div class="opt-read${isC ? " correct" : ""}${isPick ? " chosen" : ""}">
+      <span class="slot">${escapeHtml(o.id)}</span>
+      <span class="otext">${bi(o.en, o.ar)}</span>
+      ${isPick ? `<span class="picked">${bi(pickedLabel.en, pickedLabel.ar)}</span>` : ""}
+      ${isC ? `<span class="mark">✓</span>` : ""}
+    </div>`;
+		})
+		.join("");
+}
+
 // The quiz visual system. Built on the brand tokens in brand.ts (--bg/--surface/
 // --charcoal/--tint/--fill/--line/--success/--danger …). Editorial-calm: generous
 // rhythm, one tactile interaction (the option rows), a quiet score moment. No new
@@ -150,8 +186,20 @@ details.qedit[open]>summary::before{content:"–"}
 /* Read view of an admin option */
 .opt-read{display:flex;gap:10px;align-items:flex-start;padding:8px 12px;border:1px solid var(--line);border-radius:10px;margin:6px 0;background:var(--tint)}
 .opt-read .slot{font-weight:700;color:var(--slate);min-width:18px}
+.opt-read .otext{flex:1}
 .opt-read.correct{border-color:#cfe2d6;background:#f4f9f6}
 .opt-read .mark{color:var(--success);font-weight:700}
+/* The rep's chosen option in an admin read-out: a charcoal inset ring (works on top
+ * of the green "correct" background, so right-and-chosen reads as both). */
+.opt-read.chosen{border-color:var(--ring);box-shadow:inset 0 0 0 1px var(--ring)}
+.opt-read .picked{color:var(--slate);font-weight:700;font-size:11px;white-space:nowrap}
+
+/* Admin grading bar: award (0–points) + note, optionally a per-row action (Accept /
+ * Save). One shared 3-col grid; the action column collapses to 0 when empty. */
+.gradebar{display:grid;gap:12px;align-items:end;margin-top:14px;grid-template-columns:120px minmax(0,1fr) auto}
+.gradebar label{margin-top:0}
+.awarded-chip{font-variant-numeric:tabular-nums}
+@media (max-width:640px){.gradebar{grid-template-columns:1fr}}
 
 /* Empty states */
 .qempty{text-align:center;padding:38px 24px}

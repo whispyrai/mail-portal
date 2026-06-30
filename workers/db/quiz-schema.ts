@@ -63,13 +63,19 @@ export const quizAttempts = sqliteTable("quiz_attempts", {
 	updated_at: integer("updated_at").notNull(),
 });
 
+// ponytail: the award/score columns are declared INTEGER but hold fractional values
+// (0.5 partial credit). SQLite's INTEGER *affinity* stores a non-integer REAL
+// losslessly, and Drizzle's integer() column passes numbers through unchanged (no
+// Math.round on read or write — verified in drizzle-orm/sqlite-core), so 0.5
+// round-trips through D1 without a column-type migration. Clamping/snapping to 0.5
+// steps is enforced in code (grading.clampAward), not by the DB.
 export const quizAnswers = sqliteTable("quiz_answers", {
 	id: text("id").primaryKey(), // ans_<uuid>
 	attempt_id: text("attempt_id").notNull(),
 	question_id: text("question_id").notNull(),
 	selected_json: text("selected_json"), // JSON array of chosen option ids (MCQ)
 	text_answer: text("text_answer"), // free text (short)
-	awarded_points: integer("awarded_points"), // MCQ auto; short admin-set, null until graded
+	awarded_points: integer("awarded_points"), // MCQ auto; admin-overridable; may be fractional
 	is_correct: integer("is_correct"), // 0/1 (MCQ convenience)
 	grader_note: text("grader_note"),
 	created_at: integer("created_at").notNull(),

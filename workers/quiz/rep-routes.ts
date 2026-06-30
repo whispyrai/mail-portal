@@ -8,7 +8,7 @@ import type { SessionClaims } from "../lib/auth";
 import { escapeHtml } from "../lib/email-helpers";
 import type { Env } from "../types";
 import type { QuizAnswerRow, QuizQuestionRow, QuizRow } from "../db/quiz-schema";
-import { bi, biBlock, quizShell, TIMER_SCRIPT, TAKE_SCRIPT } from "./render";
+import { bi, biBlock, optionReadout, quizShell, TIMER_SCRIPT, TAKE_SCRIPT } from "./render";
 import {
 	getAttempt,
 	getAnswers,
@@ -259,29 +259,33 @@ function renderReviewRow(q: QuizQuestionRow, ans: QuizAnswerRow | undefined): st
 	}
 
 	const options = parseOptions(q);
-	const label = (id: string) => {
-		const o = options.find((x) => x.id === id);
-		return o ? bi(o.en, o.ar) : escapeHtml(id);
-	};
 	const selected = ans ? parseSelected(ans) : [];
 	const correct = parseCorrect(q);
 	const isCorrect = ans?.is_correct === 1;
+	const blank = selected.length === 0;
 
-	const sep = `<span class="muted">، </span>`;
-	const yours = selected.length
-		? selected.map(label).join(sep)
-		: `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`;
-	const right = correct.map(label).join(sep);
+	// The admin may override an MCQ award (accept a wrong answer, or dock partial
+	// credit). When the awarded points differ from the auto-grade, surface it so the
+	// rep's row matches their total. `is_correct` stays the factual auto result.
+	const awarded = ans?.awarded_points;
+	const auto = isCorrect ? q.points : 0;
+	const overridden = awarded !== null && awarded !== undefined && awarded !== auto;
+	const overrideChip =
+		overridden && awarded! > 0
+			? `<span class="tag ok">${!isCorrect ? `${bi("Accepted", "مقبولة")} · ` : ""}${awarded} / ${q.points}</span>`
+			: overridden
+				? `<span class="tag no">${awarded} / ${q.points}</span>`
+				: "";
+	const note = ans?.grader_note;
 
+	// Each option on its own row with the rep's pick + the correct answer marked —
+	// readable even when options are full sentences (unlike a comma-joined line).
 	return `<div class="review-row ${isCorrect ? "correct" : "wrong"}">${head}
-    <div class="qrow-split"><span class="ans-lbl">${bi("Your answer", "إجابتك")}</span> ${isCorrect ? `<span class="tag ok">${bi("Correct", "صح")}</span>` : `<span class="tag no">${bi("Incorrect", "غلط")}</span>`}</div>
-    <div class="ans-line">${yours}</div>
-    ${
-			isCorrect
-				? ""
-				: `<div class="ans-lbl">${bi("Correct answer", "الإجابة الصحيحة")}</div><div class="ans-line">${right}</div>`
-		}
+    <div class="qrow-split"><span class="ans-lbl">${bi("✓ correct · your pick highlighted", "✓ الصح · اختيارك مظلّل")}</span> <span class="editbtns">${isCorrect ? `<span class="tag ok">${bi("Correct", "صح")}</span>` : `<span class="tag no">${bi("Incorrect", "غلط")}</span>`}${overrideChip}</span></div>
+    ${optionReadout(options, correct, selected, { en: "your pick", ar: "اختيارك" })}
+    ${blank ? `<div class="ans-line"><span class="muted">${bi("You left this blank.", "سِبتها فاضية.")}</span></div>` : ""}
     ${q.explanation_en || q.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(q.explanation_en, q.explanation_ar)}</div>` : ""}
+    ${note ? `<div class="why"><b>${bi("Note", "ملاحظة")}:</b> ${escapeHtml(note)}</div>` : ""}
   </div>`;
 }
 

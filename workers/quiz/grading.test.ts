@@ -3,7 +3,14 @@
 // Exits non-zero on the first failed assertion.
 
 import assert from "node:assert/strict";
-import { gradeMcqAnswer, gradeSubmission, type GradableQuestion } from "./grading.ts";
+import {
+	gradeMcqAnswer,
+	gradeSubmission,
+	clampAward,
+	scoreFromAwards,
+	type GradableQuestion,
+	type ScoreQuestion,
+} from "./grading.ts";
 
 const single: GradableQuestion = { id: "q1", type: "single", points: 1, correct: ["b"] };
 const multi: GradableQuestion = { id: "q2", type: "multi", points: 1, correct: ["a", "c", "e"] };
@@ -44,5 +51,33 @@ assert.equal(gf.mcqMax, 25, "full mcqMax");
 assert.equal(gf.shortMax, 15, "full shortMax");
 assert.equal(gf.totalMax, 40, "full totalMax");
 assert.equal(gf.mcqScore, 0, "no answers → 0 mcqScore");
+
+// ── clampAward: admin overrides snap to [0, max] in 0.5 steps ──
+assert.equal(clampAward(0.5, 1), 0.5, "half point allowed");
+assert.equal(clampAward(1, 1), 1, "full point allowed");
+assert.equal(clampAward(2, 1), 1, "above max clamps to max");
+assert.equal(clampAward(-1, 3), 0, "below zero clamps to 0");
+assert.equal(clampAward(0.7, 3), 0.5, "snaps to nearest 0.5 (down)");
+assert.equal(clampAward(0.8, 3), 1, "snaps to nearest 0.5 (up)");
+assert.equal(clampAward(Number.NaN, 3), 0, "NaN → 0");
+
+// ── scoreFromAwards: MCQ overrides + partial credit flow into the total ──
+const sq: ScoreQuestion[] = [
+	{ id: "m1", type: "single", points: 1 }, // accepted-anyway: was wrong, awarded 1
+	{ id: "m2", type: "multi", points: 1 }, // partial credit: 0.5
+	{ id: "s1", type: "short", points: 3 }, // graded 2
+	{ id: "s2", type: "short", points: 3 }, // still ungraded
+];
+const partial = scoreFromAwards(sq, { m1: 1, m2: 0.5, s1: 2, s2: null });
+assert.equal(partial.mcqScore, 1.5, "mcqScore = 1 + 0.5 (override + partial)");
+assert.equal(partial.mcqMax, 2, "mcqMax = 1 + 1");
+assert.equal(partial.shortScore, 2, "shortScore counts only graded short");
+assert.equal(partial.shortMax, 6, "shortMax = 3 + 3");
+assert.equal(partial.totalScore, 3.5, "totalScore = mcq + short");
+assert.equal(partial.allShortGraded, false, "one short ungraded ⇒ not fully graded");
+
+const done = scoreFromAwards(sq, { m1: 0, m2: 1, s1: 3, s2: 1.5 });
+assert.equal(done.totalScore, 5.5, "fully graded total = 0 + 1 + 3 + 1.5");
+assert.equal(done.allShortGraded, true, "all short graded");
 
 console.log("grading.test.ts: all assertions passed");

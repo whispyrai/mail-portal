@@ -21,6 +21,22 @@ import {
 	toolMoveEmail,
 } from "../lib/tools";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
+import {
+	listQuizzes,
+	getQuizById,
+	getQuizByKey,
+	attemptCounts,
+	listResults,
+	getAttemptById,
+	getQuestion,
+	listQuestions,
+	listQuestionSubmissions,
+	getAnswers,
+	gradeAnswer,
+	parseOptions,
+	parseCorrect,
+	parseSelected,
+} from "../quiz/queries";
 import type { UserRole } from "../db/users-schema";
 import type { Env } from "../types";
 
@@ -506,6 +522,175 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 					};
 				}
 				return mcpText(result);
+			},
+		);
+
+		// ── Quiz tools (ADMIN only) ────────────────────────────────
+		// Read all reps' quiz answers and grade them (partial credit, "accept anyway",
+		// short-answer marks). Every tool requires an ADMIN token — quiz data spans the
+		// whole team, so AGENT sessions get nothing here. Writes reuse the same clamp +
+		// recompute path as the admin UI (workers/quiz/queries.ts).
+		const requireAdmin = () =>
+			this.props?.role === "ADMIN"
+				? null
+				: mcpError("Quiz tools require an ADMIN token.");
+
+		/** Resolve a quiz by its id or its key ('real-estate-market' | 'whispyr-system'). */
+		const resolveQuiz = async (ref: string) =>
+			(await getQuizById(env, ref)) ?? (await getQuizByKey(env, ref));
+
+		// ── quiz_overview ──────────────────────────────────────────
+		this.server.tool(
+			"quiz_overview",
+			"ADMIN: list every quiz with its status and attempt counts (submitted / graded). Start here to find a quiz's id/key.",
+			{},
+			async () => {
+				const denied = requireAdmin();
+				if (denied) return denied;
+				const quizzes = await listQuizzes(env);
+				const out = await Promise.all(
+					quizzes.map(async (q) => ({
+						id: q.id,
+						key: q.key,
+						title_en: q.title_en,
+						title_ar: q.title_ar,
+						status: q.status,
+						...(await attemptCounts(env, q.id)),
+					})),
+				);
+				return mcpText(out);
+			},
+		);
+
+		// ── quiz_results ───────────────────────────────────────────
+		this.server.tool(
+			"quiz_results",
+			"ADMIN: the results table for one quiz — every rep with their MCQ / short / total scores, status, and attemptId (pass attemptId to quiz_attempt for the full breakdown).",
+			{ quiz: z.string().describe("Quiz id or key (real-estate-market | whispyr-system)") },
+			async ({ quiz }) => {
+				const denied = requireAdmin();
+				if (denied) return denied;
+				const q = await resolveQuiz(quiz);
+				if (!q) return mcpError(`Quiz "${quiz}" not found. Use quiz_overview to list quizzes.`);
+				return mcpText({ quiz: { id: q.id, key: q.key, status: q.status }, results: await listResults(env, q.id) });
+			},
+		);
+
+		// ── quiz_attempt ───────────────────────────────────────────
+		this.server.tool(
+			"quiz_attempt",
+			"ADMIN: one rep's full attempt — every question with its correct answer, the rep's selected/typed answer, the awarded points, auto-correctness, and any note. This is how you read the answers to grade them.",
+			{ attemptId: z.string().describe("The attempt id (from quiz_results)") },
+			async ({ attemptId }) => {
+				const denied = requireAdmin();
+				if (denied) return denied;
+				const attempt = await getAttemptById(env, attemptId);
+				if (!attempt) return mcpError(`Attempt "${attemptId}" not found.`);
+				const questions = await listQuestions(env, attempt.quiz_id);
+				const answers = await getAnswers(env, attempt.id);
+				const ansByQ = new Map(answers.map((a) => [a.question_id, a]));
+				const rep = (await listResults(env, attempt.quiz_id)).find((r) => r.attemptId === attempt.id);
+
+				const detail = questions.map((q) => {
+					const a = ansByQ.get(q.id);
+					const base = {
+						questionId: q.id,
+						answerId: a?.id ?? null,
+						position: q.position,
+						type: q.type,
+						points: q.points,
+						prompt_en: q.prompt_en,
+						prompt_ar: q.prompt_ar,
+						awarded: a?.awarded_points ?? null,
+						grader_note: a?.grader_note ?? null,
+					};
+					if (q.type === "short") {
+						return { ...base, rubric_en: q.rubric_en, rubric_ar: q.rubric_ar, text_answer: a?.text_answer ?? null };
+					}
+					return {
+						...base,
+						options: parseOptions(q),
+						correct: parseCorrect(q),
+						selected: a ? parseSelected(a) : [],
+						is_correct: a?.is_correct ?? null,
+						explanation_en: q.explanation_en,
+						explanation_ar: q.explanation_ar,
+					};
+				});
+
+				return mcpText({
+					attempt: {
+						id: attempt.id,
+						quiz_id: attempt.quiz_id,
+						status: attempt.status,
+						mcq_score: attempt.mcq_score,
+						mcq_max: attempt.mcq_max,
+						short_score: attempt.short_score,
+						short_max: attempt.short_max,
+						total_score: attempt.total_score,
+						total_max: attempt.total_max,
+					},
+					rep: rep ? { userId: rep.userId, email: rep.email, mailbox: rep.mailbox } : null,
+					questions: detail,
+				});
+			},
+		);
+
+		// ── quiz_question ──────────────────────────────────────────
+		this.server.tool(
+			"quiz_question",
+			"ADMIN: one question with every rep's answer to it, for grading the same question across the whole team. Each submission includes its answerId (pass to quiz_grade_answer).",
+			{ questionId: z.string().describe("The question id (from quiz_attempt)") },
+			async ({ questionId }) => {
+				const denied = requireAdmin();
+				if (denied) return denied;
+				const q = await getQuestion(env, questionId);
+				if (!q) return mcpError(`Question "${questionId}" not found.`);
+				return mcpText({
+					question: {
+						id: q.id,
+						quiz_id: q.quiz_id,
+						position: q.position,
+						type: q.type,
+						points: q.points,
+						prompt_en: q.prompt_en,
+						prompt_ar: q.prompt_ar,
+						options: parseOptions(q),
+						correct: parseCorrect(q),
+						rubric_en: q.rubric_en,
+						rubric_ar: q.rubric_ar,
+					},
+					submissions: await listQuestionSubmissions(env, q.id),
+				});
+			},
+		);
+
+		// ── quiz_grade_answer ──────────────────────────────────────
+		this.server.tool(
+			"quiz_grade_answer",
+			"ADMIN: set the awarded points (+ optional note) for ONE answer — partial credit or accepting a wrong answer. Points are clamped to [0, the question's max] in 0.5 steps; the owning attempt's totals are recomputed automatically.",
+			{
+				answerId: z.string().describe("The answer id (from quiz_attempt or quiz_question)"),
+				points: z.number().describe("Points to award (0 to the question's max; 0.5 steps)"),
+				note: z.string().optional().describe("Optional note shown to the rep after grading"),
+			},
+			async ({ answerId, points, note }) => {
+				const denied = requireAdmin();
+				if (denied) return denied;
+				const res = await gradeAnswer(env, answerId, points, note ?? "");
+				if (!res.ok) return mcpError(`Answer "${answerId}" not found.`);
+				return mcpText({
+					ok: true,
+					questionId: res.question.id,
+					attempt: {
+						id: res.attempt.id,
+						status: res.attempt.status,
+						mcq_score: res.attempt.mcq_score,
+						short_score: res.attempt.short_score,
+						total_score: res.attempt.total_score,
+						total_max: res.attempt.total_max,
+					},
+				});
 			},
 		);
 	}

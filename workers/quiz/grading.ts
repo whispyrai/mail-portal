@@ -31,6 +31,18 @@ export function gradeMcqAnswer(
 	return { awarded: ok ? q.points : 0, isCorrect: ok };
 }
 
+/**
+ * Clamp a (possibly garbage) admin-entered award to a valid value for a question
+ * worth `max` points: a number in [0, max], snapped to the nearest 0.5 step (so the
+ * UI's partial-credit affordance can't smuggle in float noise). NaN → 0. This is the
+ * single gate every manual override passes through, MCQ or short alike.
+ */
+export function clampAward(raw: number, max: number): number {
+	if (!Number.isFinite(raw)) return 0;
+	const snapped = Math.round(raw * 2) / 2;
+	return Math.min(max, Math.max(0, snapped));
+}
+
 export interface GradedAnswer {
 	questionId: string;
 	awarded: number | null; // null for short (admin-graded later)
@@ -74,4 +86,64 @@ export function gradeSubmission(
 	}
 
 	return { answers, mcqScore, mcqMax, shortMax, totalMax: mcqMax + shortMax };
+}
+
+export interface ScoreQuestion {
+	id: string;
+	type: QuestionType;
+	points: number;
+}
+
+export interface AttemptScore {
+	mcqScore: number;
+	mcqMax: number;
+	shortScore: number;
+	shortMax: number;
+	totalScore: number;
+	totalMax: number;
+	allShortGraded: boolean; // true ⇒ attempt is fully graded
+}
+
+/**
+ * Recompute an attempt's totals from the *current* per-answer awards — the single
+ * source of truth once an admin can override any question (MCQ partial credit,
+ * "accept anyway", short-answer marks). `awardsByQuestion` maps a question id to its
+ * stored `awarded_points` (null = not yet graded, treated as 0 but flips
+ * `allShortGraded` false). Maxes are summed from the questions, never hardcoded, so
+ * the math survives question edits. Sums are rounded to 0.5 to kill float drift.
+ */
+export function scoreFromAwards(
+	questions: ScoreQuestion[],
+	awardsByQuestion: Record<string, number | null | undefined>,
+): AttemptScore {
+	let mcqScore = 0;
+	let mcqMax = 0;
+	let shortScore = 0;
+	let shortMax = 0;
+	let allShortGraded = true;
+
+	for (const q of questions) {
+		const awarded = awardsByQuestion[q.id];
+		if (q.type === "short") {
+			shortMax += q.points;
+			if (awarded === null || awarded === undefined) allShortGraded = false;
+			else shortScore += awarded;
+		} else {
+			mcqMax += q.points;
+			mcqScore += awarded ?? 0;
+		}
+	}
+
+	const round = (n: number) => Math.round(n * 2) / 2;
+	mcqScore = round(mcqScore);
+	shortScore = round(shortScore);
+	return {
+		mcqScore,
+		mcqMax,
+		shortScore,
+		shortMax,
+		totalScore: round(mcqScore + shortScore),
+		totalMax: mcqMax + shortMax,
+		allShortGraded,
+	};
 }

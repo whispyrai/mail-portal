@@ -8,9 +8,9 @@ import type { SessionClaims } from "../lib/auth";
 import { escapeHtml } from "../lib/email-helpers";
 import type { Env } from "../types";
 import { QUESTION_TYPES, QUIZ_STATUSES } from "../db/quiz-schema";
-import type { QuizQuestionRow, QuizRow } from "../db/quiz-schema";
+import type { QuizAnswerRow, QuizQuestionRow, QuizRow } from "../db/quiz-schema";
 import type { SeedOption } from "./seed";
-import { bi, biBlock, quizShell } from "./render";
+import { bi, biBlock, optionReadout, quizShell } from "./render";
 import {
 	attemptCounts,
 	createQuestion,
@@ -20,7 +20,9 @@ import {
 	getAttemptById,
 	getQuestion,
 	getQuizById,
+	gradeAnswer,
 	listQuestions,
+	listQuestionSubmissions,
 	listQuizzes,
 	listResults,
 	moveQuestion,
@@ -31,6 +33,7 @@ import {
 	setQuizStatus,
 	updateQuestion,
 	type QuestionInput,
+	type QuestionSubmissionRow,
 } from "./queries";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
@@ -62,6 +65,48 @@ function statusBadge(status: string): string {
 					? "no"
 					: "plain";
 	return `<span class="tag ${cls}">${statusLabel(status)}</span>`;
+}
+
+/** Tidy award for display: the number as-is (0.5 → "0.5"), or "—" when ungraded. */
+function fmtAward(n: number | null | undefined): string {
+	return n === null || n === undefined ? "—" : String(n);
+}
+
+/** Bilingual label for one option id within a question (falls back to the raw id). */
+function optLabel(q: QuizQuestionRow, id: string): string {
+	const o = parseOptions(q).find((x) => x.id === id);
+	return o ? bi(o.en, o.ar) : escapeHtml(id);
+}
+
+/** Clip a prompt for a compact list cell. */
+function clip(s: string, n = 90): string {
+	return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+/** Read-out of an MCQ's options for the admin: each option marked correct (✓) and/or
+ * the rep's pick. Delegates to the shared optionReadout (also used on the rep review). */
+function renderOptionReadout(q: QuizQuestionRow, selected: string[]): string {
+	return optionReadout(parseOptions(q), parseCorrect(q), selected);
+}
+
+/** The award (0–points, 0.5 steps) + note inputs for one answer. `idable` gives the
+ * award input an id so the per-attempt "Accept" button can target it; the by-question
+ * screen leaves it off and posts each row on its own. */
+function awardFields(
+	namePrefix: string,
+	qid: string,
+	points: number,
+	awarded: number | null | undefined,
+	note: string | null | undefined,
+	opts: { idable?: boolean } = {},
+): { award: string; note: string } {
+	const id = opts.idable ? ` id="${namePrefix}_${qid}"` : "";
+	return {
+		award: `<label>${bi("Award", "الدرجة")} (0–${points})</label>
+      <input${id} class="awardin" type="number" inputmode="decimal" name="${namePrefix}_${qid}" min="0" max="${points}" step="0.5" value="${awarded ?? ""}" placeholder="0–${points}">`,
+		note: `<label>${bi("Note to rep", "ملاحظة للمندوب")}</label>
+      <input name="note_${qid}" value="${escapeHtml(note ?? "")}" placeholder="${escapeHtml("…")}">`,
+	};
 }
 
 // ── GET /admin/quizzes — overview + controls + seed ─────────────────
@@ -180,6 +225,7 @@ function renderAdminQuestion(quiz: QuizRow, q: QuizQuestionRow, idx: number, tot
     <div class="qrow-split">
       <div class="qindex">#${q.position} · ${escapeHtml(q.type)} · ${q.points} ${bi("pt", "نقطة")}</div>
       <div class="editbtns">${move}
+        <a class="btn secondary sm" href="/admin/quizzes/${quiz.id}/questions/${q.id}/submissions">${bi("Submissions", "الإجابات")}</a>
         <form method="post" action="/admin/quizzes/${quiz.id}/questions/${q.id}/delete" class="inline" onsubmit="return confirm('Delete this question?')"><button class="sm danger secondary" type="submit">${bi("Delete", "حذف")}</button></form>
       </div>
     </div>
@@ -322,13 +368,14 @@ adminQuizApp.get("/:quizId/grade", async (c) => {
 	const quiz = await getQuizById(c.env, c.req.param("quizId"));
 	if (!quiz) return c.redirect(`/admin/quizzes?err=${encodeURIComponent("Quiz not found.")}`, 302);
 	const results = await listResults(c.env, quiz.id);
+	const questions = await listQuestions(c.env, quiz.id);
 
 	const rowsFor = (status: string) =>
 		results
 			.filter((r) => r.status === status)
 			.map(
 				(r) =>
-					`<tr><td>${escapeHtml(r.email)}</td><td>${escapeHtml(r.mailbox)}</td><td>${r.mcqScore ?? 0} / ${r.mcqMax ?? 0}</td>
+					`<tr><td>${escapeHtml(r.email)}</td><td>${escapeHtml(r.mailbox)}</td><td>${fmtAward(r.mcqScore)} / ${r.mcqMax ?? 0}</td>
             <td style="text-align:right"><a class="btn secondary sm" href="/admin/quizzes/${quiz.id}/grade/${r.attemptId}">${status === "graded" ? bi("Re-grade", "إعادة تصحيح") : bi("Grade", "صحّح")}</a></td></tr>`,
 			)
 			.join("");
@@ -337,17 +384,68 @@ adminQuizApp.get("/:quizId/grade", async (c) => {
 	const graded = rowsFor("graded");
 	const tableHead = `<thead><tr><th>${bi("Email", "الإيميل")}</th><th>${bi("Mailbox", "الصندوق")}</th><th>MCQ</th><th></th></tr></thead>`;
 
+	const byQuestion = questions
+		.map(
+			(q) =>
+				`<tr><td><b>#${q.position}</b></td><td>${escapeHtml(q.type)} · ${q.points} ${bi("pt", "نقطة")}</td>
+          <td style="white-space:normal;max-width:420px">${bi(clip(q.prompt_en), clip(q.prompt_ar))}</td>
+          <td style="text-align:right"><a class="btn secondary sm" href="/admin/quizzes/${quiz.id}/questions/${q.id}/submissions">${bi("Submissions", "الإجابات")}</a></td></tr>`,
+		)
+		.join("");
+
 	const body = `<h1 class="qhead">${bi(quiz.title_en, quiz.title_ar)}</h1>
-    <p class="qlede">${bi("Score each rep's short answers (0–3 + a note), then finalize.", "صحّح إجابات كل مندوب المقالية (٠–٣ وملاحظة)، وبعدين أنهِ.")}</p>
+    <p class="qlede">${bi("Grade each attempt — short answers, partial credit, or accepting a wrong multiple-choice answer — then finalize. Or grade one question across the whole team below.", "صحّح كل محاولة — المقالي، درجات جزئية، أو قبول إجابة اختيارات غلط — وبعدين أنهِ. أو صحّح سؤال واحد لكل الفريق تحت.")}</p>
     ${flash(c)}
     <div class="qcard"><h2 style="margin-top:0">${bi("Awaiting grading", "في انتظار التصحيح")} <span class="tag wait plain">${(submitted.match(/<tr>/g) || []).length}</span></h2>
       <div class="tablewrap"><table>${tableHead}
       <tbody>${submitted || `<tr><td colspan="4"><span class="muted">${bi("Nobody waiting.", "مفيش حد مستني.")}</span></td></tr>`}</tbody></table></div></div>
     <div class="qcard"><h2 style="margin-top:0">${bi("Already graded", "اتصحّح")}</h2>
       <div class="tablewrap"><table>${tableHead}
-      <tbody>${graded || `<tr><td colspan="4"><span class="muted">${bi("None yet.", "لسه ولا واحد.")}</span></td></tr>`}</tbody></table></div></div>`;
+      <tbody>${graded || `<tr><td colspan="4"><span class="muted">${bi("None yet.", "لسه ولا واحد.")}</span></td></tr>`}</tbody></table></div></div>
+    <div class="qcard"><h2 style="margin-top:0">${bi("Grade by question", "التصحيح بالسؤال")}</h2>
+      <p class="qlede">${bi("Open one question to see and grade every rep's answer side-by-side.", "افتح سؤال واحد عشان تشوف وتصحّح إجابات كل المناديب جنب بعض.")}</p>
+      <div class="tablewrap"><table>
+      <tbody>${byQuestion || `<tr><td><span class="muted">${bi("No questions yet.", "مفيش أسئلة لسه.")}</span></td></tr>`}</tbody></table></div></div>`;
 	return c.html(quizShell("Grade", body, { backHref: "/admin/quizzes", backLabelEn: "All quizzes", backLabelAr: "كل الاختبارات" }));
 });
+
+/** One question on the per-attempt grade page: the rep's answer in context (MCQ option
+ * read-out or short text + rubric), the auto result, and an award + note input. Wrong
+ * MCQs get a one-click "Accept · full marks" button. Lives inside the single grade form. */
+function renderGradeQuestion(q: QuizQuestionRow, ans: QuizAnswerRow | undefined): string {
+	const fields = awardFields("mark", q.id, q.points, ans?.awarded_points, ans?.grader_note, {
+		idable: true,
+	});
+
+	let detail = "";
+	let action = "";
+	if (q.type === "short") {
+		detail = `<div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(q.rubric_en, q.rubric_ar, "qlede")}
+      <div class="ans-lbl">${bi("Rep's answer", "إجابة المندوب")}</div>
+      <div class="preview" style="margin-top:6px">${escapeHtml(ans?.text_answer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
+	} else {
+		const selected = ans ? parseSelected(ans) : [];
+		const ok = ans?.is_correct === 1;
+		const autoChip = ok
+			? `<span class="tag ok plain">${bi("Auto: correct", "تلقائي: صح")}</span>`
+			: `<span class="tag no plain">${bi("Auto: incorrect", "تلقائي: غلط")}</span>`;
+		detail = `<div class="qrow-split"><span class="ans-lbl">${bi("✓ correct · ring = rep's pick", "✓ الصح · الإطار = اختيار المندوب")}</span> ${autoChip}</div>
+      ${renderOptionReadout(q, selected)}
+      ${q.explanation_en || q.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(q.explanation_en, q.explanation_ar)}</div>` : ""}`;
+		if (!ok) {
+			// type=button so it only fills the field; the single Finalize submit saves.
+			action = `<button type="button" class="btn secondary sm" onclick="var e=document.getElementById('mark_${q.id}');e.value='${q.points}';e.focus();">${bi("Accept · full marks", "اقبلها · الدرجة كاملة")}</button>`;
+		}
+	}
+
+	return `<div class="qcard" data-qgroup>
+    <div class="qindex">#${q.position} · ${escapeHtml(q.type)} · ${q.points} ${bi("pt", "نقطة")}</div>
+    ${q.title_en || q.title_ar ? `<div class="qtitle">${bi(q.title_en, q.title_ar)}</div>` : ""}
+    <div class="qprompt">${bi(q.prompt_en, q.prompt_ar)}</div>
+    ${detail}
+    <div class="gradebar"><div>${fields.award}</div><div>${fields.note}</div><div>${action}</div></div>
+  </div>`;
+}
 
 // ── GET /admin/quizzes/:quizId/grade/:attemptId — grade one attempt ─
 adminQuizApp.get("/:quizId/grade/:attemptId", async (c) => {
@@ -359,52 +457,20 @@ adminQuizApp.get("/:quizId/grade/:attemptId", async (c) => {
 	const questions = await listQuestions(c.env, quiz.id);
 	const answers = await getAnswers(c.env, attempt.id);
 	const ansByQ = new Map(answers.map((a) => [a.question_id, a]));
+	const who = (await listResults(c.env, quiz.id)).find((r) => r.attemptId === attempt.id);
 
-	const shortQs = questions.filter((q) => q.type === "short");
-	const shortBlocks = shortQs
-		.map((q) => {
-			const a = ansByQ.get(q.id);
-			const awarded = a?.awarded_points;
-			return `<div class="qcard" data-qgroup>
-        <div class="qindex">${bi(q.title_en, q.title_ar)} · ${q.points} ${bi("pts", "نقاط")}</div>
-        <div class="qprompt">${bi(q.prompt_en, q.prompt_ar)}</div>
-        <div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(q.rubric_en, q.rubric_ar, "qlede")}
-        <div class="ans-lbl">${bi("Rep's answer", "إجابة المندوب")}</div>
-        <div class="preview" style="margin-top:6px">${escapeHtml(a?.text_answer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>
-        <div style="display:grid;grid-template-columns:150px 1fr;gap:12px;margin-top:14px">
-          <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
-            <input type="number" name="mark_${q.id}" min="0" max="${q.points}" value="${awarded ?? ""}" placeholder="0–${q.points}"></div>
-          <div><label>${bi("Note to rep", "ملاحظة للمندوب")}</label><input name="note_${q.id}" value="${escapeHtml(a?.grader_note ?? "")}"></div>
-        </div>
-      </div>`;
-		})
-		.join("");
-
-	// MCQ breakdown, read-only for context.
-	const mcqRows = questions
-		.filter((q) => q.type !== "short")
-		.map((q) => {
-			const a = ansByQ.get(q.id);
-			const sel = a ? parseSelected(a).join(", ") : "";
-			const correct = parseCorrect(q).join(", ");
-			const ok = a?.is_correct === 1;
-			return `<tr><td>#${q.position}</td><td>${escapeHtml(sel) || "—"}</td><td>${escapeHtml(correct)}</td><td>${ok ? `<span class="tag ok plain">✓</span>` : `<span class="tag no plain">✗</span>`}</td></tr>`;
-		})
-		.join("");
+	const cards = questions.map((q) => renderGradeQuestion(q, ansByQ.get(q.id))).join("");
 
 	const body = `<h1 class="qhead">${bi("Grade attempt", "تصحيح المحاولة")}</h1>
-    <p class="qlede">${escapeHtml(attempt.status)} · MCQ ${attempt.mcq_score ?? 0} / ${attempt.mcq_max ?? 0}</p>
+    <p class="qlede">${who ? `${escapeHtml(who.email)} · ` : ""}${statusBadge(attempt.status)} · MCQ ${fmtAward(attempt.mcq_score)} / ${attempt.mcq_max ?? 0} · ${bi("Total", "الإجمالي")} ${fmtAward(attempt.total_score)} / ${attempt.total_max ?? 0}</p>
     ${flash(c)}
     <form id="quizform" method="post" action="/admin/quizzes/${quiz.id}/grade/${attempt.id}">
-      ${shortBlocks || `<div class="qcard qempty"><p>${bi("This quiz has no short answers.", "الاختبار ده مفيهوش أسئلة مقالية.")}</p></div>`}
+      ${cards || `<div class="qcard qempty"><p>${bi("This quiz has no questions.", "الاختبار ده مفيهوش أسئلة.")}</p></div>`}
       <div class="qcard qfooter">
-        <span class="muted">${bi("Finalize sets the total and marks the attempt graded.", "الإنهاء بيحسب الإجمالي ويعتبر المحاولة متصحّحة.")}</span>
+        <span class="muted">${bi("Set an award for every question — partial credit and accepting a wrong answer are fine. Finalize recomputes the total and marks the attempt graded.", "حُط درجة لكل سؤال — تقدر تدي درجة جزئية أو تقبل إجابة غلط. الإنهاء بيعيد حساب الإجمالي ويعتبر المحاولة متصحّحة.")}</span>
         <button type="submit">${bi("Finalize grade", "إنهاء التصحيح")}</button>
       </div>
-    </form>
-    <div class="qcard"><h2 style="margin-top:0">${bi("Multiple-choice (read-only)", "الاختيارات (للعرض فقط)")}</h2>
-      <div class="tablewrap"><table><thead><tr><th>#</th><th>${bi("Chose", "اختار")}</th><th>${bi("Correct", "الصح")}</th><th></th></tr></thead>
-      <tbody>${mcqRows}</tbody></table></div></div>`;
+    </form>`;
 	return c.html(quizShell("Grade attempt", body, { backHref: `/admin/quizzes/${quiz.id}/grade`, backLabelEn: "Back to grading", backLabelAr: "ارجع للتصحيح" }));
 });
 
@@ -416,15 +482,112 @@ adminQuizApp.post("/:quizId/grade/:attemptId", async (c) => {
 
 	const questions = await listQuestions(c.env, attempt.quiz_id);
 	const form = await c.req.parseBody();
+	// Marks for EVERY question (MCQ + short); finalizeGrading clamps each to its max.
+	// A blank field parses to NaN → clamped to 0. MCQ fields are pre-filled with the
+	// current award, so leaving them untouched preserves the auto-grade.
 	const marks: Record<string, { awarded: number; note: string }> = {};
 	for (const q of questions) {
-		if (q.type !== "short") continue;
-		const raw = parseInt(String(form[`mark_${q.id}`] ?? ""), 10);
-		const awarded = Number.isFinite(raw) ? Math.min(q.points, Math.max(0, raw)) : 0;
-		marks[q.id] = { awarded, note: String(form[`note_${q.id}`] ?? "") };
+		marks[q.id] = {
+			awarded: Number.parseFloat(String(form[`mark_${q.id}`] ?? "")),
+			note: String(form[`note_${q.id}`] ?? ""),
+		};
 	}
 	await finalizeGrading(c.env, attempt.id, marks);
 	return c.redirect(`/admin/quizzes/${quizId}/results?ok=${encodeURIComponent("Attempt graded.")}`, 302);
+});
+
+// ── GET /admin/quizzes/:quizId/questions/:questionId/submissions ─────
+// One question, every rep's answer side-by-side, each gradable inline (design: the
+// "view a question and see all its submissions at once" surface).
+adminQuizApp.get("/:quizId/questions/:questionId/submissions", async (c) => {
+	const quiz = await getQuizById(c.env, c.req.param("quizId"));
+	if (!quiz) return c.redirect(`/admin/quizzes?err=${encodeURIComponent("Quiz not found.")}`, 302);
+	const question = await getQuestion(c.env, c.req.param("questionId"));
+	if (!question || question.quiz_id !== quiz.id) {
+		return c.redirect(`/admin/quizzes/${quiz.id}/questions?err=${encodeURIComponent("Question not found.")}`, 302);
+	}
+	const subs = await listQuestionSubmissions(c.env, question.id);
+
+	const keyBlock =
+		question.type === "short"
+			? `<div class="ans-lbl">${bi("Rubric", "معايير التصحيح")}</div>${biBlock(question.rubric_en, question.rubric_ar, "qlede")}`
+			: `<div class="ans-lbl">${bi("Correct answer", "الإجابة الصحيحة")}</div>
+        <div class="ans-line">${parseCorrect(question).map((id) => optLabel(question, id)).join('<span class="muted">، </span>') || "—"}</div>
+        ${question.explanation_en || question.explanation_ar ? `<div class="why"><b>${bi("Why", "ليه")}:</b> ${bi(question.explanation_en, question.explanation_ar)}</div>` : ""}`;
+
+	const rows = subs.map((s) => renderSubmissionRow(quiz, question, s)).join("");
+
+	const body = `<h1 class="qhead">${bi("Submissions", "الإجابات")}</h1>
+    <p class="qlede">${subs.length} ${bi("reps answered this question.", "مندوب جاوبوا السؤال ده.")}</p>
+    <div class="qcard">
+      <div class="qindex">#${question.position} · ${escapeHtml(question.type)} · ${question.points} ${bi("pt", "نقطة")}</div>
+      ${question.title_en || question.title_ar ? `<div class="qtitle">${bi(question.title_en, question.title_ar)}</div>` : ""}
+      <div class="qprompt">${bi(question.prompt_en, question.prompt_ar)}</div>
+      ${keyBlock}
+    </div>
+    ${flash(c)}
+    ${rows || `<div class="qcard qempty"><p>${bi("No submissions for this question yet.", "مفيش إجابات للسؤال ده لسه.")}</p></div>`}`;
+	return c.html(
+		quizShell("Submissions", body, {
+			backHref: `/admin/quizzes/${quiz.id}/questions`,
+			backLabelEn: "Edit questions",
+			backLabelAr: "تعديل الأسئلة",
+		}),
+	);
+});
+
+/** One rep's answer to a question, with an inline award + note form that posts on its
+ * own (so the same question can be graded across the whole team from one screen). */
+function renderSubmissionRow(quiz: QuizRow, q: QuizQuestionRow, s: QuestionSubmissionRow): string {
+	let answerHtml: string;
+	let resultChip = "";
+	if (q.type === "short") {
+		answerHtml = `<div class="preview" style="margin-top:6px">${escapeHtml(s.textAnswer ?? "") || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
+	} else {
+		const chosen = s.selected.map((id) => optLabel(q, id)).join('<span class="muted">، </span>');
+		answerHtml = `<div class="ans-line">${chosen || `<span class="muted">${bi("(blank)", "(فاضي)")}</span>`}</div>`;
+		resultChip =
+			s.isCorrect === 1
+				? `<span class="tag ok plain">${bi("Auto: correct", "تلقائي: صح")}</span>`
+				: `<span class="tag no plain">${bi("Auto: incorrect", "تلقائي: غلط")}</span>`;
+	}
+	const awardedChip = `<span class="tag ${s.awarded == null ? "wait" : "ok"} plain awarded-chip">${fmtAward(s.awarded)} / ${q.points}</span>`;
+
+	return `<div class="qcard">
+    <div class="qrow-split">
+      <div class="qindex" style="margin:0">${escapeHtml(s.email)} · ${escapeHtml(s.mailbox)}</div>
+      <div class="editbtns">${resultChip} ${awardedChip} ${statusBadge(s.status)}</div>
+    </div>
+    <div class="ans-lbl">${bi("Their answer", "إجابته")}</div>
+    ${answerHtml}
+    <form method="post" action="/admin/quizzes/${quiz.id}/answers/${s.answerId}/award" class="gradebar">
+      <div><label>${bi("Award", "الدرجة")} (0–${q.points})</label>
+        <input class="awardin" type="number" inputmode="decimal" name="points" min="0" max="${q.points}" step="0.5" value="${s.awarded ?? ""}" placeholder="0–${q.points}"></div>
+      <div><label>${bi("Note to rep", "ملاحظة للمندوب")}</label><input name="note" value="${escapeHtml(s.note ?? "")}" placeholder="${escapeHtml("…")}"></div>
+      <div><button type="submit" class="sm">${bi("Save", "حفظ")}</button></div>
+    </form>
+  </div>`;
+}
+
+// ── POST /admin/quizzes/:quizId/answers/:answerId/award — grade one ──
+// Single-answer override (by-question screen). gradeAnswer clamps + recomputes the
+// owning attempt; redirect back to the same question's submissions list.
+adminQuizApp.post("/:quizId/answers/:answerId/award", async (c) => {
+	const quizId = c.req.param("quizId");
+	const form = await c.req.parseBody();
+	const res = await gradeAnswer(
+		c.env,
+		c.req.param("answerId"),
+		Number.parseFloat(String(form.points ?? "")),
+		String(form.note ?? ""),
+	);
+	if (!res.ok) {
+		return c.redirect(`/admin/quizzes/${quizId}/results?err=${encodeURIComponent("Answer not found.")}`, 302);
+	}
+	return c.redirect(
+		`/admin/quizzes/${quizId}/questions/${res.question.id}/submissions?ok=${encodeURIComponent("Saved.")}`,
+		302,
+	);
 });
 
 // ── GET /admin/quizzes/:quizId/results — reps × scores ──────────────
@@ -439,20 +602,21 @@ adminQuizApp.get("/:quizId/results", async (c) => {
 				`<tr>
           <td>${escapeHtml(r.email)}</td>
           <td>${escapeHtml(r.mailbox)}</td>
-          <td>${r.mcqScore ?? 0} / ${r.mcqMax ?? 0}</td>
-          <td>${r.shortScore ?? "—"} / ${(r.totalMax ?? 0) - (r.mcqMax ?? 0)}</td>
-          <td><b>${r.totalScore ?? "—"} / ${r.totalMax ?? 0}</b></td>
+          <td>${fmtAward(r.mcqScore)} / ${r.mcqMax ?? 0}</td>
+          <td>${fmtAward(r.shortScore)} / ${(r.totalMax ?? 0) - (r.mcqMax ?? 0)}</td>
+          <td><b>${fmtAward(r.totalScore)} / ${r.totalMax ?? 0}</b></td>
           <td>${statusBadge(r.status)}</td>
+          <td style="text-align:right"><a class="btn secondary sm" href="/admin/quizzes/${quiz.id}/grade/${r.attemptId}">${bi("View", "عرض")}</a></td>
         </tr>`,
 		)
 		.join("");
 
 	const body = `<h1 class="qhead">${bi(quiz.title_en, quiz.title_ar)}</h1>
-    <p class="qlede">${results.length} ${bi("reps have attempted this quiz.", "مندوب جرّبوا الاختبار ده.")}</p>
+    <p class="qlede">${results.length} ${bi("reps have attempted this quiz. Open any row to see it question-by-question and adjust scores.", "مندوب جرّبوا الاختبار ده. افتح أي صف عشان تشوفه سؤال بسؤال وتظبط الدرجات.")}</p>
     ${flash(c)}
     <div class="qcard"><div class="tablewrap"><table>
-      <thead><tr><th>${bi("Email", "الإيميل")}</th><th>${bi("Mailbox", "الصندوق")}</th><th>MCQ</th><th>${bi("Short", "مقالي")}</th><th>${bi("Total", "الإجمالي")}</th><th>${bi("Status", "الحالة")}</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="6"><span class="muted">${bi("No attempts yet.", "مفيش محاولات لسه.")}</span></td></tr>`}</tbody>
+      <thead><tr><th>${bi("Email", "الإيميل")}</th><th>${bi("Mailbox", "الصندوق")}</th><th>MCQ</th><th>${bi("Short", "مقالي")}</th><th>${bi("Total", "الإجمالي")}</th><th>${bi("Status", "الحالة")}</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7"><span class="muted">${bi("No attempts yet.", "مفيش محاولات لسه.")}</span></td></tr>`}</tbody>
     </table></div></div>`;
 	return c.html(quizShell("Results", body, { backHref: "/admin/quizzes", backLabelEn: "All quizzes", backLabelAr: "كل الاختبارات" }));
 });
