@@ -26,14 +26,14 @@ import {
 import { provisionMailbox } from "../lib/mailbox";
 import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
 import { escapeHtml } from "../lib/email-helpers";
-import { pageShell, brandLogo } from "./brand";
+import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
 import { adminQuizApp } from "../quiz/admin-routes";
 import type { Env } from "../types";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
-function shell(body: string): string {
-	return pageShell("Admin · Whispyr Mail", `<div class="wrap">${body}</div>`);
+function shell(brand: BrandConfig, body: string): string {
+	return pageShell(brand, `Admin · ${brand.appName}`, `<div class="wrap">${body}</div>`);
 }
 
 function mcpBaseUrl(c: { req: { url: string }; env: Env }): string {
@@ -57,6 +57,7 @@ adminApp.use("*", async (c, next) => {
 adminApp.route("/quizzes", adminQuizApp);
 
 adminApp.get("/users", async (c) => {
+	const brand = resolveBrand(c.env.BRAND);
 	const users = await listUsers(c.env);
 	const flash = c.req.query("ok")
 		? `<div class="flash ok">${escapeHtml(c.req.query("ok")!)}</div>`
@@ -94,8 +95,8 @@ adminApp.get("/users", async (c) => {
 		.join("");
 
 	return c.html(
-		shell(`
-  <div class="brandbar">${brandLogo({ href: "/" })}
+		shell(brand, `
+  <div class="brandbar">${brandLogo(brand, { href: "/" })}
     <form class="inline" method="post" action="/logout"><button class="sm secondary" type="submit">Sign out</button></form></div>
   <h1 style="margin-top:14px">User administration</h1>
   ${flash}
@@ -103,7 +104,7 @@ adminApp.get("/users", async (c) => {
     <h2 style="font-size:16px;margin-top:0">Create a user</h2>
     <form method="post" action="/admin/users">
       <div class="row">
-        <div><label>Email</label><input name="email" type="email" placeholder="kareem@whispyrcrm.com" required></div>
+        <div><label>Email</label><input name="email" type="email" placeholder="kareem@${brand.mailDomain}" required></div>
         <div><label>Display name</label><input name="name" type="text" placeholder="Kareem Hatem"></div>
       </div>
       <div class="row">
@@ -182,8 +183,9 @@ adminApp.post("/users/:id/mcp-token", async (c) => {
 	const token = generateMcpToken();
 	await setUserMcpTokenHash(c.env, user.id, await hashToken(token));
 	const base = mcpBaseUrl(c);
+	const brand = resolveBrand(c.env.BRAND);
 	return c.html(
-		shell(`
+		shell(brand, `
   <h1>MCP token issued</h1>
   <div class="flash ok">Copy this now — it is shown only once.</div>
   <div class="card">

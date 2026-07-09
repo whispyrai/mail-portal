@@ -8,8 +8,7 @@ import { Folders } from "shared/folders";
 import { useEmails } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
 import { useMailbox } from "~/queries/mailboxes";
-
-const BASE_TITLE = "Whispyr Mail";
+import { useBrand } from "~/hooks/useBrand";
 
 /**
  * In-app new-mail notifications (locked-decisions: in-app only, no OS push for v1).
@@ -20,6 +19,7 @@ const BASE_TITLE = "Whispyr Mail";
  */
 export function useMailNotifications(mailboxId: string | undefined) {
 	const toast = useKumoToastManager();
+	const { appName: baseTitle } = useBrand();
 	const { data: mailbox } = useMailbox(mailboxId);
 	const { data: folders = [] } = useFolders(mailboxId);
 	const { data: inbox } = useEmails(
@@ -70,9 +70,9 @@ export function useMailNotifications(mailboxId: string | undefined) {
 	// Reflect total unread in the tab title.
 	useEffect(() => {
 		const unread = folders.reduce((sum, f) => sum + (f.unreadCount || 0), 0);
-		document.title = unread > 0 ? `(${unread}) ${BASE_TITLE}` : BASE_TITLE;
+		document.title = unread > 0 ? `(${unread}) ${baseTitle}` : baseTitle;
 		return () => {
-			document.title = BASE_TITLE;
+			document.title = baseTitle;
 		};
-	}, [folders]);
+	}, [folders, baseTitle]);
 }

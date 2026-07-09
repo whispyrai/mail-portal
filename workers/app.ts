@@ -14,6 +14,7 @@ import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
 import { bulkPage } from "./routes/bulk";
+import { resolveBrand } from "./routes/brand";
 import { quizApp } from "./quiz/rep-routes";
 import {
 	loginPage,
@@ -252,6 +253,9 @@ async function fetchWithBranding(
 		try {
 			const meta = (await res.clone().json()) as Record<string, unknown>;
 			meta.logo_uri = `${new URL(request.url).origin}/icon-512.png`;
+			// The static resourceMetadata below is set at module load (no env); rewrite
+			// the resource_name per brand so a Wiser deploy doesn't advertise "Whispyr Mail".
+			meta.resource_name = resolveBrand(env.BRAND).appName;
 			const headers = new Headers(res.headers);
 			headers.delete("content-length");
 			return new Response(JSON.stringify(meta), { status: res.status, headers });

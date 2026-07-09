@@ -11,19 +11,20 @@
 
 import type { Context } from "hono";
 import type { SessionClaims } from "../lib/auth";
-import { pageShell, brandLogo } from "./brand";
+import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
 import type { Env } from "../types";
 import { ATTACHMENT_LIMITS } from "../../shared/attachments";
 
 type Ctx = Context<{ Bindings: Env; Variables: { session?: SessionClaims } }>;
 
-function renderBulk(mailbox: string, apiBase: string, uploadBase: string): string {
+function renderBulk(brand: BrandConfig, mailbox: string, apiBase: string, uploadBase: string): string {
 	// Injected as a JSON island the page script reads.
 	const cfg = JSON.stringify({ mailbox, apiBase, uploadBase, limits: ATTACHMENT_LIMITS }).replace(/</g, "\\u003c");
 	return pageShell(
-		"Bulk send · Whispyr Mail",
+		brand,
+		`Bulk send · ${brand.appName}`,
 		`<div class="wrap">
-  <div class="brandbar">${brandLogo({ href: "/" })}
+  <div class="brandbar">${brandLogo(brand, { href: "/" })}
     <div class="row"><a href="/">← Inbox</a> <form method="post" action="/logout" style="margin:0"><button class="sm secondary" type="submit">Sign out</button></form></div>
   </div>
   <h1 style="margin:0 0 4px">Bulk send</h1>
@@ -217,5 +218,5 @@ export function bulkPage(c: Ctx) {
 	const mailbox = session.mailbox;
 	const apiBase = `/api/v1/mailboxes/${encodeURIComponent(mailbox)}/bulk`;
 	const uploadBase = `/api/v1/mailboxes/${encodeURIComponent(mailbox)}/attachments`;
-	return c.html(renderBulk(mailbox, apiBase, uploadBase));
+	return c.html(renderBulk(resolveBrand(c.env.BRAND), mailbox, apiBase, uploadBase));
 }

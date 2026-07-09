@@ -23,7 +23,19 @@ import {
 	ScrollRestoration,
 } from "react-router";
 import { ApiError } from "~/services/api";
+import { useBrand } from "~/hooks/useBrand";
+import { resolveBrand } from "../workers/routes/brand";
+import type { Route } from "./+types/root";
 import "./index.css";
+
+// BRAND selects the active brand (WISER-238). Resolved server-side so the
+// <html data-brand> below is set before first paint — no flash of the wrong
+// palette. Mirrors the static data-mode="light". resolveBrand fails safe to
+// whispyr for an unset/unknown value.
+export async function loader({ context }: Route.LoaderArgs) {
+	const b = resolveBrand(context.cloudflare.env.BRAND);
+	return { brand: b.id, name: b.name, appName: b.appName };
+}
 
 function makeQueryClient() {
 	return new QueryClient({
@@ -76,11 +88,19 @@ const KumoLink = forwardRef<
 });
 
 export function Layout({ children }: { children: React.ReactNode }) {
+	const { brand, appName } = useBrand();
 	return (
-		<html lang="en" data-mode="light" data-theme="kumo">
+		<html lang="en" data-mode="light" data-theme="kumo" data-brand={brand}>
 			<head>
 				<meta charSet="UTF-8" />
-				<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+				<link
+					rel="icon"
+					type="image/svg+xml"
+					href={brand === "wiser" ? "/wiser-mark.svg" : "/favicon.svg"}
+				/>
+				{/* ponytail: the .ico legacy fallback stays Whispyr's; a dedicated
+				    wiser .ico is a go-live asset (WISER-242). Modern browsers use
+				    the brand SVG above. */}
 				<link
 					rel="icon"
 					type="image/x-icon"
@@ -88,7 +108,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
 					sizes="48x48 32x32 16x16"
 				/>
 				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-				<title>Whispyr Mail</title>
+				<title>{appName}</title>
 				<Meta />
 				<Links />
 			</head>

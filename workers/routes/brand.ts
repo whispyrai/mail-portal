@@ -2,23 +2,136 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 //
-// Shared Whispyr brand shell for the Worker-rendered pages (login, admin, bulk,
-// landing fallback). Matches the whispyrcrm.com landing: Kamerik 105 type,
-// cream/charcoal palette, purple accent used sparingly, the Whispyr mark.
-// Brand assets are served statically from public/ (fonts/, whispyr-mark.svg).
+// Brand registry for the Worker-rendered pages (login, admin, bulk, landing,
+// OAuth consent, quiz). One shared codebase serves multiple brands; the active
+// brand is selected at runtime by the `BRAND` env var and resolved via
+// `resolveBrand(env.BRAND)` (unset/unknown → whispyr, so a missing var can never
+// break the live portal). Each brand fully declares its own palette, font, mark,
+// and wordmark. Brand assets are served statically from public/ (fonts/, *.svg).
+//
+// Two brand seams are kept in sync by hand: this module (server HTML pages) and
+// app/index.css (the React SPA, via `:root[data-brand="..."]`).
 
-export const BRAND_CSS = `
+export type Brand = "whispyr" | "wiser";
+
+export interface BrandConfig {
+	/** Stable brand id — also the `data-brand` value on the SPA `<html>`. */
+	id: Brand;
+	/** Wordmark text. */
+	name: string;
+	/** Page-title brand, e.g. "Whispyr Mail". */
+	appName: string;
+	/** Logo mark asset path (served from public/). */
+	mark: string;
+	markWidth: number;
+	markHeight: number;
+	/** Marketing site (MCP/OAuth metadata). */
+	websiteUrl: string;
+	/** Absolute origin of the mail app (MCP/OAuth absolute asset URLs). */
+	mailOrigin: string;
+	/** `<meta name="theme-color">`. */
+	themeColor: string;
+	/** CSS font stack. */
+	fontFamily: string;
+	/** `@font-face` declarations for the brand font. */
+	fontFaceCss: string;
+	/** The woff2 to `<link rel="preload">`. */
+	preloadFont: string;
+	/** The brand's `:root` custom-property palette (no font / color-scheme). */
+	rootVars: string;
+	/** Email-address domain, used in address placeholders. */
+	mailDomain: string;
+	/** Login-page tagline (shown when not bootstrapping). */
+	loginTagline: string;
+	/** Login-page footer note. */
+	loginNote: string;
+	/** Landing-page description (inline HTML allowed). */
+	landingBlurb: string;
+}
+
+const KAMERIK_FACES = `
 @font-face { font-family:"Kamerik 105"; src:url("/fonts/Kamerik105-Light.woff2") format("woff2"); font-weight:300; font-display:swap; }
 @font-face { font-family:"Kamerik 105"; src:url("/fonts/Kamerik105-Book.woff2") format("woff2"); font-weight:400; font-display:swap; }
-@font-face { font-family:"Kamerik 105"; src:url("/fonts/Kamerik105-Bold.woff2") format("woff2"); font-weight:700; font-display:swap; }
-:root{
+@font-face { font-family:"Kamerik 105"; src:url("/fonts/Kamerik105-Bold.woff2") format("woff2"); font-weight:700; font-display:swap; }`;
+
+const INTER_FACES = `
+@font-face { font-family:"Inter"; src:url("/fonts/Inter-Regular.woff2") format("woff2"); font-weight:400; font-display:swap; }
+@font-face { font-family:"Inter"; src:url("/fonts/Inter-Medium.woff2") format("woff2"); font-weight:500; font-display:swap; }
+@font-face { font-family:"Inter"; src:url("/fonts/Inter-SemiBold.woff2") format("woff2"); font-weight:600; font-display:swap; }
+@font-face { font-family:"Inter"; src:url("/fonts/Inter-Bold.woff2") format("woff2"); font-weight:700; font-display:swap; }`;
+
+const BRANDS: Record<Brand, BrandConfig> = {
+	// Whispyr — the live production portal. Values reproduce today's look exactly
+	// (charcoal ink + charcoal primary actions, warm off-white canvas, Kamerik).
+	whispyr: {
+		id: "whispyr",
+		name: "Whispyr",
+		appName: "Whispyr Mail",
+		mark: "/whispyr-mark.svg",
+		markWidth: 22,
+		markHeight: 36,
+		websiteUrl: "https://whispyrai.com",
+		mailOrigin: "https://mail.whispyrcrm.com",
+		themeColor: "#faf8f5",
+		fontFamily: `"Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif`,
+		fontFaceCss: KAMERIK_FACES,
+		preloadFont: "/fonts/Kamerik105-Book.woff2",
+		rootVars: `
   --bg:#fbfaf8; --surface:#ffffff; --charcoal:#1a1a1a; --slate:#3a352f; --muted:#6b6b6b;
   --tint:#f7f3ec; --fill:#f1ebe1;
   --line:rgba(26,26,26,.12); --line-strong:rgba(26,26,26,.20); --ring:rgba(26,26,26,.30);
   --success:#1e6b43; --danger:#b42318;
-  --font:"Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  color-scheme:light;
+  --accent:#1a1a1a; --accent-hover:#000000; --accent-fg:#ffffff; --focus-shadow:rgba(26,26,26,.12);`,
+		mailDomain: "whispyrcrm.com",
+		loginTagline: "Whispyr sales mail portal",
+		loginNote: "Whispyr sales team only.",
+		landingBlurb: `This is the outreach mail domain for the <strong>Whispyr</strong> sales team. Whispyr is an
+    AI-powered sales platform that helps real estate teams close more deals with WhatsApp,
+    AI lead scoring, and automated outreach.`,
+	},
+	// Wiser — the team portal. Reuses the Wiser product's light tokens: olive
+	// primary action, warm-cream canvas, near-charcoal ink, Inter. Forced light.
+	wiser: {
+		id: "wiser",
+		name: "Wiser",
+		appName: "Wiser Mail",
+		mark: "/wiser-mark.svg",
+		markWidth: 30,
+		markHeight: 30,
+		websiteUrl: "https://wiserchat.ai",
+		mailOrigin: "https://mail.wiserchat.ai",
+		themeColor: "#f9f7f3",
+		fontFamily: `"Inter", ui-sans-serif, system-ui, -apple-system, sans-serif`,
+		fontFaceCss: INTER_FACES,
+		preloadFont: "/fonts/Inter-Regular.woff2",
+		rootVars: `
+  --bg:hsl(38 35% 96.5%); --surface:#ffffff; --charcoal:hsl(30 18% 12%); --slate:hsl(30 12% 25%); --muted:hsl(30 10% 42%);
+  --tint:hsl(38 28% 93%); --fill:hsl(38 22% 89%);
+  --line:hsl(35 18% 87%); --line-strong:hsl(35 16% 80%); --ring:hsl(70 28% 38% / .5);
+  --success:#1e6b43; --danger:hsl(8 60% 48%);
+  --accent:hsl(70 28% 38%); --accent-hover:hsl(70 28% 31%); --accent-fg:hsl(38 35% 97%); --focus-shadow:hsl(70 28% 38% / .16);`,
+		mailDomain: "wiserchat.ai",
+		loginTagline: "Wiser team mail",
+		loginNote: "Wiser team only.",
+		landingBlurb: `This is the internal team mail portal for <strong>Wiser</strong>.`,
+	},
+};
+
+/**
+ * Resolve the active brand from the `BRAND` env var. Case-insensitive; an
+ * unset, empty, or unknown value falls back to Whispyr so a missing/typo'd var
+ * can never break the live production portal.
+ */
+export function resolveBrand(value: string | undefined | null): BrandConfig {
+	const key = (value ?? "").trim().toLowerCase();
+	return key in BRANDS ? BRANDS[key as Brand] : BRANDS.whispyr;
 }
+
+// Component styles shared across brands — they reference the per-brand `:root`
+// custom properties above, so the same markup re-skins per brand. `--charcoal`
+// is the ink (primary text); `--accent` is the primary action color (split out
+// so Wiser's buttons are olive while its text stays dark).
+const COMPONENT_CSS = `
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--charcoal);font-family:var(--font);font-weight:400;line-height:1.5;letter-spacing:-.005em;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;}
 a{color:var(--charcoal);text-decoration:none}
@@ -40,12 +153,12 @@ h2{font-size:16px;font-weight:700;margin:0 0 14px}
 .card--auth{width:100%;max-width:412px;margin:0}
 label{display:block;font-size:13px;font-weight:500;color:var(--slate);margin:14px 0 6px}
 input,select,textarea{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line-strong);background:var(--surface);color:var(--charcoal);font-size:15px;font-family:inherit;transition:border-color .12s,box-shadow .12s}
-input:focus,select:focus,textarea:focus{outline:none;border-color:var(--charcoal);box-shadow:0 0 0 3px rgba(26,26,26,.12)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--focus-shadow)}
 textarea{min-height:170px;resize:vertical;line-height:1.5}
 input[type=file]{padding:9px 0;border:0;background:transparent;font-size:13px;color:var(--slate)}
-button,.btn{appearance:none;cursor:pointer;font-family:inherit;font-weight:600;font-size:15px;border:1px solid var(--charcoal);background:var(--charcoal);color:#fff;padding:11px 18px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;transition:background .12s,border-color .12s}
-button:hover,.btn:hover{background:#000;border-color:#000;text-decoration:none}
-a.btn{color:#fff}
+button,.btn{appearance:none;cursor:pointer;font-family:inherit;font-weight:600;font-size:15px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg);padding:11px 18px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;transition:background .12s,border-color .12s}
+button:hover,.btn:hover{background:var(--accent-hover);border-color:var(--accent-hover);text-decoration:none}
+a.btn{color:var(--accent-fg)}
 a.btn.secondary{color:var(--charcoal)}
 button.block{width:100%;margin-top:22px}
 .btn.secondary,button.secondary{background:transparent;color:var(--charcoal);border-color:var(--line-strong)}
@@ -73,7 +186,7 @@ form.inline{display:inline;margin:0}
 .topbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:8px;flex-wrap:wrap}
 .preview{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px;white-space:pre-wrap;font-size:13px}
 .bar{height:8px;background:var(--tint);border-radius:999px;overflow:hidden;border:1px solid var(--line)}
-.bar>span{display:block;height:100%;background:var(--charcoal);width:0%;transition:width .3s}
+.bar>span{display:block;height:100%;background:var(--accent);width:0%;transition:width .3s}
 .hide{display:none}
 @media (max-width:640px){
   .wrap{padding:18px 16px 48px}
@@ -84,26 +197,38 @@ form.inline{display:inline;margin:0}
   .row>div{min-width:100%}
   button,.btn{font-size:14px;padding:11px 16px}
   button.sm{width:auto}
-}
-`;
+}`;
 
-/** The Whispyr mark + wordmark. `href` defaults to the inbox; `sub` is the suffix word. */
-export function brandLogo(opts: { href?: string; sub?: string } = {}): string {
+/** The full stylesheet for a brand: its font faces, its `:root` palette, and the shared component rules. */
+export function brandCss(b: BrandConfig): string {
+	return `${b.fontFaceCss}
+:root{${b.rootVars}
+  --font:${b.fontFamily};
+  color-scheme:light;
+}
+${COMPONENT_CSS}`;
+}
+
+/** The brand mark + wordmark. `href` defaults to the inbox; `sub` is the suffix word. */
+export function brandLogo(
+	b: BrandConfig,
+	opts: { href?: string; sub?: string } = {},
+): string {
 	const href = opts.href ?? "/";
 	const sub = opts.sub ?? "Mail";
-	return `<a class="brand" href="${href}" aria-label="Whispyr ${sub}">
-  <img src="/whispyr-mark.svg" alt="" width="22" height="36">
-  <b>Whispyr${sub ? ` <span>${sub}</span>` : ""}</b>
+	return `<a class="brand" href="${href}" aria-label="${b.name} ${sub}">
+  <img src="${b.mark}" alt="" width="${b.markWidth}" height="${b.markHeight}">
+  <b>${b.name}${sub ? ` <span>${sub}</span>` : ""}</b>
 </a>`;
 }
 
-/** Full HTML document with the Whispyr brand styles applied. */
-export function pageShell(title: string, body: string): string {
+/** Full HTML document with the brand's styles applied. */
+export function pageShell(b: BrandConfig, title: string, body: string): string {
 	return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<meta name="theme-color" content="#faf8f5">
+<meta name="theme-color" content="${b.themeColor}">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="preload" href="/fonts/Kamerik105-Book.woff2" as="font" type="font/woff2" crossorigin>
-<title>${title}</title><style>${BRAND_CSS}</style></head><body>${body}</body></html>`;
+<link rel="preload" href="${b.preloadFont}" as="font" type="font/woff2" crossorigin>
+<title>${title}</title><style>${brandCss(b)}</style></head><body>${body}</body></html>`;
 }
