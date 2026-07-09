@@ -25,7 +25,7 @@
 		"dev:whispyr": "CLOUDFLARE_ENV=whispyr react-router dev",
 		"dev": "npm run dev:whispyr",
 		"preview:whispyr": "npm run build:whispyr && vite preview",
-		"test": "node --experimental-strip-types --test 'workers/**/*.test.ts'",
+		"test": "node --experimental-strip-types --test 'workers/**/*.test.ts' 'app/**/*.test.ts'",
 		"typecheck": "npm run cf-typegen && react-router typegen && tsc -b"
 	},
 	"dependencies": {

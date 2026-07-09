@@ -102,3 +102,16 @@ export const SendEmailResponseSchema = z.object({
 	id: z.string(),
 	status: z.string(),
 });
+
+/**
+ * A device push subscription as the browser's PushManager serialises it
+ * (`subscription.toJSON()`). userAgent + deviceLabel are derived server-side
+ * from the request, never trusted from the client (WISER-240).
+ */
+export const PushSubscriptionSchema = z.object({
+	endpoint: z.string().url(),
+	keys: z.object({
+		p256dh: z.string().min(1),
+		auth: z.string().min(1),
+	}),
+});

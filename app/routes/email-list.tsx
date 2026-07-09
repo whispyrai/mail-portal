@@ -18,7 +18,7 @@ import {
 } from "@phosphor-icons/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router";
+import { useParams, useSearchParams } from "react-router";
 import { Folders } from "shared/folders";
 import { formatListDate } from "shared/dates";
 import MailboxSplitView from "~/components/MailboxSplitView";
@@ -152,6 +152,7 @@ export default function EmailListRoute() {
 		startCompose,
 	} = useUIStore();
 	const [page, setPage] = useState(1);
+	const [searchParams, setSearchParams] = useSearchParams();
 
 	const queryClient = useQueryClient();
 	const updateEmail = useUpdateEmail();
@@ -197,6 +198,23 @@ export default function EmailListRoute() {
 			setPage(1);
 		}
 	}, [mailboxId, folder, closePanel]);
+
+	// Deep-link from a push notification tap: `?email=<id>` opens that email,
+	// then the param is consumed so closing the panel doesn't reopen it (WISER-240).
+	// Runs after the folder-change effect above, so its selection wins on mount.
+	useEffect(() => {
+		const emailId = searchParams.get("email");
+		if (!emailId) return;
+		selectEmail(emailId);
+		setSearchParams(
+			(prev) => {
+				const next = new URLSearchParams(prev);
+				next.delete("email");
+				return next;
+			},
+			{ replace: true },
+		);
+	}, [searchParams, selectEmail, setSearchParams]);
 
 	const toggleStar = (e: React.MouseEvent, email: Email) => {
 		e.preventDefault();

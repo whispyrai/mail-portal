@@ -11,3 +11,11 @@ JWT_SECRET=your-long-random-jwt-secret
 
 # Email allowed to self-provision the first ADMIN account on first login.
 ADMIN_BOOTSTRAP_EMAIL=hesham@whispyrcrm.com
+
+# Web Push VAPID keypair (WISER-240). Generate once with:
+#   npx web-push generate-vapid-keys
+# VAPID_SUBJECT is a plain var in wrangler.jsonc; the keypair is secret.
+# In prod: wrangler secret put VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY --env <brand>.
+# Leave blank to run without push (mail still receives).
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=

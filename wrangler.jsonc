@@ -34,7 +34,11 @@
 				"DOMAINS": "whispyrcrm.com",
 				"EMAIL_ADDRESSES": [],
 				"AWS_REGION": "eu-west-2",
-				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+					// Web Push contact (RFC 8292 VAPID subject) for WISER-240. The keypair
+					// is secret (`wrangler secret put VAPID_PUBLIC_KEY --env whispyr` +
+					// `VAPID_PRIVATE_KEY`). Until set, push self-disables.
+					"VAPID_SUBJECT": "mailto:hesham@whispyrcrm.com"
 			},
 			// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing
 			// page (whispyrcrm.com) is a separate static site on Vercel (D-68).

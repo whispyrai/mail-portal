@@ -29,7 +29,9 @@ import {
 	extractThreadToken,
 	listMailboxes,
 } from "./lib/email-helpers";
-import { SendEmailRequestSchema, AttachmentRefSchema } from "./lib/schemas";
+import { SendEmailRequestSchema, AttachmentRefSchema, PushSubscriptionSchema } from "./lib/schemas";
+import { buildDeviceLabel } from "./lib/push/deviceLabel";
+import { buildPushPayload } from "./lib/push/payload";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { draftReplyForEmail, draftNewEmail } from "./lib/agent-context";
 import { systemPromptFor } from "./lib/prompts";
@@ -108,7 +110,38 @@ app.get("/api/v1/config", (c) => {
 	const domainsRaw = c.env.DOMAINS || "";
 	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
 	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
-	return c.json({ domains, emailAddresses });
+	// The VAPID public key drives the client's push subscribe + shows/hides the
+	// enable-notifications UI. null when push isn't configured for this env.
+	return c.json({ domains, emailAddresses, vapidPublicKey: c.env.VAPID_PUBLIC_KEY || null });
+});
+
+// PWA manifest, brand-parameterized (WISER-240). Public (no session): the
+// browser fetches it uncredentialed. Ends in a file extension so the auth gate
+// treats it as a static path.
+app.get("/manifest.webmanifest", (c: AppContext) => {
+	const b = resolveBrand(c.env.BRAND);
+	const manifest = {
+		id: "/",
+		name: b.appName,
+		short_name: b.name,
+		description: `${b.name} team mail`,
+		start_url: "/",
+		scope: "/",
+		display: "standalone",
+		theme_color: b.themeColor,
+		background_color: b.themeColor,
+		// Brand-specific PWA icons are a go-live asset (WISER-242); the shared
+		// 192/512 marks serve both brands until then.
+		icons: [
+			{ src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+			{ src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "maskable" },
+			{ src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+			{ src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+		],
+	};
+	return new Response(JSON.stringify(manifest), {
+		headers: { "Content-Type": "application/manifest+json" },
+	});
 });
 
 // Who am I — drives the SPA header (account, admin link, sign out).
@@ -447,6 +480,39 @@ app.delete("/api/v1/mailboxes/:mailboxId/folders/:id", async (c: AppContext) => 
 	return ok ? c.body(null, 204) : c.json({ error: "Folder not found or cannot be deleted" }, 400);
 });
 
+// -- Push subscriptions (WISER-240) ---------------------------------
+// Per-device Web Push subscriptions, scoped to the mailbox by requireMailbox
+// (a rep manages only their own; an admin any — the natural home for role
+// inboxes like hello@/contact@). The list never exposes endpoint or keys.
+
+app.post("/api/v1/mailboxes/:mailboxId/push-subscriptions", async (c: AppContext) => {
+	let body: z.infer<typeof PushSubscriptionSchema>;
+	try {
+		body = PushSubscriptionSchema.parse(await c.req.json());
+	} catch (e) {
+		return c.json({ error: `Invalid subscription: ${(e as Error).message}` }, 400);
+	}
+	// Derive the device label server-side from the request UA — never trusted from the body.
+	const userAgent = c.req.header("user-agent") ?? null;
+	const result = await c.var.mailboxStub.upsertPushSubscription({
+		endpoint: body.endpoint,
+		p256dh: body.keys.p256dh,
+		auth: body.keys.auth,
+		userAgent,
+		deviceLabel: buildDeviceLabel(userAgent),
+	});
+	return c.json(result, 201);
+});
+
+app.get("/api/v1/mailboxes/:mailboxId/push-subscriptions", async (c: AppContext) => {
+	return c.json({ subscriptions: await c.var.mailboxStub.listPushSubscriptionDevices() });
+});
+
+app.delete("/api/v1/mailboxes/:mailboxId/push-subscriptions/:id", async (c: AppContext) => {
+	const ok = await c.var.mailboxStub.deletePushSubscription(c.req.param("id")!);
+	return ok ? c.body(null, 204) : c.json({ error: "Not found" }, 404);
+});
+
 // -- Search ---------------------------------------------------------
 
 app.get("/api/v1/mailboxes/:mailboxId/search", async (c: AppContext) => {
@@ -588,6 +654,30 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
+
+	// Fire one background OS push to the mailbox's enabled devices (WISER-240),
+	// after the mail is durably stored. Best-effort: firePush never throws and
+	// no-ops when push isn't configured, so mail receipt is never affected.
+	// Notification content is decision B — sender, subject, and a body snippet.
+	ctx.waitUntil(
+		stub
+			.firePush(
+				buildPushPayload({
+					emailId: messageId,
+					mailboxId,
+					fromName: parsedEmail.from?.name || null,
+					fromAddress: parsedEmail.from?.address || "",
+					subject: parsedEmail.subject || "",
+					body: parsedEmail.text || parsedEmail.html || "",
+					// Brand-specific PWA icons are a go-live asset (WISER-242); the
+					// shared marks serve both brands until then.
+					icon: "/icon-192.png",
+					badge: "/favicon-32.png",
+				}),
+			)
+			.catch((e) => console.error("Push dispatch failed:", (e as Error).message)),
+	);
+
 	// Auto-draft-on-inbound is intentionally disabled (locked-decisions D-40).
 	// The AI assistant is manual-only: side-panel chat + "Draft reply" button.
 }

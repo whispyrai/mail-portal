@@ -168,4 +168,24 @@ export const mailboxMigrations: Migration[] = [
             CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
         `,
 	},
+	{
+		// Web Push per-device subscriptions for this mailbox (WISER-240). One row
+		// per device: `endpoint` is the browser-minted capability URL (unique);
+		// `id` is a stable client-facing handle for the device list + removal.
+		// No txn() wrapper — a single idempotent CREATE ... IF NOT EXISTS (see
+		// migration 8 for why DO runtime forbids SQL-level transactions).
+		name: "9_add_push_subscriptions",
+		sql: `
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL UNIQUE,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                user_agent TEXT,
+                device_label TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `,
+	},
 ];

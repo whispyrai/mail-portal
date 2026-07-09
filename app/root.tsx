@@ -24,6 +24,7 @@ import {
 } from "react-router";
 import { ApiError } from "~/services/api";
 import { useBrand } from "~/hooks/useBrand";
+import { ServiceWorkerRegistrar } from "~/components/pwa/ServiceWorkerRegistrar";
 import { resolveBrand } from "../workers/routes/brand";
 import { isQuizEnabled } from "../workers/lib/features";
 import type { Route } from "./+types/root";
@@ -42,6 +43,7 @@ export async function loader({ context }: Route.LoaderArgs) {
 		name: b.name,
 		appName: b.appName,
 		quizEnabled: isQuizEnabled(env.FEATURES, b.id),
+		themeColor: b.themeColor,
 	};
 }
 
@@ -96,11 +98,19 @@ const KumoLink = forwardRef<
 });
 
 export function Layout({ children }: { children: React.ReactNode }) {
-	const { brand, appName } = useBrand();
+	const { brand, appName, themeColor } = useBrand();
 	return (
 		<html lang="en" data-mode="light" data-theme="kumo" data-brand={brand}>
 			<head>
 				<meta charSet="UTF-8" />
+				{/* PWA: installable + home-screen behaviour (WISER-240). */}
+				<link rel="manifest" href="/manifest.webmanifest" />
+				<meta name="theme-color" content={themeColor} />
+				<meta name="mobile-web-app-capable" content="yes" />
+				<meta name="apple-mobile-web-app-capable" content="yes" />
+				<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+				<meta name="apple-mobile-web-app-title" content={appName} />
+				<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 				<link
 					rel="icon"
 					type="image/svg+xml"
@@ -146,6 +156,7 @@ export default function App() {
 			<LinkProvider component={KumoLink}>
 				<TooltipProvider>
 					<Toasty>
+						<ServiceWorkerRegistrar />
 						<Outlet />
 					</Toasty>
 				</TooltipProvider>

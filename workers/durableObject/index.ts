@@ -19,6 +19,10 @@ import {
 } from "../lib/email-helpers";
 import { arrayBufferToBase64, uploadKey } from "../lib/attachments";
 import { validateAttachmentSet } from "../../shared/attachments";
+import { vapidConfig } from "../lib/push/transport";
+import { sendWebPush } from "../lib/push/send";
+import { fanOutPush } from "../lib/push/fanout";
+import type { PushPayload } from "../lib/push/types";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -1150,6 +1154,123 @@ export class MailboxDO extends DurableObject<Env> {
 		if (queue.length > 0) {
 			const delay = BULK_MIN_DELAY_MS + Math.floor(Math.random() * BULK_MAX_JITTER_MS);
 			await this.ctx.storage.setAlarm(Date.now() + delay);
+		}
+	}
+
+	// ── Push subscriptions (WISER-240) ─────────────────────────────
+	// Per-device rows for this mailbox. `firePush` fans a payload out to every
+	// enabled device best-effort and prunes the ones the push service reports
+	// gone. Storage + send + prune are co-located here because the subscriptions
+	// are local to the DO (the CRM keys by user; the portal keys by mailbox).
+
+	async upsertPushSubscription(input: {
+		endpoint: string;
+		p256dh: string;
+		auth: string;
+		userAgent: string | null;
+		deviceLabel: string;
+	}): Promise<{ id: string; deviceLabel: string }> {
+		// Re-subscribing the same device yields the same endpoint → refresh its
+		// keys + last_seen without minting a new row. device_label / user_agent
+		// stay create-only (the first registration's values stick).
+		const id = crypto.randomUUID();
+		this.ctx.storage.sql.exec(
+			`INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, user_agent, device_label)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(endpoint) DO UPDATE SET
+			   p256dh = excluded.p256dh,
+			   auth = excluded.auth,
+			   last_seen_at = datetime('now')`,
+			id,
+			input.endpoint,
+			input.p256dh,
+			input.auth,
+			input.userAgent,
+			input.deviceLabel,
+		);
+		const row = [
+			...this.ctx.storage.sql.exec(
+				`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`,
+				input.endpoint,
+			),
+		][0] as { id: string; device_label: string };
+		return { id: row.id, deviceLabel: row.device_label };
+	}
+
+	async listPushSubscriptionDevices(): Promise<
+		Array<{
+			id: string;
+			deviceLabel: string | null;
+			userAgent: string | null;
+			createdAt: string;
+			lastSeenAt: string;
+		}>
+	> {
+		// Never returns endpoint / keys — the device list is UX metadata only.
+		return [
+			...this.ctx.storage.sql.exec(
+				`SELECT id, device_label, user_agent, created_at, last_seen_at
+				 FROM push_subscriptions ORDER BY last_seen_at DESC`,
+			),
+		].map((r) => {
+			const row = r as {
+				id: string;
+				device_label: string | null;
+				user_agent: string | null;
+				created_at: string;
+				last_seen_at: string;
+			};
+			return {
+				id: row.id,
+				deviceLabel: row.device_label,
+				userAgent: row.user_agent,
+				createdAt: row.created_at,
+				lastSeenAt: row.last_seen_at,
+			};
+		});
+	}
+
+	async deletePushSubscription(id: string): Promise<boolean> {
+		const existing = [
+			...this.ctx.storage.sql.exec(`SELECT id FROM push_subscriptions WHERE id = ?`, id),
+		];
+		if (existing.length === 0) return false;
+		this.ctx.storage.sql.exec(`DELETE FROM push_subscriptions WHERE id = ?`, id);
+		return true;
+	}
+
+	/**
+	 * Fan a push out to every device on this mailbox, prune dead endpoints, and
+	 * touch the delivered ones. Best-effort and never throws — a push failure or
+	 * missing VAPID config must never break mail receipt (the caller fires this
+	 * from `receiveEmail` after the mail is already stored).
+	 */
+	async firePush(payload: PushPayload): Promise<void> {
+		const vapid = vapidConfig(this.env);
+		if (!vapid) return; // push not configured for this env — no-op
+
+		const rows = [
+			...this.ctx.storage.sql.exec(`SELECT endpoint, p256dh, auth FROM push_subscriptions`),
+		];
+		if (rows.length === 0) return;
+
+		const subs = rows.map((r) => {
+			const row = r as { endpoint: string; p256dh: string; auth: string };
+			return { endpoint: row.endpoint, p256dh: row.p256dh, auth: row.auth };
+		});
+
+		const result = await fanOutPush(subs, JSON.stringify(payload), (sub, body) =>
+			sendWebPush(sub, body, vapid),
+		);
+
+		for (const endpoint of result.deadEndpoints) {
+			this.ctx.storage.sql.exec(`DELETE FROM push_subscriptions WHERE endpoint = ?`, endpoint);
+		}
+		for (const endpoint of result.deliveredEndpoints) {
+			this.ctx.storage.sql.exec(
+				`UPDATE push_subscriptions SET last_seen_at = datetime('now') WHERE endpoint = ?`,
+				endpoint,
+			);
 		}
 	}
 }
