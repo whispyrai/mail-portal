@@ -1,10 +1,10 @@
 {
-	"name": "agentic-inbox",
+	"name": "mail-portal",
 	"private": true,
 	"license": "Apache-2.0",
 	"type": "module",
 	"cloudflare": {
-		"label": "Agentic Inbox",
+		"label": "Mail Portal",
 		"products": [
 			"Workers",
 			"Durable Objects",
@@ -19,10 +19,12 @@
 	},
 	"scripts": {
 		"build": "react-router build",
-		"cf-typegen": "wrangler types",
-		"deploy": "npm run build && wrangler deploy",
-		"dev": "react-router dev",
-		"preview": "npm run build && vite preview",
+		"build:whispyr": "CLOUDFLARE_ENV=whispyr react-router build",
+		"cf-typegen": "wrangler types --env whispyr",
+		"deploy:whispyr": "npm run build:whispyr && wrangler deploy",
+		"dev:whispyr": "CLOUDFLARE_ENV=whispyr react-router dev",
+		"dev": "npm run dev:whispyr",
+		"preview:whispyr": "npm run build:whispyr && vite preview",
 		"typecheck": "npm run cf-typegen && react-router typegen && tsc -b"
 	},
 	"dependencies": {

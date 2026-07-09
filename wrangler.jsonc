@@ -1,6 +1,14 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "sales-mail-portal",
+	// Brand-neutral template. This top level is NEVER deployed directly — it
+	// declares only the inheritable build keys. Every brand is a named
+	// environment under `env.*` that fully declares its own Worker name,
+	// bindings, vars, and routes (Wrangler does not inherit those into named
+	// environments). Deploy a brand by baking its env at build time:
+	//   CLOUDFLARE_ENV=<brand> react-router build && wrangler deploy
+	// (the @cloudflare/vite-plugin reads CLOUDFLARE_ENV and resolves the env
+	// into the redirected build/server/wrangler.json that wrangler deploys).
+	"name": "mail-portal",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
 	"observability": {
@@ -9,84 +17,91 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
-	"vars": {
-		// DOMAINS: the email + session-cookie domain. Secrets (set via
-		// `wrangler secret put`): AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-		// JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
-		"DOMAINS": "whispyrcrm.com",
-		"EMAIL_ADDRESSES": [],
-		"AWS_REGION": "eu-west-2",
-		"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-	},
-	// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing page
-	// (whispyrcrm.com) is a separate static site on Vercel (locked-decisions D-68).
-	"routes": [
-		{
-			"pattern": "mail.whispyrcrm.com",
-			"custom_domain": true
-		}
-	],
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "sales_portal_users",
-			"database_id": "f322fd13-dc49-4390-888c-ff862ca05882",
-			"migrations_dir": "migrations"
-		}
-	],
-	"r2_buckets": [
-		{
-			"binding": "BUCKET",
-			"bucket_name": "sales-mail-portal",
-			"preview_bucket_name": "sales-mail-portal"
-		}
-	],
-	// Backs @cloudflare/workers-oauth-provider (OAuth grants, registered clients,
-	// access/refresh tokens) for the MCP connector. Created via
-	// `wrangler kv namespace create OAUTH_KV`.
-	"kv_namespaces": [
-		{
-			"binding": "OAUTH_KV",
-			"id": "cd541026bdf949d9ac63b3b5fdff4969"
-		}
-	],
-	"ai": {
-		"binding": "AI"
-	},
-	"durable_objects": {
-		"bindings": [
-			{
-				"name": "MAILBOX",
-				"class_name": "MailboxDO"
+	"env": {
+		// Whispyr Sales Mail Portal — the live production deploy. `name` is pinned
+		// to the existing Worker so `CLOUDFLARE_ENV=whispyr` redeploys onto it
+		// byte-identical (without the pin, a named env would deploy to a new
+		// Worker `mail-portal-whispyr`). All bindings/IDs are the live resources,
+		// unchanged. Secrets (via `wrangler secret put --env whispyr`):
+		// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
+		"whispyr": {
+			"name": "sales-mail-portal",
+			"vars": {
+				"DOMAINS": "whispyrcrm.com",
+				"EMAIL_ADDRESSES": [],
+				"AWS_REGION": "eu-west-2",
+				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 			},
-			{
-				"name": "EMAIL_AGENT",
-				"class_name": "EmailAgent"
+			// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing
+			// page (whispyrcrm.com) is a separate static site on Vercel (D-68).
+			"routes": [
+				{
+					"pattern": "mail.whispyrcrm.com",
+					"custom_domain": true
+				}
+			],
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "sales_portal_users",
+					"database_id": "f322fd13-dc49-4390-888c-ff862ca05882",
+					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "sales-mail-portal",
+					"preview_bucket_name": "sales-mail-portal"
+				}
+			],
+			// Backs @cloudflare/workers-oauth-provider (OAuth grants, registered
+			// clients, access/refresh tokens) for the MCP connector.
+			"kv_namespaces": [
+				{
+					"binding": "OAUTH_KV",
+					"id": "cd541026bdf949d9ac63b3b5fdff4969"
+				}
+			],
+			"ai": {
+				"binding": "AI"
 			},
-			{
-				"name": "EMAIL_MCP",
-				"class_name": "EmailMCP"
-			}
-		]
-	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": [
-				"MailboxDO"
-			]
-		},
-		{
-			"tag": "v2",
-			"new_sqlite_classes": [
-				"EmailAgent"
-			]
-		},
-		{
-			"tag": "v3",
-			"new_sqlite_classes": [
-				"EmailMCP"
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "MAILBOX",
+						"class_name": "MailboxDO"
+					},
+					{
+						"name": "EMAIL_AGENT",
+						"class_name": "EmailAgent"
+					},
+					{
+						"name": "EMAIL_MCP",
+						"class_name": "EmailMCP"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"MailboxDO"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"EmailAgent"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"EmailMCP"
+					]
+				}
 			]
 		}
-	]
+	}
 }

@@ -1,9 +1,13 @@
 <div align="center">
-  <h1>Whispyr Sales Mail Portal</h1>
-  <p><em>Self-hosted email for the Whispyr sales team — send/receive, bulk send, and a manual AI assistant, on Cloudflare Workers + AWS SES.</em></p>
+  <h1>Mail Portal</h1>
+  <p><em>Self-hosted team email — send/receive, bulk send, and a manual AI assistant, on Cloudflare Workers + AWS SES. One brand-parameterized codebase, one isolated deploy per brand.</em></p>
 </div>
 
-A fork of [cloudflare/agentic-inbox](https://github.com/cloudflare/agentic-inbox) (Apache 2.0), adapted for the Whispyr sales team. Reps log in with email + password, send and receive from `firstname@whispyrcrm.com`, do light bulk send (mail merge), and use a manually-invoked AI assistant. Full design + decisions live in the second brain: `~/Documents/hesham-os/whispyr-sales/initiatives/sales-mail-portal/`.
+A fork of [cloudflare/agentic-inbox](https://github.com/cloudflare/agentic-inbox) (Apache 2.0). Users log in with email + password, send and receive from `firstname@<brand-domain>`, do light bulk send (mail merge), and use a manually-invoked AI assistant.
+
+This is a **shared, brand-parameterized platform**: source is shared, but each brand deploys as its own isolated Cloudflare Worker (own D1, Durable Objects, R2, KV, SES identity, secrets, and domain) via a named Wrangler environment. Brands are selected at build time with `CLOUDFLARE_ENV` — e.g. `npm run deploy:whispyr`. Whispyr (`mail.whispyrcrm.com`) is live; Wiser is being added.
+
+Design + decisions live in the second brain: the shared platform in `~/Documents/hesham-os/wiserchat/initiatives/team-mail-portal/`, Whispyr history in `~/Documents/hesham-os/whispyr-sales/initiatives/sales-mail-portal/`.
 
 ## What changed from upstream
 
@@ -32,9 +36,9 @@ npm run dev                      # Cloudflare Access is bypassed in dev; auth ga
 
 `npm run typecheck` and `npm run build` should both pass before deploying.
 
-## Deploy (production runbook)
+## Deploy (production runbook — Whispyr environment)
 
-Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS SES production account in `eu-west-2`.
+Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, …), deployed by baking the env at build time. The steps below are the Whispyr environment; a new brand repeats them against its own resources under a new `env.<brand>` block. Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS SES production account in `eu-west-2`.
 
 1. **D1 database**
 
@@ -62,10 +66,10 @@ Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS 
    ```
    `AWS_REGION` and `DOMAINS` are plain vars already set in `wrangler.jsonc`.
 
-4. **Deploy** — provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `wrangler.jsonc`):
+4. **Deploy** — provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `env.whispyr`). `CLOUDFLARE_ENV=whispyr` is baked in by the script, so the build resolves the `env.whispyr` block and the deploy lands on the `sales-mail-portal` Worker:
 
    ```bash
-   npm run deploy
+   npm run deploy:whispyr
    ```
 
 5. **Inbound — Cloudflare Email Routing** (dashboard → `whispyrcrm.com` → Email Routing): enable it (accept the MX records), then add a **catch-all** rule that delivers to this Worker.
