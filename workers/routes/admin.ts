@@ -7,7 +7,10 @@
 // Worker-rendered HTML (no React) — locked-decisions D-23, D-62, D-64.
 
 import { Hono } from "hono";
+import PostalMime from "postal-mime";
 import { USER_ROLES, type UserRole } from "../db/users-schema";
+import { storeParsedEmail, MAX_EMAIL_SIZE } from "../index";
+import { mapZohoFolder, normalizeEmailDate, deriveImportId } from "../lib/import/parse";
 import {
 	listUsers,
 	getUserById,
@@ -199,6 +202,60 @@ adminApp.post("/users/:id/mcp-token", async (c) => {
     <a href="/admin/users">← Back to users</a>
   </div>`),
 	);
+});
+
+// ── One-time Zoho mail importer (WISER-241) ─────────────────────────
+//
+// POST /admin/import/:mailboxId?folder=<zohoFolder> with a raw RFC822 .eml body.
+// ADMIN-only (inherited guard). Feeds historical mail through the SAME store path
+// as live receipt (storeParsedEmail), but preserves the original date, routes the
+// original folder (Trash/Spam dropped), and marks history read — and never fires
+// push. Idempotent: the internal id is derived from the message, so re-running
+// skips anything already imported (R2 keys are keyed on that id too). Removable
+// after the migration.
+adminApp.post("/import/:mailboxId", async (c) => {
+	const mailboxId = decodeURIComponent(c.req.param("mailboxId")).toLowerCase();
+	const sourceFolder = c.req.query("folder");
+	if (!sourceFolder) return c.json({ error: "folder query param is required" }, 400);
+
+	// Require a pre-provisioned mailbox — the importer never creates one (role
+	// inboxes are admin-provisioned via /admin/users before import).
+	if (!(await c.env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		return c.json({ error: "Mailbox not found" }, 404);
+	}
+
+	const folder = mapZohoFolder(sourceFolder);
+	if (!folder) {
+		return c.json({ status: "skipped", reason: "excluded-folder", folder: sourceFolder }, 200);
+	}
+
+	const raw = await c.req.arrayBuffer();
+	if (raw.byteLength === 0) return c.json({ error: "empty message body" }, 400);
+	if (raw.byteLength > MAX_EMAIL_SIZE) return c.json({ error: "message exceeds size limit" }, 413);
+
+	const parsed = await new PostalMime().parse(raw);
+	const id = await deriveImportId({
+		messageId: parsed.messageId,
+		from: parsed.from?.address,
+		date: parsed.date,
+		subject: parsed.subject,
+	});
+
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+
+	// Idempotent re-run: skip anything already imported under this stable id.
+	if (await stub.getEmail(id)) {
+		return c.json({ status: "skipped", reason: "duplicate", id, folder }, 200);
+	}
+
+	await storeParsedEmail(c.env, stub, parsed, {
+		folder,
+		date: normalizeEmailDate(parsed.date),
+		messageId: id,
+		read: true, // imported history is already-seen — lands read, no unread wall
+	});
+
+	return c.json({ status: "imported", id, folder }, 201);
 });
 
 export { adminApp };

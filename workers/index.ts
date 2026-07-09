@@ -577,7 +577,7 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 
 // -- Receive inbound email ------------------------------------------
 
-const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
+export const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
 async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	if (streamSize > MAX_EMAIL_SIZE) throw new Error(`Email too large: ${streamSize} bytes exceeds ${MAX_EMAIL_SIZE} byte limit`);
@@ -595,6 +595,67 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
+type ParsedEmail = Awaited<ReturnType<InstanceType<typeof PostalMime>["parse"]>>;
+type MailboxStub = ReturnType<Env["MAILBOX"]["get"]>;
+
+const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
+
+// Shared parse-and-store path for both live inbound receipt and the one-time
+// Zoho importer (WISER-241). Streams attachments to R2, resolves the thread
+// (thread-token → References → In-Reply-To → subject fallback), and inserts via
+// the mailbox DO. The caller owns the folder, stored date, internal id, and read
+// flag: live mail lands unread in INBOX at receive-time, while imported history
+// lands read in its original folder with its original date. Push is NOT fired
+// here — only live receipt notifies (see receiveEmail).
+async function storeParsedEmail(
+	env: Env,
+	stub: MailboxStub,
+	parsed: ParsedEmail,
+	opts: { folder: string; date: string; messageId: string; read?: boolean },
+): Promise<void> {
+	const { folder, date, messageId, read } = opts;
+
+	const allRecipients = (parsed.to || []).map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const ccRecipients = (parsed.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+	const bccRecipients = (parsed.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+
+	const attachmentData: StoredAttachment[] = [];
+	if (parsed.attachments) {
+		for (const att of parsed.attachments) {
+			const attId = crypto.randomUUID();
+			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
+			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
+				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
+				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
+		}
+	}
+
+	const inReplyTo = parsed.inReplyTo ? extractMsgId(parsed.inReplyTo) : null;
+	const emailReferences = parsed.references ? parsed.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
+	// Our app-controlled thread token (in References) is the most reliable match:
+	// SES rewrites Message-ID but not References, so replies echo it back to us.
+	const tokenThreadId = extractThreadToken(emailReferences, inReplyTo);
+	let threadId = tokenThreadId || emailReferences[0] || inReplyTo || messageId;
+
+	if (!tokenThreadId && !inReplyTo && emailReferences.length === 0) {
+		const subjectThread = await (stub as any).findThreadBySubject(parsed.subject || "", parsed.from?.address || undefined);
+		if (subjectThread) threadId = subjectThread;
+	}
+
+	const originalMessageId = parsed.messageId ? extractMsgId(parsed.messageId) : null;
+
+	await stub.createEmail(folder, {
+		id: messageId, subject: parsed.subject || "",
+		sender: (parsed.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
+		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
+		date, read,
+		body: parsed.html || parsed.text || "",
+		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
+		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsed.headers),
+	}, attachmentData);
+}
+
 async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
@@ -603,8 +664,6 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
 	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
-	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
-	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
 	let mailboxId: string | undefined;
 	if (allowedAddresses.length > 0) {
@@ -618,42 +677,14 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
-	const attachmentData: StoredAttachment[] = [];
-	if (parsedEmail.attachments) {
-		for (const att of parsedEmail.attachments) {
-			const attId = crypto.randomUUID();
-			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
-			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
-			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
-				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
-				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
-		}
-	}
-
-	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
-	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
-	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
-	// Our app-controlled thread token (in References) is the most reliable match:
-	// SES rewrites Message-ID but not References, so replies echo it back to us.
-	const tokenThreadId = extractThreadToken(emailReferences, inReplyTo);
-	let threadId = tokenThreadId || emailReferences[0] || inReplyTo || messageId;
-
-	if (!tokenThreadId && !inReplyTo && emailReferences.length === 0) {
-		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
-		if (subjectThread) threadId = subjectThread;
-	}
-
-	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
-
-	await stub.createEmail(Folders.INBOX, {
-		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
-		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
-		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
-		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
-	}, attachmentData);
+	// Live inbound: folder is always INBOX, stored date is receive time, unread.
+	// (The importer supplies the original folder/date and marks history read.)
+	await storeParsedEmail(env, stub, parsedEmail, {
+		folder: Folders.INBOX,
+		date: new Date().toISOString(),
+		messageId,
+		read: false,
+	});
 
 	// Fire one background OS push to the mailbox's enabled devices (WISER-240),
 	// after the mail is durably stored. Best-effort: firePush never throws and
@@ -682,4 +713,4 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	// The AI assistant is manual-only: side-panel chat + "Draft reply" button.
 }
 
-export { app, receiveEmail };
+export { app, receiveEmail, storeParsedEmail };
