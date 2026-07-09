@@ -13,7 +13,8 @@ import {
 	stripHtmlToText,
 	textToHtml,
 } from "./email-helpers";
-import { WHISPYR_SYSTEM_PROMPT } from "./whispyr-prompt";
+import { systemPromptFor } from "./prompts";
+import { resolveBrand } from "../routes/brand";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 
@@ -44,7 +45,7 @@ export async function getMailboxSystemPrompt(
 	} catch {
 		// Fall through to the default.
 	}
-	return WHISPYR_SYSTEM_PROMPT;
+	return systemPromptFor(resolveBrand(env.BRAND).id);
 }
 
 /**
@@ -132,7 +133,7 @@ export async function draftReplyForEmail(
 	const messages = [
 		{
 			role: "system",
-			content: `${systemPrompt}\n\nYou are drafting a reply on behalf of the rep (${mailboxId}). Output ONLY the plain-text body of the reply — no subject line, no "To:" line, no commentary, and do NOT include the quoted original message.\n\nStructure the reply as a proper email:\n- Open with a natural greeting using the sender's first name (e.g. "Hi Ahmed,")\n- Write the reply in clear, well-spaced paragraphs\n- Close with a professional sign-off (e.g. "Best regards,") on its own line, followed by the rep's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
+			content: `${systemPrompt}\n\nYou are drafting a reply on behalf of the mailbox owner (${mailboxId}). Output ONLY the plain-text body of the reply — no subject line, no "To:" line, no commentary, and do NOT include the quoted original message.\n\nStructure the reply as a proper email:\n- Open with a natural greeting using the sender's first name (e.g. "Hi Ahmed,")\n- Write the reply in clear, well-spaced paragraphs\n- Close with a professional sign-off (e.g. "Best regards,") on its own line, followed by the mailbox owner's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
 		},
 		{
 			role: "user",
@@ -183,7 +184,7 @@ export async function draftNewEmail(
 	const messages = [
 		{
 			role: "system",
-			content: `${systemPrompt}\n\nYou are composing a brand-new outbound email on behalf of the rep whose mailbox is ${mailboxId}.\n\nOutput your response in exactly this format — nothing else:\nSUBJECT: <concise subject line>\n\n<full email body>\n\nThe body MUST:\n- Open with a natural greeting (e.g. "Hi [Name]," or "Dear [Name],")\n- Contain clear, well-spaced paragraphs conveying the message\n- Close with a professional sign-off (e.g. "Best regards,") on its own line followed by the rep's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
+			content: `${systemPrompt}\n\nYou are composing a brand-new outbound email on behalf of the mailbox owner whose mailbox is ${mailboxId}.\n\nOutput your response in exactly this format — nothing else:\nSUBJECT: <concise subject line>\n\n<full email body>\n\nThe body MUST:\n- Open with a natural greeting (e.g. "Hi [Name]," or "Dear [Name],")\n- Contain clear, well-spaced paragraphs conveying the message\n- Close with a professional sign-off (e.g. "Best regards,") on its own line followed by the mailbox owner's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
 		},
 		{
 			role: "user",

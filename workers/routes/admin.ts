@@ -24,7 +24,7 @@ import {
 	type SessionClaims,
 } from "../lib/auth";
 import { provisionMailbox } from "../lib/mailbox";
-import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
+import { systemPromptFor } from "../lib/prompts";
 import { escapeHtml } from "../lib/email-helpers";
 import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
 import { adminQuizApp } from "../quiz/admin-routes";
@@ -149,7 +149,7 @@ adminApp.post("/users", async (c) => {
 		mailboxAddress: email,
 	});
 	// Provision the mailbox and seed the Whispyr AI context (D-43).
-	await provisionMailbox(c.env, email, name, { agentSystemPrompt: WHISPYR_SYSTEM_PROMPT });
+	await provisionMailbox(c.env, email, name, { agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id) });
 
 	return c.redirect(`/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}).`)}`, 302);
 });

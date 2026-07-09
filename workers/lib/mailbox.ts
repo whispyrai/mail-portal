@@ -14,7 +14,8 @@ import { createMiddleware } from "hono/factory";
 import type { MailboxDO } from "../durableObject";
 import type { Env } from "../types";
 import type { SessionClaims } from "./auth";
-import { WHISPYR_SYSTEM_PROMPT } from "./whispyr-prompt";
+import { systemPromptFor } from "./prompts";
+import { resolveBrand } from "../routes/brand";
 
 export type MailboxContext = {
 	Bindings: Env;
@@ -76,7 +77,7 @@ export async function provisionMailbox(
 			forwarding: { enabled: false, email: "" },
 			signature: { enabled: false, text: "" },
 			autoReply: { enabled: false, subject: "", message: "" },
-			agentSystemPrompt: WHISPYR_SYSTEM_PROMPT,
+			agentSystemPrompt: systemPromptFor(resolveBrand(env.BRAND).id),
 		};
 		await env.BUCKET.put(key, JSON.stringify({ ...defaultSettings, ...settings }));
 	}

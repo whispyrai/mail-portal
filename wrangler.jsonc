@@ -28,6 +28,9 @@
 			"name": "sales-mail-portal",
 			"vars": {
 				"BRAND": "whispyr",
+				// Brand-specific modules enabled in this environment (WISER-239). The
+				// rep-quiz (workers/quiz) is a Whispyr-only module; Wiser omits it.
+				"FEATURES": ["quiz"],
 				"DOMAINS": "whispyrcrm.com",
 				"EMAIL_ADDRESSES": [],
 				"AWS_REGION": "eu-west-2",

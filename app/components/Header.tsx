@@ -7,6 +7,7 @@ import { ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIco
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useUIStore } from "~/hooks/useUIStore";
+import { useBrand } from "~/hooks/useBrand";
 
 export default function Header() {
 	const [searchQuery, setSearchQuery] = useState("");
@@ -16,6 +17,7 @@ export default function Header() {
 	const location = useLocation();
 	const [searchParams] = useSearchParams();
 	const { toggleSidebar, toggleAgentPanel, isAgentPanelOpen } = useUIStore();
+	const { quizEnabled } = useBrand();
 	const [me, setMe] = useState<{ email: string; role: string } | null>(null);
 
 	// Identify the signed-in user to show the admin link + sign-out (see /api/v1/me).
@@ -162,19 +164,24 @@ export default function Header() {
 						aria-label="Settings"
 					/>
 				</Tooltip>
-				<Tooltip content="Quizzes" side="bottom" asChild>
-					<Button
-						variant="ghost"
-						shape="square"
-						icon={<ExamIcon size={20} />}
-						onClick={() => {
-							// Worker-rendered pages (outside the SPA) — full-page nav. Admins land on
-							// the management console; everyone else on their quiz list.
-							window.location.href = me?.role === "ADMIN" ? "/admin/quizzes" : "/quizzes";
-						}}
-						aria-label="Quizzes"
-					/>
-				</Tooltip>
+				{/* Quizzes is a Whispyr-only module — hidden where FEATURES omits it, e.g.
+				    Wiser (WISER-239). quizEnabled is SSR'd via the root loader so the
+				    button never flashes on. The routes also 404 server-side. */}
+				{quizEnabled && (
+					<Tooltip content="Quizzes" side="bottom" asChild>
+						<Button
+							variant="ghost"
+							shape="square"
+							icon={<ExamIcon size={20} />}
+							onClick={() => {
+								// Worker-rendered pages (outside the SPA) — full-page nav. Admins land on
+								// the management console; everyone else on their quiz list.
+								window.location.href = me?.role === "ADMIN" ? "/admin/quizzes" : "/quizzes";
+							}}
+							aria-label="Quizzes"
+						/>
+					</Tooltip>
+				)}
 				<Tooltip content="Bulk send" side="bottom" asChild>
 					<Button
 						variant="ghost"

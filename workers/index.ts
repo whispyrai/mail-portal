@@ -32,7 +32,8 @@ import {
 import { SendEmailRequestSchema, AttachmentRefSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { draftReplyForEmail, draftNewEmail } from "./lib/agent-context";
-import { WHISPYR_SYSTEM_PROMPT } from "./lib/whispyr-prompt";
+import { systemPromptFor } from "./lib/prompts";
+import { resolveBrand } from "./routes/brand";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
@@ -149,7 +150,7 @@ app.post("/api/v1/mailboxes", async (c: AppContext) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" }, agentSystemPrompt: WHISPYR_SYSTEM_PROMPT };
+	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" }, agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id) };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));

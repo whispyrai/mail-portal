@@ -17,7 +17,7 @@ import {
 } from "../lib/auth";
 import { getUserByEmail, countUsers, createUser } from "../lib/users";
 import { provisionMailbox } from "../lib/mailbox";
-import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
+import { systemPromptFor } from "../lib/prompts";
 import { escapeHtml } from "../lib/email-helpers";
 import { safeAuthorizeReturnTo } from "../lib/auth";
 import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
@@ -112,7 +112,7 @@ export async function handleLogin(c: Ctx) {
 				mailboxAddress: email,
 			});
 			await provisionMailbox(c.env, email, email.split("@")[0], {
-				agentSystemPrompt: WHISPYR_SYSTEM_PROMPT,
+				agentSystemPrompt: systemPromptFor(brand.id),
 			});
 		}
 	}

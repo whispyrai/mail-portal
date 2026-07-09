@@ -7,8 +7,9 @@ import type { loader } from "~/root";
 
 // Whispyr display bits used when the root loader data is absent — during the
 // error boundary render, and as a defensive default. Same fail-safe brand as
-// resolveBrand's server-side default (WISER-238).
-const FALLBACK = { brand: "whispyr", name: "Whispyr", appName: "Whispyr Mail" } as const;
+// resolveBrand's server-side default (WISER-238). quizEnabled mirrors the
+// whispyr baseline so the fallback never hides a live feature (WISER-239).
+const FALLBACK = { brand: "whispyr", name: "Whispyr", appName: "Whispyr Mail", quizEnabled: true } as const;
 
 /** The active brand's display strings, SSR'd from BRAND via the root loader. */
 export function useBrand() {

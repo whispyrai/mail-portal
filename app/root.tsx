@@ -25,16 +25,24 @@ import {
 import { ApiError } from "~/services/api";
 import { useBrand } from "~/hooks/useBrand";
 import { resolveBrand } from "../workers/routes/brand";
+import { isQuizEnabled } from "../workers/lib/features";
 import type { Route } from "./+types/root";
 import "./index.css";
 
 // BRAND selects the active brand (WISER-238). Resolved server-side so the
 // <html data-brand> below is set before first paint — no flash of the wrong
 // palette. Mirrors the static data-mode="light". resolveBrand fails safe to
-// whispyr for an unset/unknown value.
+// whispyr for an unset/unknown value. quizEnabled is SSR'd the same way so the
+// Header's Quizzes button never flashes on before a brand that omits it (WISER-239).
 export async function loader({ context }: Route.LoaderArgs) {
-	const b = resolveBrand(context.cloudflare.env.BRAND);
-	return { brand: b.id, name: b.name, appName: b.appName };
+	const env = context.cloudflare.env;
+	const b = resolveBrand(env.BRAND);
+	return {
+		brand: b.id,
+		name: b.name,
+		appName: b.appName,
+		quizEnabled: isQuizEnabled(env.FEATURES, b.id),
+	};
 }
 
 function makeQueryClient() {
