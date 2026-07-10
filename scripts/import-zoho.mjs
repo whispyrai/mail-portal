@@ -7,11 +7,13 @@
 // idempotent (derives a stable id per message and skips duplicates).
 //
 // Usage:
+//   read -s IMPORT_PASSWORD; export IMPORT_PASSWORD
 //   node scripts/import-zoho.mjs \
 //     --base https://mail.wiserchat.ai \
-//     --email admin@wiserchat.ai --password '••••••••••••' \
+//     --email admin@wiserchat.ai \
 //     --mailbox hello@wiserchat.ai \
 //     --dir ./zoho-export/hello
+//   unset IMPORT_PASSWORD
 //
 // The export dir is expected to hold one subdirectory per Zoho folder
 // (Inbox/, Sent/, Archive/, Trash/, Spam/, …), each containing .eml files. The
@@ -23,25 +25,41 @@ import { readdir, readFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 
 function parseArgs(argv) {
+	const allowed = new Set(["base", "email", "mailbox", "dir"]);
 	const args = {};
 	for (let i = 0; i < argv.length; i += 2) {
-		const key = argv[i]?.replace(/^--/, "");
-		if (key) args[key] = argv[i + 1];
+		const flag = argv[i];
+		const key = flag?.startsWith("--") ? flag.slice(2) : "";
+		if (!key || !allowed.has(key) || argv[i + 1] === undefined) {
+			throw new Error(`Unexpected or incomplete argument: ${flag ?? "(missing)"}`);
+		}
+		args[key] = argv[i + 1];
 	}
 	return args;
 }
 
-const args = parseArgs(process.argv.slice(2));
-const required = ["base", "email", "password", "mailbox", "dir"];
+let args;
+try {
+	args = parseArgs(process.argv.slice(2));
+} catch (error) {
+	console.error(error instanceof Error ? error.message : "Invalid arguments");
+	process.exit(1);
+}
+const required = ["base", "email", "mailbox", "dir"];
 const missing = required.filter((k) => !args[k]);
 if (missing.length) {
 	console.error(`Missing required args: ${missing.map((m) => "--" + m).join(", ")}`);
 	process.exit(1);
 }
+const password = process.env.IMPORT_PASSWORD;
+if (!password) {
+	console.error("IMPORT_PASSWORD is required. Set it with a hidden shell prompt before running.");
+	process.exit(1);
+}
 const base = args.base.replace(/\/$/, "");
 
 async function login() {
-	const body = new URLSearchParams({ email: args.email, password: args.password });
+	const body = new URLSearchParams({ email: args.email, password });
 	const res = await fetch(`${base}/login`, {
 		method: "POST",
 		headers: { "content-type": "application/x-www-form-urlencoded" },

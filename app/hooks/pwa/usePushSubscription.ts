@@ -3,8 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { useState } from "react";
+import { decodeBase64Url } from "../../../shared/base64url";
 import { useAppConfig, useRegisterPushDevice } from "~/queries/push";
-import { urlBase64ToUint8Array } from "~/utils/pwa/urlBase64ToUint8Array";
 
 const SW_READY_TIMEOUT_MS = 10_000;
 
@@ -38,6 +38,8 @@ export function usePushSubscription(mailboxId: string | undefined) {
 
 	async function enable(): Promise<boolean> {
 		if (!canSubscribe || !vapidKey) return false;
+		const applicationServerKey = decodeBase64Url(vapidKey);
+		if (!applicationServerKey) return false;
 		setIsSubscribing(true);
 		try {
 			const permission = await Notification.requestPermission();
@@ -48,7 +50,7 @@ export function usePushSubscription(mailboxId: string | undefined) {
 
 			const subscription = await registration.pushManager.subscribe({
 				userVisibleOnly: true,
-				applicationServerKey: urlBase64ToUint8Array(vapidKey),
+				applicationServerKey,
 			});
 			const json = subscription.toJSON();
 			await register.mutateAsync({

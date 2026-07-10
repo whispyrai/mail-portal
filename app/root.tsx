@@ -42,6 +42,11 @@ export async function loader({ context }: Route.LoaderArgs) {
 		brand: b.id,
 		name: b.name,
 		appName: b.appName,
+		favicon: b.favicon,
+		appleTouchIcon: b.appleTouchIcon,
+		legacyFavicon: b.legacyFavicon,
+		legacyFaviconType: b.legacyFaviconType,
+		legacyFaviconSizes: b.legacyFaviconSizes,
 		quizEnabled: isQuizEnabled(env.FEATURES, b.id),
 		themeColor: b.themeColor,
 	};
@@ -98,7 +103,16 @@ const KumoLink = forwardRef<
 });
 
 export function Layout({ children }: { children: React.ReactNode }) {
-	const { brand, appName, themeColor } = useBrand();
+	const {
+		brand,
+		appName,
+		favicon,
+		appleTouchIcon,
+		legacyFavicon,
+		legacyFaviconType,
+		legacyFaviconSizes,
+		themeColor,
+	} = useBrand();
 	return (
 		<html lang="en" data-mode="light" data-theme="kumo" data-brand={brand}>
 			<head>
@@ -110,20 +124,17 @@ export function Layout({ children }: { children: React.ReactNode }) {
 				<meta name="apple-mobile-web-app-capable" content="yes" />
 				<meta name="apple-mobile-web-app-status-bar-style" content="default" />
 				<meta name="apple-mobile-web-app-title" content={appName} />
-				<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+				<link rel="apple-touch-icon" href={appleTouchIcon} />
 				<link
 					rel="icon"
 					type="image/svg+xml"
-					href={brand === "wiser" ? "/wiser-mark.svg" : "/favicon.svg"}
+					href={favicon}
 				/>
-				{/* ponytail: the .ico legacy fallback stays Whispyr's; a dedicated
-				    wiser .ico is a go-live asset (WISER-242). Modern browsers use
-				    the brand SVG above. */}
 				<link
 					rel="icon"
-					type="image/x-icon"
-					href="/favicon.ico"
-					sizes="48x48 32x32 16x16"
+					type={legacyFaviconType}
+					href={legacyFavicon}
+					sizes={legacyFaviconSizes}
 				/>
 				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 				<title>{appName}</title>

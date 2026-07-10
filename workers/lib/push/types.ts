@@ -7,24 +7,24 @@
 // swaps the send transport for the Worker runtime — see ./transport.ts.
 
 /** A stored per-device push subscription (one row in the mailbox DO). */
-export interface PushSubscription {
+export type PushSubscription = {
 	/** Opaque URL minted by the browser's push service — globally unique. */
 	endpoint: string;
 	/** ECDH public key (base64url) for aes128gcm payload encryption. */
 	p256dh: string;
 	/** Auth secret (base64url) for the same. */
 	auth: string;
-}
+};
 
 /** The JSON payload the service worker receives and renders (see public/sw.js). */
-export interface PushPayload {
+export type PushPayload = {
 	title: string;
 	body: string;
 	icon: string;
 	badge: string;
 	clickUrl: string;
 	data: { emailId: string; mailboxId: string };
-}
+};
 
 /**
  * Why a single-endpoint send failed. Mirrors the CRM's

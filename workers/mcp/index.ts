@@ -96,7 +96,7 @@ function mcpServerInfo(b: BrandConfig) {
 		// on the brand's prod host; PNG first (universally supported) then SVG fallback.
 		icons: [
 			{
-				src: `${b.mailOrigin}/icon-512.png`,
+				src: `${b.mailOrigin}${b.pwaIcon512}`,
 				mimeType: "image/png",
 				sizes: ["512x512"],
 			},

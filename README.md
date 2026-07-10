@@ -5,7 +5,7 @@
 
 A fork of [cloudflare/agentic-inbox](https://github.com/cloudflare/agentic-inbox) (Apache 2.0). Users log in with email + password, send and receive from `firstname@<brand-domain>`, do light bulk send (mail merge), and use a manually-invoked AI assistant.
 
-This is a **shared, brand-parameterized platform**: source is shared, but each brand deploys as its own isolated Cloudflare Worker (own D1, Durable Objects, R2, KV, SES identity, secrets, and domain) via a named Wrangler environment. Brands are selected at build time with `CLOUDFLARE_ENV` — e.g. `npm run deploy:whispyr`. Whispyr (`mail.whispyrcrm.com`) is live; Wiser is being added.
+This is a **shared, brand-parameterized platform**: source is shared, but each brand deploys as its own isolated Cloudflare Worker (own D1, Durable Objects, R2, KV, SES identity, secrets, and domain) via a named Wrangler environment. Brands are selected at build time with `CLOUDFLARE_ENV` - e.g. `npm run deploy:whispyr` or `npm run deploy:wiser`. Whispyr (`mail.whispyrcrm.com`) is live; Wiser (`mail.wiserchat.ai`) is isolated in `env.wiser` and follows the Wiser go-live runbook.
 
 Design + decisions live in the second brain: the shared platform in `~/Documents/hesham-os/wiserchat/initiatives/team-mail-portal/`, Whispyr history in `~/Documents/hesham-os/whispyr-sales/initiatives/sales-mail-portal/`.
 
@@ -30,11 +30,35 @@ Single Cloudflare Worker (Hono + React Router v7 SSR). Per-mailbox state in Dura
 
 ```bash
 npm install
-cp .dev.vars.example .dev.vars   # fill in AWS keys, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL
-npm run dev                      # Cloudflare Access is bypassed in dev; auth gate still runs
+cp .dev.vars.example .dev.vars.whispyr   # for Whispyr local dev
+cp .dev.vars.example .dev.vars.wiser     # for Wiser local dev
+npm run dev:whispyr                      # Cloudflare Access is bypassed in dev; auth gate still runs
+npm run dev:wiser                        # uses only .dev.vars.wiser, not the generic file
 ```
 
-`npm run typecheck` and `npm run build` should both pass before deploying.
+Do not use one generic `.dev.vars` for both brands. Wrangler loads `.dev.vars.<environment>` exclusively when it exists, which keeps local secrets isolated by brand. `npm run typecheck`, `npm run typecheck:wiser`, `npm run verify:env:whispyr`, and `npm run verify:env:wiser` should pass before deploying brand work.
+
+## One-time Zoho import
+
+The admin-only importer restores exported `.eml` history into a mailbox that has
+already been provisioned. It preserves dates, threads, folders, and attachments;
+Trash and Spam are excluded, and re-running the same export is safe.
+
+Keep the admin password out of command arguments. Capture it with a hidden shell
+prompt, export it only for the importer process, then remove it:
+
+```bash
+read -s IMPORT_PASSWORD
+export IMPORT_PASSWORD
+node scripts/import-zoho.mjs \
+  --base https://mail.wiserchat.ai \
+  --email hesham@wiserchat.ai \
+  --mailbox hello@wiserchat.ai \
+  --dir ./zoho-export/hello
+unset IMPORT_PASSWORD
+```
+
+Repeat for `contact@wiserchat.ai`. The driver exits non-zero if any message fails. The full Wiser migration/cutover order is in [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md).
 
 ## Deploy (production runbook — Whispyr environment)
 
@@ -81,6 +105,10 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, �
 7. **First admin** — visit `https://mail.whispyrcrm.com/login` and sign in with `ADMIN_BOOTSTRAP_EMAIL` + a password (≥12 chars). With zero users, this bootstraps the first `ADMIN` account and provisions its mailbox. Then create reps at `/admin/users`.
 
 8. **MCP (optional)** — in `/admin/users`, "Rotate MCP token" for a user, then point an MCP client at `https://mail.whispyrcrm.com/mcp` with header `Authorization: Bearer <token>`. An ADMIN token can read all mailboxes but sends only from the admin's address; an AGENT token is confined to their own mailbox.
+
+## Deploy (production runbook - Wiser environment)
+
+Wiser has its own named Wrangler environment, resources, secrets, SES identity, and DNS/routing sequence. Use [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md) for the exact approval-gated end-to-end launch checklist.
 
 ## License
 

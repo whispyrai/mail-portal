@@ -12,19 +12,33 @@
 // shared transport-agnostic code ported verbatim from the CRM.
 
 import { SignJWT, importJWK } from "jose";
+import { decodeBase64Url } from "../../../shared/base64url.ts";
 import type { Env } from "../../types";
 
 // crypto.subtle's BufferSource wants ArrayBuffer-backed views (not the wider
 // ArrayBufferLike). Pin every byte buffer we hand it to this.
 type Bytes = Uint8Array<ArrayBuffer>;
 
-export interface VapidConfig {
+export type VapidConfig = {
 	/** `mailto:` or `https:` contact, per RFC 8292. */
 	subject: string;
 	/** Base64url P-256 public key (also handed to the browser to subscribe). */
 	publicKey: string;
 	/** Base64url P-256 private scalar. Secret. */
 	privateKey: string;
+};
+
+type VapidEnvironment = Partial<
+	Pick<Env, "VAPID_SUBJECT" | "VAPID_PUBLIC_KEY" | "VAPID_PRIVATE_KEY">
+>;
+
+function isVapidSubject(value: string): boolean {
+	try {
+		const protocol = new URL(value).protocol;
+		return protocol === "mailto:" || protocol === "https:";
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -32,23 +46,30 @@ export interface VapidConfig {
  * a bonus channel: a portal env without VAPID keys (e.g. before secrets are
  * set) simply never sends push — it must never break mail receipt.
  */
-export function vapidConfig(env: Env): VapidConfig | null {
+export function vapidConfig(env: VapidEnvironment): VapidConfig | null {
 	const subject = env.VAPID_SUBJECT;
 	const publicKey = env.VAPID_PUBLIC_KEY;
 	const privateKey = env.VAPID_PRIVATE_KEY;
 	if (!subject || !publicKey || !privateKey) return null;
+	const publicBytes = decodeBase64Url(publicKey);
+	const privateBytes = decodeBase64Url(privateKey);
+	if (
+		!isVapidSubject(subject) ||
+		publicBytes?.byteLength !== 65 ||
+		publicBytes[0] !== 0x04 ||
+		privateBytes?.byteLength !== 32
+	) {
+		return null;
+	}
 	return { subject, publicKey, privateKey };
 }
 
 // ── base64url + byte helpers ───────────────────────────────────────
 
-function b64urlToBytes(s: string): Bytes {
-	const pad = "=".repeat((4 - (s.length % 4)) % 4);
-	const b64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
-	const raw = atob(b64);
-	const out = new Uint8Array(raw.length);
-	for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
-	return out;
+function requiredBase64Url(value: string, label: string): Bytes {
+	const bytes = decodeBase64Url(value);
+	if (!bytes) throw new TypeError(`${label} must be valid unpadded base64url`);
+	return bytes;
 }
 
 function bytesToB64url(bytes: Uint8Array): string {
@@ -82,16 +103,17 @@ async function hkdf(salt: Bytes, ikm: Bytes, info: Bytes, lengthBytes: number): 
 
 // ── RFC 8291 aes128gcm payload encryption ──────────────────────────
 
-export interface EncryptOptions {
+type EncryptOptions = {
 	/** Injectable for deterministic tests; random 16 bytes in production. */
 	salt?: Bytes;
 	/** Injectable ECDH keypair for deterministic tests. */
 	serverKeys?: CryptoKeyPair;
-}
+};
 
 /** aes128gcm content-coding header framing constants (RFC 8188). */
 const RECORD_SIZE = 4096;
 const KEY_ID_LENGTH = 65; // an uncompressed P-256 point
+const MAX_WEB_PUSH_PLAINTEXT_BYTES = 3_993;
 
 /**
  * Encrypt `plaintext` for a subscription's keys, returning the full
@@ -103,8 +125,15 @@ export async function encryptPayload(
 	auth: string,
 	opts: EncryptOptions = {},
 ): Promise<Bytes> {
-	const receiverPublic = b64urlToBytes(p256dh);
-	const authSecret = b64urlToBytes(auth);
+	const plaintextBytes = utf8(plaintext);
+	if (plaintextBytes.byteLength > MAX_WEB_PUSH_PLAINTEXT_BYTES) {
+		throw new RangeError(
+			`Web Push payload exceeds the ${MAX_WEB_PUSH_PLAINTEXT_BYTES} bytes maximum`,
+		);
+	}
+
+	const receiverPublic = requiredBase64Url(p256dh, "p256dh");
+	const authSecret = requiredBase64Url(auth, "auth");
 	const salt = opts.salt ?? crypto.getRandomValues(new Uint8Array(16));
 
 	const serverKeys =
@@ -133,7 +162,7 @@ export async function encryptPayload(
 
 	const cekKey = await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["encrypt"]);
 	// Single, last record: append the 0x02 padding delimiter, then seal.
-	const record = concatBytes(utf8(plaintext), new Uint8Array([0x02]));
+	const record = concatBytes(plaintextBytes, new Uint8Array([0x02]));
 	const ciphertext = new Uint8Array(
 		await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, tagLength: 128 }, cekKey, record),
 	);
@@ -152,7 +181,7 @@ export async function encryptPayload(
 
 /** Build the ES256 VAPID JWT for one push endpoint's origin (audience). */
 export async function buildVapidJwt(audience: string, vapid: VapidConfig): Promise<string> {
-	const pub = b64urlToBytes(vapid.publicKey); // 0x04 || x[32] || y[32]
+	const pub = requiredBase64Url(vapid.publicKey, "VAPID public key"); // 0x04 || x[32] || y[32]
 	const jwk = {
 		kty: "EC",
 		crv: "P-256",

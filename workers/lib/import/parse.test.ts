@@ -8,7 +8,12 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mapZohoFolder, normalizeEmailDate, deriveImportId } from "./parse.ts";
+import {
+	deriveImportId,
+	deriveImportThreadId,
+	mapZohoFolder,
+	normalizeEmailDate,
+} from "./parse.ts";
 
 // ── mapZohoFolder ──────────────────────────────────────────────────
 
@@ -72,7 +77,7 @@ test("deriveImportId differs for different Message-IDs", async () => {
 	assert.notEqual(a, b);
 });
 
-test("deriveImportId falls back to from|date|subject when no Message-ID", async () => {
+test("deriveImportId falls back to a stable message fingerprint when no Message-ID", async () => {
 	const parts = { from: "john@acme.com", date: "2026-04-15T15:42:00Z", subject: "Hi" };
 	const a = await deriveImportId(parts);
 	const b = await deriveImportId(parts);
@@ -81,4 +86,42 @@ test("deriveImportId falls back to from|date|subject when no Message-ID", async 
 
 	const c = await deriveImportId({ ...parts, subject: "Different" });
 	assert.notEqual(a, c); // subject participates in the fallback key
+});
+
+test("deriveImportId distinguishes same-header messages by their content", async () => {
+	const parts = {
+		from: "john@acme.com",
+		to: "hello@wiserchat.ai",
+		date: "2026-04-15T15:42:00Z",
+		subject: "Hi",
+	};
+	const first = await deriveImportId({ ...parts, content: "First message" });
+	const second = await deriveImportId({ ...parts, content: "Second message" });
+	assert.notEqual(first, second);
+});
+
+test("deriveImportThreadId groups RFC-referenced messages regardless of import order", async () => {
+	const rootId = await deriveImportId({ messageId: "<root@zoho.example>" });
+	const firstReplyThreadId = await deriveImportThreadId({
+		messageId: "<reply-1@zoho.example>",
+		inReplyTo: "<root@zoho.example>",
+		references: "<root@zoho.example>",
+	});
+	const secondReplyThreadId = await deriveImportThreadId({
+		messageId: "<reply-2@zoho.example>",
+		inReplyTo: "<reply-1@zoho.example>",
+		references: "<root@zoho.example> <reply-1@zoho.example>",
+	});
+
+	assert.equal(firstReplyThreadId, rootId);
+	assert.equal(secondReplyThreadId, rootId);
+});
+
+test("deriveImportThreadId uses the imported message id for a thread root", async () => {
+	const messageId = "<root@zoho.example>";
+
+	assert.equal(
+		await deriveImportThreadId({ messageId }),
+		await deriveImportId({ messageId }),
+	);
 });

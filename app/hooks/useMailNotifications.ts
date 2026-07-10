@@ -11,7 +11,7 @@ import { useMailbox } from "~/queries/mailboxes";
 import { useBrand } from "~/hooks/useBrand";
 
 /**
- * In-app new-mail notifications (locked-decisions: in-app only, no OS push for v1).
+ * Foreground new-mail notifications. Web Push owns the background/closed-app path.
  *
  * - Polls the inbox and raises a toast the first time a newer inbound message
  *   appears (seeded silently on first load so existing mail never toasts).

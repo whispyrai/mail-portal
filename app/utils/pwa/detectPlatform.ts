@@ -8,18 +8,18 @@
 // Screen; Android installs from Chrome. In-app browsers (Instagram, etc.)
 // can't install at all and are detected up front.
 
-export type Platform = "ios" | "android" | "desktop" | "unknown";
-export type Browser = "safari" | "chrome" | "edge" | "firefox" | "samsung" | "in-app" | "other";
+type Platform = "ios" | "android" | "desktop" | "unknown";
+type Browser = "safari" | "chrome" | "edge" | "firefox" | "samsung" | "in-app" | "other";
 
-export interface PwaInstallEnvironment {
+export type PwaInstallEnvironment = {
 	platform: Platform;
 	browser: Browser;
 	/** iOS needs Safari and Android needs Chrome to install + subscribe. */
 	isRecommendedMobileBrowser: boolean;
-}
+};
 
 function isInAppBrowser(ua: string): boolean {
-	return /FBAN|FBAV|Instagram|Line\/|WhatsApp|wv\)/.test(ua);
+	return /FBAN|FBAV|Instagram|Line\/|WhatsApp|MicroMessenger|wv\)/.test(ua);
 }
 
 function platformFromUserAgent(ua: string, maxTouchPoints: number): Platform {
@@ -73,8 +73,4 @@ export function detectPwaInstallEnvironment(): PwaInstallEnvironment {
 		return { platform: "unknown", browser: "other", isRecommendedMobileBrowser: false };
 	}
 	return detectPwaInstallEnvironmentFromUserAgent(navigator.userAgent, navigator.maxTouchPoints);
-}
-
-export function detectPlatform(): Platform {
-	return detectPwaInstallEnvironment().platform;
 }

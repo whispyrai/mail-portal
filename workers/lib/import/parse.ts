@@ -7,6 +7,7 @@
 //   - mapZohoFolder     — Zoho source folder → portal folder (drop Trash/Spam)
 //   - normalizeEmailDate — original Date header → sortable ISO (epoch fallback)
 //   - deriveImportId    — stable id for idempotent re-runs
+//   - deriveImportThreadId — stable thread id from RFC reply headers
 
 // Type-only import (stripped at runtime) so this module stays resolvable by the
 // `node --experimental-strip-types` test runner, which can't follow extensionless
@@ -43,11 +44,24 @@ export function normalizeEmailDate(raw: string | null | undefined): string {
 }
 
 /** Fields used to derive a stable id when a Message-ID is present or not. */
-export interface ImportIdParts {
+type ImportIdParts = {
 	messageId?: string | null;
 	from?: string | null;
+	to?: string | null;
 	date?: string | null;
 	subject?: string | null;
+	content?: string | null;
+};
+
+type ImportThreadParts = ImportIdParts & {
+	inReplyTo?: string | null;
+	references?: string | null;
+};
+
+function normalizeMessageId(raw: string | null | undefined): string | null {
+	const value = raw?.trim();
+	if (!value) return null;
+	return value.match(/<([^>]+)>/)?.[1] ?? value.split(/\s+/)[0] ?? null;
 }
 
 /**
@@ -55,18 +69,38 @@ export interface ImportIdParts {
  * import is idempotent: the endpoint skips any message whose id already exists,
  * and R2 attachment keys are built on this same id (re-runs overwrite in place
  * rather than duplicating). Keyed on the RFC `Message-ID` when present, else on
- * `from|date|subject`. SHA-256 → first 32 hex chars: stable, collision-safe for
- * a two-mailbox migration, and filesystem/URL-safe for R2 paths and deep links.
+ * the sender, recipients, date, subject, and content. SHA-256 → first 32 hex
+ * chars: stable and filesystem/URL-safe for R2 paths and deep links.
  */
 export async function deriveImportId(parts: ImportIdParts): Promise<string> {
-	const mid = parts.messageId?.trim();
+	const mid = normalizeMessageId(parts.messageId);
 	const key = mid
 		? `msgid:${mid}`
-		: `fallback:${parts.from ?? ""}|${parts.date ?? ""}|${parts.subject ?? ""}`;
+		: `fallback:${JSON.stringify([
+			parts.from ?? "",
+			parts.to ?? "",
+			parts.date ?? "",
+			parts.subject ?? "",
+			parts.content ?? "",
+		])}`;
 	const bytes = new TextEncoder().encode(key);
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	const hex = Array.from(new Uint8Array(digest))
 		.map((b) => b.toString(16).padStart(2, "0"))
 		.join("");
 	return hex.slice(0, 32);
+}
+
+/**
+ * Resolve every imported conversation to the same deterministic internal
+ * thread id. RFC References lists the root first, so it wins over the direct
+ * parent in In-Reply-To and makes grouping independent of import order.
+ */
+export async function deriveImportThreadId(parts: ImportThreadParts): Promise<string> {
+	const rootMessageId =
+		normalizeMessageId(parts.references) ??
+		normalizeMessageId(parts.inReplyTo) ??
+		normalizeMessageId(parts.messageId);
+
+	return deriveImportId({ ...parts, messageId: rootMessageId });
 }

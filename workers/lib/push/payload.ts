@@ -9,7 +9,7 @@
 
 import type { PushPayload } from "./types";
 
-export interface BuildPushPayloadInput {
+type BuildPushPayloadInput = {
 	emailId: string;
 	mailboxId: string;
 	fromName?: string | null;
@@ -19,7 +19,10 @@ export interface BuildPushPayloadInput {
 	body?: string | null;
 	icon: string;
 	badge: string;
-}
+};
+
+const MAX_TITLE_LENGTH = 120;
+const MAX_SUBJECT_LENGTH = 240;
 
 const ENTITIES: [RegExp, string][] = [
 	[/&nbsp;/g, " "],
@@ -41,15 +44,23 @@ export function htmlToSnippet(raw: string | null | undefined, maxLength = 120): 
 	let s = raw.replace(/<[^>]*>/g, " ");
 	for (const [re, ch] of ENTITIES) s = s.replace(re, ch);
 	s = s.replace(/\s+/g, " ").trim();
-	if (s.length > maxLength) s = `${s.slice(0, maxLength - 1).trimEnd()}…`;
-	return s;
+	return truncateText(s, maxLength);
+}
+
+function truncateText(value: string, maxLength: number): string {
+	const codePoints = Array.from(value);
+	if (codePoints.length <= maxLength) return value;
+	return `${codePoints.slice(0, maxLength - 1).join("").trimEnd()}…`;
 }
 
 export function buildPushPayload(input: BuildPushPayloadInput): PushPayload {
 	const { emailId, mailboxId, fromName, fromAddress, subject, body, icon, badge } = input;
 
-	const title = fromName?.trim() || fromAddress.split("@")[0] || "New email";
-	const subjectText = subject?.trim() || "(no subject)";
+	const title = truncateText(
+		fromName?.trim() || fromAddress.split("@")[0] || "New email",
+		MAX_TITLE_LENGTH,
+	);
+	const subjectText = truncateText(subject?.trim() || "(no subject)", MAX_SUBJECT_LENGTH);
 	const snippet = htmlToSnippet(body);
 
 	return {

@@ -24,6 +24,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useUIStore } from "~/hooks/useUIStore";
 import { useBrand } from "~/hooks/useBrand";
+import { assistantCopyFor } from "~/utils/assistant-copy";
 import type { UIMessage } from "ai";
 
 const TOOL_LABELS: Record<string, { label: string; icon: React.ReactNode }> = {
@@ -307,7 +308,8 @@ function AgentChatConnected({
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 	const [inputValue, setInputValue] = useState("");
 	const { startCompose } = useUIStore();
-	const { name } = useBrand();
+	const { brand, name } = useBrand();
+	const assistantCopy = assistantCopyFor(brand, name);
 
 	const agent = useAgent({ agent: "EmailAgent", name: mailboxId });
 	const { messages, sendMessage, status, setMessages, stop } =
@@ -337,12 +339,6 @@ function AgentChatConnected({
 			handleSend();
 		}
 	};
-
-	const suggestedPrompts = [
-		"Summarize my unread emails",
-		"Which prospects are waiting on a reply?",
-		"Draft a reply to the latest email",
-	];
 
 	return (
 		<div className="flex flex-col h-full">
@@ -387,12 +383,10 @@ function AgentChatConnected({
 							/>
 						</div>
 						<p className="text-xs text-kumo-subtle text-center leading-relaxed px-4">
-							I can read your inbox, summarize conversations, find
-							prospects waiting on you, and draft replies in your
-							voice.
+							{assistantCopy.emptyState}
 						</p>
 						<div className="flex flex-col gap-1.5 w-full">
-							{suggestedPrompts.map((prompt) => (
+							{assistantCopy.suggestedPrompts.map((prompt) => (
 								<button
 									key={prompt}
 									type="button"

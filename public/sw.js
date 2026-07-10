@@ -14,7 +14,7 @@
 // Bump SW_VERSION when the handler shape changes; combined with the
 // `Cache-Control: no-cache` on this file, browsers refetch + swap on next load.
 
-const SW_VERSION = "notif-v1";
+const SW_VERSION = "notif-v2";
 
 self.addEventListener("install", () => {
 	// Take over immediately instead of waiting for every old tab to close.
@@ -61,16 +61,33 @@ self.addEventListener("notificationclick", (event) => {
 
 	event.waitUntil(
 		(async () => {
-			const allClients = await self.clients.matchAll({
-				type: "window",
-				includeUncontrolled: true,
-			});
+			let allClients = [];
+			try {
+				allClients = await self.clients.matchAll({
+					type: "window",
+					includeUncontrolled: true,
+				});
+			} catch (err) {
+				console.warn("[sw] failed to inspect existing windows", err);
+			}
 			// Focus + navigate an existing same-origin window if one is open.
 			for (const client of allClients) {
 				if (client.url.startsWith(self.location.origin) && "focus" in client) {
-					await client.focus();
-					if ("navigate" in client) await client.navigate(clickUrl);
-					return;
+					try {
+						await client.focus();
+					} catch (err) {
+						console.warn("[sw] failed to focus existing window", err);
+						continue;
+					}
+					if (typeof client.navigate === "function") {
+						try {
+							const navigatedClient = await client.navigate(clickUrl);
+							if (navigatedClient) return;
+						} catch (err) {
+							console.warn("[sw] failed to navigate existing window", err);
+						}
+					}
+					break;
 				}
 			}
 			// Otherwise open a fresh window at the deep link.

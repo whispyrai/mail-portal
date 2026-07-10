@@ -11,7 +11,8 @@
  * Zod schemas: used across route handlers to eliminate duplication.
  */
 import { z } from "zod";
-import { ATTACHMENT_LIMITS } from "../../shared/attachments";
+import { ATTACHMENT_LIMITS } from "../../shared/attachments.ts";
+import { decodeBase64Url } from "../../shared/base64url.ts";
 
 // ── TypeScript Interfaces ──────────────────────────────────────────
 
@@ -103,15 +104,39 @@ export const SendEmailResponseSchema = z.object({
 	status: z.string(),
 });
 
+const P256dhSchema = z.string().refine(
+	(value) => {
+		const bytes = decodeBase64Url(value);
+		return bytes?.byteLength === 65 && bytes[0] === 0x04;
+	},
+	{ message: "p256dh must be a 65-byte uncompressed P-256 public key" },
+);
+
+const PushAuthSecretSchema = z.string().refine(
+	(value) => decodeBase64Url(value)?.byteLength === 16,
+	{ message: "auth must be a 16-byte Web Push authentication secret" },
+);
+
+const PushEndpointSchema = z.string().url().refine(
+	(value) => {
+		try {
+			return new URL(value).protocol === "https:";
+		} catch {
+			return false;
+		}
+	},
+	{ message: "endpoint must use HTTPS" },
+);
+
 /**
  * A device push subscription as the browser's PushManager serialises it
  * (`subscription.toJSON()`). userAgent + deviceLabel are derived server-side
  * from the request, never trusted from the client (WISER-240).
  */
 export const PushSubscriptionSchema = z.object({
-	endpoint: z.string().url(),
+	endpoint: PushEndpointSchema,
 	keys: z.object({
-		p256dh: z.string().min(1),
-		auth: z.string().min(1),
+		p256dh: P256dhSchema,
+		auth: PushAuthSecretSchema,
 	}),
 });

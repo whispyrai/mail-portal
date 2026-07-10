@@ -15,8 +15,8 @@ import {
 	cookieDomainFor,
 	type SessionClaims,
 } from "../lib/auth";
-import { getUserByEmail, countUsers, createUser } from "../lib/users";
-import { provisionMailbox } from "../lib/mailbox";
+import { getUserByEmail, countUsers } from "../lib/users";
+import { provisionAccount } from "../lib/account-provisioning";
 import { systemPromptFor } from "../lib/prompts";
 import { escapeHtml } from "../lib/email-helpers";
 import { safeAuthorizeReturnTo } from "../lib/auth";
@@ -103,17 +103,32 @@ export async function handleLogin(c: Ctx) {
 					400,
 				);
 			}
+
 			const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
-			user = await createUser(c.env, {
-				email,
-				passwordHash: hash,
-				passwordSalt: salt,
-				role: "ADMIN",
-				mailboxAddress: email,
-			});
-			await provisionMailbox(c.env, email, email.split("@")[0], {
-				agentSystemPrompt: systemPromptFor(brand.id),
-			});
+			try {
+				user = await provisionAccount(c.env, {
+					email,
+					passwordHash: hash,
+					passwordSalt: salt,
+					role: "ADMIN",
+					mailboxAddress: email,
+					displayName: email.split("@")[0],
+					mailboxSettings: { agentSystemPrompt: systemPromptFor(brand.id) },
+				});
+			} catch (error) {
+				console.error("[auth] failed to bootstrap admin and mailbox", {
+					email,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return c.html(
+					renderLogin(brand, {
+						error: "Could not create the admin account and mailbox. Please retry or inspect logs.",
+						bootstrap: true,
+						returnTo,
+					}),
+					500,
+				);
+			}
 		}
 	}
 

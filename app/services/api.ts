@@ -92,15 +92,6 @@ interface EmailListResponse {
 	totalCount: number;
 }
 
-/** A registered push device, as the list endpoint returns it (no endpoint/keys). */
-export interface PushDevice {
-	id: string;
-	deviceLabel: string | null;
-	userAgent: string | null;
-	createdAt: string;
-	lastSeenAt: string;
-}
-
 // ---------- API client ----------
 
 const api = {
@@ -112,7 +103,15 @@ const api = {
 
 	// Push subscriptions (WISER-240)
 	listPushSubscriptions: (mailboxId: string) =>
-		get<{ subscriptions: PushDevice[] }>(`/api/v1/mailboxes/${mailboxId}/push-subscriptions`),
+		get<{
+			subscriptions: Array<{
+				id: string;
+				deviceLabel: string | null;
+				userAgent: string | null;
+				createdAt: string;
+				lastSeenAt: string;
+			}>;
+		}>(`/api/v1/mailboxes/${mailboxId}/push-subscriptions`),
 	registerPushSubscription: (
 		mailboxId: string,
 		sub: { endpoint: string; keys: { p256dh: string; auth: string } },

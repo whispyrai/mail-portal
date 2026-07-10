@@ -13,10 +13,10 @@
  * route already use).
  */
 import type { Env } from "../types";
-import { ATTACHMENT_LIMITS, validateAttachmentSet } from "../../shared/attachments";
+import { ATTACHMENT_LIMITS, validateAttachmentSet } from "../../shared/attachments.ts";
 
 /** Metadata for one stored attachment, shaped for the DO `attachments` table. */
-export interface StoredAttachment {
+export type StoredAttachment = {
 	id: string;
 	email_id: string;
 	filename: string;
@@ -24,16 +24,16 @@ export interface StoredAttachment {
 	size: number;
 	content_id: string | null;
 	disposition: string;
-}
+};
 
 /** An attachment shaped for `sendEmail` (SES inline delivery). */
-export interface SesAttachmentInput {
+type SesAttachmentInput = {
 	content: string; // base64
 	filename: string;
 	type: string;
 	disposition: "attachment" | "inline";
 	contentId?: string;
-}
+};
 
 /**
  * A reference to a file to attach, sent by the client instead of the bytes:
@@ -80,19 +80,19 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 /** Minimal DO-stub surface needed to resolve `existing` references. */
-interface StubForResolve {
+type StubForResolve = {
 	getAttachment: (
 		id: string,
 	) => Promise<{ filename: string; mimetype: string; size: number; email_id: string } | null>;
-}
+};
 
-interface ResolvedSource {
+type ResolvedSource = {
 	bytes: ArrayBuffer;
 	filename: string;
 	mimetype: string;
 	disposition: "attachment" | "inline";
 	stagingKey?: string; // present for `upload` refs; deleted after promotion
-}
+};
 
 /**
  * Resolve attachment references to deliverable + storable form.

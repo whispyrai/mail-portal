@@ -892,31 +892,33 @@ export class MailboxDO extends DurableObject<Env> {
 
 		// Sent emails are always read — the sender obviously knows what they wrote.
 		// This prevents sent replies from inflating thread_unread_count.
-		this.db
-			.insert(schema.emails)
-			.values({
-				id: email.id,
-				folder_id: folderId,
-				subject: email.subject,
-				sender: email.sender,
-				recipient: email.recipient,
-				cc: email.cc ?? null,
-				bcc: email.bcc ?? null,
-				date: email.date,
-				read: isSent ? 1 : (email.read ? 1 : 0),
-				starred: email.starred ? 1 : 0,
-				body: email.body,
-				in_reply_to: email.in_reply_to ?? null,
-				email_references: email.email_references ?? null,
-				thread_id: email.thread_id ?? null,
-				message_id: email.message_id ?? null,
-				raw_headers: email.raw_headers ?? null,
-			})
-			.run();
+		this.ctx.storage.transactionSync(() => {
+			this.db
+				.insert(schema.emails)
+				.values({
+					id: email.id,
+					folder_id: folderId,
+					subject: email.subject,
+					sender: email.sender,
+					recipient: email.recipient,
+					cc: email.cc ?? null,
+					bcc: email.bcc ?? null,
+					date: email.date,
+					read: isSent ? 1 : (email.read ? 1 : 0),
+					starred: email.starred ? 1 : 0,
+					body: email.body,
+					in_reply_to: email.in_reply_to ?? null,
+					email_references: email.email_references ?? null,
+					thread_id: email.thread_id ?? null,
+					message_id: email.message_id ?? null,
+					raw_headers: email.raw_headers ?? null,
+				})
+				.run();
 
-		if (attachments.length > 0) {
-			this.db.insert(schema.attachments).values(attachments).run();
-		}
+			if (attachments.length > 0) {
+				this.db.insert(schema.attachments).values(attachments).run();
+			}
+		});
 	}
 
 	// ── Bulk send (mail merge) — alarm-scheduled, throttled (F-06) ──
@@ -1188,12 +1190,11 @@ export class MailboxDO extends DurableObject<Env> {
 			input.userAgent,
 			input.deviceLabel,
 		);
-		const row = [
-			...this.ctx.storage.sql.exec(
-				`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`,
-				input.endpoint,
-			),
-		][0] as { id: string; device_label: string };
+		const [row] = this.ctx.storage.sql.exec<{ id: string; device_label: string }>(
+			`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`,
+			input.endpoint,
+		);
+		if (!row) throw new Error("Push subscription was not stored");
 		return { id: row.id, deviceLabel: row.device_label };
 	}
 
@@ -1208,18 +1209,17 @@ export class MailboxDO extends DurableObject<Env> {
 	> {
 		// Never returns endpoint / keys — the device list is UX metadata only.
 		return [
-			...this.ctx.storage.sql.exec(
-				`SELECT id, device_label, user_agent, created_at, last_seen_at
-				 FROM push_subscriptions ORDER BY last_seen_at DESC`,
-			),
-		].map((r) => {
-			const row = r as {
+			...this.ctx.storage.sql.exec<{
 				id: string;
 				device_label: string | null;
 				user_agent: string | null;
 				created_at: string;
 				last_seen_at: string;
-			};
+			}>(
+				`SELECT id, device_label, user_agent, created_at, last_seen_at
+				 FROM push_subscriptions ORDER BY last_seen_at DESC`,
+			),
+		].map((row) => {
 			return {
 				id: row.id,
 				deviceLabel: row.device_label,
@@ -1246,31 +1246,52 @@ export class MailboxDO extends DurableObject<Env> {
 	 * from `receiveEmail` after the mail is already stored).
 	 */
 	async firePush(payload: PushPayload): Promise<void> {
-		const vapid = vapidConfig(this.env);
-		if (!vapid) return; // push not configured for this env — no-op
+		try {
+			const vapid = vapidConfig(this.env);
+			if (!vapid) return; // push not configured for this env — no-op
 
-		const rows = [
-			...this.ctx.storage.sql.exec(`SELECT endpoint, p256dh, auth FROM push_subscriptions`),
-		];
-		if (rows.length === 0) return;
+			const rows = [
+				...this.ctx.storage.sql.exec<{ endpoint: string; p256dh: string; auth: string }>(
+					`SELECT endpoint, p256dh, auth FROM push_subscriptions`,
+				),
+			];
+			if (rows.length === 0) return;
 
-		const subs = rows.map((r) => {
-			const row = r as { endpoint: string; p256dh: string; auth: string };
-			return { endpoint: row.endpoint, p256dh: row.p256dh, auth: row.auth };
-		});
-
-		const result = await fanOutPush(subs, JSON.stringify(payload), (sub, body) =>
-			sendWebPush(sub, body, vapid),
-		);
-
-		for (const endpoint of result.deadEndpoints) {
-			this.ctx.storage.sql.exec(`DELETE FROM push_subscriptions WHERE endpoint = ?`, endpoint);
-		}
-		for (const endpoint of result.deliveredEndpoints) {
-			this.ctx.storage.sql.exec(
-				`UPDATE push_subscriptions SET last_seen_at = datetime('now') WHERE endpoint = ?`,
-				endpoint,
+			const result = await fanOutPush(rows, JSON.stringify(payload), (sub, body) =>
+				sendWebPush(sub, body, vapid),
 			);
+			if (result.delivered < result.attempted) {
+				console.warn("[push] delivery incomplete", {
+					mailboxId: payload.data.mailboxId,
+					attempted: result.attempted,
+					delivered: result.delivered,
+					pruned: result.deadEndpoints.length,
+					failureCounts: result.failureCounts,
+				});
+			}
+
+			for (const endpoint of result.deadEndpoints) {
+				const attemptedSubscription = rows.find((row) => row.endpoint === endpoint);
+				if (!attemptedSubscription) continue;
+				this.ctx.storage.sql.exec(
+					`DELETE FROM push_subscriptions
+					 WHERE endpoint = ? AND p256dh = ? AND auth = ?`,
+					attemptedSubscription.endpoint,
+					attemptedSubscription.p256dh,
+					attemptedSubscription.auth,
+				);
+			}
+			for (const endpoint of result.deliveredEndpoints) {
+				this.ctx.storage.sql.exec(
+					`UPDATE push_subscriptions SET last_seen_at = datetime('now') WHERE endpoint = ?`,
+					endpoint,
+				);
+			}
+		} catch (error) {
+			console.error("[push] dispatch failed", {
+				mailboxId: payload.data.mailboxId,
+				error,
+			});
 		}
 	}
 }

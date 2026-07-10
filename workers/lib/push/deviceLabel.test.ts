@@ -18,12 +18,15 @@ const WINDOWS_EDGE =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0";
 const IOS_CHROME =
 	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/124.0 Mobile/15E148 Safari/604.1";
+const ANDROID_EDGE =
+	"Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 EdgA/124.0.0.0";
 
 test("humanises platform + browser", () => {
 	assert.equal(buildDeviceLabel(IPHONE_SAFARI), "iPhone (Safari)");
 	assert.equal(buildDeviceLabel(ANDROID_CHROME), "Android (Chrome)");
 	assert.equal(buildDeviceLabel(MAC_SAFARI), "Mac (Safari)");
 	assert.equal(buildDeviceLabel(WINDOWS_EDGE), "Windows (Edge)");
+	assert.equal(buildDeviceLabel(ANDROID_EDGE), "Android (Edge)");
 });
 
 test("browser precedence: iOS-Chrome (CriOS) is Chrome, not Safari", () => {

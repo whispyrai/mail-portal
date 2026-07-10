@@ -10,6 +10,7 @@ import { useComposeForm } from "~/hooks/useComposeForm";
 import { useUIStore } from "~/hooks/useUIStore";
 import { useBrand } from "~/hooks/useBrand";
 import { useAiDraftCompose } from "~/queries/emails";
+import { assistantCopyFor } from "~/utils/assistant-copy";
 import RichTextEditor from "./RichTextEditor";
 import ComposeAttachments from "./ComposeAttachments";
 
@@ -26,7 +27,8 @@ export default function ComposeEmail() {
 	}>();
 
 	const { isComposing, closeCompose, composeOptions } = useUIStore();
-	const { name } = useBrand();
+	const { brand, name } = useBrand();
+	const assistantCopy = assistantCopyFor(brand, name);
 	const aiComposeMut = useAiDraftCompose();
 	const [showAiPrompt, setShowAiPrompt] = useState(false);
 	const [aiPrompt, setAiPrompt] = useState("");
@@ -176,7 +178,7 @@ export default function ComposeEmail() {
 												if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleAiGenerate();
 												if (e.key === "Escape") setShowAiPrompt(false);
 											}}
-											placeholder={`e.g. Introduce ${name} to Ahmed at ABC Realty who asked about pricing, offer a 20-min demo`}
+											placeholder={assistantCopy.composePlaceholder}
 											rows={2}
 											className="w-full resize-none rounded border border-kumo-line bg-white px-3 py-2 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:outline-none focus:ring-2 focus:ring-kumo-focus"
 										/>

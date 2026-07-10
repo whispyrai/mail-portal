@@ -13,6 +13,11 @@ const FALLBACK = {
 	brand: "whispyr",
 	name: "Whispyr",
 	appName: "Whispyr Mail",
+	favicon: "/favicon.svg",
+	appleTouchIcon: "/apple-touch-icon.png",
+	legacyFavicon: "/favicon.ico",
+	legacyFaviconType: "image/x-icon",
+	legacyFaviconSizes: "48x48 32x32 16x16",
 	quizEnabled: true,
 	themeColor: "#faf8f5",
 } as const;

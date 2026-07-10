@@ -21,6 +21,7 @@ test("all deliver → nothing pruned", async () => {
 	assert.equal(r.delivered, 2);
 	assert.equal(r.attempted, 2);
 	assert.deepEqual(r.deadEndpoints, []);
+	assert.deepEqual(r.failureCounts, {});
 });
 
 test("only 404/410 endpoints are collected for pruning; transient failures are kept", async () => {
@@ -34,6 +35,10 @@ test("only 404/410 endpoints are collected for pruning; transient failures are k
 	assert.equal(r.attempted, 3);
 	assert.deepEqual(r.deadEndpoints, ["https://push/b"]);
 	assert.deepEqual(r.deliveredEndpoints, ["https://push/a"]);
+	assert.deepEqual(r.failureCounts, {
+		PERMISSION_REVOKED: 1,
+		SERVICE_UNAVAILABLE: 1,
+	});
 });
 
 test("a thrown send is swallowed — counted as failed, never pruned, never rethrown", async () => {
@@ -44,6 +49,7 @@ test("a thrown send is swallowed — counted as failed, never pruned, never reth
 	assert.equal(r.delivered, 1);
 	assert.equal(r.attempted, 2);
 	assert.deepEqual(r.deadEndpoints, []); // a throw is not proof the endpoint is dead
+	assert.deepEqual(r.failureCounts, { SEND_FAILED: 1 });
 });
 
 test("no subscriptions → no-op result, no send calls", async () => {
@@ -53,5 +59,11 @@ test("no subscriptions → no-op result, no send calls", async () => {
 		return ok;
 	});
 	assert.equal(calls, 0);
-	assert.deepEqual(r, { delivered: 0, attempted: 0, deadEndpoints: [], deliveredEndpoints: [] });
+	assert.deepEqual(r, {
+		delivered: 0,
+		attempted: 0,
+		deadEndpoints: [],
+		deliveredEndpoints: [],
+		failureCounts: {},
+	});
 });

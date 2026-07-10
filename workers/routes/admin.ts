@@ -7,10 +7,11 @@
 // Worker-rendered HTML (no React) — locked-decisions D-23, D-62, D-64.
 
 import { Hono } from "hono";
-import PostalMime from "postal-mime";
+import PostalMime, { type Email } from "postal-mime";
 import { USER_ROLES, type UserRole } from "../db/users-schema";
-import { storeParsedEmail, MAX_EMAIL_SIZE } from "../index";
-import { mapZohoFolder, normalizeEmailDate, deriveImportId } from "../lib/import/parse";
+import { importParsedEmail } from "../lib/import/import-email";
+import { mapZohoFolder } from "../lib/import/parse";
+import { MAX_EMAIL_SIZE } from "../lib/store-email";
 import {
 	listUsers,
 	getUserById,
@@ -26,9 +27,13 @@ import {
 	hashToken,
 	type SessionClaims,
 } from "../lib/auth";
-import { provisionMailbox } from "../lib/mailbox";
+import { provisionAccount } from "../lib/account-provisioning";
 import { systemPromptFor } from "../lib/prompts";
 import { escapeHtml } from "../lib/email-helpers";
+import {
+	isAddressInConfiguredMailDomains,
+	normalizeMailAddress,
+} from "../lib/mail-address";
 import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
 import { adminQuizApp } from "../quiz/admin-routes";
 import type { Env } from "../types";
@@ -127,14 +132,19 @@ adminApp.get("/users", async (c) => {
 
 adminApp.post("/users", async (c) => {
 	const form = await c.req.parseBody();
-	const email = String(form.email || "").trim().toLowerCase();
-	const name = String(form.name || "").trim() || email.split("@")[0];
+	const email = normalizeMailAddress(String(form.email || ""));
 	const password = String(form.password || "");
 	const roleRaw = String(form.role || "AGENT");
 	const role: UserRole = roleRaw === "ADMIN" ? "ADMIN" : "AGENT";
 
-	if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+	if (!email) {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("Invalid email address.")}`, 302);
+	}
+	if (!isAddressInConfiguredMailDomains(email, c.env.DOMAINS)) {
+		return c.redirect(
+			`/admin/users?err=${encodeURIComponent("Email address must use a configured mail domain.")}`,
+			302,
+		);
 	}
 	if (password.length < 12) {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("Password must be at least 12 characters.")}`, 302);
@@ -142,17 +152,29 @@ adminApp.post("/users", async (c) => {
 	if (await getUserByEmail(c.env, email)) {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("A user with that email already exists.")}`, 302);
 	}
+	const name = String(form.name || "").trim() || email.split("@")[0];
 
 	const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
-	await createUser(c.env, {
-		email,
-		passwordHash: hash,
-		passwordSalt: salt,
-		role,
-		mailboxAddress: email,
-	});
-	// Provision the mailbox and seed the Whispyr AI context (D-43).
-	await provisionMailbox(c.env, email, name, { agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id) });
+	try {
+		await provisionAccount(c.env, {
+			email,
+			passwordHash: hash,
+			passwordSalt: salt,
+			role,
+			mailboxAddress: email,
+			displayName: name,
+			mailboxSettings: { agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id) },
+		});
+	} catch (error) {
+		console.error("[admin] failed to create user and mailbox", {
+			email,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return c.redirect(
+			`/admin/users?err=${encodeURIComponent("User and mailbox could not be created. Please retry or inspect logs.")}`,
+			302,
+		);
+	}
 
 	return c.redirect(`/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}).`)}`, 302);
 });
@@ -207,15 +229,15 @@ adminApp.post("/users/:id/mcp-token", async (c) => {
 // ── One-time Zoho mail importer (WISER-241) ─────────────────────────
 //
 // POST /admin/import/:mailboxId?folder=<zohoFolder> with a raw RFC822 .eml body.
-// ADMIN-only (inherited guard). Feeds historical mail through the SAME store path
-// as live receipt (storeParsedEmail), but preserves the original date, routes the
+// ADMIN-only (inherited guard). Feeds historical mail through the shared store path,
+// preserves the original date, routes the
 // original folder (Trash/Spam dropped), and marks history read — and never fires
 // push. Idempotent: the internal id is derived from the message, so re-running
 // skips anything already imported (R2 keys are keyed on that id too). Removable
 // after the migration.
 adminApp.post("/import/:mailboxId", async (c) => {
 	const mailboxId = decodeURIComponent(c.req.param("mailboxId")).toLowerCase();
-	const sourceFolder = c.req.query("folder");
+	const sourceFolder = c.req.query("folder")?.trim();
 	if (!sourceFolder) return c.json({ error: "folder query param is required" }, 400);
 
 	// Require a pre-provisioned mailbox — the importer never creates one (role
@@ -233,29 +255,15 @@ adminApp.post("/import/:mailboxId", async (c) => {
 	if (raw.byteLength === 0) return c.json({ error: "empty message body" }, 400);
 	if (raw.byteLength > MAX_EMAIL_SIZE) return c.json({ error: "message exceeds size limit" }, 413);
 
-	const parsed = await new PostalMime().parse(raw);
-	const id = await deriveImportId({
-		messageId: parsed.messageId,
-		from: parsed.from?.address,
-		date: parsed.date,
-		subject: parsed.subject,
-	});
-
-	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
-
-	// Idempotent re-run: skip anything already imported under this stable id.
-	if (await stub.getEmail(id)) {
-		return c.json({ status: "skipped", reason: "duplicate", id, folder }, 200);
+	let parsed: Email;
+	try {
+		parsed = await new PostalMime().parse(raw);
+	} catch {
+		return c.json({ error: "invalid RFC822 message" }, 400);
 	}
-
-	await storeParsedEmail(c.env, stub, parsed, {
-		folder,
-		date: normalizeEmailDate(parsed.date),
-		messageId: id,
-		read: true, // imported history is already-seen — lands read, no unread wall
-	});
-
-	return c.json({ status: "imported", id, folder }, 201);
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	const result = await importParsedEmail({ bucket: c.env.BUCKET, mailbox: stub }, parsed, folder);
+	return result.status === "imported" ? c.json(result, 201) : c.json(result, 200);
 });
 
 export { adminApp };

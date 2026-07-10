@@ -40,6 +40,16 @@
 					// `VAPID_PRIVATE_KEY`). Until set, push self-disables.
 					"VAPID_SUBJECT": "mailto:hesham@whispyrcrm.com"
 			},
+			"secrets": {
+				"required": [
+					"AWS_ACCESS_KEY_ID",
+					"AWS_SECRET_ACCESS_KEY",
+					"JWT_SECRET",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"VAPID_PUBLIC_KEY",
+					"VAPID_PRIVATE_KEY"
+				]
+			},
 			// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing
 			// page (whispyrcrm.com) is a separate static site on Vercel (D-68).
 			"routes": [
@@ -69,6 +79,99 @@
 				{
 					"binding": "OAUTH_KV",
 					"id": "cd541026bdf949d9ac63b3b5fdff4969"
+				}
+			],
+			"ai": {
+				"binding": "AI"
+			},
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "MAILBOX",
+						"class_name": "MailboxDO"
+					},
+					{
+						"name": "EMAIL_AGENT",
+						"class_name": "EmailAgent"
+					},
+					{
+						"name": "EMAIL_MCP",
+						"class_name": "EmailMCP"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"MailboxDO"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"EmailAgent"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"EmailMCP"
+					]
+				}
+			]
+		},
+		// Wiser Team Mail Portal — isolated runtime for WISER-242. Bindings,
+		// Durable Object namespaces, data, and secrets are distinct from Whispyr.
+		// During the pre-cutover proof, Email Routing is enabled only on
+		// test.wiserchat.ai; the apex joins DOMAINS now so the same tested Worker
+		// can receive it immediately after the separately approved MX cutover.
+		"wiser": {
+			"name": "wiser-mail-portal",
+			"vars": {
+				"BRAND": "wiser",
+				"FEATURES": [],
+				"DOMAINS": "wiserchat.ai,test.wiserchat.ai",
+				"EMAIL_ADDRESSES": [],
+				"AWS_REGION": "eu-west-2",
+				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"VAPID_SUBJECT": "mailto:contact@wiserchat.ai"
+			},
+			"secrets": {
+				"required": [
+					"AWS_ACCESS_KEY_ID",
+					"AWS_SECRET_ACCESS_KEY",
+					"JWT_SECRET",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"VAPID_PUBLIC_KEY",
+					"VAPID_PRIVATE_KEY"
+				]
+			},
+			"routes": [
+				{
+					"pattern": "mail.wiserchat.ai",
+					"custom_domain": true
+				}
+			],
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "wiser_mail_portal_users",
+					"database_id": "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
+					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "wiser-mail-portal",
+					"preview_bucket_name": "wiser-mail-portal"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "OAUTH_KV",
+					"id": "c934d803c2f8430d9088f4a5d9f29d55"
 				}
 			],
 			"ai": {

@@ -13,7 +13,7 @@
 
 import type { Brand } from "../routes/brand";
 
-export type Feature = "quiz";
+type Feature = "quiz";
 
 // The brand-specific modules a brand ships when `FEATURES` is unset. Whispyr
 // ships the rep-quiz; a neutral brand ships none.
@@ -26,7 +26,7 @@ const DEFAULT_FEATURES: Record<Brand, readonly Feature[]> = {
  * Whether `feature` is enabled for a resolved brand. An explicit `FEATURES`
  * array (from the env) wins; when it is undefined the brand baseline applies.
  */
-export function isFeatureEnabled(
+function isFeatureEnabled(
 	features: readonly string[] | undefined,
 	brand: Brand,
 	feature: Feature,

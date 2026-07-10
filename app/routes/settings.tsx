@@ -7,7 +7,7 @@ import { RobotIcon, ArrowCounterClockwiseIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { useMailbox, useUpdateMailbox } from "~/queries/mailboxes";
-import { PushNotificationsSection } from "~/components/settings/PushNotificationsSection";
+import { PushNotificationsSection } from "~/components/settings/push-notifications/PushNotificationsSection";
 
 // Placeholder shown in the textarea when no custom prompt is set.
 // The authoritative default prompt lives in workers/agent/index.ts (DEFAULT_SYSTEM_PROMPT).

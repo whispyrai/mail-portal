@@ -22,18 +22,38 @@ function decodeJwtPart(part: string): Record<string, unknown> {
 }
 
 test("vapidConfig returns null unless all three env values are present", () => {
-	assert.equal(vapidConfig({} as never), null);
-	assert.equal(vapidConfig({ VAPID_SUBJECT: "mailto:a@b.co" } as never), null);
+	const publicKey = b64url(Uint8Array.from({ length: 65 }, (_, index) => (index === 0 ? 4 : index)));
+	const privateKey = b64url(Uint8Array.from({ length: 32 }, (_, index) => index));
+	assert.equal(vapidConfig({}), null);
+	assert.equal(vapidConfig({ VAPID_SUBJECT: "mailto:a@b.co" }), null);
 	assert.equal(
-		vapidConfig({ VAPID_SUBJECT: "mailto:a@b.co", VAPID_PUBLIC_KEY: "pub" } as never),
+		vapidConfig({ VAPID_SUBJECT: "mailto:a@b.co", VAPID_PUBLIC_KEY: publicKey }),
 		null,
 	);
 	const cfg = vapidConfig({
 		VAPID_SUBJECT: "mailto:a@b.co",
-		VAPID_PUBLIC_KEY: "pub",
-		VAPID_PRIVATE_KEY: "priv",
-	} as never);
-	assert.deepEqual(cfg, { subject: "mailto:a@b.co", publicKey: "pub", privateKey: "priv" });
+		VAPID_PUBLIC_KEY: publicKey,
+		VAPID_PRIVATE_KEY: privateKey,
+	});
+	assert.deepEqual(cfg, { subject: "mailto:a@b.co", publicKey, privateKey });
+	assert.equal(
+		vapidConfig({
+			VAPID_SUBJECT: "contact@example.com",
+			VAPID_PUBLIC_KEY: publicKey,
+			VAPID_PRIVATE_KEY: privateKey,
+		}),
+		null,
+		"the VAPID subject must use mailto: or https:",
+	);
+	assert.equal(
+		vapidConfig({
+			VAPID_SUBJECT: "mailto:a@b.co",
+			VAPID_PUBLIC_KEY: "malformed",
+			VAPID_PRIVATE_KEY: privateKey,
+		}),
+		null,
+		"malformed key material does not enable push",
+	);
 });
 
 test("encryptPayload emits a well-framed aes128gcm body (RFC 8188 header)", async () => {
@@ -79,6 +99,13 @@ test("encryptPayload is deterministic for fixed salt + server keys", async () =>
 	assert.deepEqual(a, b);
 });
 
+test("encryptPayload rejects plaintext above the Web Push body ceiling before crypto", async () => {
+	await assert.rejects(
+		() => encryptPayload("x".repeat(3_994), "invalid", "invalid"),
+		/3993 bytes/,
+	);
+});
+
 test("buildVapidJwt signs an ES256 JWT with the endpoint origin as audience", async () => {
 	// Generate a VAPID keypair and express it the way `web-push generate-vapid-keys` does:
 	// base64url raw public point + base64url private scalar (from the JWK `d`).
@@ -87,7 +114,9 @@ test("buildVapidJwt signs an ES256 JWT with the endpoint origin as audience", as
 		"verify",
 	]);
 	const publicKey = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey)));
-	const jwk = (await crypto.subtle.exportKey("jwk", kp.privateKey)) as { d: string };
+	const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+	assert.equal(typeof jwk.d, "string");
+	if (!jwk.d) assert.fail("private JWK is missing its scalar");
 
 	const jwt = await buildVapidJwt("https://fcm.googleapis.com", {
 		subject: "mailto:team@wiserchat.ai",
@@ -101,5 +130,6 @@ test("buildVapidJwt signs an ES256 JWT with the endpoint origin as audience", as
 	assert.equal(claims.aud, "https://fcm.googleapis.com");
 	assert.equal(claims.sub, "mailto:team@wiserchat.ai");
 	assert.equal(typeof claims.exp, "number");
-	assert.ok((claims.exp as number) > Math.floor(Date.now() / 1000), "exp is in the future");
+	if (typeof claims.exp !== "number") assert.fail("JWT expiration is not numeric");
+	assert.ok(claims.exp > Math.floor(Date.now() / 1000), "exp is in the future");
 });

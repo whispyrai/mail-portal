@@ -9,16 +9,17 @@
 // send is one device's problem, not the dispatch's; the caller keeps storing
 // mail regardless.
 
-import type { PushSubscription, SendPushResult } from "./types";
+import type { PushFailureReason, PushSubscription, SendPushResult } from "./types";
 
-export interface FanOutResult {
+type FanOutResult = {
 	delivered: number;
 	attempted: number;
 	deadEndpoints: string[];
 	deliveredEndpoints: string[];
-}
+	failureCounts: Partial<Record<PushFailureReason, number>>;
+};
 
-export type SendFn = (sub: PushSubscription, payload: string) => Promise<SendPushResult>;
+type SendFn = (sub: PushSubscription, payload: string) => Promise<SendPushResult>;
 
 export async function fanOutPush(
 	subs: PushSubscription[],
@@ -44,11 +45,17 @@ export async function fanOutPush(
 	const deadEndpoints = settled
 		.filter((r) => !r.result.ok && r.result.shouldDelete)
 		.map((r) => r.endpoint);
+	const failureCounts: Partial<Record<PushFailureReason, number>> = {};
+	for (const { result } of settled) {
+		if (result.ok) continue;
+		failureCounts[result.reason] = (failureCounts[result.reason] ?? 0) + 1;
+	}
 
 	return {
 		delivered: deliveredEndpoints.length,
 		attempted: settled.length,
 		deadEndpoints,
 		deliveredEndpoints,
+		failureCounts,
 	};
 }

@@ -14,7 +14,7 @@
 
 export type Brand = "whispyr" | "wiser";
 
-export interface BrandConfig {
+export type BrandConfig = {
 	/** Stable brand id — also the `data-brand` value on the SPA `<html>`. */
 	id: Brand;
 	/** Wordmark text. */
@@ -23,6 +23,19 @@ export interface BrandConfig {
 	appName: string;
 	/** Logo mark asset path (served from public/). */
 	mark: string;
+	/** Modern SVG favicon asset path. */
+	favicon: string;
+	/** Install and connector PNGs. */
+	pwaIcon192: string;
+	pwaIcon512: string;
+	/** Home-screen icon used by Apple devices. */
+	appleTouchIcon: string;
+	/** Monochrome-capable notification badge. */
+	notificationBadge: string;
+	/** Raster fallback for browsers that do not use the SVG favicon. */
+	legacyFavicon: string;
+	legacyFaviconType: "image/png" | "image/x-icon";
+	legacyFaviconSizes: string;
 	markWidth: number;
 	markHeight: number;
 	/** Marketing site (MCP/OAuth metadata). */
@@ -47,7 +60,7 @@ export interface BrandConfig {
 	loginNote: string;
 	/** Landing-page description (inline HTML allowed). */
 	landingBlurb: string;
-}
+};
 
 const KAMERIK_FACES = `
 @font-face { font-family:"Kamerik 105"; src:url("/fonts/Kamerik105-Light.woff2") format("woff2"); font-weight:300; font-display:swap; }
@@ -68,6 +81,14 @@ const BRANDS: Record<Brand, BrandConfig> = {
 		name: "Whispyr",
 		appName: "Whispyr Mail",
 		mark: "/whispyr-mark.svg",
+		favicon: "/favicon.svg",
+		pwaIcon192: "/icon-192.png",
+		pwaIcon512: "/icon-512.png",
+		appleTouchIcon: "/apple-touch-icon.png",
+		notificationBadge: "/favicon-32.png",
+		legacyFavicon: "/favicon.ico",
+		legacyFaviconType: "image/x-icon",
+		legacyFaviconSizes: "48x48 32x32 16x16",
 		markWidth: 22,
 		markHeight: 36,
 		websiteUrl: "https://whispyrai.com",
@@ -96,6 +117,14 @@ const BRANDS: Record<Brand, BrandConfig> = {
 		name: "Wiser",
 		appName: "Wiser Mail",
 		mark: "/wiser-mark.svg",
+		favicon: "/wiser-mark.svg",
+		pwaIcon192: "/wiser-icon-192.png",
+		pwaIcon512: "/wiser-icon-512.png",
+		appleTouchIcon: "/wiser-apple-touch-icon.png",
+		notificationBadge: "/wiser-badge-96.png",
+		legacyFavicon: "/wiser-favicon-32.png",
+		legacyFaviconType: "image/png",
+		legacyFaviconSizes: "32x32",
 		markWidth: 30,
 		markHeight: 30,
 		websiteUrl: "https://wiserchat.ai",
@@ -124,7 +153,39 @@ const BRANDS: Record<Brand, BrandConfig> = {
  */
 export function resolveBrand(value: string | undefined | null): BrandConfig {
 	const key = (value ?? "").trim().toLowerCase();
-	return key in BRANDS ? BRANDS[key as Brand] : BRANDS.whispyr;
+	if (key === "wiser") return BRANDS.wiser;
+	return BRANDS.whispyr;
+}
+
+/** Install metadata for the active brand's public web-manifest endpoint. */
+export function pwaManifestFor(b: BrandConfig) {
+	return {
+		id: "/",
+		name: b.appName,
+		short_name: b.name,
+		description: `${b.name} team mail`,
+		start_url: "/",
+		scope: "/",
+		display: "standalone",
+		theme_color: b.themeColor,
+		background_color: b.themeColor,
+		icons: [
+			{ src: b.pwaIcon192, sizes: "192x192", type: "image/png", purpose: "any" },
+			{
+				src: b.pwaIcon192,
+				sizes: "192x192",
+				type: "image/png",
+				purpose: "maskable",
+			},
+			{ src: b.pwaIcon512, sizes: "512x512", type: "image/png", purpose: "any" },
+			{
+				src: b.pwaIcon512,
+				sizes: "512x512",
+				type: "image/png",
+				purpose: "maskable",
+			},
+		],
+	};
 }
 
 // Component styles shared across brands — they reference the per-brand `:root`
@@ -228,7 +289,9 @@ export function pageShell(b: BrandConfig, title: string, body: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <meta name="theme-color" content="${b.themeColor}">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="${b.favicon}" type="image/svg+xml">
+<link rel="icon" href="${b.legacyFavicon}" type="${b.legacyFaviconType}" sizes="${b.legacyFaviconSizes}">
+<link rel="apple-touch-icon" href="${b.appleTouchIcon}">
 <link rel="preload" href="${b.preloadFont}" as="font" type="font/woff2" crossorigin>
 <title>${title}</title><style>${brandCss(b)}</style></head><body>${body}</body></html>`;
 }

@@ -7,9 +7,9 @@
 
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
-import * as schema from "../db/users-schema";
-import type { UserRole, UserRow } from "../db/users-schema";
-import type { Env } from "../types";
+import * as schema from "../db/users-schema.ts";
+import type { UserRole, UserRow } from "../db/users-schema.ts";
+import type { Env } from "../types.ts";
 
 export type User = UserRow;
 
@@ -86,6 +86,10 @@ export async function createUser(
 	};
 	await db(env).insert(schema.users).values(row).run();
 	return row;
+}
+
+export async function deleteUser(env: Env, id: string): Promise<void> {
+	await db(env).delete(schema.users).where(eq(schema.users.id, id)).run();
 }
 
 export async function setUserActive(

@@ -9,7 +9,7 @@
 
 /** Order matters: earlier tokens win when a UA contains several (e.g. CriOS also carries "Safari"). */
 function browserFromUA(ua: string): string {
-	if (/EdgiOS|Edg\//.test(ua)) return "Edge";
+	if (/EdgiOS|EdgA|Edg\//.test(ua)) return "Edge";
 	if (/FxiOS|Firefox/.test(ua)) return "Firefox";
 	if (/OPR\/|Opera/.test(ua)) return "Opera";
 	if (/SamsungBrowser/.test(ua)) return "Samsung Internet";

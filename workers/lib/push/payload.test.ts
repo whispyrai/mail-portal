@@ -79,3 +79,15 @@ test("icon/badge pass through and data carries the routing ids", () => {
 	assert.equal(p.badge, "/favicon-32.png");
 	assert.deepEqual(p.data, { emailId: "msg-123", mailboxId: "hesham@wiserchat.ai" });
 });
+
+test("sender-controlled notification text stays inside the Web Push plaintext limit", () => {
+	const payload = buildPushPayload({
+		...base,
+		fromName: "🚀".repeat(3_000),
+		subject: "\\\"".repeat(3_000),
+		body: "أ".repeat(3_000),
+	});
+	const encodedLength = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
+
+	assert.ok(encodedLength <= 3_993, `payload is ${encodedLength} bytes`);
+});
