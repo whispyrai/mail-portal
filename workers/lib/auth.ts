@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 //
-// Hand-rolled email + password auth for the sales mail portal (locked-decisions
+// Hand-rolled email + password auth for the team mail portal (locked-decisions
 // D-20..D-25): PBKDF2-SHA256 password hashing via Web Crypto, signed JWT session
 // cookies via jose, and helpers for the per-user MCP bearer token.
 //

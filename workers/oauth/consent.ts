@@ -32,7 +32,7 @@ import {
 } from "../lib/auth";
 import { getUserById, getUserByMcpTokenHash } from "../lib/users";
 import { escapeHtml } from "../lib/email-helpers";
-import { pageShell, brandLogo } from "../routes/brand";
+import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "../routes/brand";
 import type { Env } from "../types";
 
 type Ctx = Context<{ Bindings: Env; Variables: { session?: SessionClaims } }>;
@@ -44,6 +44,7 @@ export const MCP_SCOPES = ["email.read", "email.send"];
 // ── /authorize (GET): authenticate the user, then show consent ──────
 
 export async function authorizeGet(c: Ctx) {
+	const brand = resolveBrand(c.env.BRAND);
 	// parseAuthRequest validates the client against KV and throws for unknown /
 	// stale client_ids — surface that as a clean error rather than a 500.
 	let oauthReq: AuthRequest;
@@ -51,12 +52,12 @@ export async function authorizeGet(c: Ctx) {
 		oauthReq = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
 	} catch {
 		return c.html(
-			renderError("This authorization request is invalid or has expired. Please reconnect from the app."),
+			renderError(brand, "This authorization request is invalid or has expired. Please reconnect from the app."),
 			400,
 		);
 	}
 	if (!oauthReq.clientId) {
-		return c.html(renderError("This authorization request is missing a client."), 400);
+		return c.html(renderError(brand, "This authorization request is missing a client."), 400);
 	}
 
 	const session = await sessionFrom(c);
@@ -71,7 +72,7 @@ export async function authorizeGet(c: Ctx) {
 	const client = await c.env.OAUTH_PROVIDER.lookupClient(oauthReq.clientId);
 	const txn = await signAuthTxn(oauthReq, c.env.JWT_SECRET);
 	return c.html(
-		renderConsent({
+		renderConsent(brand, {
 			appName: client?.clientName?.trim() || "An application",
 			session,
 			txn,
@@ -82,6 +83,7 @@ export async function authorizeGet(c: Ctx) {
 // ── /authorize (POST): record the approve/deny decision ─────────────
 
 export async function authorizePost(c: Ctx) {
+	const brand = resolveBrand(c.env.BRAND);
 	const form = await c.req.parseBody();
 	const txn = String(form.txn || "");
 	const decision = String(form.decision || "");
@@ -89,7 +91,7 @@ export async function authorizePost(c: Ctx) {
 	const oauthReq = await verifyAuthTxn<AuthRequest>(txn, c.env.JWT_SECRET);
 	if (!oauthReq?.clientId || !oauthReq.redirectUri) {
 		return c.html(
-			renderError("Your authorization session expired. Please reconnect from the app."),
+			renderError(brand, "Your authorization session expired. Please reconnect from the app."),
 			400,
 		);
 	}
@@ -113,7 +115,7 @@ export async function authorizePost(c: Ctx) {
 
 	const user = await getUserById(c.env, session.sub);
 	if (!user || user.is_active !== 1) {
-		return c.html(renderError("Your account is not active."), 403);
+		return c.html(renderError(brand, "Your account is not active."), 403);
 	}
 
 	const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
@@ -169,21 +171,25 @@ function authorizeUrlFrom(req: AuthRequest): string {
 	return `/authorize?${p.toString()}`;
 }
 
-function renderConsent(opts: {
-	appName: string;
-	session: SessionClaims;
-	txn: string;
-}): string {
+function renderConsent(
+	brand: BrandConfig,
+	opts: {
+		appName: string;
+		session: SessionClaims;
+		txn: string;
+	},
+): string {
 	const app = escapeHtml(opts.appName);
 	const email = escapeHtml(opts.session.email);
 	const mailbox = escapeHtml(opts.session.mailbox);
 	const isAdmin = opts.session.role === "ADMIN";
 	return pageShell(
-		"Authorize · Whispyr Mail",
+		brand,
+		`Authorize · ${brand.appName}`,
 		`<div class="wrap--center">
   <div class="card card--auth">
-    ${brandLogo({ href: "/" })}
-    <h2 style="margin-top:18px">Connect ${app} to Whispyr Mail</h2>
+    ${brandLogo(brand, { href: "/" })}
+    <h2 style="margin-top:18px">Connect ${app} to ${brand.appName}</h2>
     <p class="sub">Signed in as <strong>${email}</strong></p>
     <div class="card" style="margin:8px 0 4px;background:var(--tint)">
       <p class="muted" style="margin:0 0 8px">${app} will be able to:</p>
@@ -204,15 +210,16 @@ function renderConsent(opts: {
 	);
 }
 
-function renderError(message: string): string {
+function renderError(brand: BrandConfig, message: string): string {
 	return pageShell(
-		"Authorization error · Whispyr Mail",
+		brand,
+		`Authorization error · ${brand.appName}`,
 		`<div class="wrap--center">
   <div class="card card--auth">
-    ${brandLogo({ href: "/" })}
+    ${brandLogo(brand, { href: "/" })}
     <h2 style="margin-top:18px">Authorization error</h2>
     <div class="err">${escapeHtml(message)}</div>
-    <a class="btn secondary block" href="/" style="margin-top:14px">Back to Whispyr Mail</a>
+    <a class="btn secondary block" href="/" style="margin-top:14px">Back to ${brand.appName}</a>
   </div>
 </div>`,
 	);

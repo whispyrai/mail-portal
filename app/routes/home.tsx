@@ -24,10 +24,6 @@ import {
 } from "~/queries/mailboxes";
 import { queryKeys } from "~/queries/keys";
 
-export function meta() {
-	return [{ title: "Whispyr Mail" }];
-}
-
 export default function HomeRoute() {
 	const toastManager = useKumoToastManager();
 	const { data: mailboxes = [], refetch: refetchMailboxes, isFetched: mailboxesFetched } = useMailboxes();
@@ -41,7 +37,7 @@ export default function HomeRoute() {
 	});
 
 	// Identity drives who can manage mailboxes (admins only) and lets us send a
-	// single-mailbox rep straight to their inbox.
+	// single-mailbox user straight to their inbox.
 	const { data: me } = useQuery({
 		queryKey: ["me"],
 		queryFn: async () => {

@@ -6,7 +6,7 @@
 // and never unmount, switching language preserves the rep's selections (design §7).
 
 import { escapeHtml } from "../lib/email-helpers";
-import { pageShell, brandLogo } from "../routes/brand";
+import { pageShell, brandLogo, resolveBrand } from "../routes/brand";
 
 /** Inline bilingual text: both languages emitted, CSS shows the active one. */
 export function bi(en: string, ar: string): string {
@@ -369,6 +369,10 @@ export function quizShell(
 	bodyHtml: string,
 	opts: { scripts?: string[]; backHref?: string; backLabelEn?: string; backLabelAr?: string; stagger?: boolean } = {},
 ): string {
+	// ponytail: the rep-quiz is a Whispyr-only feature (WISER-239 feature-flags it
+	// off for Wiser), so its shell always renders the whispyr brand. Revisit only if
+	// the quiz is ever enabled for another brand.
+	const brand = resolveBrand("whispyr");
 	const back = opts.backHref
 		? `<a class="qback" href="${opts.backHref}">← ${bi(opts.backLabelEn ?? "Back", opts.backLabelAr ?? "رجوع")}</a>`
 		: "";
@@ -378,7 +382,7 @@ export function quizShell(
 	// toggle's only-en/only-ar CSS and dir flip reach the header too, not just the body.
 	const body = `<div class="wrap">
   <div id="quizroot" class="${rootClass}" dir="ltr">
-    <div class="qtopbar">${brandLogo({ href: "/" })}
+    <div class="qtopbar">${brandLogo(brand, { href: "/" })}
       <div class="qtools">${langBar()}
         <a href="/">${bi("Inbox", "البريد")}</a>
         <form method="post" action="/logout" style="margin:0"><button class="sm secondary" type="submit">${bi("Sign out", "خروج")}</button></form>
@@ -388,5 +392,5 @@ export function quizShell(
     ${bodyHtml}
   </div>
 </div>${scripts}`;
-	return pageShell(`${title} · Whispyr Mail`, `<style>${QUIZ_CSS}</style>${body}`);
+	return pageShell(brand, `${title} · ${brand.appName}`, `<style>${QUIZ_CSS}</style>${body}`);
 }

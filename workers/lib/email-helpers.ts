@@ -11,6 +11,7 @@
 import type { MailboxDO } from "../durableObject";
 import type { EmailFull } from "./schemas";
 import { Folders } from "../../shared/folders";
+export { buildThreadToken, extractThreadToken } from "./thread-token";
 import type { Env } from "../types";
 import { formatQuotedDate } from "../../shared/dates";
 
@@ -122,29 +123,6 @@ export function buildReferencesChain(original: EmailFull): {
  * recipient's client echoes this token back in their reply. That gives us
  * deterministic, SES-proof threading. See locked-decisions D-65.
  */
-export function buildThreadToken(threadId: string, domain: string): string {
-	return `thread-${threadId}@${domain}`;
-}
-
-const THREAD_TOKEN_RE = /^thread-(.+)@/;
-
-/**
- * Recover our thread id from an inbound message's In-Reply-To / References by
- * finding the thread token we stamped on the original outbound. Returns null if
- * no token is present (e.g. a fresh inbound that isn't a reply to us).
- */
-export function extractThreadToken(
-	references: string[],
-	inReplyTo: string | null,
-): string | null {
-	const candidates = inReplyTo ? [...references, inReplyTo] : references;
-	for (const candidate of candidates) {
-		const match = candidate.match(THREAD_TOKEN_RE);
-		if (match) return match[1];
-	}
-	return null;
-}
-
 /**
  * Build threading headers (In-Reply-To + References) for an outbound message.
  * `originalMsgId` is set only for replies. `threadToken` (when provided) is

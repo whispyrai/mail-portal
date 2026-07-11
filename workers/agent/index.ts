@@ -211,7 +211,7 @@ export class EmailAgent extends AIChatAgent<any> {
 		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, mailboxId);
 
-		// Ground the assistant: per-mailbox Whispyr prompt + a live snapshot of the
+		// Ground the assistant: per-mailbox brand prompt + a live snapshot of the
 		// inbox, so even small models answer from real data instead of guessing.
 		const [systemPrompt, mailboxContext] = await Promise.all([
 			getMailboxSystemPrompt(env, mailboxId),

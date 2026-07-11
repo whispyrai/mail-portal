@@ -14,7 +14,8 @@ import { createMiddleware } from "hono/factory";
 import type { MailboxDO } from "../durableObject";
 import type { Env } from "../types";
 import type { SessionClaims } from "./auth";
-import { WHISPYR_SYSTEM_PROMPT } from "./whispyr-prompt";
+import { systemPromptFor } from "./prompts.ts";
+import { resolveBrand } from "../routes/brand.ts";
 
 export type MailboxContext = {
 	Bindings: Env;
@@ -60,7 +61,7 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
  * Provision a mailbox: create its R2 settings doc (if missing) and initialise
  * the MailboxDO (default folders). Idempotent. Used by admin user creation and
  * the first-admin bootstrap. `settings` is merged over defaults — pass
- * `agentSystemPrompt` here to seed the AI's Whispyr context (D-43).
+ * `agentSystemPrompt` here to seed the active brand's AI context (D-43).
  */
 export async function provisionMailbox(
 	env: Env,
@@ -71,16 +72,23 @@ export async function provisionMailbox(
 	const addr = email.toLowerCase();
 	const key = `mailboxes/${addr}.json`;
 	if (!(await env.BUCKET.head(key))) {
+		// Initialise the Durable Object before publishing the R2 settings document
+		// that makes the mailbox routable to inbound catch-all delivery. If the DO
+		// init fails, inbound must still reject the address as unprovisioned.
+		const stub = env.MAILBOX.get(env.MAILBOX.idFromName(addr));
+		await stub.getFolders();
 		const defaultSettings = {
 			fromName: name,
 			forwarding: { enabled: false, email: "" },
 			signature: { enabled: false, text: "" },
 			autoReply: { enabled: false, subject: "", message: "" },
-			agentSystemPrompt: WHISPYR_SYSTEM_PROMPT,
+			agentSystemPrompt: systemPromptFor(resolveBrand(env.BRAND).id),
 		};
 		await env.BUCKET.put(key, JSON.stringify({ ...defaultSettings, ...settings }));
+		return;
 	}
-	// Touching the DO initialises it (creates the default folders).
+	// Existing settings already make the mailbox routable; still touch the DO so a
+	// partially initialised mailbox can self-heal when provisioning is retried.
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(addr));
 	await stub.getFolders();
 }

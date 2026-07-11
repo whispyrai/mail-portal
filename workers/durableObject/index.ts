@@ -19,6 +19,10 @@ import {
 } from "../lib/email-helpers";
 import { arrayBufferToBase64, uploadKey } from "../lib/attachments";
 import { validateAttachmentSet } from "../../shared/attachments";
+import { vapidConfig } from "../lib/push/transport";
+import { sendWebPush } from "../lib/push/send";
+import { fanOutPush } from "../lib/push/fanout";
+import type { PushPayload } from "../lib/push/types";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -888,31 +892,33 @@ export class MailboxDO extends DurableObject<Env> {
 
 		// Sent emails are always read — the sender obviously knows what they wrote.
 		// This prevents sent replies from inflating thread_unread_count.
-		this.db
-			.insert(schema.emails)
-			.values({
-				id: email.id,
-				folder_id: folderId,
-				subject: email.subject,
-				sender: email.sender,
-				recipient: email.recipient,
-				cc: email.cc ?? null,
-				bcc: email.bcc ?? null,
-				date: email.date,
-				read: isSent ? 1 : (email.read ? 1 : 0),
-				starred: email.starred ? 1 : 0,
-				body: email.body,
-				in_reply_to: email.in_reply_to ?? null,
-				email_references: email.email_references ?? null,
-				thread_id: email.thread_id ?? null,
-				message_id: email.message_id ?? null,
-				raw_headers: email.raw_headers ?? null,
-			})
-			.run();
+		this.ctx.storage.transactionSync(() => {
+			this.db
+				.insert(schema.emails)
+				.values({
+					id: email.id,
+					folder_id: folderId,
+					subject: email.subject,
+					sender: email.sender,
+					recipient: email.recipient,
+					cc: email.cc ?? null,
+					bcc: email.bcc ?? null,
+					date: email.date,
+					read: isSent ? 1 : (email.read ? 1 : 0),
+					starred: email.starred ? 1 : 0,
+					body: email.body,
+					in_reply_to: email.in_reply_to ?? null,
+					email_references: email.email_references ?? null,
+					thread_id: email.thread_id ?? null,
+					message_id: email.message_id ?? null,
+					raw_headers: email.raw_headers ?? null,
+				})
+				.run();
 
-		if (attachments.length > 0) {
-			this.db.insert(schema.attachments).values(attachments).run();
-		}
+			if (attachments.length > 0) {
+				this.db.insert(schema.attachments).values(attachments).run();
+			}
+		});
 	}
 
 	// ── Bulk send (mail merge) — alarm-scheduled, throttled (F-06) ──
@@ -1150,6 +1156,142 @@ export class MailboxDO extends DurableObject<Env> {
 		if (queue.length > 0) {
 			const delay = BULK_MIN_DELAY_MS + Math.floor(Math.random() * BULK_MAX_JITTER_MS);
 			await this.ctx.storage.setAlarm(Date.now() + delay);
+		}
+	}
+
+	// ── Push subscriptions (WISER-240) ─────────────────────────────
+	// Per-device rows for this mailbox. `firePush` fans a payload out to every
+	// enabled device best-effort and prunes the ones the push service reports
+	// gone. Storage + send + prune are co-located here because the subscriptions
+	// are local to the DO (the CRM keys by user; the portal keys by mailbox).
+
+	async upsertPushSubscription(input: {
+		endpoint: string;
+		p256dh: string;
+		auth: string;
+		userAgent: string | null;
+		deviceLabel: string;
+	}): Promise<{ id: string; deviceLabel: string }> {
+		// Re-subscribing the same device yields the same endpoint → refresh its
+		// keys + last_seen without minting a new row. device_label / user_agent
+		// stay create-only (the first registration's values stick).
+		const id = crypto.randomUUID();
+		this.ctx.storage.sql.exec(
+			`INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, user_agent, device_label)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(endpoint) DO UPDATE SET
+			   p256dh = excluded.p256dh,
+			   auth = excluded.auth,
+			   last_seen_at = datetime('now')`,
+			id,
+			input.endpoint,
+			input.p256dh,
+			input.auth,
+			input.userAgent,
+			input.deviceLabel,
+		);
+		const [row] = this.ctx.storage.sql.exec<{ id: string; device_label: string }>(
+			`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`,
+			input.endpoint,
+		);
+		if (!row) throw new Error("Push subscription was not stored");
+		return { id: row.id, deviceLabel: row.device_label };
+	}
+
+	async listPushSubscriptionDevices(): Promise<
+		Array<{
+			id: string;
+			deviceLabel: string | null;
+			userAgent: string | null;
+			createdAt: string;
+			lastSeenAt: string;
+		}>
+	> {
+		// Never returns endpoint / keys — the device list is UX metadata only.
+		return [
+			...this.ctx.storage.sql.exec<{
+				id: string;
+				device_label: string | null;
+				user_agent: string | null;
+				created_at: string;
+				last_seen_at: string;
+			}>(
+				`SELECT id, device_label, user_agent, created_at, last_seen_at
+				 FROM push_subscriptions ORDER BY last_seen_at DESC`,
+			),
+		].map((row) => {
+			return {
+				id: row.id,
+				deviceLabel: row.device_label,
+				userAgent: row.user_agent,
+				createdAt: row.created_at,
+				lastSeenAt: row.last_seen_at,
+			};
+		});
+	}
+
+	async deletePushSubscription(id: string): Promise<boolean> {
+		const existing = [
+			...this.ctx.storage.sql.exec(`SELECT id FROM push_subscriptions WHERE id = ?`, id),
+		];
+		if (existing.length === 0) return false;
+		this.ctx.storage.sql.exec(`DELETE FROM push_subscriptions WHERE id = ?`, id);
+		return true;
+	}
+
+	/**
+	 * Fan a push out to every device on this mailbox, prune dead endpoints, and
+	 * touch the delivered ones. Best-effort and never throws — a push failure or
+	 * missing VAPID config must never break mail receipt (the caller fires this
+	 * from `receiveEmail` after the mail is already stored).
+	 */
+	async firePush(payload: PushPayload): Promise<void> {
+		try {
+			const vapid = vapidConfig(this.env);
+			if (!vapid) return; // push not configured for this env — no-op
+
+			const rows = [
+				...this.ctx.storage.sql.exec<{ endpoint: string; p256dh: string; auth: string }>(
+					`SELECT endpoint, p256dh, auth FROM push_subscriptions`,
+				),
+			];
+			if (rows.length === 0) return;
+
+			const result = await fanOutPush(rows, JSON.stringify(payload), (sub, body) =>
+				sendWebPush(sub, body, vapid),
+			);
+			if (result.delivered < result.attempted) {
+				console.warn("[push] delivery incomplete", {
+					mailboxId: payload.data.mailboxId,
+					attempted: result.attempted,
+					delivered: result.delivered,
+					pruned: result.deadEndpoints.length,
+					failureCounts: result.failureCounts,
+				});
+			}
+
+			for (const endpoint of result.deadEndpoints) {
+				const attemptedSubscription = rows.find((row) => row.endpoint === endpoint);
+				if (!attemptedSubscription) continue;
+				this.ctx.storage.sql.exec(
+					`DELETE FROM push_subscriptions
+					 WHERE endpoint = ? AND p256dh = ? AND auth = ?`,
+					attemptedSubscription.endpoint,
+					attemptedSubscription.p256dh,
+					attemptedSubscription.auth,
+				);
+			}
+			for (const endpoint of result.deliveredEndpoints) {
+				this.ctx.storage.sql.exec(
+					`UPDATE push_subscriptions SET last_seen_at = datetime('now') WHERE endpoint = ?`,
+					endpoint,
+				);
+			}
+		} catch (error) {
+			console.error("[push] dispatch failed", {
+				mailboxId: payload.data.mailboxId,
+				error,
+			});
 		}
 	}
 }

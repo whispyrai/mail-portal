@@ -4,7 +4,6 @@
 
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
-import PostalMime from "postal-mime";
 import { z } from "zod";
 import { sendEmail } from "./email-sender";
 import {
@@ -12,7 +11,6 @@ import {
 	uploadKey,
 	sanitizeFilename,
 	attachmentKey,
-	type StoredAttachment,
 } from "./lib/attachments";
 import {
 	ATTACHMENT_LIMITS,
@@ -26,16 +24,22 @@ import {
 	generateMessageId,
 	buildThreadingHeaders,
 	buildThreadToken,
-	extractThreadToken,
 	listMailboxes,
 } from "./lib/email-helpers";
-import { SendEmailRequestSchema, AttachmentRefSchema } from "./lib/schemas";
+import { SendEmailRequestSchema, AttachmentRefSchema, PushSubscriptionSchema } from "./lib/schemas";
+import { buildDeviceLabel } from "./lib/push/deviceLabel";
+import { vapidConfig } from "./lib/push/transport";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { draftReplyForEmail, draftNewEmail } from "./lib/agent-context";
-import { WHISPYR_SYSTEM_PROMPT } from "./lib/whispyr-prompt";
+import { systemPromptFor } from "./lib/prompts";
+import { pwaManifestFor, resolveBrand } from "./routes/brand";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	isAddressInConfiguredMailDomains,
+	normalizeMailAddress,
+} from "./lib/mail-address";
 
 type AppContext = Context<MailboxContext>;
 
@@ -107,7 +111,23 @@ app.get("/api/v1/config", (c) => {
 	const domainsRaw = c.env.DOMAINS || "";
 	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
 	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
-	return c.json({ domains, emailAddresses });
+	// The VAPID public key drives the client's push subscribe + shows/hides the
+	// enable-notifications UI. null when push isn't configured for this env.
+	return c.json({
+		domains,
+		emailAddresses,
+		vapidPublicKey: vapidConfig(c.env)?.publicKey ?? null,
+	});
+});
+
+// PWA manifest, brand-parameterized (WISER-240). Public (no session): the
+// browser fetches it uncredentialed. Ends in a file extension so the auth gate
+// treats it as a static path.
+app.get("/manifest.webmanifest", (c: AppContext) => {
+	const manifest = pwaManifestFor(resolveBrand(c.env.BRAND));
+	return new Response(JSON.stringify(manifest), {
+		headers: { "Content-Type": "application/manifest+json" },
+	});
 });
 
 // Who am I — drives the SPA header (account, admin link, sign out).
@@ -142,14 +162,17 @@ app.post("/api/v1/mailboxes", async (c: AppContext) => {
 		return c.json({ error: "Forbidden" }, 403);
 	}
 	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
-	const email = rawEmail.toLowerCase();
+	const email = normalizeMailAddress(rawEmail);
+	if (!email || !isAddressInConfiguredMailDomains(email, c.env.DOMAINS)) {
+		return c.json({ error: "Mailbox must use a configured mail domain" }, 403);
+	}
 	const allowedAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
 	if (allowedAddresses.length > 0 && !allowedAddresses.map((a) => a.toLowerCase()).includes(email)) {
 		return c.json({ error: "Mailbox creation is restricted to configured EMAIL_ADDRESSES" }, 403);
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" }, agentSystemPrompt: WHISPYR_SYSTEM_PROMPT };
+	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" }, agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id) };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
@@ -446,6 +469,40 @@ app.delete("/api/v1/mailboxes/:mailboxId/folders/:id", async (c: AppContext) => 
 	return ok ? c.body(null, 204) : c.json({ error: "Folder not found or cannot be deleted" }, 400);
 });
 
+// -- Push subscriptions (WISER-240) ---------------------------------
+// Per-device Web Push subscriptions, scoped to the mailbox by requireMailbox
+// (an AGENT manages only their own; an admin any — the natural home for role
+// inboxes like hello@/contact@). The list never exposes endpoint or keys.
+
+app.post("/api/v1/mailboxes/:mailboxId/push-subscriptions", async (c: AppContext) => {
+	const parsed = PushSubscriptionSchema.safeParse(await c.req.json().catch(() => null));
+	if (!parsed.success) {
+		return c.json({ error: `Invalid subscription: ${parsed.error.message}` }, 400);
+	}
+	const body = parsed.data;
+	// Derive the device label server-side from the request UA — never trusted from the body.
+	const userAgent = c.req.header("user-agent") ?? null;
+	const result = await c.var.mailboxStub.upsertPushSubscription({
+		endpoint: body.endpoint,
+		p256dh: body.keys.p256dh,
+		auth: body.keys.auth,
+		userAgent,
+		deviceLabel: buildDeviceLabel(userAgent),
+	});
+	return c.json(result, 201);
+});
+
+app.get("/api/v1/mailboxes/:mailboxId/push-subscriptions", async (c: AppContext) => {
+	return c.json({ subscriptions: await c.var.mailboxStub.listPushSubscriptionDevices() });
+});
+
+app.delete("/api/v1/mailboxes/:mailboxId/push-subscriptions/:id", async (c: AppContext) => {
+	const subscriptionId = c.req.param("id");
+	if (!subscriptionId) return c.json({ error: "Subscription id is required" }, 400);
+	const ok = await c.var.mailboxStub.deletePushSubscription(subscriptionId);
+	return ok ? c.body(null, 204) : c.json({ error: "Not found" }, 404);
+});
+
 // -- Search ---------------------------------------------------------
 
 app.get("/api/v1/mailboxes/:mailboxId/search", async (c: AppContext) => {
@@ -508,87 +565,4 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 	return new Response(obj.body, { headers });
 });
 
-// -- Receive inbound email ------------------------------------------
-
-const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
-
-async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
-	if (streamSize > MAX_EMAIL_SIZE) throw new Error(`Email too large: ${streamSize} bytes exceeds ${MAX_EMAIL_SIZE} byte limit`);
-	if (streamSize <= 0) throw new Error(`Invalid stream size: ${streamSize}`);
-	const result = new Uint8Array(streamSize);
-	let bytesRead = 0;
-	const reader = stream.getReader();
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		if (bytesRead + value.length > streamSize) { reader.cancel(); throw new Error(`Stream exceeds declared size`); }
-		result.set(value, bytesRead);
-		bytesRead += value.length;
-	}
-	return result;
-}
-
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
-	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
-	const parsedEmail = await new PostalMime().parse(rawEmail);
-
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
-
-	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
-	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
-	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
-
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
-
-	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
-
-	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
-
-	const attachmentData: StoredAttachment[] = [];
-	if (parsedEmail.attachments) {
-		for (const att of parsedEmail.attachments) {
-			const attId = crypto.randomUUID();
-			const filename = (att.filename || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
-			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, att.content);
-			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: att.mimeType,
-				size: typeof att.content === "string" ? att.content.length : att.content.byteLength,
-				content_id: att.contentId || null, disposition: att.disposition || "attachment" });
-		}
-	}
-
-	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
-	const inReplyTo = parsedEmail.inReplyTo ? extractMsgId(parsedEmail.inReplyTo) : null;
-	const emailReferences = parsedEmail.references ? parsedEmail.references.split(/\s+/).filter(Boolean).map(extractMsgId) : [];
-	// Our app-controlled thread token (in References) is the most reliable match:
-	// SES rewrites Message-ID but not References, so replies echo it back to us.
-	const tokenThreadId = extractThreadToken(emailReferences, inReplyTo);
-	let threadId = tokenThreadId || emailReferences[0] || inReplyTo || messageId;
-
-	if (!tokenThreadId && !inReplyTo && emailReferences.length === 0) {
-		const subjectThread = await (stub as any).findThreadBySubject(parsedEmail.subject || "", parsedEmail.from?.address || undefined);
-		if (subjectThread) threadId = subjectThread;
-	}
-
-	const originalMessageId = parsedEmail.messageId ? extractMsgId(parsedEmail.messageId) : null;
-
-	await stub.createEmail(Folders.INBOX, {
-		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
-		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
-		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
-		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
-	}, attachmentData);
-	// Auto-draft-on-inbound is intentionally disabled (locked-decisions D-40).
-	// The AI assistant is manual-only: side-panel chat + "Draft reply" button.
-}
-
-export { app, receiveEmail };
+export { app };

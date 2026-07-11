@@ -7,7 +7,11 @@
 // Worker-rendered HTML (no React) — locked-decisions D-23, D-62, D-64.
 
 import { Hono } from "hono";
+import PostalMime, { type Email } from "postal-mime";
 import { USER_ROLES, type UserRole } from "../db/users-schema";
+import { importParsedEmail } from "../lib/import/import-email";
+import { mapZohoFolder } from "../lib/import/parse";
+import { MAX_EMAIL_SIZE } from "../lib/store-email";
 import {
 	listUsers,
 	getUserById,
@@ -23,17 +27,21 @@ import {
 	hashToken,
 	type SessionClaims,
 } from "../lib/auth";
-import { provisionMailbox } from "../lib/mailbox";
-import { WHISPYR_SYSTEM_PROMPT } from "../lib/whispyr-prompt";
+import { provisionAccount } from "../lib/account-provisioning";
+import { systemPromptFor } from "../lib/prompts";
 import { escapeHtml } from "../lib/email-helpers";
-import { pageShell, brandLogo } from "./brand";
+import {
+	isAddressInConfiguredMailDomains,
+	normalizeMailAddress,
+} from "../lib/mail-address";
+import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
 import { adminQuizApp } from "../quiz/admin-routes";
 import type { Env } from "../types";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
-function shell(body: string): string {
-	return pageShell("Admin · Whispyr Mail", `<div class="wrap">${body}</div>`);
+function shell(brand: BrandConfig, body: string): string {
+	return pageShell(brand, `Admin · ${brand.appName}`, `<div class="wrap">${body}</div>`);
 }
 
 function mcpBaseUrl(c: { req: { url: string }; env: Env }): string {
@@ -57,6 +65,7 @@ adminApp.use("*", async (c, next) => {
 adminApp.route("/quizzes", adminQuizApp);
 
 adminApp.get("/users", async (c) => {
+	const brand = resolveBrand(c.env.BRAND);
 	const users = await listUsers(c.env);
 	const flash = c.req.query("ok")
 		? `<div class="flash ok">${escapeHtml(c.req.query("ok")!)}</div>`
@@ -94,8 +103,8 @@ adminApp.get("/users", async (c) => {
 		.join("");
 
 	return c.html(
-		shell(`
-  <div class="brandbar">${brandLogo({ href: "/" })}
+		shell(brand, `
+  <div class="brandbar">${brandLogo(brand, { href: "/" })}
     <form class="inline" method="post" action="/logout"><button class="sm secondary" type="submit">Sign out</button></form></div>
   <h1 style="margin-top:14px">User administration</h1>
   ${flash}
@@ -103,7 +112,7 @@ adminApp.get("/users", async (c) => {
     <h2 style="font-size:16px;margin-top:0">Create a user</h2>
     <form method="post" action="/admin/users">
       <div class="row">
-        <div><label>Email</label><input name="email" type="email" placeholder="kareem@whispyrcrm.com" required></div>
+        <div><label>Email</label><input name="email" type="email" placeholder="kareem@${brand.mailDomain}" required></div>
         <div><label>Display name</label><input name="name" type="text" placeholder="Kareem Hatem"></div>
       </div>
       <div class="row">
@@ -123,14 +132,19 @@ adminApp.get("/users", async (c) => {
 
 adminApp.post("/users", async (c) => {
 	const form = await c.req.parseBody();
-	const email = String(form.email || "").trim().toLowerCase();
-	const name = String(form.name || "").trim() || email.split("@")[0];
+	const email = normalizeMailAddress(String(form.email || ""));
 	const password = String(form.password || "");
 	const roleRaw = String(form.role || "AGENT");
 	const role: UserRole = roleRaw === "ADMIN" ? "ADMIN" : "AGENT";
 
-	if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+	if (!email) {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("Invalid email address.")}`, 302);
+	}
+	if (!isAddressInConfiguredMailDomains(email, c.env.DOMAINS)) {
+		return c.redirect(
+			`/admin/users?err=${encodeURIComponent("Email address must use a configured mail domain.")}`,
+			302,
+		);
 	}
 	if (password.length < 12) {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("Password must be at least 12 characters.")}`, 302);
@@ -138,17 +152,29 @@ adminApp.post("/users", async (c) => {
 	if (await getUserByEmail(c.env, email)) {
 		return c.redirect(`/admin/users?err=${encodeURIComponent("A user with that email already exists.")}`, 302);
 	}
+	const name = String(form.name || "").trim() || email.split("@")[0];
 
 	const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
-	await createUser(c.env, {
-		email,
-		passwordHash: hash,
-		passwordSalt: salt,
-		role,
-		mailboxAddress: email,
-	});
-	// Provision the mailbox and seed the Whispyr AI context (D-43).
-	await provisionMailbox(c.env, email, name, { agentSystemPrompt: WHISPYR_SYSTEM_PROMPT });
+	try {
+		await provisionAccount(c.env, {
+			email,
+			passwordHash: hash,
+			passwordSalt: salt,
+			role,
+			mailboxAddress: email,
+			displayName: name,
+			mailboxSettings: { agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id) },
+		});
+	} catch (error) {
+		console.error("[admin] failed to create user and mailbox", {
+			email,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return c.redirect(
+			`/admin/users?err=${encodeURIComponent("User and mailbox could not be created. Please retry or inspect logs.")}`,
+			302,
+		);
+	}
 
 	return c.redirect(`/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}).`)}`, 302);
 });
@@ -182,8 +208,9 @@ adminApp.post("/users/:id/mcp-token", async (c) => {
 	const token = generateMcpToken();
 	await setUserMcpTokenHash(c.env, user.id, await hashToken(token));
 	const base = mcpBaseUrl(c);
+	const brand = resolveBrand(c.env.BRAND);
 	return c.html(
-		shell(`
+		shell(brand, `
   <h1>MCP token issued</h1>
   <div class="flash ok">Copy this now — it is shown only once.</div>
   <div class="card">
@@ -197,6 +224,46 @@ adminApp.post("/users/:id/mcp-token", async (c) => {
     <a href="/admin/users">← Back to users</a>
   </div>`),
 	);
+});
+
+// ── One-time Zoho mail importer (WISER-241) ─────────────────────────
+//
+// POST /admin/import/:mailboxId?folder=<zohoFolder> with a raw RFC822 .eml body.
+// ADMIN-only (inherited guard). Feeds historical mail through the shared store path,
+// preserves the original date, routes the
+// original folder (Trash/Spam dropped), and marks history read — and never fires
+// push. Idempotent: the internal id is derived from the message, so re-running
+// skips anything already imported (R2 keys are keyed on that id too). Removable
+// after the migration.
+adminApp.post("/import/:mailboxId", async (c) => {
+	const mailboxId = decodeURIComponent(c.req.param("mailboxId")).toLowerCase();
+	const sourceFolder = c.req.query("folder")?.trim();
+	if (!sourceFolder) return c.json({ error: "folder query param is required" }, 400);
+
+	// Require a pre-provisioned mailbox — the importer never creates one (role
+	// inboxes are admin-provisioned via /admin/users before import).
+	if (!(await c.env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		return c.json({ error: "Mailbox not found" }, 404);
+	}
+
+	const folder = mapZohoFolder(sourceFolder);
+	if (!folder) {
+		return c.json({ status: "skipped", reason: "excluded-folder", folder: sourceFolder }, 200);
+	}
+
+	const raw = await c.req.arrayBuffer();
+	if (raw.byteLength === 0) return c.json({ error: "empty message body" }, 400);
+	if (raw.byteLength > MAX_EMAIL_SIZE) return c.json({ error: "message exceeds size limit" }, 413);
+
+	let parsed: Email;
+	try {
+		parsed = await new PostalMime().parse(raw);
+	} catch {
+		return c.json({ error: "invalid RFC822 message" }, 400);
+	}
+	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	const result = await importParsedEmail({ bucket: c.env.BUCKET, mailbox: stub }, parsed, folder);
+	return result.status === "imported" ? c.json(result, 201) : c.json(result, 200);
 });
 
 export { adminApp };

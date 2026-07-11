@@ -1,9 +1,13 @@
 <div align="center">
-  <h1>Whispyr Sales Mail Portal</h1>
-  <p><em>Self-hosted email for the Whispyr sales team — send/receive, bulk send, and a manual AI assistant, on Cloudflare Workers + AWS SES.</em></p>
+  <h1>Mail Portal</h1>
+  <p><em>Self-hosted team email — send/receive, bulk send, and a manual AI assistant, on Cloudflare Workers + AWS SES. One brand-parameterized codebase, one isolated deploy per brand.</em></p>
 </div>
 
-A fork of [cloudflare/agentic-inbox](https://github.com/cloudflare/agentic-inbox) (Apache 2.0), adapted for the Whispyr sales team. Reps log in with email + password, send and receive from `firstname@whispyrcrm.com`, do light bulk send (mail merge), and use a manually-invoked AI assistant. Full design + decisions live in the second brain: `~/Documents/hesham-os/whispyr-sales/initiatives/sales-mail-portal/`.
+A fork of [cloudflare/agentic-inbox](https://github.com/cloudflare/agentic-inbox) (Apache 2.0). Users log in with email + password, send and receive from `firstname@<brand-domain>`, do light bulk send (mail merge), and use a manually-invoked AI assistant.
+
+This is a **shared, brand-parameterized platform**: source is shared, but each brand deploys as its own isolated Cloudflare Worker (own D1, Durable Objects, R2, KV, SES identity, secrets, and domain) via a named Wrangler environment. Brands are selected at build time with `CLOUDFLARE_ENV` - e.g. `npm run deploy:whispyr` or `npm run deploy:wiser`. Whispyr (`mail.whispyrcrm.com`) is live; Wiser (`mail.wiserchat.ai`) is isolated in `env.wiser` and follows the Wiser go-live runbook.
+
+Design + decisions live in the second brain: the shared platform in `~/Documents/hesham-os/wiserchat/initiatives/team-mail-portal/`, Whispyr history in `~/Documents/hesham-os/whispyr-sales/initiatives/sales-mail-portal/`.
 
 ## What changed from upstream
 
@@ -26,15 +30,39 @@ Single Cloudflare Worker (Hono + React Router v7 SSR). Per-mailbox state in Dura
 
 ```bash
 npm install
-cp .dev.vars.example .dev.vars   # fill in AWS keys, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL
-npm run dev                      # Cloudflare Access is bypassed in dev; auth gate still runs
+cp .dev.vars.example .dev.vars.whispyr   # for Whispyr local dev
+cp .dev.vars.example .dev.vars.wiser     # for Wiser local dev
+npm run dev:whispyr                      # Cloudflare Access is bypassed in dev; auth gate still runs
+npm run dev:wiser                        # uses only .dev.vars.wiser, not the generic file
 ```
 
-`npm run typecheck` and `npm run build` should both pass before deploying.
+Do not use one generic `.dev.vars` for both brands. Wrangler loads `.dev.vars.<environment>` exclusively when it exists, which keeps local secrets isolated by brand. `npm run typecheck`, `npm run typecheck:wiser`, `npm run verify:env:whispyr`, and `npm run verify:env:wiser` should pass before deploying brand work.
 
-## Deploy (production runbook)
+## One-time Zoho import
 
-Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS SES production account in `eu-west-2`.
+The admin-only importer restores exported `.eml` history into a mailbox that has
+already been provisioned. It preserves dates, threads, folders, and attachments;
+Trash and Spam are excluded, and re-running the same export is safe.
+
+Keep the admin password out of command arguments. Capture it with a hidden shell
+prompt, export it only for the importer process, then remove it:
+
+```bash
+read -s IMPORT_PASSWORD
+export IMPORT_PASSWORD
+node scripts/import-zoho.mjs \
+  --base https://mail.wiserchat.ai \
+  --email hesham@wiserchat.ai \
+  --mailbox hello@wiserchat.ai \
+  --dir ./zoho-export/hello
+unset IMPORT_PASSWORD
+```
+
+Repeat for `contact@wiserchat.ai`. The driver exits non-zero if any message fails. The full Wiser migration/cutover order is in [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md).
+
+## Deploy (production runbook — Whispyr environment)
+
+Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, …), deployed by baking the env at build time. The steps below are the Whispyr environment; a new brand repeats them against its own resources under a new `env.<brand>` block. Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS SES production account in `eu-west-2`.
 
 1. **D1 database**
 
@@ -62,10 +90,10 @@ Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS 
    ```
    `AWS_REGION` and `DOMAINS` are plain vars already set in `wrangler.jsonc`.
 
-4. **Deploy** — provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `wrangler.jsonc`):
+4. **Deploy** — provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `env.whispyr`). `CLOUDFLARE_ENV=whispyr` is baked in by the script, so the build resolves the `env.whispyr` block and the deploy lands on the `sales-mail-portal` Worker:
 
    ```bash
-   npm run deploy
+   npm run deploy:whispyr
    ```
 
 5. **Inbound — Cloudflare Email Routing** (dashboard → `whispyrcrm.com` → Email Routing): enable it (accept the MX records), then add a **catch-all** rule that delivers to this Worker.
@@ -77,6 +105,10 @@ Prerequisites: a Cloudflare account with `whispyrcrm.com`, and the existing AWS 
 7. **First admin** — visit `https://mail.whispyrcrm.com/login` and sign in with `ADMIN_BOOTSTRAP_EMAIL` + a password (≥12 chars). With zero users, this bootstraps the first `ADMIN` account and provisions its mailbox. Then create reps at `/admin/users`.
 
 8. **MCP (optional)** — in `/admin/users`, "Rotate MCP token" for a user, then point an MCP client at `https://mail.whispyrcrm.com/mcp` with header `Authorization: Bearer <token>`. An ADMIN token can read all mailboxes but sends only from the admin's address; an AGENT token is confined to their own mailbox.
+
+## Deploy (production runbook - Wiser environment)
+
+Wiser has its own named Wrangler environment, resources, secrets, SES identity, and DNS/routing sequence. Use [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md) for the exact approval-gated end-to-end launch checklist.
 
 ## License
 

@@ -7,6 +7,8 @@ import { Hono, type Context } from "hono";
 import type { SessionClaims } from "../lib/auth";
 import { escapeHtml } from "../lib/email-helpers";
 import type { Env } from "../types";
+import { isQuizEnabled } from "../lib/features";
+import { resolveBrand } from "../routes/brand";
 import type { QuizAnswerRow, QuizQuestionRow, QuizRow } from "../db/quiz-schema";
 import { bi, biBlock, optionReadout, quizShell, TIMER_SCRIPT, TAKE_SCRIPT } from "./render";
 import {
@@ -24,6 +26,16 @@ import {
 type QuizEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
 const quizApp = new Hono<QuizEnv>();
+
+// The rep-quiz is a Whispyr-only module. Where the env's FEATURES omits it, 404
+// the whole surface so it is genuinely absent (not merely hidden) — e.g. Wiser
+// (WISER-239). resolveBrand supplies the fail-safe default when FEATURES is unset.
+quizApp.use("*", async (c, next) => {
+	if (!isQuizEnabled(c.env.FEATURES, resolveBrand(c.env.BRAND).id)) {
+		return c.notFound();
+	}
+	return next();
+});
 
 function notAvailable(c: Context<QuizEnv>, quiz?: QuizRow) {
 	const t = quiz ? bi(quiz.title_en, quiz.title_ar) : bi("This quiz", "هذا الاختبار");

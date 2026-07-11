@@ -1,6 +1,10 @@
-# Local dev secrets. Copy to .dev.vars (gitignored) and fill in real values.
+# Local dev secrets. Copy to the environment-specific file you are running:
+#   cp .dev.vars.example .dev.vars.whispyr
+#   cp .dev.vars.example .dev.vars.wiser
+# Both are gitignored. Do not use one generic .dev.vars for both brands: Wrangler
+# otherwise makes those credentials available to every named local environment.
 
-# AWS SES outbound (eu-west-2). Use the sales-mail-portal-ses-sender IAM user.
+# AWS SES outbound (eu-west-2). Use that brand's dedicated send-only IAM user.
 # Region is set in wrangler.jsonc (AWS_REGION); these two are secrets.
 AWS_ACCESS_KEY_ID=your-ses-iam-access-key-id
 AWS_SECRET_ACCESS_KEY=your-ses-iam-secret-access-key
@@ -10,4 +14,12 @@ AWS_SECRET_ACCESS_KEY=your-ses-iam-secret-access-key
 JWT_SECRET=your-long-random-jwt-secret
 
 # Email allowed to self-provision the first ADMIN account on first login.
-ADMIN_BOOTSTRAP_EMAIL=hesham@whispyrcrm.com
+ADMIN_BOOTSTRAP_EMAIL=replace-with-the-brand-admin-address
+
+# Web Push VAPID keypair (WISER-240). Generate once with:
+#   npx web-push generate-vapid-keys
+# VAPID_SUBJECT is a plain var in wrangler.jsonc; the keypair is secret.
+# In prod: wrangler secret put VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY --env <brand>.
+# Leave blank to run without push (mail still receives).
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=

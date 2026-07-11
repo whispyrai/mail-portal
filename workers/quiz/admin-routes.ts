@@ -7,6 +7,8 @@ import { Hono } from "hono";
 import type { SessionClaims } from "../lib/auth";
 import { escapeHtml } from "../lib/email-helpers";
 import type { Env } from "../types";
+import { isQuizEnabled } from "../lib/features";
+import { resolveBrand } from "../routes/brand";
 import { QUESTION_TYPES, QUIZ_STATUSES } from "../db/quiz-schema";
 import type { QuizAnswerRow, QuizQuestionRow, QuizRow } from "../db/quiz-schema";
 import type { SeedOption } from "./seed";
@@ -42,6 +44,15 @@ type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 const OPTION_SLOTS = ["a", "b", "c", "d", "e", "f"] as const;
 
 const adminQuizApp = new Hono<AdminEnv>();
+
+// Match the rep-quiz gate: 404 the admin quiz console too where FEATURES omits
+// the quiz, so no quiz surface exists in a Wiser environment (WISER-239).
+adminQuizApp.use("*", async (c, next) => {
+	if (!isQuizEnabled(c.env.FEATURES, resolveBrand(c.env.BRAND).id)) {
+		return c.notFound();
+	}
+	return next();
+});
 
 function flash(c: { req: { query: (k: string) => string | undefined } }): string {
 	const ok = c.req.query("ok");

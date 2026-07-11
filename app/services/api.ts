@@ -97,7 +97,31 @@ interface EmailListResponse {
 const api = {
 	// Config
 	getConfig: () =>
-		get<{ domains: string[]; emailAddresses: string[] }>("/api/v1/config"),
+		get<{ domains: string[]; emailAddresses: string[]; vapidPublicKey: string | null }>(
+			"/api/v1/config",
+		),
+
+	// Push subscriptions (WISER-240)
+	listPushSubscriptions: (mailboxId: string) =>
+		get<{
+			subscriptions: Array<{
+				id: string;
+				deviceLabel: string | null;
+				userAgent: string | null;
+				createdAt: string;
+				lastSeenAt: string;
+			}>;
+		}>(`/api/v1/mailboxes/${mailboxId}/push-subscriptions`),
+	registerPushSubscription: (
+		mailboxId: string,
+		sub: { endpoint: string; keys: { p256dh: string; auth: string } },
+	) =>
+		post<{ id: string; deviceLabel: string }>(
+			`/api/v1/mailboxes/${mailboxId}/push-subscriptions`,
+			sub,
+		),
+	deletePushSubscription: (mailboxId: string, id: string) =>
+		del<void>(`/api/v1/mailboxes/${mailboxId}/push-subscriptions/${id}`),
 
 	// Mailboxes
 	listMailboxes: () => get<Mailbox[]>("/api/v1/mailboxes"),

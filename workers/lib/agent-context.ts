@@ -4,7 +4,7 @@
 //
 // Shared context + model helpers for the manually-invoked AI assistant.
 // Used by both the chat agent (workers/agent) and the one-shot "AI Reply"
-// endpoint so they answer from the rep's real mailbox with Whispyr context.
+// endpoint so they answer from the mailbox's real data and active brand context.
 
 import {
 	getMailboxStub,
@@ -13,7 +13,8 @@ import {
 	stripHtmlToText,
 	textToHtml,
 } from "./email-helpers";
-import { WHISPYR_SYSTEM_PROMPT } from "./whispyr-prompt";
+import { systemPromptFor } from "./prompts";
+import { resolveBrand } from "../routes/brand";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 
@@ -28,7 +29,7 @@ export function getAiModel(env: Env): string {
 
 /**
  * Resolve the system prompt for a mailbox: the per-mailbox `agentSystemPrompt`
- * from R2 settings if set, otherwise the canonical Whispyr prompt.
+ * from R2 settings if set, otherwise the active brand's canonical prompt.
  */
 export async function getMailboxSystemPrompt(
 	env: Env,
@@ -44,7 +45,7 @@ export async function getMailboxSystemPrompt(
 	} catch {
 		// Fall through to the default.
 	}
-	return WHISPYR_SYSTEM_PROMPT;
+	return systemPromptFor(resolveBrand(env.BRAND).id);
 }
 
 /**
@@ -96,7 +97,7 @@ export async function buildMailboxContext(
 /**
  * One-shot reply draft for a single email/thread. Used by the "AI Reply" button.
  * Generates directly (no agent tool-calling) so it's reliable on small models,
- * then returns plain fields the composer can pre-fill. The rep reviews + sends.
+ * then returns plain fields the composer can pre-fill. The mailbox owner reviews and sends.
  */
 export async function draftReplyForEmail(
 	env: Env,
@@ -126,17 +127,17 @@ export async function draftReplyForEmail(
 	const systemPrompt = await getMailboxSystemPrompt(env, mailboxId);
 	const model = getAiModel(env);
 
-	const repRaw = mailboxId.split("@")[0].split(".")[0];
-	const repFirstName = repRaw.charAt(0).toUpperCase() + repRaw.slice(1);
+	const ownerRaw = mailboxId.split("@")[0].split(".")[0];
+	const ownerFirstName = ownerRaw.charAt(0).toUpperCase() + ownerRaw.slice(1);
 
 	const messages = [
 		{
 			role: "system",
-			content: `${systemPrompt}\n\nYou are drafting a reply on behalf of the rep (${mailboxId}). Output ONLY the plain-text body of the reply — no subject line, no "To:" line, no commentary, and do NOT include the quoted original message.\n\nStructure the reply as a proper email:\n- Open with a natural greeting using the sender's first name (e.g. "Hi Ahmed,")\n- Write the reply in clear, well-spaced paragraphs\n- Close with a professional sign-off (e.g. "Best regards,") on its own line, followed by the rep's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
+			content: `${systemPrompt}\n\nYou are drafting a reply on behalf of the mailbox owner (${mailboxId}). Output ONLY the plain-text body of the reply — no subject line, no "To:" line, no commentary, and do NOT include the quoted original message.\n\nStructure the reply as a proper email:\n- Open with a natural greeting using the sender's first name (e.g. "Hi Ahmed,")\n- Write the reply in clear, well-spaced paragraphs\n- Close with a professional sign-off (e.g. "Best regards,") on its own line, followed by the mailbox owner's first name: ${ownerFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
 		},
 		{
 			role: "user",
-			content: `Draft the rep's reply to the most recent message in this thread.\n\n${threadText}`,
+			content: `Draft the mailbox owner's reply to the most recent message in this thread.\n\n${threadText}`,
 		},
 	];
 
@@ -165,7 +166,7 @@ export async function draftReplyForEmail(
 }
 
 /**
- * One-shot compose draft for a brand-new outbound email. The rep provides a
+ * One-shot compose draft for a brand-new outbound email. The mailbox owner provides a
  * plain-language prompt describing what they want to write; the model returns
  * a subject line and a full email body (greeting → paragraphs → sign-off).
  */
@@ -177,13 +178,13 @@ export async function draftNewEmail(
 	const systemPrompt = await getMailboxSystemPrompt(env, mailboxId);
 	const model = getAiModel(env);
 
-	const repRaw = mailboxId.split("@")[0].split(".")[0];
-	const repFirstName = repRaw.charAt(0).toUpperCase() + repRaw.slice(1);
+	const ownerRaw = mailboxId.split("@")[0].split(".")[0];
+	const ownerFirstName = ownerRaw.charAt(0).toUpperCase() + ownerRaw.slice(1);
 
 	const messages = [
 		{
 			role: "system",
-			content: `${systemPrompt}\n\nYou are composing a brand-new outbound email on behalf of the rep whose mailbox is ${mailboxId}.\n\nOutput your response in exactly this format — nothing else:\nSUBJECT: <concise subject line>\n\n<full email body>\n\nThe body MUST:\n- Open with a natural greeting (e.g. "Hi [Name]," or "Dear [Name],")\n- Contain clear, well-spaced paragraphs conveying the message\n- Close with a professional sign-off (e.g. "Best regards,") on its own line followed by the rep's first name: ${repFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
+			content: `${systemPrompt}\n\nYou are composing a brand-new outbound email on behalf of the mailbox owner whose mailbox is ${mailboxId}.\n\nOutput your response in exactly this format — nothing else:\nSUBJECT: <concise subject line>\n\n<full email body>\n\nThe body MUST:\n- Open with a natural greeting (e.g. "Hi [Name]," or "Dear [Name],")\n- Contain clear, well-spaced paragraphs conveying the message\n- Close with a professional sign-off (e.g. "Best regards,") on its own line followed by the mailbox owner's first name: ${ownerFirstName}\nNo markdown, no bullet lists, no headers — natural paragraphs only.`,
 		},
 		{
 			role: "user",

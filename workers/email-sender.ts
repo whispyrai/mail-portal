@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 //
-// Outbound delivery for the Whispyr sales mail portal.
+// Outbound delivery for the shared team mail portal.
 //
 // Upstream Agentic Inbox sent through the Cloudflare Email Service binding
 // (`env.EMAIL.send()`). This fork sends through AWS SES instead (existing

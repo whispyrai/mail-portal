@@ -7,6 +7,14 @@
 @font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Book.woff2") format("woff2"); font-weight: 400; font-display: swap; }
 @font-face { font-family: "Kamerik 105"; src: url("/fonts/Kamerik105-Bold.woff2") format("woff2"); font-weight: 700; font-display: swap; }
 
+/* Wiser brand font — Inter, self-hosted from /public/fonts (WISER-238).
+   Faces are always declared but only load when --font-sans references them
+   (i.e. under data-brand="wiser"), so this is inert for Whispyr. */
+@font-face { font-family: "Inter"; src: url("/fonts/Inter-Regular.woff2") format("woff2"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Inter"; src: url("/fonts/Inter-Medium.woff2") format("woff2"); font-weight: 500; font-display: swap; }
+@font-face { font-family: "Inter"; src: url("/fonts/Inter-SemiBold.woff2") format("woff2"); font-weight: 600; font-display: swap; }
+@font-face { font-family: "Inter"; src: url("/fonts/Inter-Bold.woff2") format("woff2"); font-weight: 700; font-display: swap; }
+
 /* ============================================================
    Whispyr enterprise theme
    White-dominant surfaces, charcoal text + primary actions, warm-tan
@@ -99,11 +107,60 @@
   --color-kumo-tip-stroke: rgba(26, 26, 26, 0.08);
 }
 
+/* ============================================================
+   Wiser skin (WISER-238) — olive + cream identity, Inter type.
+   Layered AFTER the Whispyr block so equal-specificity token
+   overrides win on source order. Only brand-identity tokens are
+   re-declared; status colors (success/danger/warning/info) inherit
+   from above. Gated on data-brand="wiser" (SSR'd in root.tsx), so
+   Whispyr renders byte-identical. Palette mirrors the Worker-page
+   olive/cream in workers/routes/brand.ts.
+   ============================================================ */
+:root[data-brand="wiser"] {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* Surfaces — warm cream canvas behind near-white panels. */
+  --color-kumo-surface: hsl(40 33% 98.5%);
+  --color-kumo-base: hsl(40 33% 98.5%);
+  --color-kumo-recessed: hsl(38 35% 95%);
+  --color-kumo-elevated: hsl(40 33% 98.5%);
+  --color-kumo-overlay: hsl(40 33% 98.5%);
+  --color-kumo-control: hsl(40 33% 98.5%);
+
+  /* Interaction tint — warm olive-cream, hover → selected. */
+  --color-kumo-tint: hsl(45 30% 92%);
+  --color-kumo-fill: hsl(46 28% 89%);
+  --color-kumo-fill-hover: hsl(48 26% 86%);
+  --color-kumo-interact: hsl(50 24% 82%);
+  --color-kumo-contrast: hsl(30 18% 12%);
+
+  /* Brand → olive (primary actions). */
+  --color-kumo-brand: hsl(70 28% 38%);
+  --color-kumo-brand-hover: hsl(70 28% 31%);
+
+  /* Hairlines + focus ring (olive). */
+  --color-kumo-line: hsl(30 18% 12% / 0.12);
+  --color-kumo-ring: hsl(70 28% 38% / 0.40);
+
+  /* Text — warm near-black ink; links + brand text olive. */
+  --text-color-kumo-default: hsl(30 18% 12%);
+  --text-color-kumo-strong: hsl(30 20% 20%);
+  --text-color-kumo-subtle: hsl(35 12% 40%);
+  --text-color-kumo-inactive: hsl(40 14% 58%);
+  --text-color-kumo-inverse: hsl(38 35% 97%);
+  --text-color-kumo-brand: hsl(70 28% 34%);
+  --text-color-kumo-link: hsl(70 28% 34%);
+
+  /* Tooltip surface. */
+  --color-kumo-tip-shadow: hsl(30 18% 12% / 0.12);
+  --color-kumo-tip-stroke: hsl(70 28% 38% / 0.10);
+}
+
 html,
 body {
   margin: 0;
   color-scheme: light;
-  font-family: "Kamerik 105", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-family: var(--font-sans);
 }
 
 /* TipTap list styles */

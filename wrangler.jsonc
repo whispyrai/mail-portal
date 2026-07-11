@@ -1,6 +1,14 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "sales-mail-portal",
+	// Brand-neutral template. This top level is NEVER deployed directly — it
+	// declares only the inheritable build keys. Every brand is a named
+	// environment under `env.*` that fully declares its own Worker name,
+	// bindings, vars, and routes (Wrangler does not inherit those into named
+	// environments). Deploy a brand by baking its env at build time:
+	//   CLOUDFLARE_ENV=<brand> react-router build && wrangler deploy
+	// (the @cloudflare/vite-plugin reads CLOUDFLARE_ENV and resolves the env
+	// into the redirected build/server/wrangler.json that wrangler deploys).
+	"name": "mail-portal",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
 	"observability": {
@@ -9,84 +17,202 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
-	"vars": {
-		// DOMAINS: the email + session-cookie domain. Secrets (set via
-		// `wrangler secret put`): AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-		// JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
-		"DOMAINS": "whispyrcrm.com",
-		"EMAIL_ADDRESSES": [],
-		"AWS_REGION": "eu-west-2",
-		"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-	},
-	// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing page
-	// (whispyrcrm.com) is a separate static site on Vercel (locked-decisions D-68).
-	"routes": [
-		{
-			"pattern": "mail.whispyrcrm.com",
-			"custom_domain": true
-		}
-	],
-	"d1_databases": [
-		{
-			"binding": "DB",
-			"database_name": "sales_portal_users",
-			"database_id": "f322fd13-dc49-4390-888c-ff862ca05882",
-			"migrations_dir": "migrations"
-		}
-	],
-	"r2_buckets": [
-		{
-			"binding": "BUCKET",
-			"bucket_name": "sales-mail-portal",
-			"preview_bucket_name": "sales-mail-portal"
-		}
-	],
-	// Backs @cloudflare/workers-oauth-provider (OAuth grants, registered clients,
-	// access/refresh tokens) for the MCP connector. Created via
-	// `wrangler kv namespace create OAUTH_KV`.
-	"kv_namespaces": [
-		{
-			"binding": "OAUTH_KV",
-			"id": "cd541026bdf949d9ac63b3b5fdff4969"
-		}
-	],
-	"ai": {
-		"binding": "AI"
-	},
-	"durable_objects": {
-		"bindings": [
-			{
-				"name": "MAILBOX",
-				"class_name": "MailboxDO"
+	"env": {
+		// Whispyr Sales Mail Portal — the live production deploy. `name` is pinned
+		// to the existing Worker so `CLOUDFLARE_ENV=whispyr` redeploys onto it
+		// byte-identical (without the pin, a named env would deploy to a new
+		// Worker `mail-portal-whispyr`). All bindings/IDs are the live resources,
+		// unchanged. Secrets (via `wrangler secret put --env whispyr`):
+		// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
+		"whispyr": {
+			"name": "sales-mail-portal",
+			"vars": {
+				"BRAND": "whispyr",
+				// Brand-specific modules enabled in this environment (WISER-239). The
+				// rep-quiz (workers/quiz) is a Whispyr-only module; Wiser omits it.
+				"FEATURES": ["quiz"],
+				"DOMAINS": "whispyrcrm.com",
+				"EMAIL_ADDRESSES": [],
+				"AWS_REGION": "eu-west-2",
+				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+					// Web Push contact (RFC 8292 VAPID subject) for WISER-240. The keypair
+					// is secret (`wrangler secret put VAPID_PUBLIC_KEY --env whispyr` +
+					// `VAPID_PRIVATE_KEY`). Until set, push self-disables.
+					"VAPID_SUBJECT": "mailto:hesham@whispyrcrm.com"
 			},
-			{
-				"name": "EMAIL_AGENT",
-				"class_name": "EmailAgent"
+			"secrets": {
+				"required": [
+					"AWS_ACCESS_KEY_ID",
+					"AWS_SECRET_ACCESS_KEY",
+					"JWT_SECRET",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"VAPID_PUBLIC_KEY",
+					"VAPID_PRIVATE_KEY"
+				]
 			},
-			{
-				"name": "EMAIL_MCP",
-				"class_name": "EmailMCP"
-			}
-		]
-	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": [
-				"MailboxDO"
+			// The Worker serves the mail app on mail.whispyrcrm.com. The apex landing
+			// page (whispyrcrm.com) is a separate static site on Vercel (D-68).
+			"routes": [
+				{
+					"pattern": "mail.whispyrcrm.com",
+					"custom_domain": true
+				}
+			],
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "sales_portal_users",
+					"database_id": "f322fd13-dc49-4390-888c-ff862ca05882",
+					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "sales-mail-portal",
+					"preview_bucket_name": "sales-mail-portal"
+				}
+			],
+			// Backs @cloudflare/workers-oauth-provider (OAuth grants, registered
+			// clients, access/refresh tokens) for the MCP connector.
+			"kv_namespaces": [
+				{
+					"binding": "OAUTH_KV",
+					"id": "cd541026bdf949d9ac63b3b5fdff4969"
+				}
+			],
+			"ai": {
+				"binding": "AI"
+			},
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "MAILBOX",
+						"class_name": "MailboxDO"
+					},
+					{
+						"name": "EMAIL_AGENT",
+						"class_name": "EmailAgent"
+					},
+					{
+						"name": "EMAIL_MCP",
+						"class_name": "EmailMCP"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"MailboxDO"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"EmailAgent"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"EmailMCP"
+					]
+				}
 			]
 		},
-		{
-			"tag": "v2",
-			"new_sqlite_classes": [
-				"EmailAgent"
-			]
-		},
-		{
-			"tag": "v3",
-			"new_sqlite_classes": [
-				"EmailMCP"
+		// Wiser Team Mail Portal — isolated runtime for WISER-242. Bindings,
+		// Durable Object namespaces, data, and secrets are distinct from Whispyr.
+		// During the pre-cutover proof, Email Routing is enabled only on
+		// test.wiserchat.ai; the apex joins DOMAINS now so the same tested Worker
+		// can receive it immediately after the separately approved MX cutover.
+		"wiser": {
+			"name": "wiser-mail-portal",
+			"vars": {
+				"BRAND": "wiser",
+				"FEATURES": [],
+				"DOMAINS": "wiserchat.ai,test.wiserchat.ai",
+				"EMAIL_ADDRESSES": [],
+				"AWS_REGION": "eu-west-2",
+				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"VAPID_SUBJECT": "mailto:contact@wiserchat.ai"
+			},
+			"secrets": {
+				"required": [
+					"AWS_ACCESS_KEY_ID",
+					"AWS_SECRET_ACCESS_KEY",
+					"JWT_SECRET",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"VAPID_PUBLIC_KEY",
+					"VAPID_PRIVATE_KEY"
+				]
+			},
+			"routes": [
+				{
+					"pattern": "mail.wiserchat.ai",
+					"custom_domain": true
+				}
+			],
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "wiser_mail_portal_users",
+					"database_id": "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
+					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "wiser-mail-portal",
+					"preview_bucket_name": "wiser-mail-portal"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "OAUTH_KV",
+					"id": "c934d803c2f8430d9088f4a5d9f29d55"
+				}
+			],
+			"ai": {
+				"binding": "AI"
+			},
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "MAILBOX",
+						"class_name": "MailboxDO"
+					},
+					{
+						"name": "EMAIL_AGENT",
+						"class_name": "EmailAgent"
+					},
+					{
+						"name": "EMAIL_MCP",
+						"class_name": "EmailMCP"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"MailboxDO"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"EmailAgent"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"EmailMCP"
+					]
+				}
 			]
 		}
-	]
+	}
 }

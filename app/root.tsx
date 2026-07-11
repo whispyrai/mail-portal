@@ -23,7 +23,34 @@ import {
 	ScrollRestoration,
 } from "react-router";
 import { ApiError } from "~/services/api";
+import { useBrand } from "~/hooks/useBrand";
+import { ServiceWorkerRegistrar } from "~/components/pwa/ServiceWorkerRegistrar";
+import { resolveBrand } from "../workers/routes/brand";
+import { isQuizEnabled } from "../workers/lib/features";
+import type { Route } from "./+types/root";
 import "./index.css";
+
+// BRAND selects the active brand (WISER-238). Resolved server-side so the
+// <html data-brand> below is set before first paint — no flash of the wrong
+// palette. Mirrors the static data-mode="light". resolveBrand fails safe to
+// whispyr for an unset/unknown value. quizEnabled is SSR'd the same way so the
+// Header's Quizzes button never flashes on before a brand that omits it (WISER-239).
+export async function loader({ context }: Route.LoaderArgs) {
+	const env = context.cloudflare.env;
+	const b = resolveBrand(env.BRAND);
+	return {
+		brand: b.id,
+		name: b.name,
+		appName: b.appName,
+		favicon: b.favicon,
+		appleTouchIcon: b.appleTouchIcon,
+		legacyFavicon: b.legacyFavicon,
+		legacyFaviconType: b.legacyFaviconType,
+		legacyFaviconSizes: b.legacyFaviconSizes,
+		quizEnabled: isQuizEnabled(env.FEATURES, b.id),
+		themeColor: b.themeColor,
+	};
+}
 
 function makeQueryClient() {
 	return new QueryClient({
@@ -76,19 +103,41 @@ const KumoLink = forwardRef<
 });
 
 export function Layout({ children }: { children: React.ReactNode }) {
+	const {
+		brand,
+		appName,
+		favicon,
+		appleTouchIcon,
+		legacyFavicon,
+		legacyFaviconType,
+		legacyFaviconSizes,
+		themeColor,
+	} = useBrand();
 	return (
-		<html lang="en" data-mode="light" data-theme="kumo">
+		<html lang="en" data-mode="light" data-theme="kumo" data-brand={brand}>
 			<head>
 				<meta charSet="UTF-8" />
-				<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+				{/* PWA: installable + home-screen behaviour (WISER-240). */}
+				<link rel="manifest" href="/manifest.webmanifest" />
+				<meta name="theme-color" content={themeColor} />
+				<meta name="mobile-web-app-capable" content="yes" />
+				<meta name="apple-mobile-web-app-capable" content="yes" />
+				<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+				<meta name="apple-mobile-web-app-title" content={appName} />
+				<link rel="apple-touch-icon" href={appleTouchIcon} />
 				<link
 					rel="icon"
-					type="image/x-icon"
-					href="/favicon.ico"
-					sizes="48x48 32x32 16x16"
+					type="image/svg+xml"
+					href={favicon}
+				/>
+				<link
+					rel="icon"
+					type={legacyFaviconType}
+					href={legacyFavicon}
+					sizes={legacyFaviconSizes}
 				/>
 				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-				<title>Whispyr Mail</title>
+				<title>{appName}</title>
 				<Meta />
 				<Links />
 			</head>
@@ -118,6 +167,7 @@ export default function App() {
 			<LinkProvider component={KumoLink}>
 				<TooltipProvider>
 					<Toasty>
+						<ServiceWorkerRegistrar />
 						<Outlet />
 					</Toasty>
 				</TooltipProvider>

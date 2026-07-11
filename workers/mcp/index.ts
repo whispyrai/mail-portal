@@ -5,6 +5,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { resolveBrand, type BrandConfig } from "../routes/brand";
 import {
 	toolListMailboxes,
 	toolListEmails,
@@ -83,6 +84,31 @@ function mcpResult(result: Record<string, unknown>) {
 const MAILBOX_ARG_DESCRIPTION =
 	"The mailbox email address. Omit to use your own mailbox; ADMIN sessions may target another mailbox for read operations.";
 
+/** MCP server identity for a brand — name, title, marketing URL, connector icons. */
+function mcpServerInfo(b: BrandConfig) {
+	return {
+		name: `${b.id}-mail`,
+		version: "1.0.0",
+		title: b.appName,
+		websiteUrl: b.websiteUrl,
+		// MCP-native server icons (spec 2025-11-25). Best-effort connector branding:
+		// clients that honor serverInfo.icons show the brand mark. Absolute https URLs
+		// on the brand's prod host; PNG first (universally supported) then SVG fallback.
+		icons: [
+			{
+				src: `${b.mailOrigin}${b.pwaIcon512}`,
+				mimeType: "image/png",
+				sizes: ["512x512"],
+			},
+			{
+				src: `${b.mailOrigin}${b.mark}`,
+				mimeType: "image/svg+xml",
+				sizes: ["any"],
+			},
+		],
+	};
+}
+
 /**
  * EmailMCP — exposes email tools over the Model Context Protocol, scoped per
  * authenticated user (locked-decisions D-64). Identity arrives as `this.props`,
@@ -91,27 +117,10 @@ const MAILBOX_ARG_DESCRIPTION =
  *   - Writes/sends: every role acts only on their own mailbox.
  */
 export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
-	server = new McpServer({
-		name: "whispyr-mail",
-		version: "1.0.0",
-		title: "Whispyr Mail",
-		websiteUrl: "https://whispyrai.com",
-		// MCP-native server icons (spec 2025-11-25). Best-effort connector branding:
-		// clients that honor serverInfo.icons show the Whispyr mark. Absolute https
-		// URLs on the prod host; PNG first (universally supported) then SVG fallback.
-		icons: [
-			{
-				src: "https://mail.whispyrcrm.com/icon-512.png",
-				mimeType: "image/png",
-				sizes: ["512x512"],
-			},
-			{
-				src: "https://mail.whispyrcrm.com/whispyr-mark.svg",
-				mimeType: "image/svg+xml",
-				sizes: ["any"],
-			},
-		],
-	});
+	// Brand-aware connector identity. `this.env` is set by the McpAgent base
+	// constructor before this field initializes; resolveBrand fails safe to
+	// whispyr if the BRAND var is ever absent.
+	server = new McpServer(mcpServerInfo(resolveBrand(this.env.BRAND)));
 
 	/**
 	 * Resolve the effective mailbox for a request, enforcing scope. Returns the

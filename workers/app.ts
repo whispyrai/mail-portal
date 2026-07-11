@@ -10,10 +10,12 @@ import { routeAgentRequest } from "agents";
 import { Hono, type Context } from "hono";
 import { createRequestHandler } from "react-router";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
-import { app as apiApp, receiveEmail } from "./index";
+import { app as apiApp } from "./index";
+import { receiveEmail } from "./inbound-email";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
 import { bulkPage } from "./routes/bulk";
+import { resolveBrand } from "./routes/brand";
 import { quizApp } from "./quiz/rep-routes";
 import {
 	loginPage,
@@ -158,7 +160,7 @@ app.use("*", async (c, next) => {
 	return next();
 });
 
-// ── Bulk send (mail merge) page — any authed rep, scoped to own mailbox ──
+// ── Bulk send (mail merge) page — any authed user, scoped to own mailbox ──
 app.get("/bulk", bulkPage);
 
 // ── Quiz tool (any authed rep; role-gating for admin routes lives in adminApp) ──
@@ -224,7 +226,9 @@ const oauthProvider = new OAuthProvider<Env>({
 	// Claude sends a path-aware resource (…/mcp) at token exchange while the metadata
 	// advertises the origin; origin-only matching keeps the audiences consistent.
 	resourceMatchOriginOnly: true,
-	resourceMetadata: { resource_name: "Whispyr Mail" },
+	// Runtime discovery responses are rewritten per brand below. Keep the static
+	// fallback neutral so a failed rewrite cannot leak one brand into another.
+	resourceMetadata: { resource_name: "Mail Portal" },
 	// Keep the admin-issued static bearer token working for CLI / non-OAuth clients.
 	resolveExternalToken: resolveLegacyBearer,
 });
@@ -250,11 +254,19 @@ async function fetchWithBranding(
 			path.startsWith("/.well-known/oauth-protected-resource"))
 	) {
 		try {
-			const meta = (await res.clone().json()) as Record<string, unknown>;
-			meta.logo_uri = `${new URL(request.url).origin}/icon-512.png`;
+			const metadata: unknown = await res.clone().json();
+			if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return res;
+			// The static resourceMetadata below is set at module load (no env); rewrite
+			// the resource_name per brand so a Wiser deploy doesn't advertise "Whispyr Mail".
+			const brand = resolveBrand(env.BRAND);
+			const brandedMetadata = {
+				...metadata,
+				logo_uri: `${new URL(request.url).origin}${brand.pwaIcon512}`,
+				resource_name: brand.appName,
+			};
 			const headers = new Headers(res.headers);
 			headers.delete("content-length");
-			return new Response(JSON.stringify(meta), { status: res.status, headers });
+			return new Response(JSON.stringify(brandedMetadata), { status: res.status, headers });
 		} catch {
 			return res;
 		}
@@ -264,11 +276,7 @@ async function fetchWithBranding(
 
 export default {
 	fetch: fetchWithBranding,
-	async email(
-		event: { raw: ReadableStream; rawSize: number },
-		env: Env,
-		ctx: ExecutionContext,
-	) {
+	async email(event: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
 		try {
 			await receiveEmail(event, env, ctx);
 		} catch (e) {
