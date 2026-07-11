@@ -13,6 +13,7 @@ import {
 	ArrowBendUpLeftIcon,
 	ArrowCounterClockwiseIcon,
 	ArrowsClockwiseIcon,
+	ClockIcon,
 	EnvelopeOpenIcon,
 	EnvelopeSimpleIcon,
 	FileIcon,
@@ -35,6 +36,9 @@ import LabelPicker from "~/components/labels/LabelPicker";
 import { MAIL_COMMAND_EVENT } from "~/components/MailKeyboardController";
 import OutboundDeliveryActions from "~/components/OutboundDeliveryActions";
 import SaveCurrentViewButton from "~/components/SaveCurrentViewButton";
+import SnoozeDialog, {
+	type SnoozeDialogTarget,
+} from "~/components/SnoozeDialog";
 import {
 	resolveVisibleMailTargetId,
 	type MailCommand,
@@ -53,6 +57,11 @@ import {
 	shouldLoadOutboundState,
 } from "~/lib/outbound-folder-state";
 import { getSnippetText } from "~/lib/utils";
+import {
+	reconcileSnoozedSelection,
+	snoozeScopeAffectsRow,
+	type SnoozedSelectionTracker,
+} from "~/lib/snooze-selection";
 import { definitionFromFolderView } from "~/lib/saved-view-navigation";
 import {
 	useDeleteEmail,
@@ -70,6 +79,7 @@ import {
 } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
 import { useLabels, useMutateLabels } from "~/queries/labels";
+import { useUnsnooze } from "~/queries/snooze";
 import { queryKeys } from "~/queries/keys";
 import { useUIStore } from "~/hooks/useUIStore";
 import type {
@@ -82,6 +92,7 @@ import {
 	isBatchTriageActionAllowed,
 	type BatchTriageAction,
 } from "../../shared/batch-triage";
+import type { SnoozeScope } from "../../shared/snooze";
 
 const PAGE_SIZE = 25;
 
@@ -136,6 +147,12 @@ const FOLDER_EMPTY_STATES: Record<
 		title: "Archive is empty",
 		description:
 			"Move emails here to keep your inbox clean without deleting them.",
+	},
+	[Folders.SNOOZED]: {
+		icon: <ClockIcon size={48} weight="thin" className="text-kumo-subtle" />,
+		title: "Nothing is snoozed",
+		description:
+			"Mail you pause will wait here, then return automatically at the time you choose.",
 	},
 	[Folders.TRASH]: {
 		icon: <TrashIcon size={48} weight="thin" className="text-kumo-subtle" />,
@@ -237,6 +254,34 @@ function deliveryBadgeClass(status: OutboundDelivery["status"]) {
 	return "bg-kumo-fill text-kumo-subtle";
 }
 
+function canSnoozeFromFolder(folderId: string | undefined): boolean {
+	return Boolean(
+		folderId &&
+			!folderId.startsWith("_") &&
+			!new Set<string>([
+				Folders.SNOOZED,
+				Folders.SENT,
+				Folders.DRAFT,
+				Folders.OUTBOX,
+				Folders.TRASH,
+				Folders.SPAM,
+			]).has(folderId),
+	);
+}
+
+function snoozeReturnLabel(value: string | null | undefined): string | null {
+	if (!value) return null;
+	const date = new Date(value);
+	if (Number.isNaN(date.getTime())) return null;
+	return new Intl.DateTimeFormat(undefined, {
+		weekday: "short",
+		month: "short",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+	}).format(date);
+}
+
 export default function EmailListRoute() {
 	const { mailboxId, folder } = useParams<{
 		mailboxId: string;
@@ -249,6 +294,8 @@ export default function EmailListRoute() {
 	const [batchSelection, setBatchSelection] = useState<Set<string>>(
 		() => new Set(),
 	);
+	const [snoozeTarget, setSnoozeTarget] =
+		useState<SnoozeDialogTarget | null>(null);
 	const [searchParams, setSearchParams] = useSearchParams();
 	const labelId = searchParams.get("label_id") ?? "";
 	const toastManager = useKumoToastManager();
@@ -265,8 +312,29 @@ export default function EmailListRoute() {
 	const trashConversation = useTrashConversation();
 	const batchTriage = useBatchTriage();
 	const mutateLabels = useMutateLabels();
+	const unsnooze = useUnsnooze();
 	const isOutbox = folder === Folders.OUTBOX;
 	const { data: labels = [] } = useLabels(mailboxId);
+
+	const snoozeScopeFor = (email: Email): SnoozeScope => {
+		const conversationId = email.conversation_id ?? email.thread_id;
+		return conversationId && (email.thread_count ?? 1) > 1
+			? {
+					kind: "conversation",
+					conversationId,
+					emailId: email.id,
+					folderId: folder || Folders.SNOOZED,
+				}
+			: { kind: "message", emailId: email.id };
+	};
+
+	const openSnooze = (email: Email) =>
+		setSnoozeTarget({
+			emailId: email.id,
+			folderId: folder || email.folder_id || Folders.INBOX,
+			conversationId: email.conversation_id ?? email.thread_id,
+			conversationCount: email.thread_count ?? 1,
+		});
 
 	const params = useMemo(
 		() => ({
@@ -313,6 +381,28 @@ export default function EmailListRoute() {
 		() => emails.map((email) => email.id),
 		[emails],
 	);
+	const clearSnooze = (email: Email) => {
+		if (!mailboxId || unsnooze.isPending) return;
+		const scope = snoozeScopeFor(email);
+		const selectedRow = emails.find((row) => row.id === selectedEmailId);
+		unsnooze.mutate(
+			{ mailboxId, scope },
+			{
+				onSuccess: () => {
+					toastManager.add({ title: "Mail returned" });
+					if (selectedRow && snoozeScopeAffectsRow(scope, selectedRow)) {
+						setKeyboardTargetId(null);
+						closePanel();
+					}
+				},
+				onError: () =>
+					toastManager.add({
+						title: "Could not unsnooze mail",
+						variant: "error",
+					}),
+			},
+		);
+	};
 	const selectionContext = batchSelectionContextKey({
 		mailboxId: mailboxId ?? "",
 		folderId: folder ?? "",
@@ -320,6 +410,7 @@ export default function EmailListRoute() {
 		searchQuery: labelId,
 	});
 	const previousSelectionContext = useRef(selectionContext);
+	const snoozedSelectionTracker = useRef<SnoozedSelectionTracker | null>(null);
 	const selectedVisibleIds = useMemo(
 		() => reconcileVisibleSelection(batchSelection, visibleEmailIds),
 		[batchSelection, visibleEmailIds],
@@ -420,6 +511,33 @@ export default function EmailListRoute() {
 			return batchSelectionsEqual(next, current) ? current : next;
 		});
 	}, [selectionContext, visibleEmailIds]);
+
+	useEffect(() => {
+		const reconciliation = reconcileSnoozedSelection(
+			snoozedSelectionTracker.current,
+			{
+				contextKey: selectionContext,
+				folderId: folder,
+				selectedId: selectedEmailId,
+				visibleIds: visibleEmailIds,
+				isFetching: isRefreshing,
+				hasResolvedData: emailData !== undefined,
+			},
+		);
+		snoozedSelectionTracker.current = reconciliation.tracker;
+		if (reconciliation.shouldClose) {
+			setKeyboardTargetId(null);
+			closePanel();
+		}
+	}, [
+		closePanel,
+		emailData,
+		folder,
+		isRefreshing,
+		selectedEmailId,
+		selectionContext,
+		visibleEmailIds,
+	]);
 
 	// Deep-link from a push notification tap: `?email=<id>` opens that email,
 	// then the param is consumed so closing the panel doesn't reopen it (WISER-240).
@@ -698,6 +816,7 @@ export default function EmailListRoute() {
 					return;
 				case "archive":
 					{
+						if (folder === Folders.SNOOZED) return;
 						const action = planKeyboardConversationAction(
 							"archive",
 							target,
@@ -719,6 +838,7 @@ export default function EmailListRoute() {
 					return;
 				case "trash":
 					{
+						if (folder === Folders.SNOOZED) return;
 						const action = planKeyboardConversationAction(
 							"trash",
 							target,
@@ -763,6 +883,10 @@ export default function EmailListRoute() {
 						});
 					}
 					return;
+				case "snooze":
+					if (folder === Folders.SNOOZED) clearSnooze(target);
+					else if (canSnoozeFromFolder(folder)) openSnooze(target);
+					return;
 				default:
 					return;
 			}
@@ -786,6 +910,7 @@ export default function EmailListRoute() {
 		startCompose,
 		setConversationRead,
 		trashConversation,
+		unsnooze,
 		updateEmail,
 		visibleEmailIds,
 	]);
@@ -910,6 +1035,7 @@ export default function EmailListRoute() {
 							const isKeyboardTarget = keyboardTargetId === email.id;
 							const snippet = getSnippetText(email.snippet);
 							const delivery = deliveryByEmailId.get(email.id);
+							const returnAt = snoozeReturnLabel(email.snoozed_until);
 							return (
 								<div
 									key={email.id}
@@ -1018,15 +1144,21 @@ export default function EmailListRoute() {
 												>
 													{email.subject}
 												</span>
-												{(email.labels ?? []).slice(0, 2).map((label) => (
-													<LabelChip key={label.id} label={label} />
-												))}
-												{snippet && (
-													<span className="text-kumo-subtle font-normal">
-														{" "}
-														&mdash; {snippet}
-													</span>
-												)}
+											{(email.labels ?? []).slice(0, 2).map((label) => (
+												<LabelChip key={label.id} label={label} />
+											))}
+											{snippet && (
+												<span className="text-kumo-subtle font-normal">
+													{" "}
+													&mdash; {snippet}
+												</span>
+											)}
+											{folder === Folders.SNOOZED && returnAt && (
+												<span className="ms-2 inline-flex items-center gap-1 text-xs font-medium text-kumo-brand">
+													<ClockIcon size={12} aria-hidden="true" />
+													Returns {returnAt}
+												</span>
+											)}
 											</div>
 										</div>
 									</button>
@@ -1039,9 +1171,9 @@ export default function EmailListRoute() {
 										/>
 									)}
 
-									{/* Secondary actions remain hover-only on pointer devices. */}
+									{/* Keep core actions discoverable and touch-accessible on every viewport. */}
 									{!isOutbox && (
-										<div className="hidden items-center shrink-0 group-hover:flex group-focus-within:flex">
+										<div className="flex items-center shrink-0">
 											<>
 												<Tooltip
 													content={email.read ? "Mark unread" : "Mark read"}
@@ -1073,6 +1205,39 @@ export default function EmailListRoute() {
 														}
 													/>
 												</Tooltip>
+											{folder === Folders.SNOOZED ? (
+												<Tooltip content="Return now" asChild>
+													<Button
+														variant="ghost"
+														shape="square"
+														size="sm"
+														className="min-h-11 min-w-11"
+														icon={<ArrowCounterClockwiseIcon size={14} />}
+														onClick={(event) => {
+															event.stopPropagation();
+															clearSnooze(email);
+														}}
+														disabled={unsnooze.isPending}
+														aria-label="Return snoozed mail now"
+													/>
+												</Tooltip>
+											) : canSnoozeFromFolder(folder) ? (
+												<Tooltip content="Snooze" asChild>
+													<Button
+														variant="ghost"
+														shape="square"
+														size="sm"
+														className="min-h-11 min-w-11"
+														icon={<ClockIcon size={14} />}
+														onClick={(event) => {
+															event.stopPropagation();
+															openSnooze(email);
+														}}
+														aria-label="Snooze mail"
+													/>
+												</Tooltip>
+											) : null}
+											{folder !== Folders.SNOOZED && (
 												<Tooltip
 													content={
 														folder === Folders.TRASH
@@ -1111,6 +1276,7 @@ export default function EmailListRoute() {
 														}
 													/>
 												</Tooltip>
+											)}
 											</>
 										</div>
 									)}
@@ -1133,6 +1299,17 @@ export default function EmailListRoute() {
 						totalCount={totalCount}
 					/>
 				</div>
+			)}
+
+			{mailboxId && snoozeTarget && (
+				<SnoozeDialog
+					mailboxId={mailboxId}
+					target={snoozeTarget}
+					open
+					onOpenChange={(open) => {
+						if (!open) setSnoozeTarget(null);
+					}}
+				/>
 			)}
 		</MailboxSplitView>
 	);

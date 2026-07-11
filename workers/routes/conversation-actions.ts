@@ -22,13 +22,15 @@ function isArchiveSource(folderId: string) {
 		Folders.SENT,
 		Folders.TRASH,
 		Folders.ARCHIVE,
+		Folders.SNOOZED,
 	]).has(folderId);
 }
 
 function isTrashSource(folderId: string) {
 	return folderId !== Folders.OUTBOX &&
 		folderId !== Folders.DRAFT &&
-		folderId !== Folders.TRASH;
+		folderId !== Folders.TRASH &&
+		folderId !== Folders.SNOOZED;
 }
 
 function mutationResponse(c: AppContext, result: { status: string; affectedCount?: number }) {
@@ -38,6 +40,12 @@ function mutationResponse(c: AppContext, result: { status: string; affectedCount
 	if (result.status === "outbound_delivery_active") {
 		return c.json(
 			{ error: "Cancel queued sends before moving this conversation." },
+			409,
+		);
+	}
+	if (result.status === "snoozed_state_requires_unsnooze") {
+		return c.json(
+			{ error: "Unsnooze this conversation before moving it.", code: result.status },
 			409,
 		);
 	}

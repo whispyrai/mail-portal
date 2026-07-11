@@ -32,6 +32,7 @@ test("maps primary mail navigation and triage shortcuts", () => {
 	assert.deepEqual(shortcut("#"), { command: "trash" });
 	assert.deepEqual(shortcut("u"), { command: "toggle-unread" });
 	assert.deepEqual(shortcut("s"), { command: "toggle-star" });
+	assert.deepEqual(shortcut("z"), { command: "snooze" });
 	assert.deepEqual(shortcut("?"), { command: "show-shortcuts" });
 });
 

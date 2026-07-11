@@ -15,6 +15,7 @@ export const Folders = {
 	SENT: "sent",
 	DRAFT: "draft",
 	OUTBOX: "outbox",
+	SNOOZED: "snoozed",
 	ARCHIVE: "archive",
 	TRASH: "trash",
 	SPAM: "spam",
@@ -40,6 +41,7 @@ export const SYSTEM_FOLDER_IDS: readonly FolderId[] = [
 	Folders.SENT,
 	Folders.DRAFT,
 	Folders.OUTBOX,
+	Folders.SNOOZED,
 	Folders.ARCHIVE,
 	Folders.TRASH,
 ];
@@ -53,6 +55,7 @@ export const FOLDER_DISPLAY_NAMES: Record<string, string> = {
 	[Folders.SENT]: "Sent",
 	[Folders.DRAFT]: "Drafts",
 	[Folders.OUTBOX]: "Outbox",
+	[Folders.SNOOZED]: "Snoozed",
 	[Folders.ARCHIVE]: "Archive",
 	[Folders.TRASH]: "Trash",
 	[Folders.SPAM]: "Spam",
@@ -60,7 +63,7 @@ export const FOLDER_DISPLAY_NAMES: Record<string, string> = {
 
 /** Formatted string for tool parameter descriptions (agent + MCP). */
 export const FOLDER_TOOL_DESCRIPTION =
-	"Folder to list: inbox, sent, draft, archive, trash";
+	"Folder to list: inbox, sent, draft, outbox, snoozed, archive, trash";
 
 /** Formatted string for move-email tool descriptions. */
 export const MOVE_FOLDER_TOOL_DESCRIPTION =

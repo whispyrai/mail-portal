@@ -10,6 +10,7 @@ import {
 	ArrowCounterClockwiseIcon,
 	ArrowLeftIcon,
 	ChatCircleIcon,
+	ClockIcon,
 	CodeIcon,
 	EnvelopeOpenIcon,
 	EnvelopeSimpleIcon,
@@ -28,6 +29,9 @@ interface EmailPanelToolbarProps {
 	mailboxId?: string;
 	isDraftFolder: boolean;
 	isOutboxFolder: boolean;
+	isSnoozedFolder: boolean;
+	canSnooze: boolean;
+	isUnsnoozing: boolean;
 	isSending: boolean;
 	isDrafting: boolean;
 	moveToFolders: Folder[];
@@ -42,6 +46,8 @@ interface EmailPanelToolbarProps {
 	onToggleStar: () => void;
 	onToggleRead: () => void;
 	onMove: (folderId: string) => void;
+	onSnooze: () => void;
+	onUnsnooze: () => void;
 	onViewSource: () => void;
 	onDelete: () => void;
 	onRestore: () => void;
@@ -53,6 +59,9 @@ export default function EmailPanelToolbar({
 	mailboxId,
 	isDraftFolder,
 	isOutboxFolder,
+	isSnoozedFolder,
+	canSnooze,
+	isUnsnoozing,
 	isSending,
 	isDrafting,
 	moveToFolders,
@@ -66,6 +75,8 @@ export default function EmailPanelToolbar({
 	onToggleStar,
 	onToggleRead,
 	onMove,
+	onSnooze,
+	onUnsnooze,
 	onViewSource,
 	onDelete,
 	onRestore,
@@ -77,7 +88,7 @@ export default function EmailPanelToolbar({
 			? "Discard draft"
 			: "Move to Trash";
 	return (
-		<div className="flex items-center gap-1 px-3 py-2 border-b border-kumo-line shrink-0 md:px-4">
+		<div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-kumo-line px-3 py-2 md:px-4">
 			<Button
 				variant="ghost"
 				shape="square"
@@ -190,9 +201,34 @@ export default function EmailPanelToolbar({
 				/>
 			</Tooltip>
 
-			{!isOutboxFolder && (
+			{!isOutboxFolder && !isSnoozedFolder && (
 				<MoveToFolderMenu folders={moveToFolders} onMove={onMove} />
 			)}
+
+			{isSnoozedFolder ? (
+				<Tooltip content="Return now" side="bottom" asChild>
+					<Button
+						variant="ghost"
+						shape="square"
+						size="sm"
+						icon={<ArrowCounterClockwiseIcon size={18} />}
+						onClick={onUnsnooze}
+						disabled={isUnsnoozing}
+						aria-label="Return snoozed mail now"
+					/>
+				</Tooltip>
+			) : canSnooze ? (
+				<Tooltip content="Snooze" side="bottom" asChild>
+					<Button
+						variant="ghost"
+						shape="square"
+						size="sm"
+						icon={<ClockIcon size={18} />}
+						onClick={onSnooze}
+						aria-label="Snooze mail"
+					/>
+				</Tooltip>
+			) : null}
 
 			<div className="ml-auto flex items-center gap-0.5">
 				<Tooltip content="View source" side="bottom" asChild>
@@ -205,7 +241,7 @@ export default function EmailPanelToolbar({
 						aria-label="View source"
 					/>
 				</Tooltip>
-				{!isOutboxFolder && (
+				{!isOutboxFolder && !isSnoozedFolder && (
 				<Tooltip content={destructiveActionLabel} side="bottom" asChild>
 					<Button
 						variant="ghost"

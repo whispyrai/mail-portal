@@ -6,6 +6,7 @@ import { Badge, Button, Dialog, Input, Tooltip } from "@cloudflare/kumo";
 import {
 	ArchiveIcon,
 	CaretLeftIcon,
+	ClockIcon,
 	FileIcon,
 	FolderIcon,
 	HourglassMediumIcon,
@@ -31,6 +32,7 @@ const FOLDER_ICONS: Record<string, React.ReactNode> = {
 	[Folders.SENT]: <PaperPlaneTiltIcon size={18} weight="regular" />,
 	[Folders.DRAFT]: <FileIcon size={18} weight="regular" />,
 	[Folders.OUTBOX]: <HourglassMediumIcon size={18} weight="regular" />,
+	[Folders.SNOOZED]: <ClockIcon size={18} weight="regular" />,
 	[Folders.ARCHIVE]: <ArchiveIcon size={18} weight="regular" />,
 	[Folders.TRASH]: <TrashIcon size={18} weight="regular" />,
 };
@@ -40,6 +42,7 @@ const SYSTEM_FOLDER_LINKS = [
 	{ id: Folders.SENT, label: "Sent" },
 	{ id: Folders.DRAFT, label: "Drafts" },
 	{ id: Folders.OUTBOX, label: "Outbox" },
+	{ id: Folders.SNOOZED, label: "Snoozed" },
 	{ id: Folders.ARCHIVE, label: "Archive" },
 	{ id: Folders.TRASH, label: "Trash" },
 ];

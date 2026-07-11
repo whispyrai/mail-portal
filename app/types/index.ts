@@ -29,6 +29,8 @@ export interface Email {
 	conversation_id?: string | null;
 	thread_id?: string | null;
 	folder_id?: string | null;
+	snooze_source_folder_id?: string | null;
+	snoozed_until?: string | null;
 	subject: string;
 	sender: string;
 	recipient: string;

@@ -85,6 +85,8 @@ export async function receiveEmail(
 		date: new Date().toISOString(),
 		messageId,
 		read: false,
+		wakeSnoozedOnReply: true,
+		followUpMailboxAddress: mailboxId,
 	});
 
 	ctx.waitUntil(

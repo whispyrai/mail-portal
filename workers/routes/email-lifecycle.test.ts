@@ -29,7 +29,9 @@ function testApp(
 		| null = null,
 	moveResult:
 		| boolean
-		| { status: "outbound_delivery_active"; deliveryId: string } = true,
+		| { status: "outbound_delivery_active"; deliveryId: string }
+		| { status: "snoozed_state_requires_unsnooze" }
+		| { status: "snoozed_state_requires_explicit_action" } = true,
 	bucketDeleteFails = false,
 ) {
 	const deletedObjects: string[][] = [];
@@ -305,5 +307,29 @@ test("generic move cannot bypass explicit cancellation of an active Outbox deliv
 		error: "Cancel the queued send before moving its Outbox message.",
 		code: "active_outbound_delivery_requires_cancel",
 		deliveryId: "delivery-2",
+	});
+});
+
+test("generic move cannot target the protected Snoozed folder", async () => {
+	const { app, env } = testApp(
+		{ status: "trashed" },
+		null,
+		null,
+		{ status: "snoozed_state_requires_explicit_action" },
+	);
+	const response = await app.request(
+		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails/email-1/move`,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ folderId: "trash" }),
+		},
+		env as never,
+	);
+
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "Use Snooze to move mail into the Snoozed folder.",
+		code: "snoozed_state_requires_explicit_action",
 	});
 });

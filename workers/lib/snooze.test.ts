@@ -111,6 +111,17 @@ test("due wake restores source folders with Inbox fallback and schedules the nex
 	);
 	assert.equal(overflow.wake.length, 100);
 	assert.equal(overflow.nextWakeAt, now);
+	const futureOverflow = planDueSnoozeWake(
+		Array.from({ length: 101 }, (_, index) => ({
+			id: `future-${index}`,
+			sourceFolderId: "inbox",
+			wakeAt: new Date(now + 60_000 + index * 1_000).toISOString(),
+		})),
+		now,
+		() => true,
+	);
+	assert.equal(futureOverflow.wake.length, 0);
+	assert.equal(futureOverflow.nextWakeAt, now + 60_000);
 });
 
 test("incoming authoritative thread replies wake the entire snoozed conversation", () => {
@@ -120,28 +131,38 @@ test("incoming authoritative thread replies wake the entire snoozed conversation
 			{ id: "b", threadId: "thread_1", sourceFolderId: "removed" },
 			{ id: "c", threadId: "thread_2", sourceFolderId: "inbox" },
 		]),
-		[
-			{ id: "a", folderId: "inbox" },
-			{ id: "b", folderId: "inbox" },
-		],
+		{
+			wake: [
+				{ id: "a", folderId: "inbox" },
+				{ id: "b", folderId: "inbox" },
+			],
+			hasMore: false,
+		},
 	);
-	assert.deepEqual(planIncomingReplyWake("", []), []);
-	assert.equal(
-		planIncomingReplyWake(
+	assert.deepEqual(planIncomingReplyWake("", []), { wake: [], hasMore: false });
+	const largeWake = planIncomingReplyWake(
 			"large-thread",
 			Array.from({ length: 101 }, (_, index) => ({
 				id: `mail-${index}`,
 				threadId: "large-thread",
 				sourceFolderId: "inbox",
 			})),
-		).length,
-		101,
-	);
+		);
+	assert.equal(largeWake.wake.length, 100);
+	assert.equal(largeWake.hasMore, true);
 });
 
 test("generic moves cannot bypass active snooze and alarm scheduling chooses the earliest subsystem", () => {
 	assert.equal(snoozeBlocksGenericMove({ folderId: "snoozed", wakeAt: null }), true);
 	assert.equal(snoozeBlocksGenericMove({ folderId: Folders.INBOX, wakeAt: "2026-07-12T00:00:00Z" }), true);
+	assert.equal(
+		snoozeBlocksGenericMove({
+			folderId: Folders.INBOX,
+			wakeAt: null,
+			sourceFolderId: Folders.ARCHIVE,
+		}),
+		true,
+	);
 	assert.equal(snoozeBlocksGenericMove({ folderId: Folders.INBOX, wakeAt: null }), false);
 	assert.equal(earliestMailboxAlarm([undefined, null, now + 5_000, now + 1_000, Number.NaN]), now + 1_000);
 	assert.equal(earliestMailboxAlarm([undefined, null, Number.NaN]), null);

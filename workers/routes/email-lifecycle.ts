@@ -23,6 +23,12 @@ export async function handleDeleteEmail(c: AppContext) {
 			409,
 		);
 	}
+	if (result.status === "snoozed_state_requires_unsnooze") {
+		return c.json(
+			{ error: "Unsnooze this message before moving it.", code: result.status },
+			409,
+		);
+	}
 	return c.json({ status: result.status });
 }
 
@@ -84,6 +90,24 @@ export async function handleMoveEmail(c: AppContext) {
 				error: "Cancel the queued send before moving its Outbox message.",
 				code: "active_outbound_delivery_requires_cancel",
 				deliveryId: moved.deliveryId,
+			},
+			409,
+		);
+	}
+	if (typeof moved === "object" && moved.status === "snoozed_state_requires_unsnooze") {
+		return c.json(
+			{ error: "Unsnooze this message before moving it.", code: moved.status },
+			409,
+		);
+	}
+	if (
+		typeof moved === "object" &&
+		moved.status === "snoozed_state_requires_explicit_action"
+	) {
+		return c.json(
+			{
+				error: "Use Snooze to move mail into the Snoozed folder.",
+				code: moved.status,
 			},
 			409,
 		);

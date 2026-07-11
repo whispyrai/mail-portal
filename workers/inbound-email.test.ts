@@ -28,6 +28,9 @@ function mailboxRegistry(active = true) {
 						async first() {
 							return active ? { id: "registered" } : null;
 						},
+						async run() {
+							return { success: true, meta: { changes: 0 } };
+						},
 					};
 				},
 			};
@@ -40,7 +43,7 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
 	const stored: Array<{ folder: string; email: Record<string, unknown> }> = [];
 	const background: Promise<unknown>[] = [];
 	const mailbox = {
-		async findThreadBySubject() {
+		async resolveCanonicalThreadId() {
 			return null;
 		},
 		async createEmail(folder: string, email: Record<string, unknown>) {
@@ -100,6 +103,10 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
 
 	assert.equal(stored.length, 1);
 	assert.equal(stored[0].folder, "inbox");
+	assert.equal(
+		stored[0].email.follow_up_reply_mailbox_address,
+		mailboxAddress,
+	);
 });
 
 test("inbound delivery permanently rejects an unprovisioned envelope recipient without reading the message", async () => {
@@ -203,7 +210,7 @@ test("inbound push payload uses the active brand's notification assets", async (
 	let pushPayload: Record<string, unknown> | undefined;
 	const background: Promise<unknown>[] = [];
 	const mailbox = {
-		async findThreadBySubject() {
+		async resolveCanonicalThreadId() {
 			return null;
 		},
 		async createEmail() {},

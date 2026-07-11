@@ -19,7 +19,11 @@ export default function SingleMessageView({
 	onPreviewImage,
 }: SingleMessageViewProps) {
 	return (
-		<div className="flex flex-col h-full">
+		<div
+			className="flex flex-col h-full"
+			data-intelligence-message-id={email.id}
+			tabIndex={-1}
+		>
 			<div className="px-4 py-4 border-b border-kumo-line md:px-6">
 				<div className="flex items-center justify-between gap-3">
 					<div className="flex items-center gap-2.5 min-w-0">

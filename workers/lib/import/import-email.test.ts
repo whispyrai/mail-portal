@@ -21,7 +21,7 @@ test("importParsedEmail preserves metadata, attachments, threads, and idempotenc
 		async getEmail(id: string) {
 			return storedEmailIds.has(id) ? { id } : null;
 		},
-		async findThreadBySubject() {
+		async resolveCanonicalThreadId() {
 			return null;
 		},
 		async createEmail(
@@ -97,7 +97,7 @@ test("importParsedEmail cleans partial objects and retries with stable attachmen
 		async getEmail(id: string) {
 			return storedEmailIds.has(id) ? { id } : null;
 		},
-		async findThreadBySubject() {
+		async resolveCanonicalThreadId() {
 			return null;
 		},
 		async createEmail(

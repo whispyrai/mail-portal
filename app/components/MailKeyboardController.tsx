@@ -33,6 +33,7 @@ const SHORTCUT_GROUPS: ReadonlyArray<{
 			["#", "Move to Trash"],
 			["U", "Mark read / unread"],
 			["S", "Star / unstar"],
+			["Z", "Snooze / return"],
 			["/", "Search"],
 		],
 	},

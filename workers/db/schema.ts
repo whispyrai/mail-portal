@@ -38,8 +38,35 @@ export const emails = sqliteTable("emails", {
 	raw_headers: text("raw_headers"),
 	previous_folder_id: text("previous_folder_id"),
 	trashed_at: text("trashed_at"),
+	snooze_source_folder_id: text("snooze_source_folder_id"),
+	snoozed_until: text("snoozed_until"),
 	draft_version: integer("draft_version").notNull().default(1),
 });
+
+export const snoozeReplyWakeQueue = sqliteTable("snooze_reply_wake_queue", {
+	thread_id: text("thread_id").primaryKey(),
+	requested_at: text("requested_at").notNull(),
+});
+
+export const followUpReplyCompletionQueue = sqliteTable(
+	"follow_up_reply_completion_queue",
+	{
+		inbound_message_id: text("inbound_message_id").primaryKey(),
+		mailbox_address: text("mailbox_address").notNull(),
+		conversation_key: text("conversation_key").notNull(),
+		inbound_message_date: text("inbound_message_date").notNull(),
+		attempts: integer("attempts").notNull().default(0),
+		next_attempt_at: integer("next_attempt_at").notNull(),
+		created_at: integer("created_at").notNull(),
+		last_error: text("last_error"),
+	},
+	(table) => [
+		index("idx_follow_up_reply_completion_due").on(
+			table.next_attempt_at,
+			table.inbound_message_id,
+		),
+	],
+);
 
 export const attachments = sqliteTable("attachments", {
 	id: text("id").primaryKey(),

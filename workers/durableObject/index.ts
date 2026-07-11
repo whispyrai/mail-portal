@@ -4,7 +4,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { drizzle } from "drizzle-orm/durable-sqlite";
-import { eq, and, or, asc, desc, inArray, sql } from "drizzle-orm";
+import { eq, and, or, asc, desc, inArray, isNotNull, lte, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import * as schema from "../db/schema";
 import {
@@ -77,6 +77,27 @@ import {
 	validateLabelMutationTargets,
 	type LabelMutationTarget,
 } from "../lib/labels.ts";
+import {
+	earliestMailboxAlarm,
+	normalizeSnoozeRequest,
+	normalizeSnoozeScope,
+	planDueSnoozeWake,
+	snoozeBlocksGenericMove,
+} from "../lib/snooze.ts";
+import {
+	executeSnooze,
+	executeUnsnooze,
+	type SnoozeRepository,
+} from "./snooze-state.ts";
+import { finalizeCommittedSnooze } from "../lib/snooze-liveness.ts";
+import { resolveUnambiguousThreadReference } from "../lib/thread-reference.ts";
+import { readConversationIntelligenceEvidenceProjection } from "../lib/conversation-intelligence-evidence.ts";
+import { readStoredReminderAnchor } from "../lib/follow-up-reminder-anchor.ts";
+import { followUpReminderD1Store } from "../lib/follow-up-reminders-d1.ts";
+import {
+	processOneFollowUpReplyCompletion,
+	type FollowUpReplyQueueRepository,
+} from "../lib/follow-up-reminder-queue.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -161,6 +182,8 @@ interface EmailData {
 	thread_id?: string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
+	snooze_wake_thread_id?: string | null;
+	follow_up_reply_mailbox_address?: string | null;
 }
 
 interface AttachmentData {
@@ -267,6 +290,7 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async getEmails(options: GetEmailsOptions = {}) {
+		await this.#selfHealSnoozes();
 		const {
 			folder,
 			label_id,
@@ -325,6 +349,8 @@ export class MailboxDO extends DurableObject<Env> {
 				email_references: schema.emails.email_references,
 				thread_id: schema.emails.thread_id,
 				folder_id: schema.emails.folder_id,
+				snooze_source_folder_id: schema.emails.snooze_source_folder_id,
+				snoozed_until: schema.emails.snoozed_until,
 				snippet: sql<string>`SUBSTR(${schema.emails.body}, 1, 300)`,
 			})
 			.from(schema.emails)
@@ -351,6 +377,7 @@ export class MailboxDO extends DurableObject<Env> {
 	async countEmails(
 		options: { folder?: string; thread_id?: string; label_id?: string } = {},
 	) {
+		await this.#selfHealSnoozes();
 		const { folder, thread_id, label_id } = options;
 		const conditions: string[] = [];
 		const params: (string | number)[] = [];
@@ -403,6 +430,7 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async getThreadedEmails(options: GetEmailsOptions = {}) {
+		await this.#selfHealSnoozes();
 		const { folder, label_id, page = 1, limit: rawLimit = 25 } = options;
 		const limit = Math.min(Math.max(rawLimit, 1), 100);
 
@@ -558,6 +586,7 @@ export class MailboxDO extends DurableObject<Env> {
 			SELECT
 				lif.id, lif.subject, lif.sender, lif.recipient, lif.date,
 				lif.read, lif.starred, lif.thread_id, lif.folder_id,
+				lif.snooze_source_folder_id, lif.snoozed_until,
 				lif.conversation_id,
 				lif.in_reply_to, lif.email_references,
 				SUBSTR(lif.body, 1, 300) as snippet,
@@ -602,6 +631,7 @@ export class MailboxDO extends DurableObject<Env> {
 	 * Returns the number of conversation groups, not individual emails.
 	 */
 	async countThreadedEmails(folder: string, labelId?: string) {
+		await this.#selfHealSnoozes();
 		const visibleFolderId = this.#visibleFolderId(folder);
 		if (!visibleFolderId) return 0;
 		const isDraftFolder = visibleFolderId === Folders.DRAFT;
@@ -657,6 +687,7 @@ export class MailboxDO extends DurableObject<Env> {
 	// ── Single email operations (Drizzle) ──────────────────────────
 
 	async getEmail(id: string) {
+		await this.#selfHealSnoozes();
 		const email = this.db
 			.select()
 			.from(schema.emails)
@@ -691,6 +722,7 @@ export class MailboxDO extends DurableObject<Env> {
 	 * N+1 individual getEmail calls.
 	 */
 	async getThreadEmails(threadId: string) {
+		await this.#selfHealSnoozes();
 		const emailRows = [
 			...this.ctx.storage.sql.exec(
 				`SELECT * FROM emails
@@ -730,6 +762,20 @@ export class MailboxDO extends DurableObject<Env> {
 			attachments: attachmentsByEmail.get(email.id) || [],
 			labels: labelsByEmail.get(email.id) ?? [],
 		}));
+	}
+
+	async getConversationIntelligenceEvidence(emailId: string) {
+		await this.#selfHealSnoozes();
+		return readConversationIntelligenceEvidenceProjection(
+			this.ctx.storage.sql,
+			emailId,
+		);
+	}
+
+	/** Resolve reminder identity from stored mail, never from client thread claims. */
+	async getFollowUpReminderAnchor(emailId: string) {
+		await this.#selfHealSnoozes();
+		return readStoredReminderAnchor(this.ctx.storage.sql, emailId);
 	}
 
 	async updateEmail(
@@ -1011,6 +1057,113 @@ export class MailboxDO extends DurableObject<Env> {
 		return executeBatchTriage(repository, command, actor);
 	}
 
+	#snoozeRepository(): SnoozeRepository {
+		return {
+			transaction: (run) => this.ctx.storage.transactionSync(run),
+			resolveScope: (scope, mode) => {
+				const folderReference = mode === "unsnooze"
+					? Folders.SNOOZED
+					: scope.kind === "conversation"
+						? scope.folderId
+						: null;
+				let emailIds: string[];
+				if (scope.kind === "message") {
+					emailIds = [scope.emailId];
+				} else {
+					const conversation = this.#conversationScope(
+						scope.conversationId,
+						folderReference!,
+					);
+					if (!conversation || !conversation.emailIds.includes(scope.emailId)) {
+						return null;
+					}
+					if (conversation.emailIds.length > 100) return { tooLarge: true };
+					emailIds = conversation.emailIds;
+				}
+				const rows = this.db
+					.select({
+						id: schema.emails.id,
+						folderId: schema.emails.folder_id,
+						sourceFolderId: schema.emails.snooze_source_folder_id,
+					})
+					.from(schema.emails)
+					.where(inArray(schema.emails.id, emailIds))
+					.all();
+				if (rows.length !== emailIds.length) return null;
+				return rows;
+			},
+			hasActiveOutbound: (emailIds) => Boolean(
+				this.db
+					.select({ id: schema.outboundDeliveries.id })
+					.from(schema.outboundDeliveries)
+					.where(and(
+						inArray(schema.outboundDeliveries.email_id, emailIds),
+						inArray(schema.outboundDeliveries.status, ["queued", "sending", "retrying"]),
+					))
+					.limit(1)
+					.get(),
+			),
+			folderExists: (folderId) => Boolean(
+				this.db
+					.select({ id: schema.folders.id })
+					.from(schema.folders)
+					.where(eq(schema.folders.id, folderId))
+					.get(),
+			),
+			applySnooze: ({ emailIds, sourceFolderId, wakeAt }) => {
+				this.db
+					.update(schema.emails)
+					.set({
+						folder_id: Folders.SNOOZED,
+						snooze_source_folder_id: sourceFolderId,
+						snoozed_until: wakeAt,
+						previous_folder_id: null,
+						trashed_at: null,
+					})
+					.where(inArray(schema.emails.id, emailIds))
+					.run();
+			},
+			clearSnooze: ({ targets }) => {
+				for (const target of targets) {
+					this.db
+						.update(schema.emails)
+						.set({
+							folder_id: target.folderId,
+							snooze_source_folder_id: null,
+							snoozed_until: null,
+						})
+						.where(eq(schema.emails.id, target.id))
+						.run();
+				}
+			},
+			recordActivity: ({ actor, action, entityType, entityId, metadata }) =>
+				this.#recordActivity(actor, action, entityType, entityId, metadata),
+		};
+	}
+
+	async snooze(input: unknown, actor: ActivityActor = { kind: "system" }) {
+		const request = normalizeSnoozeRequest(input);
+		const result = executeSnooze(this.#snoozeRepository(), request, actor);
+		if (result.status === "snoozed") {
+			await finalizeCommittedSnooze({
+				ensureAlarm: () => this.#scheduleAlarmAt(Date.parse(request.wakeAt)),
+				logFailure: (error) => console.error("failed to schedule Snooze wake alarm", {
+					wakeAt: request.wakeAt,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			});
+		}
+		return result;
+	}
+
+	async unsnooze(input: unknown, actor: ActivityActor = { kind: "system" }) {
+		return executeUnsnooze(
+			this.#snoozeRepository(),
+			normalizeSnoozeScope(input),
+			actor,
+		);
+	}
+
 	#moveConversationInFolder(
 		conversationId: string,
 		folderId: string,
@@ -1020,6 +1173,31 @@ export class MailboxDO extends DurableObject<Env> {
 		const scope = this.#conversationScope(conversationId, folderId);
 		if (!scope || scope.emailIds.length === 0) {
 			return { status: "not_found" as const, affectedCount: 0 };
+		}
+		if (scope.folderId === Folders.SNOOZED) {
+			return {
+				status: "snoozed_state_requires_unsnooze" as const,
+				affectedCount: 0,
+			};
+		}
+		const snoozedMember = this.db
+			.select({ id: schema.emails.id })
+			.from(schema.emails)
+			.where(and(
+				inArray(schema.emails.id, scope.emailIds),
+				or(
+					eq(schema.emails.folder_id, Folders.SNOOZED),
+					isNotNull(schema.emails.snoozed_until),
+					isNotNull(schema.emails.snooze_source_folder_id),
+				),
+			))
+			.limit(1)
+			.get();
+		if (snoozedMember) {
+			return {
+				status: "snoozed_state_requires_unsnooze" as const,
+				affectedCount: 0,
+			};
 		}
 		const active = this.db
 			.select({ id: schema.outboundDeliveries.id })
@@ -1080,12 +1258,25 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async deleteEmail(id: string) {
 		const email = this.db
-			.select({ id: schema.emails.id, folder_id: schema.emails.folder_id })
+			.select({
+				id: schema.emails.id,
+				folder_id: schema.emails.folder_id,
+				snooze_source_folder_id: schema.emails.snooze_source_folder_id,
+				snoozed_until: schema.emails.snoozed_until,
+			})
 			.from(schema.emails)
 			.where(eq(schema.emails.id, id))
 			.get();
 
-		if (!email || isInternalFolderId(email.folder_id)) return null;
+		if (
+			!email ||
+			isInternalFolderId(email.folder_id) ||
+			snoozeBlocksGenericMove({
+				folderId: email.folder_id,
+				wakeAt: email.snoozed_until,
+				sourceFolderId: email.snooze_source_folder_id,
+			})
+		) return null;
 
 		const emailAttachments = this.db
 			.select({
@@ -1456,7 +1647,12 @@ export class MailboxDO extends DurableObject<Env> {
 	/** Move user-visible mail to Trash without ever permanently deleting it. */
 	async trashEmail(id: string, actor: ActivityActor = { kind: "system" }) {
 		const email = this.db
-			.select({ id: schema.emails.id, folder_id: schema.emails.folder_id })
+			.select({
+				id: schema.emails.id,
+				folder_id: schema.emails.folder_id,
+				snooze_source_folder_id: schema.emails.snooze_source_folder_id,
+				snoozed_until: schema.emails.snoozed_until,
+			})
 			.from(schema.emails)
 			.where(eq(schema.emails.id, id))
 			.get();
@@ -1464,6 +1660,13 @@ export class MailboxDO extends DurableObject<Env> {
 		if (!email) return null;
 		if (isInternalFolderId(email.folder_id)) {
 			return { status: "protected_internal_state" as const };
+		}
+		if (snoozeBlocksGenericMove({
+			folderId: email.folder_id,
+			wakeAt: email.snoozed_until,
+			sourceFolderId: email.snooze_source_folder_id,
+		})) {
+			return { status: "snoozed_state_requires_unsnooze" as const };
 		}
 		const activeDelivery = this.#activeOutboundDeliveryForEmail(id);
 		if (activeDelivery) {
@@ -1598,6 +1801,7 @@ export class MailboxDO extends DurableObject<Env> {
 	// ── Folders (Drizzle) ──────────────────────────────────────────
 
 	async getFolders() {
+		await this.#selfHealSnoozes();
 		const result = this.db
 			.select({
 				id: schema.folders.id,
@@ -1918,13 +2122,28 @@ export class MailboxDO extends DurableObject<Env> {
 			.where(eq(schema.folders.id, folderId))
 			.get();
 
-		if (!folder || isInternalFolderId(folderId)) return false;
+		if (!folder || isInternalFolderId(folder.id)) return false;
+		if (folder.id === Folders.SNOOZED) {
+			return { status: "snoozed_state_requires_explicit_action" as const };
+		}
 		const email = this.db
-			.select({ id: schema.emails.id, folder_id: schema.emails.folder_id })
+			.select({
+				id: schema.emails.id,
+				folder_id: schema.emails.folder_id,
+				snooze_source_folder_id: schema.emails.snooze_source_folder_id,
+				snoozed_until: schema.emails.snoozed_until,
+			})
 			.from(schema.emails)
 			.where(eq(schema.emails.id, id))
 			.get();
 		if (!email || isInternalFolderId(email.folder_id)) return false;
+		if (snoozeBlocksGenericMove({
+			folderId: email.folder_id,
+			wakeAt: email.snoozed_until,
+			sourceFolderId: email.snooze_source_folder_id,
+		})) {
+			return { status: "snoozed_state_requires_unsnooze" as const };
+		}
 		const activeDelivery = this.#activeOutboundDeliveryForEmail(id);
 		if (activeDelivery) {
 			return {
@@ -1933,7 +2152,7 @@ export class MailboxDO extends DurableObject<Env> {
 			};
 		}
 
-		const plan = planMove(email.folder_id, folderId);
+		const plan = planMove(email.folder_id, folder.id);
 		if (plan.kind === "trash") {
 			const trashResult = await this.trashEmail(id, actor);
 			if (trashResult?.status === "outbound_delivery_active") {
@@ -1947,7 +2166,7 @@ export class MailboxDO extends DurableObject<Env> {
 			this.db
 				.update(schema.emails)
 				.set({
-					folder_id: folderId,
+					folder_id: folder.id,
 					...(plan.clearTrashMetadata
 						? { previous_folder_id: null, trashed_at: null }
 						: {}),
@@ -1959,7 +2178,7 @@ export class MailboxDO extends DurableObject<Env> {
 				"email_moved",
 				"email",
 				id,
-				{ fromFolderId: email.folder_id, toFolderId: folderId },
+				{ fromFolderId: email.folder_id, toFolderId: folder.id },
 				occurredAt,
 			);
 		});
@@ -2067,6 +2286,7 @@ export class MailboxDO extends DurableObject<Env> {
 	async searchEmails(
 		options: SearchFilterOptions & { page?: number; limit?: number },
 	) {
+		await this.#selfHealSnoozes();
 		const {
 			page = 1,
 			limit: rawLimit = 25,
@@ -2092,7 +2312,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const query = `
 			SELECT e.id, e.subject, e.sender, e.recipient, e.cc, e.bcc, e.date,
 				e.read, e.starred, e.in_reply_to, e.email_references,
-				e.thread_id, e.folder_id,
+				e.thread_id, e.folder_id, e.snooze_source_folder_id, e.snoozed_until,
 				SUBSTR(e.body, 1, 300) as snippet,
 				f.name as folder_name
 			FROM emails e
@@ -2119,6 +2339,7 @@ export class MailboxDO extends DurableObject<Env> {
 	 * Count total search results matching the given filters (for pagination).
 	 */
 	async countSearchResults(options: SearchFilterOptions) {
+		await this.#selfHealSnoozes();
 		const { conditions, params } = this.#buildSearchConditions(options);
 
 		const where =
@@ -2133,53 +2354,23 @@ export class MailboxDO extends DurableObject<Env> {
 
 	// ── Threading helpers (raw SQL) ────────────────────────────────
 
-	async findThreadBySubject(
-		subject: string,
-		senderAddress?: string,
-	): Promise<string | null> {
-		const normalized = subject
-			.replace(/^(?:(?:re|fwd?|fw|aw|wg|r[eé]f|sv)\s*:\s*)+/i, "")
-			.trim()
-			.toLowerCase();
-
-		if (!normalized) return null;
-
-		const result = this.ctx.storage.sql.exec(
-			`SELECT thread_id, subject,
-			        GROUP_CONCAT(DISTINCT LOWER(sender)) as senders,
-			        GROUP_CONCAT(DISTINCT LOWER(recipient)) as recipients
-			 FROM emails
-			 WHERE thread_id IS NOT NULL
-			   AND folder_id <> ?1
-			   AND thread_id != id
-			   AND date >= datetime('now', '-7 days')
-			 GROUP BY thread_id
-			 ORDER BY MAX(date) DESC
-			 LIMIT 50`,
-			InternalFolders.RETIRED_OUTBOUND,
-		);
-
-		const normalizedSender = senderAddress?.toLowerCase().trim();
-
-		for (const row of result) {
-			const rowSubject = String((row as any).subject || "")
-				.replace(/^(?:(?:re|fwd?|fw|aw|wg|r[eé]f|sv)\s*:\s*)+/i, "")
-				.trim()
-				.toLowerCase();
-			if (rowSubject !== normalized) continue;
-
-			if (normalizedSender) {
-				const threadSenders = String((row as any).senders || "");
-				const threadRecipients = String((row as any).recipients || "");
-				const allParticipants = `${threadSenders},${threadRecipients}`;
-				if (!allParticipants.includes(normalizedSender)) {
-					continue;
-				}
-			}
-
-			return String((row as any).thread_id);
-		}
-		return null;
+	async resolveCanonicalThreadId(messageIds: string[]): Promise<string | null> {
+		const ids = [...new Set(messageIds.map((id) => id.trim()).filter(Boolean))]
+			.slice(0, 50);
+		if (ids.length === 0) return null;
+		const rows = this.db
+			.select({
+				id: schema.emails.id,
+				messageId: schema.emails.message_id,
+				threadId: schema.emails.thread_id,
+			})
+			.from(schema.emails)
+			.where(or(
+				inArray(schema.emails.message_id, ids),
+				inArray(schema.emails.id, ids),
+			))
+			.all();
+		return resolveUnambiguousThreadReference(ids, rows);
 	}
 
 	// ── Rate limiting (raw SQL) ────────────────────────────────────
@@ -2276,6 +2467,32 @@ export class MailboxDO extends DurableObject<Env> {
 			if (attachments.length > 0) {
 				this.db.insert(schema.attachments).values(attachments).run();
 			}
+			if (folderId === Folders.INBOX && email.snooze_wake_thread_id) {
+				this.ctx.storage.sql.exec(
+					`INSERT INTO snooze_reply_wake_queue (thread_id, requested_at)
+					 SELECT ?1, ?2
+					 WHERE EXISTS (
+						SELECT 1 FROM emails
+						WHERE folder_id = ?3 AND thread_id = ?1
+					 )
+					 ON CONFLICT(thread_id) DO UPDATE SET requested_at = excluded.requested_at`,
+					email.snooze_wake_thread_id,
+					email.date,
+					Folders.SNOOZED,
+				);
+			}
+			if (folderId === Folders.INBOX && email.follow_up_reply_mailbox_address) {
+				this.db.insert(schema.followUpReplyCompletionQueue).values({
+					inbound_message_id: email.id,
+					mailbox_address: email.follow_up_reply_mailbox_address,
+					conversation_key: email.thread_id?.trim() || email.id,
+					inbound_message_date: email.date,
+					attempts: 0,
+					next_attempt_at: Date.now(),
+					created_at: Date.now(),
+					last_error: null,
+				}).onConflictDoNothing().run();
+			}
 			if (actor) {
 				this.#recordActivity(
 					actor,
@@ -2287,6 +2504,32 @@ export class MailboxDO extends DurableObject<Env> {
 				);
 			}
 		});
+		if (folderId === Folders.INBOX && email.snooze_wake_thread_id) {
+			const queued = this.db
+				.select({ threadId: schema.snoozeReplyWakeQueue.thread_id })
+				.from(schema.snoozeReplyWakeQueue)
+				.where(eq(
+					schema.snoozeReplyWakeQueue.thread_id,
+					email.snooze_wake_thread_id,
+				))
+				.get();
+			if (queued) {
+				await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
+					console.error("failed to schedule Snooze reply wake alarm", {
+						threadId: email.snooze_wake_thread_id,
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			}
+		}
+		if (folderId === Folders.INBOX && email.follow_up_reply_mailbox_address) {
+			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
+				console.error("failed to schedule follow-up reply completion", {
+					inboundMessageId: email.id,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		}
 	}
 
 	// ── Truthful outbound delivery ─────────────────────────────────
@@ -2771,6 +3014,209 @@ export class MailboxDO extends DurableObject<Env> {
 		const existing = await this.ctx.storage.getAlarm();
 		if (existing === null || timestamp < existing) {
 			await this.ctx.storage.setAlarm(timestamp);
+		}
+	}
+
+	#processDueSnoozeBatch(now = Date.now()): number | null {
+		const rows = [...this.ctx.storage.sql.exec(
+			`SELECT id,
+			        snooze_source_folder_id AS sourceFolderId,
+			        snoozed_until AS wakeAt
+			 FROM emails
+			 WHERE folder_id = ?1
+			 ORDER BY snoozed_until ASC, id ASC
+			 LIMIT 101`,
+			Folders.SNOOZED,
+		)] as Array<{ id: string; sourceFolderId: string | null; wakeAt: string }>;
+		const visibleFolders = new Set(
+			this.db
+				.select({ id: schema.folders.id })
+				.from(schema.folders)
+				.all()
+				.map((folder) => folder.id),
+		);
+		const plan = planDueSnoozeWake(
+			rows,
+			now,
+			(folderId) => visibleFolders.has(folderId),
+		);
+		if (plan.wake.length > 0) {
+			const occurredAt = new Date(now).toISOString();
+			this.ctx.storage.transactionSync(() => {
+				for (const target of plan.wake) {
+					this.db
+						.update(schema.emails)
+						.set({
+							folder_id: target.folderId,
+							snooze_source_folder_id: null,
+							snoozed_until: null,
+						})
+						.where(and(
+							eq(schema.emails.id, target.id),
+							eq(schema.emails.folder_id, Folders.SNOOZED),
+						))
+						.run();
+				}
+				this.#recordActivity(
+					{ kind: "system" },
+					"snooze_due_wake_batch",
+					"folder",
+					Folders.SNOOZED,
+					{ affectedCount: plan.wake.length },
+					occurredAt,
+				);
+			});
+		}
+		return plan.nextWakeAt;
+	}
+
+	#processReplyWakeBatch(): boolean {
+		const queued = this.db
+			.select()
+			.from(schema.snoozeReplyWakeQueue)
+			.orderBy(
+				asc(schema.snoozeReplyWakeQueue.requested_at),
+				asc(schema.snoozeReplyWakeQueue.thread_id),
+			)
+			.limit(1)
+			.get();
+		if (!queued) return false;
+		const rows = [...this.ctx.storage.sql.exec(
+			`SELECT id FROM emails
+			 WHERE folder_id = ?1 AND thread_id = ?2
+			 ORDER BY date ASC, id ASC
+			 LIMIT 100`,
+			Folders.SNOOZED,
+			queued.thread_id,
+		)] as Array<{ id: string }>;
+		const occurredAt = new Date().toISOString();
+		this.ctx.storage.transactionSync(() => {
+			if (rows.length > 0) {
+				this.db
+					.update(schema.emails)
+					.set({
+						folder_id: Folders.INBOX,
+						snooze_source_folder_id: null,
+						snoozed_until: null,
+					})
+					.where(inArray(schema.emails.id, rows.map((row) => row.id)))
+					.run();
+				this.#recordActivity(
+					{ kind: "system" },
+					"conversation_woken_by_reply",
+					"conversation",
+					queued.thread_id,
+					{ affectedCount: rows.length },
+					occurredAt,
+				);
+			}
+			const remaining = this.db
+				.select({ id: schema.emails.id })
+				.from(schema.emails)
+				.where(and(
+					eq(schema.emails.folder_id, Folders.SNOOZED),
+					eq(schema.emails.thread_id, queued.thread_id),
+				))
+				.limit(1)
+				.get();
+			if (!remaining) {
+				this.db
+					.delete(schema.snoozeReplyWakeQueue)
+					.where(eq(schema.snoozeReplyWakeQueue.thread_id, queued.thread_id))
+					.run();
+			}
+		});
+		return Boolean(
+			this.db.select({ threadId: schema.snoozeReplyWakeQueue.thread_id })
+				.from(schema.snoozeReplyWakeQueue)
+				.limit(1)
+				.get(),
+		);
+	}
+
+	async #processFollowUpReplyCompletionQueue(now: number): Promise<number | null> {
+		const repository: FollowUpReplyQueueRepository = {
+			nextDue: async (dueAt) => {
+				const row = this.db
+					.select()
+					.from(schema.followUpReplyCompletionQueue)
+					.where(lte(schema.followUpReplyCompletionQueue.next_attempt_at, dueAt))
+					.orderBy(
+						asc(schema.followUpReplyCompletionQueue.next_attempt_at),
+						asc(schema.followUpReplyCompletionQueue.inbound_message_id),
+					)
+					.limit(1)
+					.get();
+				return row ? {
+					inboundMessageId: row.inbound_message_id,
+					mailboxAddress: row.mailbox_address,
+					conversationKey: row.conversation_key,
+					inboundMessageDate: row.inbound_message_date,
+					attempts: row.attempts,
+				} : null;
+			},
+			remove: async (inboundMessageId) => {
+				this.db.delete(schema.followUpReplyCompletionQueue)
+					.where(eq(
+						schema.followUpReplyCompletionQueue.inbound_message_id,
+						inboundMessageId,
+					))
+					.run();
+			},
+			retry: async (input) => {
+				this.db.update(schema.followUpReplyCompletionQueue)
+					.set({
+						attempts: input.attempts,
+						next_attempt_at: input.nextAttemptAt,
+						last_error: input.lastError,
+					})
+					.where(eq(
+						schema.followUpReplyCompletionQueue.inbound_message_id,
+						input.inboundMessageId,
+					))
+					.run();
+			},
+			nextAttemptAt: async () => this.db
+				.select({ nextAttemptAt: schema.followUpReplyCompletionQueue.next_attempt_at })
+				.from(schema.followUpReplyCompletionQueue)
+				.orderBy(
+					asc(schema.followUpReplyCompletionQueue.next_attempt_at),
+					asc(schema.followUpReplyCompletionQueue.inbound_message_id),
+				)
+				.limit(1)
+				.get()?.nextAttemptAt ?? null,
+		};
+		return processOneFollowUpReplyCompletion({
+			repository,
+			now,
+			complete: (item) => followUpReminderD1Store(this.env)
+				.completeForInboundReply({
+					mailboxAddress: item.mailboxAddress,
+					conversationKey: item.conversationKey,
+					inboundMessageId: item.inboundMessageId,
+					inboundMessageDate: item.inboundMessageDate,
+					occurredAt: Date.now(),
+				}),
+		});
+	}
+
+	async #selfHealSnoozes(now = Date.now()) {
+		const replyWakePending = this.#processReplyWakeBatch();
+		const nextDueAt = this.#processDueSnoozeBatch(now);
+		const nextFollowUpAt = await this.#processFollowUpReplyCompletionQueue(now);
+		const next = earliestMailboxAlarm([
+			replyWakePending ? now + 100 : null,
+			nextDueAt,
+			nextFollowUpAt,
+		]);
+		if (next !== null) {
+			await finalizeCommittedSnooze({
+				ensureAlarm: () => this.#scheduleAlarmAt(Math.max(now, next)),
+				logFailure: (error) => console.error(
+					"failed to re-arm Snooze during read self-heal",
+					{ error: error instanceof Error ? error.message : String(error) },
+				),
+			});
 		}
 	}
 
@@ -3280,6 +3726,18 @@ export class MailboxDO extends DurableObject<Env> {
 
 	/** Enqueue the next recipient of the head job, persist progress, reschedule. */
 	async alarm(): Promise<void> {
+		const alarmNow = Date.now();
+		const replyWakePending = this.#processReplyWakeBatch();
+		const nextSnoozeAt = this.#processDueSnoozeBatch(alarmNow);
+		const nextFollowUpAt = await this.#processFollowUpReplyCompletionQueue(alarmNow);
+		const nextSnoozeAlarm = earliestMailboxAlarm([
+			replyWakePending ? alarmNow + 100 : null,
+			nextSnoozeAt,
+			nextFollowUpAt,
+		]);
+		if (nextSnoozeAlarm !== null) {
+			await this.#scheduleAlarmAt(Math.max(alarmNow, nextSnoozeAlarm));
+		}
 		const cleanupPending = await this.#processAttachmentCleanup();
 		await this.#processOutboundAlarm();
 		const queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];

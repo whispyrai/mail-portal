@@ -14,12 +14,15 @@ import ThreadMessage from "~/components/email-panel/ThreadMessage";
 import LabelChip from "~/components/labels/LabelChip";
 import LabelPicker from "~/components/labels/LabelPicker";
 import OutboundDeliveryActions from "~/components/OutboundDeliveryActions";
+import ConversationIntelligenceCard from "~/components/ConversationIntelligenceCard";
+import SnoozeDialog from "~/components/SnoozeDialog";
 import { splitEmailList, toEmailListValue, getNonInlineAttachments } from "~/lib/utils";
 import api from "~/services/api";
 import { useAiDraftReply, useCancelOutboundDelivery, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
 import { useMailbox } from "~/queries/mailboxes";
 import { useLabels, useMutateLabels } from "~/queries/labels";
+import { useUnsnooze } from "~/queries/snooze";
 import { useUIStore } from "~/hooks/useUIStore";
 import type { Email, Folder, Label, Mailbox } from "~/types";
 import { LogicalSendIdentity } from "~/lib/compose-send-identity";
@@ -50,6 +53,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const cancelOutboundMut = useCancelOutboundDelivery();
 	const aiDraftMut = useAiDraftReply();
 	const mutateLabels = useMutateLabels();
+	const unsnooze = useUnsnooze();
 	const { data: labels = [] } = useLabels(mailboxId);
 	const { data: folders = [] } = useFolders(mailboxId) as { data?: Folder[] };
 	const { data: currentMailbox } = useMailbox(mailboxId) as {
@@ -63,9 +67,13 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const [sourceViewEmail, setSourceViewEmail] = useState<Email | null>(null);
 	const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
 	const [previewImage, setPreviewImage] = useState<{ url: string; filename: string } | null>(null);
+	const [isSnoozeOpen, setIsSnoozeOpen] = useState(false);
 	const isDraftFolder = folder === Folders.DRAFT;
 	const isOutboxFolder = folder === Folders.OUTBOX || email?.folder_id === Folders.OUTBOX;
+	const isIntelligenceUnsupported =
+		isDraftFolder || email?.folder_id === Folders.DRAFT || isOutboxFolder;
 	const isTrashFolder = folder === Folders.TRASH || email?.folder_id === Folders.TRASH;
+	const isSnoozedFolder = folder === Folders.SNOOZED || email?.folder_id === Folders.SNOOZED;
 	const { data: outboundDeliveries = [] } = useOutboundDeliveries(
 		mailboxId,
 		email ? [email] : [],
@@ -106,13 +114,32 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		return nonDrafts.length > 0 ? nonDrafts[0] : email;
 	}, [allMessages, draftMessageIds, currentMailbox?.email, email]);
 
-	const moveToFolders = useMemo(() => { const cur = folder || email?.folder_id; return folders.filter((f) => f.id !== cur); }, [folders, folder, email?.folder_id]);
+	const moveToFolders = useMemo(() => {
+		const cur = folder || email?.folder_id;
+		return folders.filter((candidate) =>
+			candidate.id !== cur && candidate.id !== Folders.SNOOZED
+		);
+	}, [folders, folder, email?.folder_id]);
 	const selectedLabelIds = useMemo(
 		() => new Set((email?.labels ?? []).map((label) => label.id)),
 		[email?.labels],
 	);
 
 	if (!email) return <EmailPanelSkeleton />;
+
+	const snoozeFolderId = email.folder_id ?? folder ?? Folders.INBOX;
+	const snoozeConversationId = email.conversation_id ?? email.thread_id;
+	const canSnooze = !isSnoozedFolder && !isDraftFolder && !isOutboxFolder &&
+		!isTrashFolder && !new Set<string>([Folders.SENT, Folders.SPAM]).has(snoozeFolderId) &&
+		!snoozeFolderId.startsWith("_");
+	const snoozeScope = snoozeConversationId && allMessages.length > 1
+		? {
+				kind: "conversation" as const,
+				conversationId: snoozeConversationId,
+				emailId: email.id,
+				folderId: snoozeFolderId,
+			}
+		: { kind: "message" as const, emailId: email.id };
 
 	const toggleStar = () => { if (mailboxId) updateEmail.mutate({ mailboxId, id: email.id, data: { starred: !email.starred } }); };
 	const handleMove = (folderId: string) => { if (mailboxId) { moveEmailMut.mutate({ mailboxId, id: email.id, folderId }); closePanel(); } };
@@ -147,6 +174,23 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				onError: () =>
 					toastManager.add({
 						title: "Failed to restore email",
+						variant: "error",
+					}),
+			},
+		);
+	};
+	const handleUnsnooze = () => {
+		if (!mailboxId || unsnooze.isPending) return;
+		unsnooze.mutate(
+			{ mailboxId, scope: snoozeScope },
+			{
+				onSuccess: () => {
+					toastManager.add({ title: "Mail returned" });
+					closePanel();
+				},
+				onError: () =>
+					toastManager.add({
+						title: "Could not unsnooze mail",
 						variant: "error",
 					}),
 			},
@@ -320,6 +364,9 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				mailboxId={mailboxId}
 				isDraftFolder={isDraftFolder}
 				isOutboxFolder={isOutboxFolder}
+				isSnoozedFolder={isSnoozedFolder}
+				canSnooze={canSnooze}
+				isUnsnoozing={unsnooze.isPending}
 				isSending={isSending}
 				isDrafting={isDrafting}
 				moveToFolders={moveToFolders}
@@ -348,6 +395,8 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 					}
 				}}
 				onMove={handleMove}
+				onSnooze={() => setIsSnoozeOpen(true)}
+				onUnsnooze={handleUnsnooze}
 				onViewSource={() => setSourceViewEmail(email)}
 				onDelete={isDraftFolder ? () => handleDeleteDraft() : handleDelete}
 				onRestore={handleRestore}
@@ -387,6 +436,15 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			</div>
 
 			<div className="flex-1 overflow-y-auto">
+				{!isIntelligenceUnsupported && mailboxId && (
+					<ConversationIntelligenceCard
+						mailboxId={mailboxId}
+						emailId={email.id}
+						onFocusMessage={(messageId) =>
+							setExpandedMessages((current) => new Set(current).add(messageId))
+						}
+					/>
+				)}
 				{hasThread ? (
 					allMessages.map((msg, idx) => {
 						const isDraft = draftMessageIds.has(msg.id);
@@ -428,6 +486,20 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				onCloseSource={() => setSourceViewEmail(null)}
 				onClosePreview={() => setPreviewImage(null)}
 			/>
+
+			{mailboxId && isSnoozeOpen && (
+				<SnoozeDialog
+					mailboxId={mailboxId}
+					target={{
+						emailId: email.id,
+						folderId: snoozeFolderId,
+						conversationId: snoozeConversationId,
+						conversationCount: allMessages.length,
+					}}
+					open
+					onOpenChange={setIsSnoozeOpen}
+				/>
+			)}
 		</div>
 	);
 }

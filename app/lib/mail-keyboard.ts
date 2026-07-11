@@ -10,6 +10,7 @@ export type MailCommand =
 	| "trash"
 	| "toggle-unread"
 	| "toggle-star"
+	| "snooze"
 	| "refresh"
 	| "show-shortcuts"
 	| "go-inbox"
@@ -58,6 +59,7 @@ const DIRECT_COMMANDS: Readonly<Record<string, MailCommand>> = {
 	"#": "trash",
 	u: "toggle-unread",
 	s: "toggle-star",
+	z: "snooze",
 	"?": "show-shortcuts",
 };
 

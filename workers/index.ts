@@ -30,6 +30,8 @@ import { handleDeleteFolder } from "./routes/folders";
 import { handleSaveDraft } from "./routes/drafts";
 import { sharedMailboxAdminApp } from "./routes/shared-mailbox-admin";
 import { savedViewsApp } from "./routes/saved-views";
+import { snoozeRoutes } from "./routes/snooze";
+import { conversationIntelligenceApp } from "./routes/conversation-intelligence";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -185,6 +187,8 @@ app.get("/api/v1/me", (c: AppContext) => {
 
 app.route("/api/v1/admin", sharedMailboxAdminApp);
 app.route("/", savedViewsApp);
+app.route("/", snoozeRoutes);
+app.route("/", conversationIntelligenceApp);
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");

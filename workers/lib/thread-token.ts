@@ -9,16 +9,22 @@ export function buildThreadToken(threadId: string, domain: string): string {
 	return `thread-${threadId}@${domain}`;
 }
 
+export function extractThreadTokens(
+	references: string[],
+	inReplyTo: string | null,
+): string[] {
+	const candidates = inReplyTo ? [...references, inReplyTo] : references;
+	return [...new Set(candidates.flatMap((candidate) => {
+		const threadId = candidate.match(THREAD_TOKEN_RE)?.[1];
+		return threadId ? [threadId] : [];
+	}))];
+}
+
 /** Recover an app-controlled thread id from inbound reply headers. */
 export function extractThreadToken(
 	references: string[],
 	inReplyTo: string | null,
 ): string | null {
-	const candidates = inReplyTo ? [...references, inReplyTo] : references;
-	for (const candidate of candidates) {
-		const threadId = candidate.match(THREAD_TOKEN_RE)?.[1];
-		if (threadId) return threadId;
-	}
-	return null;
+	const threadIds = extractThreadTokens(references, inReplyTo);
+	return threadIds.length === 1 ? threadIds[0]! : null;
 }
-

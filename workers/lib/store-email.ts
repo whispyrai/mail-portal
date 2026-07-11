@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import type { Email } from "postal-mime";
-import { extractThreadToken } from "./thread-token.ts";
+import { extractThreadTokens } from "./thread-token.ts";
 import { sanitizeFilename, type StoredAttachment } from "./attachments.ts";
 
 export const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
@@ -23,6 +23,9 @@ type StoredEmail = {
 	thread_id: string;
 	message_id: string | null;
 	raw_headers: string;
+	/** Exact live RFC/token thread identity allowed to wake Snoozed mail. */
+	snooze_wake_thread_id: string | null;
+	follow_up_reply_mailbox_address: string | null;
 };
 
 type AttachmentBucket = {
@@ -36,7 +39,7 @@ type MailboxEmailStore = {
 		email: StoredEmail,
 		attachments: StoredAttachment[],
 	): Promise<unknown>;
-	findThreadBySubject(subject: string, senderAddress?: string): Promise<string | null>;
+	resolveCanonicalThreadId(messageIds: string[]): Promise<string | null>;
 	getEmail(id: string): Promise<unknown | null>;
 };
 
@@ -45,12 +48,20 @@ export type EmailStorageDependencies = {
 	mailbox: MailboxEmailStore;
 };
 
+export interface StoredEmailSignal {
+	conversationKey: string;
+	inboundMessageId: string;
+	inboundMessageDate: string;
+}
+
 type StoreParsedEmailOptions = {
 	folder: string;
 	date: string;
 	messageId: string;
 	read?: boolean;
 	threadId?: string;
+	wakeSnoozedOnReply?: boolean;
+	followUpMailboxAddress?: string;
 };
 
 function messageIds(value: string | undefined): string[] {
@@ -67,6 +78,17 @@ function addresses(entries: Email["to"]): string[] {
 	);
 }
 
+function boundedRfcThreadCandidates(
+	references: string[],
+	inReplyTo: string | null,
+): string[] {
+	const root = references[0];
+	const recent = references.slice(-48);
+	return [...new Set([root, ...recent, inReplyTo].filter(
+		(value): value is string => Boolean(value),
+	))].slice(0, 50);
+}
+
 /**
  * Persist one parsed email through the shared live-receive and import path.
  * Callers choose identity, folder, date, read state, and an optional imported
@@ -76,7 +98,7 @@ export async function storeParsedEmail(
 	dependencies: EmailStorageDependencies,
 	parsed: Email,
 	options: StoreParsedEmailOptions,
-): Promise<void> {
+): Promise<StoredEmailSignal> {
 	const { folder, date, messageId, read } = options;
 	const attachmentData: StoredAttachment[] = [];
 	const attachmentKeys: string[] = [];
@@ -104,17 +126,20 @@ export async function storeParsedEmail(
 
 		const inReplyTo = messageIds(parsed.inReplyTo)[0] ?? null;
 		const references = messageIds(parsed.references);
-		const tokenThreadId = extractThreadToken(references, inReplyTo);
-		let threadId =
-			options.threadId ?? tokenThreadId ?? references[0] ?? inReplyTo ?? messageId;
-
-		if (!options.threadId && !tokenThreadId && !inReplyTo && references.length === 0) {
-			threadId =
-				(await dependencies.mailbox.findThreadBySubject(
-					parsed.subject ?? "",
-					parsed.from?.address,
-				)) ?? messageId;
-		}
+		const tokenThreadIds = extractThreadTokens(references, inReplyTo);
+		const tokenThreadId = tokenThreadIds.length === 1 ? tokenThreadIds[0]! : null;
+		const rfcReplyIds = boundedRfcThreadCandidates(references, inReplyTo);
+		const canonicalReplyThreadId = tokenThreadIds.length > 1
+			? null
+			: tokenThreadId ?? (
+			rfcReplyIds.length > 0
+				? await dependencies.mailbox.resolveCanonicalThreadId(rfcReplyIds)
+				: null
+			);
+		const threadId = options.threadId ?? canonicalReplyThreadId ?? messageId;
+		const snoozeWakeThreadId = options.wakeSnoozedOnReply
+			? canonicalReplyThreadId
+			: null;
 
 		await dependencies.mailbox.createEmail(
 			folder,
@@ -133,9 +158,17 @@ export async function storeParsedEmail(
 				thread_id: threadId,
 				message_id: messageIds(parsed.messageId)[0] ?? null,
 				raw_headers: JSON.stringify(parsed.headers),
+				snooze_wake_thread_id: snoozeWakeThreadId,
+				follow_up_reply_mailbox_address:
+					options.followUpMailboxAddress?.toLowerCase() ?? null,
 			},
 			attachmentData,
 		);
+		return {
+			conversationKey: threadId,
+			inboundMessageId: messageId,
+			inboundMessageDate: date,
+		};
 	} catch (error) {
 		let emailWasStored: boolean;
 		try {

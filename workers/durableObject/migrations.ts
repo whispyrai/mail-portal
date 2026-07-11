@@ -417,4 +417,77 @@ export const mailboxMigrations: Migration[] = [
 				ON email_labels(email_id, label_id);
 		`),
 	},
+	{
+		name: "16_add_mailbox_snooze",
+		sql: txn(`
+			DROP TABLE IF EXISTS _snoozed_folder_map;
+			CREATE TABLE _snoozed_folder_map (
+				old_id TEXT PRIMARY KEY,
+				new_id TEXT NOT NULL UNIQUE,
+				new_name TEXT NOT NULL UNIQUE,
+				is_deletable INTEGER NOT NULL
+			);
+			INSERT INTO _snoozed_folder_map
+				(old_id, new_id, new_name, is_deletable)
+			SELECT id,
+				'snoozed_legacy_' || lower(hex(randomblob(8))),
+				name || ' (Legacy ' || lower(hex(randomblob(8))) || ')',
+				is_deletable
+			FROM folders
+			WHERE id = 'snoozed';
+
+			INSERT INTO folders (id, name, is_deletable)
+			SELECT new_id, new_name, is_deletable FROM _snoozed_folder_map;
+			UPDATE emails
+			SET folder_id = (
+				SELECT new_id FROM _snoozed_folder_map WHERE old_id = 'snoozed'
+			)
+			WHERE folder_id = 'snoozed';
+			UPDATE emails
+			SET previous_folder_id = (
+				SELECT new_id FROM _snoozed_folder_map WHERE old_id = 'snoozed'
+			)
+			WHERE previous_folder_id = 'snoozed';
+			DELETE FROM folders WHERE id = 'snoozed';
+
+			UPDATE folders
+			SET name = 'Snoozed (Legacy ' || lower(hex(randomblob(8))) || ')'
+			WHERE name = 'Snoozed';
+			INSERT INTO folders (id, name, is_deletable)
+			VALUES ('snoozed', 'Snoozed', 0)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				is_deletable = 0;
+			DROP TABLE _snoozed_folder_map;
+
+			ALTER TABLE emails ADD COLUMN snooze_source_folder_id TEXT;
+			ALTER TABLE emails ADD COLUMN snoozed_until TEXT;
+			CREATE INDEX idx_emails_snoozed_until
+				ON emails(snoozed_until, id);
+
+			CREATE TABLE snooze_reply_wake_queue (
+				thread_id TEXT PRIMARY KEY,
+				requested_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_snooze_reply_wake_requested
+				ON snooze_reply_wake_queue(requested_at, thread_id);
+		`),
+	},
+	{
+		name: "17_add_follow_up_reply_completion_queue",
+		sql: txn(`
+			CREATE TABLE follow_up_reply_completion_queue (
+				inbound_message_id TEXT PRIMARY KEY,
+				mailbox_address TEXT NOT NULL,
+				conversation_key TEXT NOT NULL,
+				inbound_message_date TEXT NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				next_attempt_at INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				last_error TEXT
+			);
+			CREATE INDEX idx_follow_up_reply_completion_due
+				ON follow_up_reply_completion_queue(next_attempt_at, inbound_message_id);
+		`),
+	},
 ];

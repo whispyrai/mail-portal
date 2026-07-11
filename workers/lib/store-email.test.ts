@@ -1,0 +1,149 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { Email } from "postal-mime";
+import { storeParsedEmail, type EmailStorageDependencies } from "./store-email.ts";
+import { resolveUnambiguousThreadReference } from "./thread-reference.ts";
+
+function dependencies() {
+	const created: Array<Record<string, unknown>> = [];
+	const value: EmailStorageDependencies = {
+		bucket: {
+			async put() {},
+			async delete() {},
+		},
+		mailbox: {
+			async createEmail(_folder, email) { created.push(email); },
+			async resolveCanonicalThreadId(ids) {
+				return resolveUnambiguousThreadReference(ids, created.map((email) => ({
+					id: String(email.id),
+					messageId: typeof email.message_id === "string" ? email.message_id : null,
+					threadId: typeof email.thread_id === "string" ? email.thread_id : null,
+				})));
+			},
+			async getEmail() { return null; },
+		},
+	};
+	return { value, created };
+}
+
+function parsed(overrides: Partial<Email> = {}): Email {
+	return {
+		subject: "Renewal",
+		from: { address: "customer@example.com" },
+		to: [{ address: "team@example.com" }],
+		attachments: [],
+		headers: [],
+		...overrides,
+	} as Email;
+}
+
+test("heuristic same-subject threading never gains Snooze wake authority", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed(), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "mail_1",
+		wakeSnoozedOnReply: true,
+	});
+	assert.equal(state.created[0]!.thread_id, "mail_1");
+	assert.equal(state.created[0]!.snooze_wake_thread_id, null);
+});
+
+test("live RFC reply identity may wake its exact stored thread", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed({
+		messageId: "<raw-original@example.com>",
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T09:00:00.000Z",
+		messageId: "internal-original",
+		wakeSnoozedOnReply: true,
+	});
+	const signal = await storeParsedEmail(state.value, parsed({
+		inReplyTo: "<raw-original@example.com>",
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "internal-reply",
+		wakeSnoozedOnReply: true,
+	});
+	assert.equal(state.created[0]!.message_id, "raw-original@example.com");
+	assert.equal(state.created[1]!.thread_id, "internal-original");
+	assert.equal(state.created[1]!.snooze_wake_thread_id, "internal-original");
+	assert.deepEqual(signal, {
+		conversationKey: "internal-original",
+		inboundMessageId: "internal-reply",
+		inboundMessageDate: "2026-07-11T10:00:00.000Z",
+	});
+});
+
+test("imports never wake Snoozed mail even when they carry a derived thread ID", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed({
+		inReplyTo: "<authoritative-thread>",
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "mail_1",
+		threadId: "import-thread",
+	});
+	assert.equal(state.created[0]!.thread_id, "import-thread");
+	assert.equal(state.created[0]!.snooze_wake_thread_id, null);
+	assert.equal(state.created[0]!.follow_up_reply_mailbox_address, null);
+});
+
+test("conflicting RFC References and direct parent fail closed", async () => {
+	const state = dependencies();
+	for (const [id, raw] of [["root", "raw-root"], ["direct", "raw-direct"]]) {
+		await storeParsedEmail(state.value, parsed({ messageId: `<${raw}>` }), {
+			folder: "inbox",
+			date: "2026-07-11T09:00:00.000Z",
+			messageId: id,
+		});
+	}
+	await storeParsedEmail(state.value, parsed({
+		references: "<raw-root> <raw-direct>",
+		inReplyTo: "<raw-direct>",
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "reply",
+		wakeSnoozedOnReply: true,
+	});
+	assert.equal(state.created[2]!.thread_id, "reply");
+	assert.equal(state.created[2]!.snooze_wake_thread_id, null);
+});
+
+test("a direct parent survives a References chain longer than the lookup bound", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed({ messageId: "<raw-parent>" }), {
+		folder: "inbox",
+		date: "2026-07-11T09:00:00.000Z",
+		messageId: "parent",
+	});
+	await storeParsedEmail(state.value, parsed({
+		references: Array.from({ length: 60 }, (_, index) => `<unknown-${index}>`).join(" "),
+		inReplyTo: "<raw-parent>",
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "reply",
+		wakeSnoozedOnReply: true,
+	});
+	assert.equal(state.created[1]!.thread_id, "parent");
+	assert.equal(state.created[1]!.snooze_wake_thread_id, "parent");
+});
+
+test("multiple distinct app thread tokens fail closed to a new conversation", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed({
+		references: "<thread-one@example.com> <thread-two@example.com>",
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "ambiguous",
+		wakeSnoozedOnReply: true,
+	});
+	assert.equal(state.created[0]!.thread_id, "ambiguous");
+	assert.equal(state.created[0]!.snooze_wake_thread_id, null);
+});

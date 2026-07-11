@@ -18,6 +18,10 @@ import type {
 	BatchTriageCommand,
 	BatchTriageResult,
 } from "../../shared/batch-triage";
+import type {
+	SnoozeMutationResponse,
+	SnoozeScope,
+} from "../../shared/snooze";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -248,6 +252,16 @@ const api = {
 		post<BatchTriageResult>(
 			`/api/v1/mailboxes/${mailboxId}/triage-batch`,
 			command,
+		),
+	snooze: (mailboxId: string, scope: SnoozeScope, wakeAt: string) =>
+		post<SnoozeMutationResponse>(
+			`/api/v1/mailboxes/${mailboxId}/snooze`,
+			{ scope, wakeAt },
+		),
+	unsnooze: (mailboxId: string, scope: SnoozeScope) =>
+		post<SnoozeMutationResponse>(
+			`/api/v1/mailboxes/${mailboxId}/snooze/clear`,
+			{ scope },
 		),
 	getAttachment: (mailboxId: string, emailId: string, attachmentId: string) =>
 		get<Blob>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/attachments/${attachmentId}`, { responseType: "blob" }),

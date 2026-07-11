@@ -30,6 +30,12 @@ const SnoozeRequestSchema = z.object({
 
 export type SnoozeRequest = z.infer<typeof SnoozeRequestSchema>;
 
+export function normalizeSnoozeScope(input: unknown): SnoozeRequest["scope"] {
+	const parsed = SnoozeScopeSchema.safeParse(input);
+	if (!parsed.success) throw new SnoozeValidationError();
+	return parsed.data;
+}
+
 export function normalizeSnoozeRequest(input: unknown, now = Date.now()): SnoozeRequest {
 	const parsed = SnoozeRequestSchema.safeParse(input);
 	if (!parsed.success) throw new SnoozeValidationError();
@@ -98,8 +104,13 @@ export function planDueSnoozeWake(
 		}
 		nextWakeAt = nextWakeAt === null ? timestamp : Math.min(nextWakeAt, timestamp);
 	}
-	if (rows.length > MAX_SNOOZE_TARGETS) {
-		nextWakeAt = nextWakeAt === null ? now : Math.min(nextWakeAt, now);
+	for (const overflow of rows.slice(MAX_SNOOZE_TARGETS)) {
+		const timestamp = Date.parse(overflow.wakeAt);
+		if (!Number.isFinite(timestamp) || timestamp <= now) {
+			nextWakeAt = now;
+			break;
+		}
+		nextWakeAt = nextWakeAt === null ? timestamp : Math.min(nextWakeAt, timestamp);
 	}
 	return { wake, nextWakeAt };
 }
@@ -107,23 +118,26 @@ export function planDueSnoozeWake(
 export function planIncomingReplyWake(
 	threadId: string | null | undefined,
 	rows: Array<{ id: string; threadId: string | null; sourceFolderId: string | null }>,
-): Array<{ id: string; folderId: string }> {
-	if (!threadId) return [];
-	return rows
-		.filter((row) => row.threadId === threadId)
-		.map((row) => ({
+): { wake: Array<{ id: string; folderId: string }>; hasMore: boolean } {
+	if (!threadId) return { wake: [], hasMore: false };
+	const matches = rows.filter((row) => row.threadId === threadId);
+	return {
+		wake: matches.slice(0, MAX_SNOOZE_TARGETS).map((row) => ({
 			id: row.id,
 			// The incoming reply itself arrives in Inbox. Wake the hidden messages
 			// there too so the active conversation is not split across old sources.
 			folderId: Folders.INBOX,
-		}));
+		})),
+		hasMore: matches.length > MAX_SNOOZE_TARGETS,
+	};
 }
 
 export function snoozeBlocksGenericMove(row: {
 	folderId: string;
 	wakeAt: string | null | undefined;
+	sourceFolderId?: string | null | undefined;
 }): boolean {
-	return row.folderId === SNOOZED_FOLDER_ID || Boolean(row.wakeAt);
+	return row.folderId === SNOOZED_FOLDER_ID || Boolean(row.wakeAt) || Boolean(row.sourceFolderId);
 }
 
 export function earliestMailboxAlarm(

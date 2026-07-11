@@ -74,7 +74,11 @@ export default function ThreadMessage({
 
 	if (!isExpanded) {
 		return (
-			<div className={containerClassName}>
+			<div
+				className={containerClassName}
+				data-intelligence-message-id={email.id}
+				tabIndex={-1}
+			>
 				<button
 					type="button"
 					onClick={onToggleExpand}
@@ -101,7 +105,11 @@ export default function ThreadMessage({
 	}
 
 	return (
-		<div className={`group/thread-msg ${containerClassName}`}>
+		<div
+			className={`group/thread-msg ${containerClassName}`}
+			data-intelligence-message-id={email.id}
+			tabIndex={-1}
+		>
 			<div className="px-4 py-4 md:px-6">
 				<div className="flex items-center justify-between gap-3 mb-3">
 					<div className="flex items-center gap-2.5 min-w-0">

@@ -40,7 +40,10 @@ export function isBatchTriageActionAllowed(
 	action: BatchTriageAction,
 	folderId: string,
 ): boolean {
-	if (folderId === Folders.OUTBOX || folderId === Folders.DRAFT) return false;
+	if (
+		folderId === Folders.OUTBOX ||
+		folderId === Folders.DRAFT
+	) return false;
 	if (action === "mark_read" || action === "mark_unread") {
 		return folderId !== Folders.SENT;
 	}
@@ -49,7 +52,8 @@ export function isBatchTriageActionAllowed(
 			Folders.SENT,
 			Folders.TRASH,
 			Folders.ARCHIVE,
+			Folders.SNOOZED,
 		]).has(folderId);
 	}
-	return folderId !== Folders.TRASH;
+	return folderId !== Folders.TRASH && folderId !== Folders.SNOOZED;
 }
