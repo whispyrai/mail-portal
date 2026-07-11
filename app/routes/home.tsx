@@ -128,11 +128,11 @@ export default function HomeRoute() {
 		setIsDeleting(true);
 		try {
 			await deleteMailbox.mutateAsync(mailboxToDelete.id);
-			toastManager.add({ title: "Mailbox deleted" });
+			toastManager.add({ title: "Mailbox deactivated" });
 			setIsDeleteOpen(false);
 			setMailboxToDelete(null);
 		} catch {
-			toastManager.add({ title: "Failed to delete mailbox", variant: "error" });
+			toastManager.add({ title: "Failed to deactivate mailbox", variant: "error" });
 		} finally {
 			setIsDeleting(false);
 		}
@@ -208,7 +208,7 @@ export default function HomeRoute() {
 										size="sm"
 										shape="square"
 										icon={<TrashIcon size={16} />}
-										aria-label={`Delete mailbox ${account.email}`}
+										aria-label={`Deactivate mailbox ${account.email}`}
 										onClick={(e) => {
 											e.preventDefault();
 											e.stopPropagation();
@@ -335,7 +335,7 @@ export default function HomeRoute() {
 				</Dialog>
 			</Dialog.Root>
 
-			{/* Delete Dialog */}
+			{/* Deactivate Dialog */}
 			<Dialog.Root
 				open={isDeleteOpen}
 				onOpenChange={(open) => {
@@ -345,14 +345,14 @@ export default function HomeRoute() {
 			>
 				<Dialog size="sm" className="p-6">
 					<Dialog.Title className="text-base font-semibold mb-2">
-						Delete Mailbox
+						Deactivate Mailbox
 					</Dialog.Title>
 					<Dialog.Description className="text-kumo-subtle text-sm mb-5">
-						Are you sure you want to delete{" "}
+						Are you sure you want to deactivate{" "}
 						<strong className="text-kumo-default">
 							{mailboxToDelete?.email}
 						</strong>
-						? This action cannot be undone.
+						? Mail and settings will be retained for recovery.
 					</Dialog.Description>
 					<div className="flex justify-end gap-2">
 						<Dialog.Close
@@ -368,7 +368,7 @@ export default function HomeRoute() {
 							loading={isDeleting}
 							onClick={handleDelete}
 						>
-							Delete
+							Deactivate
 						</Button>
 					</div>
 				</Dialog>

@@ -34,12 +34,12 @@ export default function ComposeAttachments({
 	const inputRef = useRef<HTMLInputElement>(null);
 
 	return (
-		<div>
+		<div aria-live="polite">
 			<button
 				type="button"
 				onClick={() => inputRef.current?.click()}
 				disabled={disabled}
-				className="flex items-center gap-1.5 text-sm text-kumo-link hover:text-kumo-link-hover font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+				className="flex min-h-11 items-center gap-1.5 rounded px-1 text-sm text-kumo-link hover:text-kumo-link-hover font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand disabled:opacity-50 disabled:cursor-not-allowed"
 			>
 				<PaperclipIcon size={15} />
 				Attach files
@@ -49,6 +49,7 @@ export default function ComposeAttachments({
 				type="file"
 				multiple
 				className="hidden"
+				aria-label="Choose files to attach"
 				onChange={(e) => {
 					if (e.target.files && e.target.files.length > 0) onAddFiles(e.target.files);
 					// Reset so picking the same file again still fires onChange.
@@ -57,20 +58,21 @@ export default function ComposeAttachments({
 			/>
 
 			{attachments.length > 0 && (
-				<div className="mt-2 flex flex-wrap gap-2">
+				<div className="mt-2 flex min-w-0 flex-wrap gap-2" role="list" aria-label="Attachments">
 					{attachments.map((a) => {
 						const isError = a.status === "error";
 						const isUploading = a.status === "uploading";
 						return (
 							<div
 								key={a.localId}
+								role="listitem"
 								title={a.error || a.filename}
-								className={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${
+								className={`flex min-w-0 max-w-full items-center gap-2 rounded-md border px-3 py-2 text-sm ${
 									isError ? "border-red-300 bg-red-50" : "border-kumo-line"
 								}`}
 							>
 								{isUploading ? (
-									<CircleNotchIcon size={16} className="text-kumo-subtle shrink-0 animate-spin" />
+									<CircleNotchIcon size={16} className="text-kumo-subtle shrink-0 animate-spin motion-reduce:animate-none" />
 								) : isError ? (
 									<WarningCircleIcon size={16} className="text-red-500 shrink-0" />
 								) : (
@@ -90,7 +92,7 @@ export default function ComposeAttachments({
 									type="button"
 									onClick={() => onRemove(a.localId)}
 									aria-label={`Remove ${a.filename}`}
-									className="shrink-0 text-kumo-subtle hover:text-kumo-default"
+									className="flex h-11 w-11 shrink-0 items-center justify-center rounded text-kumo-subtle hover:text-kumo-default focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
 								>
 									<XIcon size={14} />
 								</button>

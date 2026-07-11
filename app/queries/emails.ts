@@ -4,7 +4,8 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import api from "~/services/api";
-import type { Email, AttachmentRef } from "~/types";
+import type { Email, AttachmentRef, OutboundDelivery } from "~/types";
+import type { BatchTriageCommand } from "../../shared/batch-triage";
 import { queryKeys } from "./keys";
 
 // ---------- Types ----------
@@ -57,6 +58,67 @@ export function useEmail(
 			: ["emails", "_disabled_detail"],
 		queryFn: () => api.getEmail(mailboxId!, emailId!) as Promise<Email>,
 		enabled: !!mailboxId && !!emailId,
+	});
+}
+
+export function useOutboundDeliveries(
+	mailboxId: string | undefined,
+	emails: Array<Email | string> = [],
+	enabled = true,
+	includeThreadHighlights = false,
+) {
+	const emailIds = emails.map((email) => typeof email === "string" ? email : email.id);
+	const threadIds = includeThreadHighlights
+		? [...new Set(emails.flatMap((email) =>
+			typeof email !== "string" && email.thread_id ? [email.thread_id] : [],
+		))]
+		: [];
+	const emailIdsKey = [...new Set(emailIds)].sort().join(",");
+	const threadIdsKey = [...threadIds].sort().join(",");
+	return useQuery<OutboundDelivery[]>({
+		queryKey: mailboxId
+			? queryKeys.outbound.list(mailboxId, `${emailIdsKey}|${threadIdsKey}`)
+			: ["outbound", "_disabled"],
+		queryFn: async () =>
+			(await api.listOutboundDeliveries(mailboxId!, emailIds, threadIds)).deliveries,
+		enabled: Boolean(mailboxId) && enabled && emailIds.length > 0,
+		refetchInterval: enabled ? 2_000 : false,
+	});
+}
+
+export function useCancelOutboundDelivery() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ mailboxId, deliveryId }: { mailboxId: string; deliveryId: string }) =>
+			api.cancelOutboundDelivery(mailboxId, deliveryId),
+		onSuccess: (_data, { mailboxId }) => {
+			qc.invalidateQueries({ queryKey: ["outbound", mailboxId] });
+			qc.invalidateQueries({ queryKey: ["emails", mailboxId] });
+		},
+	});
+}
+
+export function useRetryOutboundDelivery() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			deliveryId,
+			acknowledgeDuplicateRisk,
+		}: {
+			mailboxId: string;
+			deliveryId: string;
+			acknowledgeDuplicateRisk: boolean;
+		}) =>
+			api.retryOutboundDelivery(
+				mailboxId,
+				deliveryId,
+				acknowledgeDuplicateRisk,
+			),
+		onSuccess: (_data, { mailboxId }) => {
+			qc.invalidateQueries({ queryKey: ["outbound", mailboxId] });
+			qc.invalidateQueries({ queryKey: ["emails", mailboxId] });
+		},
 	});
 }
 
@@ -204,6 +266,61 @@ export function useMarkThreadRead() {
 	});
 }
 
+function useConversationMutation<TVariables extends { mailboxId: string }>(
+	mutationFn: (variables: TVariables) => Promise<unknown>,
+) {
+	const invalidate = useInvalidateEmailData();
+	return useMutation({
+		mutationFn,
+		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),
+	});
+}
+
+export function useSetConversationRead() {
+	return useConversationMutation(
+		({ mailboxId, conversationId, folderId, read }: {
+			mailboxId: string;
+			conversationId: string;
+			folderId: string;
+			read: boolean;
+		}) => api.setConversationRead(mailboxId, conversationId, folderId, read),
+	);
+}
+
+export function useArchiveConversation() {
+	return useConversationMutation(
+		({ mailboxId, conversationId, folderId }: {
+			mailboxId: string;
+			conversationId: string;
+			folderId: string;
+		}) => api.archiveConversation(mailboxId, conversationId, folderId),
+	);
+}
+
+export function useTrashConversation() {
+	return useConversationMutation(
+		({ mailboxId, conversationId, folderId }: {
+			mailboxId: string;
+			conversationId: string;
+			folderId: string;
+		}) => api.trashConversation(mailboxId, conversationId, folderId),
+	);
+}
+
+export function useBatchTriage() {
+	const invalidate = useInvalidateEmailData();
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			command,
+		}: {
+			mailboxId: string;
+			command: BatchTriageCommand;
+		}) => api.batchTriage(mailboxId, command),
+		onSettled: (_data, _error, { mailboxId }) => invalidate(mailboxId),
+	});
+}
+
 export function useDeleteEmail() {
 	const invalidate = useInvalidateEmailData();
 	return useMutation({
@@ -212,6 +329,26 @@ export function useDeleteEmail() {
 			id,
 		}: { mailboxId: string; id: string }) =>
 			api.deleteEmail(mailboxId, id),
+		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),
+	});
+}
+
+export function useRestoreEmail() {
+	const invalidate = useInvalidateEmailData();
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			id,
+		}: { mailboxId: string; id: string }) => api.restoreEmail(mailboxId, id),
+		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),
+	});
+}
+
+export function useDiscardDraft() {
+	const invalidate = useInvalidateEmailData();
+	return useMutation({
+		mutationFn: ({ mailboxId, id }: { mailboxId: string; id: string }) =>
+			api.discardDraft(mailboxId, id),
 		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),
 	});
 }
@@ -246,6 +383,7 @@ export function useSaveDraft() {
 				in_reply_to?: string;
 				thread_id?: string;
 				draft_id?: string;
+				draft_version?: number;
 				attachments?: AttachmentRef[];
 			};
 		}) => api.saveDraft(mailboxId, draft),

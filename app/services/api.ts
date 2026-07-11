@@ -2,7 +2,22 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import type { Email, Folder, Mailbox, AttachmentRef } from "~/types";
+import type {
+	Email,
+	Folder,
+	Mailbox,
+	AttachmentRef,
+	OutboundDelivery,
+	OutboundEnqueueResponse,
+	Label,
+	LabelColor,
+	LabelMutationResult,
+	LabelMutationTarget,
+} from "~/types";
+import type {
+	BatchTriageCommand,
+	BatchTriageResult,
+} from "../../shared/batch-triage";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -101,6 +116,19 @@ const api = {
 			"/api/v1/config",
 		),
 
+	listLabels: (mailboxId: string) =>
+		get<{ labels: Label[] }>(`/api/v1/mailboxes/${mailboxId}/labels`),
+	createLabel: (mailboxId: string, input: { name: string; color: LabelColor }) =>
+		post<{ label: Label }>(`/api/v1/mailboxes/${mailboxId}/labels`, input),
+	updateLabel: (mailboxId: string, labelId: string, input: { name: string; color: LabelColor }) =>
+		put<{ label: Label }>(`/api/v1/mailboxes/${mailboxId}/labels/${labelId}`, input),
+	deleteLabel: (mailboxId: string, labelId: string) =>
+		del<void>(`/api/v1/mailboxes/${mailboxId}/labels/${labelId}`),
+	mutateLabels: (
+		mailboxId: string,
+		input: { labelId: string; action: "apply" | "remove"; targets: LabelMutationTarget[] },
+	) => post<LabelMutationResult>(`/api/v1/mailboxes/${mailboxId}/label-mutations`, input),
+
 	// Push subscriptions (WISER-240)
 	listPushSubscriptions: (mailboxId: string) =>
 		get<{
@@ -138,19 +166,89 @@ const api = {
 	listEmails: (mailboxId: string, params: Record<string, string>, opts?: { signal?: AbortSignal }) =>
 		get<EmailListResponse | Email[]>(`/api/v1/mailboxes/${mailboxId}/emails`, { params, signal: opts?.signal }),
 	sendEmail: (mailboxId: string, email: unknown) =>
-		post<void>(`/api/v1/mailboxes/${mailboxId}/emails`, email),
+		post<OutboundEnqueueResponse>(`/api/v1/mailboxes/${mailboxId}/emails`, email),
+	listOutboundDeliveries: (
+		mailboxId: string,
+		emailIds: string[] = [],
+		threadIds: string[] = [],
+	) =>
+		get<{ deliveries: OutboundDelivery[] }>(
+			`/api/v1/mailboxes/${mailboxId}/outbound-deliveries`,
+			{
+				params: emailIds.length || threadIds.length
+					? {
+						...(emailIds.length ? { emailIds: emailIds.join(",") } : {}),
+						...(threadIds.length ? { threadIds: threadIds.join(",") } : {}),
+					}
+					: undefined,
+			},
+		),
+	cancelOutboundDelivery: (mailboxId: string, deliveryId: string) =>
+		post<{ delivery: OutboundDelivery }>(
+			`/api/v1/mailboxes/${mailboxId}/outbound-deliveries/${deliveryId}/cancel`,
+		),
+	retryOutboundDelivery: (
+		mailboxId: string,
+		deliveryId: string,
+		acknowledgeDuplicateRisk = false,
+	) =>
+		post<{ delivery: OutboundDelivery }>(
+			`/api/v1/mailboxes/${mailboxId}/outbound-deliveries/${deliveryId}/retry`,
+			{ acknowledgeDuplicateRisk },
+		),
 	getEmail: (mailboxId: string, id: string, opts?: { signal?: AbortSignal }) =>
 		get<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, { signal: opts?.signal }),
 	updateEmail: (mailboxId: string, id: string, data: unknown) =>
 		put<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, data),
 	deleteEmail: (mailboxId: string, id: string) =>
-		del<void>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`),
+		del<{ status: "trashed" | "already_trashed" }>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`),
+	restoreEmail: (mailboxId: string, id: string) =>
+		post<{ status: "restored"; folderId: string }>(
+			`/api/v1/mailboxes/${mailboxId}/emails/${id}/restore`,
+		),
+	discardDraft: (mailboxId: string, id: string) =>
+		del<{ status: "discarded" }>(
+			`/api/v1/mailboxes/${mailboxId}/drafts/${id}`,
+		),
 	moveEmail: (mailboxId: string, id: string, folderId: string) =>
 		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${id}/move`, { folderId }),
 	getThread: (mailboxId: string, threadId: string, opts?: { signal?: AbortSignal }) =>
 		get<Email[]>(`/api/v1/mailboxes/${mailboxId}/threads/${threadId}`, { signal: opts?.signal }),
 	markThreadRead: (mailboxId: string, threadId: string) =>
 		post<void>(`/api/v1/mailboxes/${mailboxId}/threads/${threadId}/read`),
+	setConversationRead: (
+		mailboxId: string,
+		conversationId: string,
+		folderId: string,
+		read: boolean,
+	) =>
+		post<{ status: "updated"; affectedCount: number }>(
+			`/api/v1/mailboxes/${mailboxId}/conversations/${encodeURIComponent(conversationId)}/read`,
+			{ folderId, read },
+		),
+	archiveConversation: (
+		mailboxId: string,
+		conversationId: string,
+		folderId: string,
+	) =>
+		post<{ status: "archived"; affectedCount: number }>(
+			`/api/v1/mailboxes/${mailboxId}/conversations/${encodeURIComponent(conversationId)}/archive`,
+			{ folderId },
+		),
+	trashConversation: (
+		mailboxId: string,
+		conversationId: string,
+		folderId: string,
+	) =>
+		post<{ status: "trashed"; affectedCount: number }>(
+			`/api/v1/mailboxes/${mailboxId}/conversations/${encodeURIComponent(conversationId)}/trash`,
+			{ folderId },
+		),
+	batchTriage: (mailboxId: string, command: BatchTriageCommand) =>
+		post<BatchTriageResult>(
+			`/api/v1/mailboxes/${mailboxId}/triage-batch`,
+			command,
+		),
 	getAttachment: (mailboxId: string, emailId: string, attachmentId: string) =>
 		get<Blob>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/attachments/${attachmentId}`, { responseType: "blob" }),
 	// Upload a file to staging; returns a reference to carry into a send/reply/draft.
@@ -189,13 +287,14 @@ const api = {
 			in_reply_to?: string;
 			thread_id?: string;
 			draft_id?: string;
+			draft_version?: number;
 			attachments?: AttachmentRef[];
 		},
-	) => post<{ draft_id: string }>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
+	) => post<Email>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
 	replyToEmail: (mailboxId: string, emailId: string, email: unknown) =>
-		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email),
+		post<OutboundEnqueueResponse>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email),
 	forwardEmail: (mailboxId: string, emailId: string, email: unknown) =>
-		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/forward`, email),
+		post<OutboundEnqueueResponse>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/forward`, email),
 	aiDraftReply: (mailboxId: string, emailId: string) =>
 		post<{ to: string; subject: string; body: string }>(
 			`/api/v1/mailboxes/${mailboxId}/ai-draft`,

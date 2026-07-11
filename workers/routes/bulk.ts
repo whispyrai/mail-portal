@@ -177,9 +177,10 @@ async function poll(jobId) {
     const r = await fetch(CFG.apiBase + '/' + jobId, { credentials: 'same-origin' });
     if (!r.ok) { $('progressText').textContent = 'Lost track of the job.'; return; }
     const j = await r.json();
-    const done = j.sent + j.failed;
+	const enqueued = j.enqueued ?? j.sent ?? 0;
+	const done = enqueued + j.failed;
     $('barFill').style.width = Math.round(done / j.total * 100) + '%';
-    $('progressText').textContent = done + ' / ' + j.total + ' processed — ' + j.sent + ' sent, ' + j.failed + ' failed (' + j.status + ')';
+	$('progressText').textContent = done + ' / ' + j.total + ' processed · ' + enqueued + ' queued for delivery, ' + j.failed + ' could not be queued (' + j.status + ')';
     const list = $('errorList'); list.replaceChildren();
     (j.errors || []).slice(0, 10).forEach(e => { const d = document.createElement('div'); d.textContent = e.email + ': ' + e.error; list.appendChild(d); });
     if (j.status === 'done') { $('status').textContent = 'Done.'; $('sendBtn').disabled = false; return; }

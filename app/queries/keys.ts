@@ -19,12 +19,19 @@ export const queryKeys = {
 	folders: {
 		list: (mailboxId: string) => ["folders", mailboxId] as const,
 	},
+	labels: {
+		list: (mailboxId: string) => ["labels", mailboxId] as const,
+	},
 	search: {
-		results: (mailboxId: string, query: string, page: number) =>
-			["search", mailboxId, query, page] as const,
+		results: (mailboxId: string, query: string, page: number, labelId = "") =>
+			["search", mailboxId, query, page, labelId] as const,
 	},
 	push: {
 		devices: (mailboxId: string | undefined) => ["push", "devices", mailboxId] as const,
+	},
+	outbound: {
+		list: (mailboxId: string, emailIdsKey = "") =>
+			["outbound", mailboxId, emailIdsKey] as const,
 	},
 	config: ["config"] as const,
 };

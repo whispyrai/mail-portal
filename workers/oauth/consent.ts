@@ -23,6 +23,7 @@ import type {
 } from "@cloudflare/workers-oauth-provider";
 import {
 	verifySession,
+	sessionMatchesUserVersion,
 	readCookie,
 	hashToken,
 	signAuthTxn,
@@ -31,15 +32,18 @@ import {
 	type SessionClaims,
 } from "../lib/auth";
 import { getUserById, getUserByMcpTokenHash } from "../lib/users";
+import {
+	DEFAULT_MCP_SCOPES,
+	legacyMcpScopes,
+} from "../lib/mcp-authorization";
 import { escapeHtml } from "../lib/email-helpers";
 import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "../routes/brand";
 import type { Env } from "../types";
 
 type Ctx = Context<{ Bindings: Env; Variables: { session?: SessionClaims } }>;
 
-/** Scopes advertised in OAuth metadata. The MCP tools enforce access by role +
- * mailbox (props), so scopes here are descriptive rather than load-bearing. */
-export const MCP_SCOPES = ["email.read", "email.send"];
+/** Scopes advertised in OAuth metadata and enforced by every MCP tool. */
+export { MCP_SCOPES } from "../lib/mcp-authorization";
 
 // ── /authorize (GET): authenticate the user, then show consent ──────
 
@@ -76,6 +80,9 @@ export async function authorizeGet(c: Ctx) {
 			appName: client?.clientName?.trim() || "An application",
 			session,
 			txn,
+			scopes: oauthReq.scope.length
+				? oauthReq.scope
+				: [...DEFAULT_MCP_SCOPES],
 		}),
 	);
 }
@@ -118,14 +125,23 @@ export async function authorizePost(c: Ctx) {
 		return c.html(renderError(brand, "Your account is not active."), 403);
 	}
 
+	const grantedScopes = oauthReq.scope.length
+		? oauthReq.scope
+		: [...DEFAULT_MCP_SCOPES];
 	const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
 		request: oauthReq,
 		userId: user.id,
 		metadata: { email: user.email },
-		scope: oauthReq.scope.length ? oauthReq.scope : MCP_SCOPES,
+		scope: grantedScopes,
 		// These become `this.props` on the EmailMCP agent — identical shape to the
 		// legacy bearer path, so the MCP tools are untouched.
-		props: { userId: user.id, role: user.role, mailbox: user.mailbox_address },
+		props: {
+			userId: user.id,
+			role: user.role,
+			mailbox: user.mailbox_address,
+			scopes: grantedScopes,
+			sessionVersion: user.session_version,
+		},
 	});
 	return c.redirect(redirectTo, 302);
 }
@@ -145,7 +161,13 @@ export async function resolveLegacyBearer(
 	const user = await getUserByMcpTokenHash(env, await hashToken(input.token));
 	if (!user || user.is_active !== 1) return null;
 	return {
-		props: { userId: user.id, role: user.role, mailbox: user.mailbox_address },
+		props: {
+			userId: user.id,
+			role: user.role,
+			mailbox: user.mailbox_address,
+			scopes: legacyMcpScopes(user.role),
+			sessionVersion: user.session_version,
+		},
 	};
 }
 
@@ -153,7 +175,23 @@ export async function resolveLegacyBearer(
 
 async function sessionFrom(c: Ctx): Promise<(SessionClaims & { exp: number }) | null> {
 	const token = readCookie(c.req.header("cookie"), SESSION_COOKIE_NAME);
-	return token ? verifySession(token, c.env.JWT_SECRET) : null;
+	const claims = token ? await verifySession(token, c.env.JWT_SECRET) : null;
+	if (!claims) return null;
+	const user = await getUserById(c.env, claims.sub);
+	if (
+		!user ||
+		user.is_active !== 1 ||
+		!sessionMatchesUserVersion(claims, user)
+	) {
+		return null;
+	}
+	return {
+		...claims,
+		email: user.email,
+		role: user.role,
+		mailbox: user.mailbox_address,
+		sessionVersion: user.session_version,
+	};
 }
 
 /** Reconstruct the /authorize URL from a parsed request (for re-login resume). */
@@ -177,12 +215,27 @@ function renderConsent(
 		appName: string;
 		session: SessionClaims;
 		txn: string;
+		scopes: readonly string[];
 	},
 ): string {
 	const app = escapeHtml(opts.appName);
 	const email = escapeHtml(opts.session.email);
 	const mailbox = escapeHtml(opts.session.mailbox);
-	const isAdmin = opts.session.role === "ADMIN";
+	const scopes = new Set(opts.scopes);
+	const abilities = [
+		scopes.has("email.read")
+			? "<li>Read and search mailboxes you can access</li>"
+			: "",
+		scopes.has("email.send")
+			? `<li>Create and update reviewable drafts for <strong>${mailbox}</strong> or a Shared Mailbox you belong to. Sending, moving, and deleting stay in the mail portal.</li>`
+			: "",
+		scopes.has("quiz.read")
+			? "<li>Read team quiz results and submitted answers when you are an active administrator</li>"
+			: "",
+		scopes.has("quiz.write")
+			? "<li>Grade team quiz answers when you are an active administrator</li>"
+			: "",
+	].join("");
 	return pageShell(
 		brand,
 		`Authorize · ${brand.appName}`,
@@ -194,9 +247,7 @@ function renderConsent(
     <div class="card" style="margin:8px 0 4px;background:var(--tint)">
       <p class="muted" style="margin:0 0 8px">${app} will be able to:</p>
       <ul style="margin:0;padding-left:18px;font-size:14px;color:var(--slate);line-height:1.7">
-        <li>Read ${isAdmin ? "all mailboxes" : "your mailbox"} and search emails</li>
-        <li>Draft, reply, and send email from <strong>${mailbox}</strong></li>
-        <li>Organize email (mark read, move folders)</li>
+        ${abilities}
       </ul>
     </div>
     <form method="post" action="/authorize">

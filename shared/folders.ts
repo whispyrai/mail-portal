@@ -14,10 +14,20 @@ export const Folders = {
 	INBOX: "inbox",
 	SENT: "sent",
 	DRAFT: "draft",
+	OUTBOX: "outbox",
 	ARCHIVE: "archive",
 	TRASH: "trash",
 	SPAM: "spam",
 } as const;
+
+/** Persistence-only folders that must never be addressable as mail UI state. */
+export const InternalFolders = {
+	RETIRED_OUTBOUND: "_cancelled_outbound",
+} as const;
+
+export function isInternalFolderId(folderId: string | null | undefined): boolean {
+	return folderId === InternalFolders.RETIRED_OUTBOUND;
+}
 
 export type FolderId = (typeof Folders)[keyof typeof Folders];
 
@@ -29,6 +39,7 @@ export const SYSTEM_FOLDER_IDS: readonly FolderId[] = [
 	Folders.INBOX,
 	Folders.SENT,
 	Folders.DRAFT,
+	Folders.OUTBOX,
 	Folders.ARCHIVE,
 	Folders.TRASH,
 ];
@@ -41,6 +52,7 @@ export const FOLDER_DISPLAY_NAMES: Record<string, string> = {
 	[Folders.INBOX]: "Inbox",
 	[Folders.SENT]: "Sent",
 	[Folders.DRAFT]: "Drafts",
+	[Folders.OUTBOX]: "Outbox",
 	[Folders.ARCHIVE]: "Archive",
 	[Folders.TRASH]: "Trash",
 	[Folders.SPAM]: "Spam",

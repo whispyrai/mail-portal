@@ -6,9 +6,9 @@
  * Mailbox middleware + provisioning helpers.
  *
  * `requireMailbox` resolves the MailboxDO stub for a `:mailboxId` route param,
- * AND enforces per-mailbox authorization: a rep (AGENT) may only act on their
- * own mailbox; an ADMIN may act on any. (Upstream Agentic Inbox had no such
- * authorization — see locked-decisions D-63.)
+ * and enforces live Personal ownership or Shared membership before resolving
+ * the mailbox Durable Object. Administrator role alone never grants content
+ * access.
  */
 import { createMiddleware } from "hono/factory";
 import type { MailboxDO } from "../durableObject";
@@ -16,6 +16,7 @@ import type { Env } from "../types";
 import type { SessionClaims } from "./auth";
 import { systemPromptFor } from "./prompts.ts";
 import { resolveBrand } from "../routes/brand.ts";
+import { mailboxAccess } from "./mailbox-access.ts";
 
 export type MailboxContext = {
 	Bindings: Env;
@@ -30,12 +31,29 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
 	const mailboxId = decodeURIComponent(rawId);
 
-	// Authorization: reps are confined to their own mailbox; admins see all.
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);
-	if (
-		session.role !== "ADMIN" &&
-		session.mailbox.toLowerCase() !== mailboxId.toLowerCase()
+	const pathParts = new URL(c.req.url).pathname.split("/").filter(Boolean);
+	const isMailboxManagementRequest =
+		pathParts.length === 4 &&
+		pathParts[0] === "api" &&
+		pathParts[1] === "v1" &&
+		pathParts[2] === "mailboxes";
+	const access = mailboxAccess(c.env);
+	if (isMailboxManagementRequest && c.req.method === "DELETE") {
+		try {
+			await access.requireMailboxAdministrator(session.sub);
+		} catch {
+			return c.json({ error: "Forbidden" }, 403);
+		}
+	} else if (
+		isMailboxManagementRequest &&
+		c.req.method === "PUT" &&
+		!(await access.canManageMailboxSettings(session.sub, mailboxId))
+	) {
+		return c.json({ error: "Forbidden" }, 403);
+	} else if (
+		!(await access.canAccessMailbox(session.sub, mailboxId.toLowerCase()))
 	) {
 		return c.json({ error: "Forbidden" }, 403);
 	}

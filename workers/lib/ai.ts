@@ -2,56 +2,20 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-/**
- * AI-powered draft quality tool.
- *
- * - verifyDraft: reviews AI-drafted email bodies and removes agent/system
- *   artifacts that leaked into the text (used by the "Draft reply" tool path).
- */
+/** Deterministic draft artifact scrub used by every outbound tool path. */
 
-import { stripHtmlToText, textToHtml } from "./email-helpers";
+import { stripHtmlToText } from "./email-helpers.ts";
 
-// ── Draft Verifier ─────────────────────────────────────────────────
-
-/**
- * AI-powered draft verifier.
- *
- * Reviews draft email bodies and removes agent/system artifacts that
- * leaked into the text. Uses a capable model with a precise prompt
- * that explains what the email IS so it knows what to preserve.
- *
- * Key design: the quoted reply block (<blockquote>) is stripped BEFORE
- * sending to the AI and reattached AFTER, so the verifier only sees
- * the user's own reply text.
- */
-
-const VERIFIER_PROMPT = `You are a proofreader for outgoing business emails. You will receive the text of an email draft that was composed by an AI assistant on behalf of a human.
-
-This is a REAL email being sent to a REAL person. It contains legitimate business content: URLs, links, questions, technical details, pricing info, Discord invites, docs references, etc. ALL of that is intentional and MUST be preserved exactly.
-
-Your job: check if the AI assistant accidentally included any of its own internal commentary or system artifacts in the email text. These are things the AI said ABOUT the drafting process, not things meant for the recipient.
-
-Examples of system artifacts to REMOVE (if present):
-- "Drafted via draft_reply to email f17c9a14-..."
-- "Draft saved." / "Draft created."  
-- "The operator can review and send from the UI."
-- "I've drafted a reply for you to review."
-- "Called get_email to fetch the thread."
-- "[Auto-triggered]"
-- Lines containing tool function names like "draft_reply", "get_email" used as references to actions taken
-
-Examples of legitimate email content to KEEP (never remove these):
-- URLs and links (docs, Discord, API references, any https:// link)
-- Questions about the recipient's use case, volume, preferences
-- Pricing information, beta access details, technical caveats
-- Sign-off lines (the sender's name)
-- Literally everything that reads like a person talking to another person
-
-RULES:
-1. If the email has NO system artifacts, return it EXACTLY as-is, character for character. Do not rephrase, reformat, or "improve" anything.
-2. If you find artifacts, remove ONLY those specific lines. Keep everything else identical.
-3. When in doubt, KEEP the content. False positives (removing real content) are far worse than false negatives (leaving an artifact).
-4. Return ONLY the email text. No explanations, no "Here is the cleaned version:", no wrapper text.`;
+// Match only complete, known assistant-status lines. Ordinary mentions of tool
+// names, links, and technical language are intentionally preserved.
+const ARTIFACT_LINES = [
+	/^draft (?:saved|created)\.?$/i,
+	/^drafted via (?:draft_reply|draft_email)(?:\s+to email\s+\S+)?\.?$/i,
+	/^the operator can review and send (?:it )?from the ui\.?$/i,
+	/^(?:i've|i have) drafted (?:a|the) (?:reply|email) for you to review\.?$/i,
+	/^called (?:get_email|get_thread|search_emails|list_emails) to .+\.?$/i,
+	/^\[auto-triggered\]$/i,
+];
 
 /**
  * Split an HTML body into the reply portion and the quoted block.
@@ -69,10 +33,9 @@ function splitQuotedBlock(html: string): { reply: string; quoted: string } {
 }
 
 /**
- * Verify and clean a draft email body using AI.
- * Falls back to returning the original body if the AI call fails.
+ * Remove known assistant artifacts without making another model call.
  */
-export async function verifyDraft(ai: Ai, body: string): Promise<string> {
+export async function verifyDraft(body: string): Promise<string> {
 	if (!body || !body.trim()) return body;
 
 	// Separate the quoted reply block so the AI only reviews the user's text
@@ -81,66 +44,28 @@ export async function verifyDraft(ai: Ai, body: string): Promise<string> {
 		? splitQuotedBlock(body)
 		: { reply: body, quoted: "" };
 
-	// Extract plain text of just the reply portion
-	const replyText = isHtml ? stripHtmlToText(replyHtml) : replyHtml;
-
-	// Skip very short replies — nothing to verify
-	if (replyText.trim().length < 20) return body;
-
-	try {
-		const response = (await ai.run(
-			"@cf/meta/llama-4-scout-17b-16e-instruct",
-			{
-				messages: [
-					{ role: "system", content: VERIFIER_PROMPT },
-					{ role: "user", content: replyText },
-				],
-				max_tokens: 4096,
-				temperature: 0,
-			},
-		)) as { response?: string };
-
-		const cleaned = response?.response ?? null;
-
-		if (!cleaned || !cleaned.trim()) {
-			// AI returned empty — fall back to original
-			return body;
-		}
-
-		const cleanedTrimmed = cleaned.trim();
-
-		// If the AI returned something substantially similar, keep original formatting
-		if (normalizeWhitespace(cleanedTrimmed) === normalizeWhitespace(replyText)) {
-			return body;
-		}
-
-		// Safety check: if the AI removed more than 50% of the content,
-		// it's probably being too aggressive — fall back to original.
-		// This threshold balances between catching real artifacts and
-		// preventing the verifier from gutting legitimate emails.
-		if (cleanedTrimmed.length < replyText.trim().length * 0.5) {
-			console.warn(
-				"Draft verifier removed >50% of content, falling back to original.",
-				`Original: ${replyText.trim().length} chars, Cleaned: ${cleanedTrimmed.length} chars`,
-			);
-			return body;
-		}
-
-		// The AI cleaned something — rebuild in the original format
-		if (isHtml) {
-			return `${textToHtml(cleanedTrimmed)}${quotedBlock}`;
-		}
-
-		// Plain text: reattach quoted block if any
-		return quotedBlock
-			? `${cleanedTrimmed}\n\n${quotedBlock}`
-			: cleanedTrimmed;
-	} catch (e) {
-				console.error("AI failed — returns empty body, callers may save blank draft:", (e as Error).message);
-		return "";
+	if (isHtml) {
+		const cleanedHtml = replyHtml.replace(
+			/<(p|div|li)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/gi,
+			(full, _tag: string, inner: string) =>
+				isArtifactLine(stripHtmlToText(inner)) ? "" : full,
+		);
+		return cleanedHtml === replyHtml ? body : `${cleanedHtml}${quotedBlock}`;
 	}
+
+	// Quoted content is never inspected or changed because it is
+	// sender-controlled historical material.
+	const replyText = replyHtml;
+	const keptLines = replyText
+		.split(/\r?\n/)
+		.filter((line) => !isArtifactLine(line));
+	const cleaned = keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+	if (cleaned === replyText.trim()) return body;
+	if (!cleaned) return body;
+
+	return quotedBlock ? `${cleaned}\n\n${quotedBlock}` : cleaned;
 }
 
-function normalizeWhitespace(s: string): string {
-	return s.replace(/\s+/g, " ").trim();
+function isArtifactLine(line: string): boolean {
+	return ARTIFACT_LINES.some((pattern) => pattern.test(line.trim()));
 }

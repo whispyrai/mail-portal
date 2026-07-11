@@ -34,7 +34,12 @@
 				"DOMAINS": "whispyrcrm.com",
 				"EMAIL_ADDRESSES": [],
 				"AWS_REGION": "eu-west-2",
+				"SES_CONFIGURATION_SET": "mail-portal-events",
 				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"AI_CHEAP_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
+				"AI_STRONG_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"AI_COST_ALERT_USD": "25",
+				"AI_COST_REVIEW_USD": "50",
 					// Web Push contact (RFC 8292 VAPID subject) for WISER-240. The keypair
 					// is secret (`wrangler secret put VAPID_PUBLIC_KEY --env whispyr` +
 					// `VAPID_PRIVATE_KEY`). Until set, push self-disables.
@@ -44,8 +49,10 @@
 				"required": [
 					"AWS_ACCESS_KEY_ID",
 					"AWS_SECRET_ACCESS_KEY",
+					"SES_EVENT_WEBHOOK_SECRET",
 					"JWT_SECRET",
-					"ADMIN_BOOTSTRAP_EMAIL",
+						"ADMIN_BOOTSTRAP_EMAIL",
+						"ACCOUNT_RECOVERY_DIRECTORY",
 					"VAPID_PUBLIC_KEY",
 					"VAPID_PRIVATE_KEY"
 				]
@@ -134,15 +141,22 @@
 				"DOMAINS": "wiserchat.ai,test.wiserchat.ai",
 				"EMAIL_ADDRESSES": [],
 				"AWS_REGION": "eu-west-2",
+				"SES_CONFIGURATION_SET": "mail-portal-events",
 				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"AI_CHEAP_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
+				"AI_STRONG_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"AI_COST_ALERT_USD": "25",
+				"AI_COST_REVIEW_USD": "50",
 				"VAPID_SUBJECT": "mailto:contact@wiserchat.ai"
 			},
 			"secrets": {
 				"required": [
 					"AWS_ACCESS_KEY_ID",
 					"AWS_SECRET_ACCESS_KEY",
+					"SES_EVENT_WEBHOOK_SECRET",
 					"JWT_SECRET",
-					"ADMIN_BOOTSTRAP_EMAIL",
+						"ADMIN_BOOTSTRAP_EMAIL",
+						"ACCOUNT_RECOVERY_DIRECTORY",
 					"VAPID_PUBLIC_KEY",
 					"VAPID_PRIVATE_KEY"
 				]

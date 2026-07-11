@@ -11,16 +11,16 @@ Design + decisions live in the second brain: the shared platform in `~/Documents
 
 ## What changed from upstream
 
-| Area | Upstream | This fork |
-|------|----------|-----------|
-| Outbound | Cloudflare Email Sending (`env.EMAIL.send()`) | **AWS SES** (API v2 `SendEmail`, Simple content) via `aws4fetch` |
-| Auth | Cloudflare Access | **Email + password**, hand-rolled (PBKDF2 + JWT cookie via `jose`), roles `AGENT`/`ADMIN` |
-| Authorization | None (any authed user → any mailbox) | **Per-mailbox**: a rep sees only their mailbox; an admin sees all |
-| Users | implicit (Access) | **D1 `users` table** + `/admin/users` console |
-| AI model | Kimi K2.5 | `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, **manual-only** (auto-draft removed) |
-| MCP (`/mcp`) | open to any authed user | **per-user bearer token**; reads admin=all/agent=own, writes own-only |
-| Bulk send | — | **CSV mail merge** with a DO alarm scheduler (`/bulk`) |
-| Apex landing | — | separate static site on Vercel (this Worker serves `mail.` only) |
+| Area          | Upstream                                      | This fork                                                                                 |
+| ------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Outbound      | Cloudflare Email Sending (`env.EMAIL.send()`) | **AWS SES** (API v2 `SendEmail`, Simple content) via `aws4fetch`                          |
+| Auth          | Cloudflare Access                             | **Email + password**, hand-rolled (PBKDF2 + JWT cookie via `jose`), roles `AGENT`/`ADMIN` |
+| Authorization | None (any authed user → any mailbox)          | **Per-mailbox**: a rep sees only their mailbox; an admin sees all                         |
+| Users         | implicit (Access)                             | **D1 `users` table** + `/admin/users` console                                             |
+| AI model      | Kimi K2.5                                     | `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, **manual-only** (auto-draft removed)          |
+| MCP (`/mcp`)  | open to any authed user                       | **per-user bearer token**; reads admin=all/agent=own, writes own-only                     |
+| Bulk send     | -                                             | **CSV mail merge** with a DO alarm scheduler (`/bulk`)                                    |
+| Apex landing  | -                                             | separate static site on Vercel (this Worker serves `mail.` only)                          |
 
 ## Architecture
 
@@ -69,10 +69,16 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, �
    ```bash
    npx wrangler d1 create sales_portal_users
    ```
+
    Copy the returned `database_id` into `wrangler.jsonc` (`d1_databases[0].database_id`), then apply the schema:
+
    ```bash
    npx wrangler d1 migrations apply sales_portal_users --remote
    ```
+
+   Apply all migrations through `0007_create_saved_views.sql` before deploying
+   code that exposes personal Saved Views. The application fails closed if the
+   required D1 table is unavailable.
 
 2. **R2 bucket**
 
@@ -87,7 +93,16 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, �
    npx wrangler secret put AWS_SECRET_ACCESS_KEY
    npx wrangler secret put JWT_SECRET              # openssl rand -base64 48
    npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL   # e.g. hesham@whispyrcrm.com
+   npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY
    ```
+
+   `ACCOUNT_RECOVERY_DIRECTORY` is a platform-operator managed JSON object that
+   maps each normalized portal email to the user's external recovery email. For
+   example: `{"member@whispyrcrm.com":"member@personal.example"}`. Application
+   administrators cannot enter or change these addresses. New users remain pending
+   until they consume the emailed setup link; claimed users request recovery from
+   the sign-in page and receive a generic response that does not reveal account
+   existence.
    `AWS_REGION` and `DOMAINS` are plain vars already set in `wrangler.jsonc`.
 
 4. **Deploy** — provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `env.whispyr`). `CLOUDFLARE_ENV=whispyr` is baked in by the script, so the build resolves the `env.whispyr` block and the deploy lands on the `sales-mail-portal` Worker:
@@ -104,7 +119,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, �
 
 7. **First admin** — visit `https://mail.whispyrcrm.com/login` and sign in with `ADMIN_BOOTSTRAP_EMAIL` + a password (≥12 chars). With zero users, this bootstraps the first `ADMIN` account and provisions its mailbox. Then create reps at `/admin/users`.
 
-8. **MCP (optional)** — in `/admin/users`, "Rotate MCP token" for a user, then point an MCP client at `https://mail.whispyrcrm.com/mcp` with header `Authorization: Bearer <token>`. An ADMIN token can read all mailboxes but sends only from the admin's address; an AGENT token is confined to their own mailbox.
+8. **MCP (optional)** - connect through the OAuth flow at `https://mail.whispyrcrm.com/mcp`. A connection can access only the Personal and Shared Mailboxes available to that live user. Mail tools are limited to read, search, and reviewable Draft creation; sending and destructive actions stay in the portal.
 
 ## Deploy (production runbook - Wiser environment)
 

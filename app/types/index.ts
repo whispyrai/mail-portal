@@ -25,6 +25,8 @@ export interface Mailbox {
 
 export interface Email {
 	id: string;
+	/** Stable grouping key returned by threaded folder lists. */
+	conversation_id?: string | null;
 	thread_id?: string | null;
 	folder_id?: string | null;
 	subject: string;
@@ -40,6 +42,7 @@ export interface Email {
 	email_references?: string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
+	draft_version?: number;
 	attachments?: Attachment[];
 	snippet?: string | null;
 	// Thread aggregate fields (only present in threaded list view)
@@ -48,6 +51,34 @@ export interface Email {
 	participants?: string;
 	needs_reply?: boolean;
 	has_draft?: boolean;
+	labels?: Label[];
+}
+
+export type LabelColor =
+	| "gray" | "red" | "orange" | "yellow" | "green"
+	| "teal" | "blue" | "purple" | "pink";
+
+export interface Label {
+	id: string;
+	name: string;
+	color: LabelColor;
+	createdAt?: string;
+	updatedAt?: string;
+}
+
+export interface LabelMutationTarget {
+	emailId: string;
+	folderId: string;
+	conversationId?: string;
+}
+
+export interface LabelMutationResult {
+	status: "completed";
+	results: Array<{
+		emailId: string;
+		status: "updated" | "not_found" | "outbound_delivery_active";
+		affectedCount: number;
+	}>;
 }
 
 export interface Attachment {
@@ -72,4 +103,49 @@ export interface Folder {
 	id: string;
 	name: string;
 	unreadCount: number;
+}
+
+export type OutboundDeliveryStatus =
+	| "queued"
+	| "sending"
+	| "retrying"
+	| "sent"
+	| "bounced"
+	| "failed"
+	| "unknown"
+	| "cancelled";
+
+export interface OutboundDelivery {
+	id: string;
+	emailId: string;
+	/** Present on conversation-highlight lookups, including older thread messages. */
+	threadId?: string;
+	draftId?: string;
+	mailboxId: string;
+	status: OutboundDeliveryStatus;
+	kind: "compose" | "reply" | "forward" | "bulk";
+	createdAt: string;
+	updatedAt: string;
+	availableAt: string;
+	undoUntil: string;
+	scheduledFor?: string;
+	nextAttemptAt?: string;
+	attemptCount: number;
+	maxAttempts: number;
+	lastErrorCode?: string;
+	lastErrorMessage?: string;
+	sentAt?: string;
+	failedAt?: string;
+	unknownAt?: string;
+	cancelledAt?: string;
+	cancelRecoveryPending?: boolean;
+}
+
+export interface OutboundEnqueueResponse {
+	deliveryId: string;
+	id: string;
+	status: OutboundDeliveryStatus;
+	undoUntil: string;
+	scheduledFor: string | null;
+	replayed: boolean;
 }

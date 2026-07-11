@@ -14,7 +14,7 @@
  * are reused directly — this module covers the remaining shared operations.
  */
 
-import type { EmailFull } from "./schemas";
+import type { EmailFull } from "./schemas.ts";
 import {
 	getMailboxStub,
 	getFullEmail,
@@ -24,13 +24,17 @@ import {
 	listMailboxes,
 	generateMessageId,
 	buildReferencesChain,
-	buildThreadingHeaders,
-	buildThreadToken,
-} from "./email-helpers";
-import { verifyDraft } from "./ai";
-import { sendEmail } from "../email-sender";
-import { Folders } from "../../shared/folders";
-import type { Env } from "../types";
+} from "./email-helpers.ts";
+import { verifyDraft } from "./ai.ts";
+import { Folders } from "../../shared/folders.ts";
+import type { Env } from "../types.ts";
+import type { ActivityActor } from "./activity.ts";
+import { attachmentKey } from "./attachments.ts";
+import type {
+	EnqueueOutboundCommand,
+	OutboundDeliveryStatus,
+	OutboundDeliverySource,
+} from "./outbound-delivery-contract.ts";
 
 // ── Type casts for DO methods not on the base stub type ────────────
 type MailboxSearchStub = {
@@ -43,6 +47,72 @@ type MailboxSearchStub = {
 type RateLimitStub = {
 	checkSendRateLimit: () => Promise<string | null>;
 };
+
+type OutboundEnqueueStub = {
+	getOutboundDeliveryByIdempotencyKey: (
+		idempotencyKey: string,
+	) => Promise<{
+		id: string;
+		emailId: string;
+		status: OutboundDeliveryStatus;
+		undoUntil: string;
+	} | null>;
+	enqueueOutbound: (
+		command: EnqueueOutboundCommand,
+		attachments: readonly [],
+		emailId: string,
+	) => Promise<{
+		delivery: {
+			id: string;
+			emailId: string;
+			status: OutboundDeliveryStatus;
+			undoUntil: string;
+		};
+		replayed: boolean;
+	}>;
+};
+
+function outboundSource(actor: ActivityActor): OutboundDeliverySource {
+	if (actor.kind === "mcp") return "mcp";
+	if (actor.kind === "agent") return "agent";
+	if (actor.kind === "rule") return "rule";
+	return "api";
+}
+
+function outboundTiming() {
+	const requestedAt = new Date().toISOString();
+	return {
+		requestedAt,
+		undoUntil: new Date(Date.parse(requestedAt) + 10_000).toISOString(),
+	};
+}
+
+type ToolOutboundResult = {
+	status: OutboundDeliveryStatus;
+	deliveryId: string;
+	messageId: string;
+	undoUntil: string;
+	replayed: boolean;
+	message: string;
+};
+
+function replayedOutboundResult(
+	delivery: {
+		id: string;
+		emailId: string;
+		status: OutboundDeliveryStatus;
+		undoUntil: string;
+	},
+): ToolOutboundResult {
+	return {
+		status: delivery.status,
+		deliveryId: delivery.id,
+		messageId: delivery.emailId,
+		undoUntil: delivery.undoUntil,
+		replayed: true,
+		message: `This send action already exists with status ${delivery.status}.`,
+	};
+}
 
 // ── list_mailboxes ─────────────────────────────────────────────────
 
@@ -113,7 +183,7 @@ export async function toolSearchEmails(
  * @param bodyInput - The reply body text. Can be plain text or HTML.
  * @param options.isPlainText - If true, body is treated as plain text and
  *   converted to HTML. If false, body is treated as HTML.
- * @param options.runVerifyDraft - If true, runs AI verifyDraft on the body.
+ * @param options.runVerifyDraft - If true, deterministically scrubs assistant artifacts.
  *   The agent and MCP both do this, but the agent does it on plain text
  *   while MCP does it on HTML.
  */
@@ -128,6 +198,7 @@ export async function toolDraftReply(
 		isPlainText?: boolean;
 		runVerifyDraft?: boolean;
 	},
+	actor: ActivityActor = { kind: "system" },
 ): Promise<
 	| { status: "draft_saved"; draftId: string; message: string; draft: Record<string, string> }
 	| { error: string }
@@ -137,7 +208,7 @@ export async function toolDraftReply(
 	// Verify/sanitize if requested
 	let processedBody = params.body.trim();
 	if (params.runVerifyDraft) {
-		const sanitized = await verifyDraft(env.AI, processedBody);
+		const sanitized = await verifyDraft(processedBody);
 		if (!sanitized) {
 			return { error: "Draft verification failed — body could not be verified. Please try again." };
 		}
@@ -179,6 +250,7 @@ export async function toolDraftReply(
 			thread_id: threadId,
 		},
 		[],
+		actor,
 	);
 
 	return {
@@ -210,6 +282,7 @@ export async function toolDraftEmail(
 		/** Optional thread_id for create_draft style */
 		thread_id?: string;
 	},
+	actor: ActivityActor = { kind: "system" },
 ): Promise<
 	| { status: string; draftId: string; threadId?: string; message: string; draft?: Record<string, string> }
 	| { error: string }
@@ -218,7 +291,7 @@ export async function toolDraftEmail(
 
 	let processedBody = params.body.trim();
 	if (params.runVerifyDraft) {
-		const sanitized = await verifyDraft(env.AI, processedBody);
+		const sanitized = await verifyDraft(processedBody);
 		if (!sanitized) {
 			return { error: "Draft verification failed — body could not be verified. Please try again." };
 		}
@@ -255,6 +328,7 @@ export async function toolDraftEmail(
 			thread_id: resolvedThreadId,
 		},
 		[],
+		actor,
 	);
 
 	return {
@@ -277,13 +351,15 @@ export async function toolUpdateDraft(
 	mailboxId: string,
 	params: {
 		draftId: string;
+		draftVersion: number;
 		to?: string;
 		subject?: string;
 		bodyHtml?: string;
 	},
+	actor: ActivityActor = { kind: "system" },
 ): Promise<
 	| { status: string; newDraftId: string; oldDraftId: string; message: string }
-	| { error: string }
+	| { error: string; currentVersion?: number }
 > {
 	const stub = getMailboxStub(env, mailboxId);
 
@@ -292,35 +368,38 @@ export async function toolUpdateDraft(
 		return { error: "Draft not found" };
 	}
 
-	// Verify the body BEFORE deleting the old draft to prevent data loss
-	const newDraftId = crypto.randomUUID();
+	// Verify before applying the in-place update so rejected output leaves the
+	// source draft and its attachments untouched.
 	const rawBody = params.bodyHtml ?? oldDraft.body ?? "";
-	const verifiedBody = await verifyDraft(env.AI, rawBody);
+	const verifiedBody = await verifyDraft(rawBody);
 
 	if (!verifiedBody) {
 		return { error: "Draft verification failed — keeping existing draft unchanged. Please try again." };
 	}
 
-	await stub.deleteEmail(params.draftId);
-	await stub.createEmail(
-		Folders.DRAFT,
+	const result = await stub.updateDraft(
+		params.draftId,
+		params.draftVersion,
 		{
-			id: newDraftId,
 			subject: params.subject ?? oldDraft.subject,
-			sender: mailboxId.toLowerCase(),
-			recipient: (params.to ?? oldDraft.recipient).toLowerCase(),
-			date: new Date().toISOString(),
+			recipient: params.to ?? oldDraft.recipient,
 			body: verifiedBody,
-			in_reply_to: oldDraft.in_reply_to || null,
-			email_references: oldDraft.email_references || null,
-			thread_id: oldDraft.thread_id || newDraftId,
 		},
-		[],
+		actor,
 	);
+	if (result?.status === "version_conflict") {
+		return {
+			error: "Draft changed in another session. Reload it before updating.",
+			currentVersion: result.currentVersion,
+		};
+	}
+	if (!result || result.status !== "updated") {
+		return { error: "Draft could not be updated safely" };
+	}
 
 	return {
 		status: "draft_updated",
-		newDraftId,
+		newDraftId: params.draftId,
 		oldDraftId: params.draftId,
 		message: "Draft updated in Drafts folder.",
 	};
@@ -333,9 +412,10 @@ export async function toolMarkEmailRead(
 	mailboxId: string,
 	emailId: string,
 	read: boolean,
+	actor: ActivityActor = { kind: "system" },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	await stub.updateEmail(emailId, { read });
+	await stub.updateEmail(emailId, { read }, actor);
 	return { status: "updated", emailId, read };
 }
 
@@ -346,9 +426,20 @@ export async function toolMoveEmail(
 	mailboxId: string,
 	emailId: string,
 	folderId: string,
+	actor: ActivityActor = { kind: "system" },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	const success = await stub.moveEmail(emailId, folderId);
+	const success = await stub.moveEmail(emailId, folderId, actor);
+	if (
+		typeof success === "object" &&
+		success?.status === "outbound_delivery_active"
+	) {
+		return {
+			error: "Cancel the queued send before moving its Outbox message.",
+			code: "active_outbound_delivery_requires_cancel",
+			deliveryId: success.deliveryId,
+		};
+	}
 	if (success) {
 		return { status: "moved", emailId, folder: folderId };
 	}
@@ -361,16 +452,30 @@ export async function toolDiscardDraft(
 	env: Env,
 	mailboxId: string,
 	draftId: string,
+	actor: ActivityActor = { kind: "system" },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	const email = (await stub.getEmail(draftId)) as { folder_id?: string } | null;
-	if (!email) {
+	const result = await stub.discardDraft(draftId, actor);
+	if (result === null) {
 		return { error: "Draft not found" };
 	}
-	if (email.folder_id !== Folders.DRAFT) {
+	if (result.status === "not_draft") {
 		return { error: "Cannot discard: email is not a draft" };
 	}
-	await stub.deleteEmail(draftId);
+	if (result.attachments.length > 0) {
+		const keys = result.attachments.map((attachment) =>
+			attachmentKey(draftId, attachment.id, attachment.filename),
+		);
+		try {
+			await env.BUCKET.delete(keys);
+		} catch (error) {
+			console.error("[draft-discard] failed to remove orphaned attachment objects", {
+				draftId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			await stub.queueAttachmentCleanup(draftId, keys, actor);
+		}
+	}
 	return { status: "discarded", draftId };
 }
 
@@ -380,13 +485,22 @@ export async function toolDeleteEmail(
 	env: Env,
 	mailboxId: string,
 	emailId: string,
+	actor: ActivityActor = { kind: "system" },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	const result = await stub.deleteEmail(emailId);
+	const result = await stub.trashEmail(emailId, actor);
 	if (result === null) {
 		return { error: "Email not found", emailId };
 	}
-	return { status: "deleted", emailId };
+	if (result.status === "outbound_delivery_active") {
+		return {
+			error: "Cancel the queued send before moving its Outbox message.",
+			code: "active_outbound_delivery_requires_cancel",
+			deliveryId: result.deliveryId,
+			emailId,
+		};
+	}
+	return { status: result.status, emailId };
 }
 
 // ── send_reply ─────────────────────────────────────────────────────
@@ -399,12 +513,18 @@ export async function toolSendReply(
 		to: string;
 		subject: string;
 		bodyHtml: string;
+		idempotencyKey: string;
 	},
+	actor: ActivityActor = { kind: "system" },
 ): Promise<
-	| { status: "sent"; messageId: string; message: string }
+	| ToolOutboundResult
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const existing = await (
+		stub as unknown as OutboundEnqueueStub
+	).getOutboundDeliveryByIdempotencyKey(params.idempotencyKey);
+	if (existing) return replayedOutboundResult(existing);
 
 	// Check send rate limit
 	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
@@ -420,10 +540,10 @@ export async function toolSendReply(
 	const { originalMsgId, references, threadId } = buildReferencesChain(originalEmail);
 	const fromDomain = mailboxId.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
+	const { messageId } = generateMessageId(fromDomain);
 
 	// Verify and append quoted original message
-	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
+	const sanitizedBody = await verifyDraft(params.bodyHtml);
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
@@ -434,38 +554,41 @@ export async function toolSendReply(
 	});
 	const fullBodyHtml = sanitizedBody + quotedBlock;
 
-	try {
-		await sendEmail(env, {
-			to: params.to,
-			from: mailboxId,
-			subject: params.subject,
-			html: fullBodyHtml,
-			headers: buildThreadingHeaders(originalMsgId, references, buildThreadToken(threadId, fromDomain)),
-		});
-	} catch (e) {
-		console.error("Email send failed:", (e as Error).message);
-		return { error: `Failed to send reply: ${(e as Error).message}` };
-	}
-
-	await stub.createEmail(
-		Folders.SENT,
+	const { requestedAt, undoUntil } = outboundTiming();
+	const result = await (stub as unknown as OutboundEnqueueStub).enqueueOutbound(
 		{
-			id: messageId,
-			subject: params.subject,
-			sender: mailboxId.toLowerCase(),
-			recipient: params.to.toLowerCase(),
-			date: new Date().toISOString(),
-			body: fullBodyHtml,
-			in_reply_to: originalMsgId,
-			email_references:
-				references.length > 0 ? JSON.stringify(references) : null,
-			thread_id: threadId,
-			message_id: outgoingMessageId,
+			idempotencyKey: params.idempotencyKey,
+			source: outboundSource(actor),
+			actor,
+			snapshot: {
+				mailboxId: mailboxId.toLowerCase(),
+				kind: "reply",
+				to: [params.to.toLowerCase()],
+				cc: [],
+				bcc: [],
+				from: mailboxId.toLowerCase(),
+				subject: params.subject,
+				html: fullBodyHtml,
+				inReplyTo: originalMsgId,
+				references,
+				threadId,
+				attachmentIds: [],
+			},
+			requestedAt,
+			undoUntil,
 		},
 		[],
+		messageId,
 	);
 
-	return { status: "sent", messageId, message: `Reply sent to ${params.to}` };
+	return {
+		status: "queued",
+		deliveryId: result.delivery.id,
+		messageId: result.delivery.emailId,
+		undoUntil: result.delivery.undoUntil,
+		replayed: result.replayed,
+		message: `Reply queued for ${params.to}`,
+	};
 }
 
 // ── send_email ─────────────────────────────────────────────────────
@@ -477,12 +600,18 @@ export async function toolSendEmail(
 		to: string;
 		subject: string;
 		bodyHtml: string;
+		idempotencyKey: string;
 	},
+	actor: ActivityActor = { kind: "system" },
 ): Promise<
-	| { status: "sent"; messageId: string; message: string }
+	| ToolOutboundResult
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const existing = await (
+		stub as unknown as OutboundEnqueueStub
+	).getOutboundDeliveryByIdempotencyKey(params.idempotencyKey);
+	if (existing) return replayedOutboundResult(existing);
 
 	// Check send rate limit
 	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
@@ -492,42 +621,44 @@ export async function toolSendEmail(
 
 	const fromDomain = mailboxId.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
-	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
+	const { messageId } = generateMessageId(fromDomain);
 
-	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
+	const sanitizedBody = await verifyDraft(params.bodyHtml);
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
 
-	try {
-		await sendEmail(env, {
-			to: params.to,
-			from: mailboxId,
-			subject: params.subject,
-			html: sanitizedBody,
-			headers: buildThreadingHeaders(null, [], buildThreadToken(messageId, fromDomain)),
-		});
-	} catch (e) {
-		console.error("Email send failed:", (e as Error).message);
-		return { error: `Failed to send email: ${(e as Error).message}` };
-	}
-
-	await stub.createEmail(
-		Folders.SENT,
+	const { requestedAt, undoUntil } = outboundTiming();
+	const result = await (stub as unknown as OutboundEnqueueStub).enqueueOutbound(
 		{
-			id: messageId,
-			subject: params.subject,
-			sender: mailboxId.toLowerCase(),
-			recipient: params.to.toLowerCase(),
-			date: new Date().toISOString(),
-			body: sanitizedBody,
-			in_reply_to: null,
-			email_references: null,
-			thread_id: messageId,
-			message_id: outgoingMessageId,
+			idempotencyKey: params.idempotencyKey,
+			source: outboundSource(actor),
+			actor,
+			snapshot: {
+				mailboxId: mailboxId.toLowerCase(),
+				kind: "compose",
+				to: [params.to.toLowerCase()],
+				cc: [],
+				bcc: [],
+				from: mailboxId.toLowerCase(),
+				subject: params.subject,
+				html: sanitizedBody,
+				threadId: messageId,
+				attachmentIds: [],
+			},
+			requestedAt,
+			undoUntil,
 		},
 		[],
+		messageId,
 	);
 
-	return { status: "sent", messageId, message: `Email sent to ${params.to}` };
+	return {
+		status: "queued",
+		deliveryId: result.delivery.id,
+		messageId: result.delivery.emailId,
+		undoUntil: result.delivery.undoUntil,
+		replayed: result.replayed,
+		message: `Email queued for ${params.to}`,
+	};
 }

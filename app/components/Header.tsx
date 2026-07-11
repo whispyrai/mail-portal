@@ -3,11 +3,13 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, XIcon } from "@phosphor-icons/react";
+import { CommandIcon, ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, XIcon } from "@phosphor-icons/react";
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useUIStore } from "~/hooks/useUIStore";
 import { useBrand } from "~/hooks/useBrand";
+import { MAIL_FOCUS_SEARCH_EVENT } from "~/components/MailKeyboardController";
+import { MAIL_COMMAND_PALETTE_OPEN_EVENT } from "~/components/MailCommandPalette";
 
 export default function Header() {
 	const [searchQuery, setSearchQuery] = useState("");
@@ -19,6 +21,21 @@ export default function Header() {
 	const { toggleSidebar, toggleAgentPanel, isAgentPanelOpen } = useUIStore();
 	const { quizEnabled } = useBrand();
 	const [me, setMe] = useState<{ email: string; role: string } | null>(null);
+
+	useEffect(() => {
+		const focusSearch = () => {
+			setIsSearchExpanded(true);
+			requestAnimationFrame(() => {
+				const input = document.querySelector<HTMLInputElement>(
+					'input[aria-label="Search emails"]',
+				);
+				input?.focus();
+			});
+		};
+		window.addEventListener(MAIL_FOCUS_SEARCH_EVENT, focusSearch);
+		return () =>
+			window.removeEventListener(MAIL_FOCUS_SEARCH_EVENT, focusSearch);
+	}, []);
 
 	// Identify the signed-in user to show the admin link + sign-out (see /api/v1/me).
 	useEffect(() => {
@@ -137,6 +154,19 @@ export default function Header() {
 					className="md:hidden shrink-0"
 				/>
 			)}
+
+			<Tooltip content="Commands (⌘K)" side="bottom" asChild>
+				<Button
+					variant="ghost"
+					size="sm"
+					icon={<CommandIcon size={20} />}
+					onClick={() => window.dispatchEvent(new Event(MAIL_COMMAND_PALETTE_OPEN_EVENT))}
+					aria-label="Open command palette"
+					className="min-h-11 shrink-0 px-2"
+				>
+					<span className="hidden lg:inline">Commands</span>
+				</Button>
+			</Tooltip>
 
 			<div className="flex items-center gap-1 ml-auto shrink-0">
 				<Tooltip content={isAgentPanelOpen ? "Hide agent panel" : "Show agent panel"} side="bottom" asChild>

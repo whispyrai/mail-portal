@@ -6,8 +6,8 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveBrand, type BrandConfig } from "../routes/brand";
+import { mailboxAccess } from "../lib/mailbox-access";
 import {
-	toolListMailboxes,
 	toolListEmails,
 	toolGetEmail,
 	toolGetThread,
@@ -15,13 +15,8 @@ import {
 	toolDraftReply,
 	toolDraftEmail,
 	toolUpdateDraft,
-	toolDeleteEmail,
-	toolSendReply,
-	toolSendEmail,
-	toolMarkEmailRead,
-	toolMoveEmail,
 } from "../lib/tools";
-import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
+import { Folders, FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import {
 	listQuizzes,
 	getQuizById,
@@ -39,6 +34,12 @@ import {
 	parseSelected,
 } from "../quiz/queries";
 import type { UserRole } from "../db/users-schema";
+import { getUserById } from "../lib/users";
+import {
+	mcpCredentialVersionMatches,
+	quizAuthorizationFailure,
+	type QuizAccessMode,
+} from "../lib/mcp-authorization";
 import type { Env } from "../types";
 
 /** Per-connection identity, injected via ctx.props by the /mcp auth handler. */
@@ -46,6 +47,8 @@ interface McpProps {
 	userId: string;
 	role: UserRole;
 	mailbox: string;
+	scopes: string[];
+	sessionVersion?: number;
 	// McpAgent's props generic requires an index signature (Record<string, unknown>).
 	[key: string]: unknown;
 }
@@ -82,7 +85,7 @@ function mcpResult(result: Record<string, unknown>) {
 }
 
 const MAILBOX_ARG_DESCRIPTION =
-	"The mailbox email address. Omit to use your own mailbox; ADMIN sessions may target another mailbox for read operations.";
+	"The mailbox email address. Omit to use your Personal Mailbox, or provide a Shared Mailbox you belong to.";
 
 /** MCP server identity for a brand — name, title, marketing URL, connector icons. */
 function mcpServerInfo(b: BrandConfig) {
@@ -113,8 +116,10 @@ function mcpServerInfo(b: BrandConfig) {
  * EmailMCP — exposes email tools over the Model Context Protocol, scoped per
  * authenticated user (locked-decisions D-64). Identity arrives as `this.props`,
  * set from the bearer token by the /mcp auth handler:
- *   - Reads:  ADMIN may target any mailbox; AGENT is confined to their own.
- *   - Writes/sends: every role acts only on their own mailbox.
+ * Every operation is authorized from live Personal ownership or Shared
+ * membership before mailbox content or storage metadata is retrieved. Email
+ * tools are intentionally limited to read, search, and reviewable Draft
+ * creation. Sending and destructive actions stay in the human-operated portal.
  */
 export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 	// Brand-aware connector identity. `this.env` is set by the McpAgent base
@@ -123,37 +128,50 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 	server = new McpServer(mcpServerInfo(resolveBrand(this.env.BRAND)));
 
 	/**
-	 * Resolve the effective mailbox for a request, enforcing scope. Returns the
-	 * mailbox id to act on, or an error message if the caller is not allowed.
+	 * Resolve the requested mailbox identity. Live owner/membership authorization
+	 * is enforced immediately afterward, before mailbox data is retrieved.
 	 */
 	#resolveMailbox(
 		requested: string | undefined,
-		mode: "read" | "write",
+		_mode: "read" | "write",
 	): { mailboxId: string } | { error: string } {
 		const props = this.props;
 		if (!props?.mailbox) return { error: "Unauthenticated MCP session." };
-		const own = props.mailbox.toLowerCase();
-		const req = requested?.toLowerCase();
-
-		if (mode === "write") {
-			if (req && req !== own) {
-				return { error: "Forbidden: you can only act on your own mailbox." };
-			}
-			return { mailboxId: props.mailbox };
+		const requiredScope = _mode === "read" ? "email.read" : "email.send";
+		if (!props.scopes?.includes(requiredScope)) {
+			return { error: `Forbidden: this connection lacks ${requiredScope}.` };
 		}
-		// read
-		if (props.role === "ADMIN") return { mailboxId: requested || props.mailbox };
-		if (req && req !== own) {
-			return { error: "Forbidden: you can only access your own mailbox." };
-		}
-		return { mailboxId: props.mailbox };
+		return { mailboxId: (requested || props.mailbox).toLowerCase() };
 	}
 
 	async init() {
 		const env = this.env;
 
-		/** Verify a mailbox exists in R2; returns an MCP error response or null. */
+		const verifyLiveIdentity = async () => {
+			const props = this.props;
+			if (!props?.userId) return mcpError("Unauthenticated MCP session.");
+			const user = await getUserById(env, props.userId);
+			if (
+				!user ||
+				user.is_active !== 1 ||
+				!mcpCredentialVersionMatches(props, user)
+			) {
+				return mcpError(
+					"This MCP connection was revoked. Reconnect it before accessing mail.",
+				);
+			}
+			return null;
+		};
+
+		/** Authorize before checking storage so inaccessible metadata stays private. */
 		const verifyMailbox = async (mailboxId: string) => {
+			const identityFailure = await verifyLiveIdentity();
+			if (identityFailure) return identityFailure;
+			const userId = this.props?.userId;
+			if (!userId) return mcpError("Unauthenticated MCP session.");
+			if (!(await mailboxAccess(env).canAccessMailbox(userId, mailboxId))) {
+				return mcpError("Forbidden: you do not have access to this mailbox.");
+			}
 			const obj = await env.BUCKET.head(`mailboxes/${mailboxId}.json`);
 			if (!obj) {
 				return mcpError(`Mailbox "${mailboxId}" not found. Use list_mailboxes to see available mailboxes.`);
@@ -164,16 +182,24 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 		// ── list_mailboxes ─────────────────────────────────────────
 		this.server.tool(
 			"list_mailboxes",
-			"List the mailboxes you can access (your own; all of them for ADMIN).",
+			"List the Personal and Shared Mailboxes you can access.",
 			{},
 			async () => {
-				const all = (await toolListMailboxes(env)) as { id: string }[];
-				const own = this.props?.mailbox?.toLowerCase() ?? "";
-				const visible =
-					this.props?.role === "ADMIN"
-						? all
-						: all.filter((m) => m.id.toLowerCase() === own);
-				return mcpText(visible);
+				const userId = this.props?.userId;
+				if (!userId) return mcpError("Unauthenticated MCP session.");
+				const identityFailure = await verifyLiveIdentity();
+				if (identityFailure) return identityFailure;
+				if (!this.props?.scopes?.includes("email.read")) {
+					return mcpError("Forbidden: this connection lacks email.read.");
+				}
+				const visible = await mailboxAccess(env).listAccessibleMailboxes(userId);
+				return mcpText(
+					visible.map((mailbox) => ({
+						id: mailbox.address,
+						email: mailbox.address,
+						type: mailbox.type,
+					})),
+				);
 			},
 		);
 
@@ -299,7 +325,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 					body: bodyHtml,
 					isPlainText: false,
 					runVerifyDraft: true,
-				});
+				}, { kind: "mcp", id: this.props?.userId });
 				return mcpResult(result);
 			},
 		);
@@ -338,7 +364,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 					runVerifyDraft: true,
 					in_reply_to,
 					thread_id,
-				});
+				}, { kind: "mcp", id: this.props?.userId });
 				if ("error" in result) {
 					return mcpResult(result);
 				}
@@ -358,6 +384,11 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			{
 				mailboxId: z.string().optional().describe(MAILBOX_ARG_DESCRIPTION),
 				draftId: z.string().describe("The ID of the draft to update"),
+				draftVersion: z
+					.number()
+					.int()
+					.min(1)
+					.describe("The exact draft_version returned when the draft was read"),
 				to: z
 					.string()
 					.optional()
@@ -365,17 +396,18 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 				subject: z.string().optional().describe("Updated subject line"),
 				bodyHtml: z.string().optional().describe("Updated HTML body"),
 			},
-			async ({ mailboxId, draftId, to, subject, bodyHtml }) => {
+			async ({ mailboxId, draftId, draftVersion, to, subject, bodyHtml }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
 				const denied = await verifyMailbox(scoped.mailboxId);
 				if (denied) return denied;
 				const result = await toolUpdateDraft(env, scoped.mailboxId, {
 					draftId,
+					draftVersion,
 					to,
 					subject,
 					bodyHtml,
-				});
+				}, { kind: "mcp", id: this.props?.userId });
 				if ("error" in result) {
 					if (result.error === "Draft not found") {
 						return {
@@ -389,160 +421,19 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			},
 		);
 
-		// ── delete_email ───────────────────────────────────────────
-		this.server.tool(
-			"delete_email",
-			"Permanently delete an email by ID.",
-			{
-				mailboxId: z.string().optional().describe(MAILBOX_ARG_DESCRIPTION),
-				emailId: z.string().describe("The email ID to delete"),
-			},
-			async ({ mailboxId, emailId }) => {
-				const scoped = this.#resolveMailbox(mailboxId, "write");
-				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolDeleteEmail(env, scoped.mailboxId, emailId);
-				return mcpResult(result);
-			},
-		);
-
-		// ── send_reply ─────────────────────────────────────────────
-		this.server.tool(
-			"send_reply",
-			"Send a reply to an email. Only call after drafting and getting confirmation.",
-			{
-				mailboxId: z.string().optional().describe(MAILBOX_ARG_DESCRIPTION),
-				originalEmailId: z
-					.string()
-					.describe("The ID of the email being replied to"),
-				to: z.string().email().describe("Recipient email address"),
-				subject: z.string().describe("Subject line"),
-				bodyHtml: z.string().describe("The HTML body of the reply"),
-			},
-			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
-				const scoped = this.#resolveMailbox(mailboxId, "write");
-				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolSendReply(env, scoped.mailboxId, {
-					originalEmailId,
-					to,
-					subject,
-					bodyHtml,
-				});
-				if ("error" in result) {
-					if (typeof result.error === "string" && result.error.startsWith("Failed to send")) {
-						return {
-							content: [{ type: "text" as const, text: result.error }],
-							isError: true,
-						};
-					}
-					if (result.error === "Original email not found") {
-						return {
-							content: [{ type: "text" as const, text: "Original email not found" }],
-							isError: true,
-						};
-					}
-					return mcpResult(result);
-				}
-				return mcpText(result);
-			},
-		);
-
-		// ── send_email ─────────────────────────────────────────────
-		this.server.tool(
-			"send_email",
-			"Send a new email (not a reply). Only call after getting confirmation.",
-			{
-				mailboxId: z.string().optional().describe(MAILBOX_ARG_DESCRIPTION),
-				to: z.string().email().describe("Recipient email address"),
-				subject: z.string().describe("Subject line"),
-				bodyHtml: z.string().describe("The HTML body of the email"),
-			},
-			async ({ mailboxId, to, subject, bodyHtml }) => {
-				const scoped = this.#resolveMailbox(mailboxId, "write");
-				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolSendEmail(env, scoped.mailboxId, {
-					to,
-					subject,
-					bodyHtml,
-				});
-				if ("error" in result) {
-					if (typeof result.error === "string" && result.error.startsWith("Failed to send")) {
-						return {
-							content: [{ type: "text" as const, text: result.error }],
-							isError: true,
-						};
-					}
-					return mcpResult(result);
-				}
-				return mcpText(result);
-			},
-		);
-
-		// ── mark_email_read ────────────────────────────────────────
-		this.server.tool(
-			"mark_email_read",
-			"Mark an email as read or unread.",
-			{
-				mailboxId: z.string().optional().describe(MAILBOX_ARG_DESCRIPTION),
-				emailId: z.string().describe("The email ID"),
-				read: z.boolean().describe("true to mark as read, false for unread"),
-			},
-			async ({ mailboxId, emailId, read }) => {
-				const scoped = this.#resolveMailbox(mailboxId, "write");
-				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolMarkEmailRead(env, scoped.mailboxId, emailId, read);
-				return mcpText(result);
-			},
-		);
-
-		// ── move_email ─────────────────────────────────────────────
-		this.server.tool(
-			"move_email",
-			"Move an email to a different folder (inbox, sent, draft, archive, trash).",
-			{
-				mailboxId: z.string().optional().describe(MAILBOX_ARG_DESCRIPTION),
-				emailId: z.string().describe("The email ID"),
-				folderId: z
-					.string()
-					.describe(MOVE_FOLDER_TOOL_DESCRIPTION),
-			},
-			async ({ mailboxId, emailId, folderId }) => {
-				const scoped = this.#resolveMailbox(mailboxId, "write");
-				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolMoveEmail(env, scoped.mailboxId, emailId, folderId);
-				if ("error" in result) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({ error: "Failed to move email" }),
-							},
-						],
-						isError: true,
-					};
-				}
-				return mcpText(result);
-			},
-		);
-
 		// ── Quiz tools (ADMIN only) ────────────────────────────────
 		// Read all reps' quiz answers and grade them (partial credit, "accept anyway",
 		// short-answer marks). Every tool requires an ADMIN token — quiz data spans the
 		// whole team, so AGENT sessions get nothing here. Writes reuse the same clamp +
 		// recompute path as the admin UI (workers/quiz/queries.ts).
-		const requireAdmin = () =>
-			this.props?.role === "ADMIN"
-				? null
-				: mcpError("Quiz tools require an ADMIN token.");
+		const requireQuizAdmin = async (mode: QuizAccessMode) => {
+			const failure = await quizAuthorizationFailure(
+				this.props,
+				mode,
+				(userId) => getUserById(env, userId),
+			);
+			return failure ? mcpError(failure) : null;
+		};
 
 		/** Resolve a quiz by its id or its key ('real-estate-market' | 'whispyr-system'). */
 		const resolveQuiz = async (ref: string) =>
@@ -554,7 +445,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: list every quiz with its status and attempt counts (submitted / graded). Start here to find a quiz's id/key.",
 			{},
 			async () => {
-				const denied = requireAdmin();
+				const denied = await requireQuizAdmin("read");
 				if (denied) return denied;
 				const quizzes = await listQuizzes(env);
 				const out = await Promise.all(
@@ -577,7 +468,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: the results table for one quiz — every rep with their MCQ / short / total scores, status, and attemptId (pass attemptId to quiz_attempt for the full breakdown).",
 			{ quiz: z.string().describe("Quiz id or key (real-estate-market | whispyr-system)") },
 			async ({ quiz }) => {
-				const denied = requireAdmin();
+				const denied = await requireQuizAdmin("read");
 				if (denied) return denied;
 				const q = await resolveQuiz(quiz);
 				if (!q) return mcpError(`Quiz "${quiz}" not found. Use quiz_overview to list quizzes.`);
@@ -591,7 +482,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: one rep's full attempt — every question with its correct answer, the rep's selected/typed answer, the awarded points, auto-correctness, and any note. This is how you read the answers to grade them.",
 			{ attemptId: z.string().describe("The attempt id (from quiz_results)") },
 			async ({ attemptId }) => {
-				const denied = requireAdmin();
+				const denied = await requireQuizAdmin("read");
 				if (denied) return denied;
 				const attempt = await getAttemptById(env, attemptId);
 				if (!attempt) return mcpError(`Attempt "${attemptId}" not found.`);
@@ -651,7 +542,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: one question with every rep's answer to it, for grading the same question across the whole team. Each submission includes its answerId (pass to quiz_grade_answer).",
 			{ questionId: z.string().describe("The question id (from quiz_attempt)") },
 			async ({ questionId }) => {
-				const denied = requireAdmin();
+				const denied = await requireQuizAdmin("read");
 				if (denied) return denied;
 				const q = await getQuestion(env, questionId);
 				if (!q) return mcpError(`Question "${questionId}" not found.`);
@@ -684,7 +575,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 				note: z.string().optional().describe("Optional note shown to the rep after grading"),
 			},
 			async ({ answerId, points, note }) => {
-				const denied = requireAdmin();
+				const denied = await requireQuizAdmin("write");
 				if (denied) return denied;
 				const res = await gradeAnswer(env, answerId, points, note ?? "");
 				if (!res.ok) return mcpError(`Answer "${answerId}" not found.`);

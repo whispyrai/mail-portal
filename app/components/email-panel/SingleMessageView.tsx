@@ -41,6 +41,7 @@ export default function SingleMessageView({
 
 			<div className="flex-1 min-h-0">
 				<EmailIframe
+					messageId={email.id}
 					body={rewriteInlineImages(
 						email.body || "",
 						mailboxId || "",

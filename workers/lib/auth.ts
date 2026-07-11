@@ -42,7 +42,8 @@ function bytesToBase64Url(bytes: Uint8Array): string {
 // SHA256 over (salt || password) with a server-held pepper (JWT_SECRET, never
 // stored in the DB). Fast (<1ms), and a database dump alone cannot brute-force it
 // without also stealing the Worker secret — an appropriate posture for ~5 internal
-// users with admin-set strong passwords. For a true slow KDF, move to Workers Paid
+// users with user-selected strong passwords delivered through one-time recovery.
+// For a true slow KDF, move to Workers Paid
 // and raise limits.cpu_ms. See locked-decisions D-21 + the 2026-05-29 build log.
 
 const SALT_BYTES = 16;
@@ -106,6 +107,8 @@ export interface SessionClaims {
 	email: string;
 	role: UserRole;
 	mailbox: string; // mailbox_address this session may act as
+	/** Credential generation. Incrementing it revokes every older cookie. */
+	sessionVersion?: number;
 }
 
 export async function signSession(
@@ -117,6 +120,7 @@ export async function signSession(
 		email: claims.email,
 		role: claims.role,
 		mailbox: claims.mailbox,
+		sv: claims.sessionVersion,
 	})
 		.setProtectedHeader({ alg: "HS256", typ: "JWT" })
 		.setSubject(claims.sub)
@@ -137,7 +141,11 @@ export async function verifySession(
 			typeof payload.sub !== "string" ||
 			typeof payload.email !== "string" ||
 			typeof payload.role !== "string" ||
-			typeof payload.mailbox !== "string"
+			typeof payload.mailbox !== "string" ||
+			(payload.sv !== undefined &&
+				(typeof payload.sv !== "number" ||
+					!Number.isInteger(payload.sv) ||
+					payload.sv < 1))
 		) {
 			return null;
 		}
@@ -146,11 +154,20 @@ export async function verifySession(
 			email: payload.email,
 			role: payload.role as UserRole,
 			mailbox: payload.mailbox,
+			sessionVersion: payload.sv as number | undefined,
 			exp: typeof payload.exp === "number" ? payload.exp : 0,
 		};
 	} catch {
 		return null;
 	}
+}
+
+/** Legacy cookies predate the claim and belong to generation one only. */
+export function sessionMatchesUserVersion(
+	claims: Pick<SessionClaims, "sessionVersion">,
+	user: { session_version: number },
+): boolean {
+	return (claims.sessionVersion ?? 1) === user.session_version;
 }
 
 /** True when a still-valid session is within the sliding-renewal window. */

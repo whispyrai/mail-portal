@@ -17,14 +17,128 @@ import { systemPromptFor } from "./prompts";
 import { resolveBrand } from "../routes/brand";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
+import {
+	buildAiCacheKey,
+	calculateAiUsageCostMicros,
+	resolveAiCostControlConfig,
+} from "./ai-cost-control.ts";
+import {
+	createAiCostController,
+	getCachedAiResponse,
+	putCachedAiResponse,
+} from "./ai-cost-control-d1.ts";
+import { boundAiText, boundModelMessages } from "./ai-input-bounds.ts";
 
-/** Default Workers AI model. Override per-deployment by setting an `AI_MODEL`
- *  var/secret. Llama 3.1 8B was deprecated by Cloudflare on 2026-05-30. */
-const DEFAULT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const ESTIMATED_DRAFT_COST_MICROS = 10_000;
 
-export function getAiModel(env: Env): string {
-	const override = (env as { AI_MODEL?: string }).AI_MODEL;
-	return override && override.trim() ? override.trim() : DEFAULT_MODEL;
+async function runGuardedDraftInference(
+	env: Env,
+	input: {
+		feature: "reply_draft" | "compose_draft";
+		mailboxId: string;
+		actorUserId?: string;
+		sourceVersion: string;
+		messages: Array<{ role: string; content: string }>;
+		maxTokens: number;
+		temperature: number;
+	},
+): Promise<string> {
+	const config = resolveAiCostControlConfig(env);
+	const boundedMessages = boundModelMessages(input.messages);
+	const cacheKey = await buildAiCacheKey({
+		feature: input.feature,
+		tier: "cheap",
+		model: config.cheapModel,
+		promptVersion: `${input.feature}-v1`,
+		sourceVersion: input.sourceVersion,
+		mailboxId: input.mailboxId,
+		input: boundedMessages,
+	});
+	const cached = await getCachedAiResponse<string>(env, {
+		cacheKey,
+		mailboxId: input.mailboxId,
+	});
+	const controller = createAiCostController(env, config);
+	const decision = await controller.beginUsage({
+		feature: input.feature,
+		actorUserId: input.actorUserId,
+		mailboxId: input.mailboxId,
+		requestedTier: "cheap",
+		estimatedCostMicros: ESTIMATED_DRAFT_COST_MICROS,
+		cacheKey,
+		cacheHit: cached !== null,
+	});
+	if (cached !== null) return cached;
+	if (decision.decision === "block" || !decision.reservationId) {
+		throw new Error(
+			decision.reviewRequired
+				? "AI drafting is paused pending an administrator budget review."
+				: "AI drafting is temporarily unavailable. Your mail remains fully available.",
+		);
+	}
+
+	let promptTokens = 0;
+	let completionTokens = 0;
+	try {
+		const providerStarted = await controller.startUsage(decision.reservationId);
+		if (!providerStarted) throw new Error("AI usage reservation could not be started");
+		const ai = env.AI as unknown as {
+			run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
+		};
+		const response = (await ai.run(decision.model, {
+			messages: boundedMessages,
+			max_tokens: input.maxTokens,
+			temperature: input.temperature,
+		})) as {
+			response?: string;
+			usage?: { prompt_tokens?: number; completion_tokens?: number };
+		};
+		const text = (response.response ?? "").trim();
+		if (!text) throw new Error("The model returned an empty draft. Please try again.");
+		promptTokens = Math.max(0, Math.floor(response.usage?.prompt_tokens ?? 0));
+		completionTokens = Math.max(
+			0,
+			Math.floor(response.usage?.completion_tokens ?? 0),
+		);
+		const measuredCost = calculateAiUsageCostMicros(decision.tier, {
+			promptTokens,
+			completionTokens,
+		});
+		const completed = await controller.completeUsage(decision.reservationId, {
+			actualCostMicros: measuredCost || ESTIMATED_DRAFT_COST_MICROS,
+			promptTokens,
+			completionTokens,
+		});
+		if (completed.emitAlert) {
+			console.warn("[ai-cost] monthly AI usage reached the alert threshold");
+		}
+		await putCachedAiResponse(env, {
+			cacheKey,
+			mailboxId: input.mailboxId,
+			feature: input.feature,
+			value: text,
+		}).catch((error) =>
+			console.warn(
+				"[ai-cache] failed to persist a completed response",
+				error instanceof Error ? error.message : String(error),
+			),
+		);
+		return text;
+	} catch (error) {
+		const measuredCost = calculateAiUsageCostMicros(decision.tier, {
+			promptTokens,
+			completionTokens,
+		});
+		await controller
+			.failUsage(decision.reservationId, {
+				errorCode: error instanceof Error ? error.name : "ai_inference_failed",
+				actualCostMicros: measuredCost || undefined,
+				promptTokens,
+				completionTokens,
+			})
+			.catch(() => false);
+		throw error;
+	}
 }
 
 /**
@@ -40,12 +154,14 @@ export async function getMailboxSystemPrompt(
 		if (obj) {
 			const settings = await obj.json<Record<string, unknown>>();
 			const custom = settings.agentSystemPrompt;
-			if (typeof custom === "string" && custom.trim()) return custom;
+			if (typeof custom === "string" && custom.trim()) {
+				return boundAiText(custom.trim(), 8_000);
+			}
 		}
 	} catch {
 		// Fall through to the default.
 	}
-	return systemPromptFor(resolveBrand(env.BRAND).id);
+	return boundAiText(systemPromptFor(resolveBrand(env.BRAND).id), 8_000);
 }
 
 /**
@@ -59,10 +175,11 @@ export async function buildMailboxContext(
 	limit = 15,
 ): Promise<string> {
 	try {
+		const boundedLimit = Math.min(15, Math.max(1, Math.floor(limit)));
 		const stub = getMailboxStub(env, mailboxId);
 		const rows = (await stub.getEmails({
 			folder: Folders.INBOX,
-			limit,
+			limit: boundedLimit,
 			page: 1,
 			sortColumn: "date",
 			sortDirection: "DESC",
@@ -87,7 +204,10 @@ export async function buildMailboxContext(
 			return `${i + 1}. From ${r.sender || "unknown"}${isUnread ? " [unread]" : ""} — "${r.subject || "(no subject)"}"${when ? ` (${when})` : ""}${snippet ? ` — ${snippet}` : ""}`;
 		});
 
-		return `## Current inbox (most recent ${rows.length}, newest first)\n${lines.join("\n")}`;
+		return boundAiText(
+			`## Current inbox (most recent ${rows.length}, newest first)\n${lines.join("\n")}`,
+			12_000,
+		);
 	} catch {
 		// Context is best-effort; the tools remain available to the model.
 		return "";
@@ -103,6 +223,7 @@ export async function draftReplyForEmail(
 	env: Env,
 	mailboxId: string,
 	emailId: string,
+	actorUserId?: string,
 ): Promise<{ to: string; subject: string; body: string }> {
 	const stub = getMailboxStub(env, mailboxId);
 	const email = await getFullEmail(stub, emailId);
@@ -113,19 +234,20 @@ export async function draftReplyForEmail(
 	if (email.thread_id) {
 		const thread = await getFullThread(stub, email.thread_id);
 		threadText = thread.messages
+			.slice(-12)
 			.map((m) => {
 				const when = m.date
 					? new Date(m.date).toISOString().slice(0, 16).replace("T", " ")
 					: "";
-				return `From: ${m.sender || "unknown"}${when ? ` (${when})` : ""}\nSubject: ${m.subject || "(no subject)"}\n\n${m.body_text || ""}`;
+				return `From: ${boundAiText(m.sender || "unknown", 500)}${when ? ` (${when})` : ""}\nSubject: ${boundAiText(m.subject || "(no subject)", 1_000)}\n\n${boundAiText(m.body_text || "", 4_000)}`;
 			})
 			.join("\n\n---\n\n");
 	} else {
-		threadText = `From: ${email.sender || "unknown"}\nSubject: ${email.subject || "(no subject)"}\n\n${email.body_text || ""}`;
+		threadText = `From: ${boundAiText(email.sender || "unknown", 500)}\nSubject: ${boundAiText(email.subject || "(no subject)", 1_000)}\n\n${boundAiText(email.body_text || "", 8_000)}`;
 	}
+	threadText = boundAiText(threadText, 28_000);
 
 	const systemPrompt = await getMailboxSystemPrompt(env, mailboxId);
-	const model = getAiModel(env);
 
 	const ownerRaw = mailboxId.split("@")[0].split(".")[0];
 	const ownerFirstName = ownerRaw.charAt(0).toUpperCase() + ownerRaw.slice(1);
@@ -141,19 +263,15 @@ export async function draftReplyForEmail(
 		},
 	];
 
-	// The AI binding's run() is typed against a model-id literal union; we pass a
-	// runtime-configurable id, so go through a narrowed signature.
-	const ai = env.AI as unknown as {
-		run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
-	};
-	const res = (await ai.run(model, {
+	const text = await runGuardedDraftInference(env, {
+		feature: "reply_draft",
+		mailboxId,
+		actorUserId,
+		sourceVersion: `${email.thread_id ?? email.id}:${email.date ?? "unknown"}`,
 		messages,
-		max_tokens: 1024,
+		maxTokens: 1024,
 		temperature: 0.5,
-	})) as { response?: string };
-
-	const text = (res?.response || "").trim();
-	if (!text) throw new Error("The model returned an empty draft. Please try again.");
+	});
 
 	const base = (email.subject || "").replace(/^(re:\s*)+/i, "").trim();
 	const subject = base ? `Re: ${base}` : "Re:";
@@ -174,9 +292,9 @@ export async function draftNewEmail(
 	env: Env,
 	mailboxId: string,
 	prompt: string,
+	actorUserId?: string,
 ): Promise<{ subject: string; body: string }> {
 	const systemPrompt = await getMailboxSystemPrompt(env, mailboxId);
-	const model = getAiModel(env);
 
 	const ownerRaw = mailboxId.split("@")[0].split(".")[0];
 	const ownerFirstName = ownerRaw.charAt(0).toUpperCase() + ownerRaw.slice(1);
@@ -188,21 +306,19 @@ export async function draftNewEmail(
 		},
 		{
 			role: "user",
-			content: prompt,
+			content: boundAiText(prompt, 8_000),
 		},
 	];
 
-	const ai = env.AI as unknown as {
-		run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
-	};
-	const res = (await ai.run(model, {
+	const text = await runGuardedDraftInference(env, {
+		feature: "compose_draft",
+		mailboxId,
+		actorUserId,
+		sourceVersion: "new-compose-v1",
 		messages,
-		max_tokens: 1024,
+		maxTokens: 1024,
 		temperature: 0.6,
-	})) as { response?: string };
-
-	const text = (res?.response || "").trim();
-	if (!text) throw new Error("The model returned an empty draft. Please try again.");
+	});
 
 	// Parse "SUBJECT: ..." from the first matching line; everything after is the body.
 	const lines = text.split("\n");

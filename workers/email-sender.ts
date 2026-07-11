@@ -20,6 +20,7 @@
 // message. See architecture.md "On the Message-ID" and build-findings-2026-05-29.
 
 import { AwsClient } from "aws4fetch";
+import type { SesObservedOutcome } from "./lib/outbound-delivery-contract.ts";
 import type { Env } from "./types";
 
 export interface SendEmailParams {
@@ -40,17 +41,32 @@ export interface SendEmailParams {
 	}[];
 	/** Extra headers to set on the message, e.g. In-Reply-To and References. */
 	headers?: Record<string, string>;
+	/** Correlation tags returned by SES event publishing for bounce handling. */
+	tracking?: { mailboxId: string; deliveryId: string };
 }
 
 /** Thrown when SES rejects or fails a send. `status` is the HTTP status if any. */
 export class SesSendError extends Error {
+	readonly status?: number;
+
 	constructor(
 		message: string,
-		readonly status?: number,
+		status?: number,
 	) {
 		super(message);
 		this.name = "SesSendError";
+		this.status = status;
 	}
+}
+
+/** Minimal transport boundary used by the SES outcome adapter. */
+export interface SesRequestTransport {
+	fetch(input: string, init: RequestInit): Promise<Response>;
+}
+
+export interface SesSendDependencies {
+	/** Creating the transport happens before dispatch and is therefore testable. */
+	createTransport?: (env: Env) => SesRequestTransport;
 }
 
 /** Format an address as `Name <email>` or bare `email`. */
@@ -82,6 +98,27 @@ function getSigner(env: Env): AwsClient {
 	});
 	signerCache = { key: env.AWS_ACCESS_KEY_ID, client };
 	return client;
+}
+
+function createDefaultTransport(env: Env): SesRequestTransport {
+	const signer = getSigner(env);
+	return {
+		fetch: (input, init) => signer.fetch(input, init),
+	};
+}
+
+function errorDetail(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function base64UrlText(value: string): string {
+	const bytes = new TextEncoder().encode(value);
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary)
+		.replace(/\+/g, "-")
+		.replace(/\//g, "_")
+		.replace(/=+$/g, "");
 }
 
 interface SesHeader {
@@ -139,6 +176,37 @@ export async function sendEmail(
 	env: Env,
 	params: SendEmailParams,
 ): Promise<{ messageId: string }> {
+	const outcome = await sendEmailWithOutcome(env, params);
+
+	switch (outcome.kind) {
+		case "accepted":
+			return { messageId: outcome.messageId };
+		case "http_error":
+			throw new SesSendError(
+				`SES SendEmail failed (${outcome.status}): ${outcome.detail ?? ""}`,
+				outcome.status,
+			);
+		case "not_dispatched":
+		case "transport_ambiguous":
+			throw new SesSendError(`SES request failed: ${outcome.detail ?? ""}`);
+		case "invalid_success_response":
+			throw new SesSendError(
+				outcome.detail ?? "SES SendEmail returned no MessageId",
+			);
+	}
+}
+
+/**
+ * Observe an SES send without claiming more certainty than the HTTP exchange
+ * proves. In particular, once `transport.fetch` is invoked, any thrown error is
+ * ambiguous because SES may have accepted the message before the response was
+ * lost. Callers must not automatically retry ambiguous outcomes.
+ */
+export async function sendEmailWithOutcome(
+	env: Env,
+	params: SendEmailParams,
+	dependencies: SesSendDependencies = {},
+): Promise<SesObservedOutcome> {
 	const destination: Record<string, string[]> = {
 		ToAddresses: toAddressArray(params.to),
 	};
@@ -147,42 +215,81 @@ export async function sendEmail(
 	if (cc.length > 0) destination.CcAddresses = cc;
 	if (bcc.length > 0) destination.BccAddresses = bcc;
 
-	const payload = {
-		FromEmailAddress: formatAddress(params.from),
-		Destination: destination,
-		...(params.replyTo
-			? { ReplyToAddresses: [formatAddress(params.replyTo)] }
-			: {}),
-		Content: { Simple: buildSimpleContent(params) },
-	};
-
-	const url = `https://email.${env.AWS_REGION}.amazonaws.com/v2/email/outbound-emails`;
-	const signer = getSigner(env);
-
-	let res: Response;
+	let transport: SesRequestTransport;
+	let url: string;
+	let request: RequestInit;
 	try {
-		res = await signer.fetch(url, {
+		const payload = {
+			FromEmailAddress: formatAddress(params.from),
+			Destination: destination,
+			...(params.tracking
+				? { ConfigurationSetName: env.SES_CONFIGURATION_SET }
+				: {}),
+			...(params.replyTo
+				? { ReplyToAddresses: [formatAddress(params.replyTo)] }
+				: {}),
+			Content: { Simple: buildSimpleContent(params) },
+			...(params.tracking
+				? {
+						EmailTags: [
+							{
+								Name: "MailboxKey",
+								Value: base64UrlText(params.tracking.mailboxId),
+							},
+							{
+								Name: "DeliveryId",
+								Value: params.tracking.deliveryId,
+							},
+						],
+					}
+				: {}),
+		};
+		url = `https://email.${env.AWS_REGION}.amazonaws.com/v2/email/outbound-emails`;
+		request = {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(payload),
-		});
-	} catch (e) {
-		throw new SesSendError(
-			`SES request failed: ${(e as Error).message}`,
-		);
+		};
+		transport = (dependencies.createTransport ?? createDefaultTransport)(env);
+	} catch (error) {
+		return { kind: "not_dispatched", detail: errorDetail(error) };
+	}
+
+	let res: Response;
+	try {
+		res = await transport.fetch(url, request);
+	} catch (error) {
+		return { kind: "transport_ambiguous", detail: errorDetail(error) };
 	}
 
 	if (!res.ok) {
 		const detail = await res.text().catch(() => "");
-		throw new SesSendError(
-			`SES SendEmail failed (${res.status}): ${detail}`,
-			res.status,
-		);
+		return { kind: "http_error", status: res.status, detail };
 	}
 
-	const result = (await res.json()) as { MessageId?: string };
-	if (!result.MessageId) {
-		throw new SesSendError("SES SendEmail returned no MessageId");
+	let result: unknown;
+	try {
+		result = await res.json();
+	} catch (error) {
+		return {
+			kind: "invalid_success_response",
+			detail: errorDetail(error),
+		};
 	}
-	return { messageId: result.MessageId };
+
+	const messageId =
+		typeof result === "object" &&
+		result !== null &&
+		"MessageId" in result &&
+		typeof result.MessageId === "string"
+			? result.MessageId.trim()
+			: "";
+	if (!messageId) {
+		return {
+			kind: "invalid_success_response",
+			detail: "SES SendEmail returned no MessageId",
+		};
+	}
+
+	return { kind: "accepted", messageId };
 }

@@ -63,6 +63,16 @@ export async function receiveEmail(
 		event.setReject("Mailbox unavailable");
 		return;
 	}
+	const activeMailbox = await env.DB.prepare(
+		"SELECT id FROM mailboxes WHERE id = ?1 AND is_active = 1 LIMIT 1",
+	)
+		.bind(mailboxId)
+		.first<{ id: string }>();
+	if (!activeMailbox) {
+		console.log("[mail-receive] rejecting inactive recipient", { mailboxId });
+		event.setReject("Mailbox unavailable");
+		return;
+	}
 
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);

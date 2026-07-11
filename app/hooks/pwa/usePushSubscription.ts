@@ -2,9 +2,10 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { decodeBase64Url } from "../../../shared/base64url";
 import { useAppConfig, useRegisterPushDevice } from "~/queries/push";
+import { rebindExistingPushSubscription } from "./push-rebind";
 
 const SW_READY_TIMEOUT_MS = 10_000;
 
@@ -67,4 +68,47 @@ export function usePushSubscription(mailboxId: string | undefined) {
 	}
 
 	return { enable, canSubscribe, isSubscribing, pushSupported, hasVapidKey: !!vapidKey };
+}
+
+/**
+ * Bind a pre-migration browser subscription to the live mailbox user on the
+ * next authenticated mailbox visit. No permission prompt is shown.
+ */
+export function useRebindExistingPushSubscription(
+	mailboxId: string | undefined,
+) {
+	const { data: config } = useAppConfig();
+	const register = useRegisterPushDevice(mailboxId);
+	const registerRef = useRef(register.mutateAsync);
+	registerRef.current = register.mutateAsync;
+	const vapidKey = config?.vapidPublicKey ?? null;
+
+	useEffect(() => {
+		if (
+			!mailboxId ||
+			!vapidKey ||
+			typeof window === "undefined" ||
+			!("serviceWorker" in navigator) ||
+			typeof Notification === "undefined" ||
+			Notification.permission !== "granted"
+		) {
+			return;
+		}
+
+		let cancelled = false;
+		void waitForServiceWorkerReady()
+			.then(async (registration) => {
+				if (!registration || cancelled) return;
+				await rebindExistingPushSubscription(
+					registration,
+					(payload) => registerRef.current(payload),
+				);
+			})
+			.catch((error) => {
+				if (!cancelled) console.error("[pwa] push rebind failed", error);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [mailboxId, vapidKey]);
 }

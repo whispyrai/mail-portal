@@ -1,0 +1,31 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs";
+
+test("label UI exposes compact chips, an accessible picker, and mailbox-wide management", () => {
+	const chip = fs.readFileSync(new URL("./LabelChip.tsx", import.meta.url), "utf8");
+	const picker = fs.readFileSync(new URL("./LabelPicker.tsx", import.meta.url), "utf8");
+	const manager = fs.readFileSync(new URL("./ManageLabelsDialog.tsx", import.meta.url), "utf8");
+	const sidebar = fs.readFileSync(new URL("../Sidebar.tsx", import.meta.url), "utf8");
+	const list = fs.readFileSync(new URL("../../routes/email-list.tsx", import.meta.url), "utf8");
+	const panel = fs.readFileSync(new URL("../EmailPanel.tsx", import.meta.url), "utf8");
+	const search = fs.readFileSync(new URL("../../routes/search-results.tsx", import.meta.url), "utf8");
+	assert.match(chip, /rounded-full/);
+	assert.match(picker, /type="checkbox"/);
+	assert.match(picker, /aria-label/);
+	assert.match(picker, /aria-disabled=\{disabled/);
+	assert.match(picker, /tabIndex=\{disabled \? -1 : 0\}/);
+	assert.match(picker, /max-h-/);
+	assert.match(picker, /min-h-11/);
+	assert.match(manager, /shared by everyone with access/);
+	assert.match(manager, /never deletes mail/);
+	assert.match(manager, /useKumoToastManager/);
+	assert.match(manager, /humanizeColor/);
+	assert.match(manager, /min-h-11/);
+	assert.match(sidebar, /ManageLabelsDialog/);
+	assert.match(sidebar, /label_id=/);
+	assert.match(list, /label_id: labelId/);
+	assert.match(list, /Label selected/);
+	assert.match(panel, /Edit labels/);
+	assert.match(search, /Filter search by label/);
+});

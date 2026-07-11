@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import DOMPurify from "dompurify";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // Force every link in rendered email HTML to open in a new tab. Email anchors
 // usually carry no `target`, so inside the sandboxed iframe a click would
@@ -24,6 +24,7 @@ function ensureLinkTargetHook() {
 }
 
 interface EmailIframeProps {
+	messageId: string;
 	body: string;
 	/** When true, iframe auto-sizes to content height instead of filling parent */
 	autoSize?: boolean;
@@ -51,9 +52,17 @@ interface EmailIframeProps {
  *   affects newly-opened tabs; the email body itself stays fully
  *   sandboxed with no same-origin access to the parent page.
  */
-export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
+export default function EmailIframe({ messageId, body, autoSize }: EmailIframeProps) {
 	const iframeRef = useRef<HTMLIFrameElement>(null);
 	const [height, setHeight] = useState(autoSize ? 100 : 0);
+	const [remoteImagesForMessageId, setRemoteImagesForMessageId] = useState<
+		string | null
+	>(null);
+	const loadRemoteImages = remoteImagesForMessageId === messageId;
+	const hasRemoteImages = useMemo(
+		() => /<img\b[^>]*\bsrc\s*=\s*["']?https?:\/\//i.test(body),
+		[body],
+	);
 
 	// Listen for height reports from the sandboxed iframe
 	const handleMessage = useCallback(
@@ -85,12 +94,29 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 
 		ensureLinkTargetHook();
 
-		const cleanBody = DOMPurify.sanitize(body, {
+		let cleanBody = DOMPurify.sanitize(body, {
 			USE_PROFILES: { html: true },
 			FORBID_TAGS: ["style"],
 			ADD_ATTR: ["target"],
 			FORCE_BODY: true,
 		});
+
+		if (!loadRemoteImages) {
+			const template = document.createElement("template");
+			template.innerHTML = cleanBody;
+			for (const image of template.content.querySelectorAll("img")) {
+				const source = image.getAttribute("src")?.trim() ?? "";
+				if (/^https?:\/\//i.test(source)) {
+					image.removeAttribute("src");
+					image.setAttribute("data-remote-image-blocked", "true");
+					image.setAttribute(
+						"alt",
+						image.getAttribute("alt") || "Remote image blocked for privacy",
+					);
+				}
+			}
+			cleanBody = template.innerHTML;
+		}
 
 		const padding = autoSize ? "0" : "24px";
 
@@ -118,7 +144,7 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 <base target="_blank">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid: https:; script-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:${loadRemoteImages ? " https:" : ""}; script-src 'unsafe-inline';">
 <style>
 * { box-sizing: border-box; }
 html {
@@ -164,9 +190,9 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 </head>
 <body>${cleanBody}${heightScript}</body>
 </html>`;
-	}, [body, autoSize]);
+	}, [body, autoSize, loadRemoteImages]);
 
-	return (
+	const frame = (
 		<iframe
 			ref={iframeRef}
 			className="block w-full border-0"
@@ -174,5 +200,31 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 			sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
 			title="Email content"
 		/>
+	);
+
+	if (!hasRemoteImages) return frame;
+
+	return (
+		<div className={autoSize ? "w-full" : "flex h-full w-full flex-col"}>
+			<div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+				<span>
+					{loadRemoteImages
+						? "Remote images are visible for this message."
+						: "Remote images are blocked to protect your privacy."}
+				</span>
+				<button
+					type="button"
+					className="shrink-0 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 shadow-sm hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+					onClick={() =>
+						setRemoteImagesForMessageId((current) =>
+							current === messageId ? null : messageId,
+						)
+					}
+				>
+					{loadRemoteImages ? "Hide images" : "Load images"}
+				</button>
+			</div>
+			{frame}
+		</div>
 	);
 }

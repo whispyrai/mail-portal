@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import {
 	ArrowBendUpLeftIcon,
 	ArrowBendUpRightIcon,
+	ArrowCounterClockwiseIcon,
 	ArrowLeftIcon,
 	ChatCircleIcon,
 	CodeIcon,
@@ -26,6 +27,7 @@ interface EmailPanelToolbarProps {
 	email: Email;
 	mailboxId?: string;
 	isDraftFolder: boolean;
+	isOutboxFolder: boolean;
 	isSending: boolean;
 	isDrafting: boolean;
 	moveToFolders: Folder[];
@@ -42,12 +44,15 @@ interface EmailPanelToolbarProps {
 	onMove: (folderId: string) => void;
 	onViewSource: () => void;
 	onDelete: () => void;
+	onRestore: () => void;
+	isTrashFolder: boolean;
 }
 
 export default function EmailPanelToolbar({
 	email,
 	mailboxId,
 	isDraftFolder,
+	isOutboxFolder,
 	isSending,
 	isDrafting,
 	moveToFolders,
@@ -63,7 +68,14 @@ export default function EmailPanelToolbar({
 	onMove,
 	onViewSource,
 	onDelete,
+	onRestore,
+	isTrashFolder,
 }: EmailPanelToolbarProps) {
+	const destructiveActionLabel = isTrashFolder
+		? "Restore"
+		: isDraftFolder
+			? "Discard draft"
+			: "Move to Trash";
 	return (
 		<div className="flex items-center gap-1 px-3 py-2 border-b border-kumo-line shrink-0 md:px-4">
 			<Button
@@ -76,7 +88,11 @@ export default function EmailPanelToolbar({
 				className="md:hidden shrink-0"
 			/>
 
-			{isDraftFolder ? (
+			{isOutboxFolder ? (
+				<span className="px-2 text-sm font-medium text-kumo-subtle">
+					Delivery details
+				</span>
+			) : isDraftFolder ? (
 				<>
 					<Button
 						variant="primary"
@@ -174,7 +190,9 @@ export default function EmailPanelToolbar({
 				/>
 			</Tooltip>
 
-			<MoveToFolderMenu folders={moveToFolders} onMove={onMove} />
+			{!isOutboxFolder && (
+				<MoveToFolderMenu folders={moveToFolders} onMove={onMove} />
+			)}
 
 			<div className="ml-auto flex items-center gap-0.5">
 				<Tooltip content="View source" side="bottom" asChild>
@@ -187,16 +205,18 @@ export default function EmailPanelToolbar({
 						aria-label="View source"
 					/>
 				</Tooltip>
-				<Tooltip content="Delete" side="bottom" asChild>
+				{!isOutboxFolder && (
+				<Tooltip content={destructiveActionLabel} side="bottom" asChild>
 					<Button
 						variant="ghost"
 						shape="square"
 						size="sm"
-						icon={<TrashIcon size={18} />}
-						onClick={onDelete}
-						aria-label="Delete"
+						icon={isTrashFolder ? <ArrowCounterClockwiseIcon size={18} /> : <TrashIcon size={18} />}
+						onClick={isTrashFolder ? onRestore : onDelete}
+						aria-label={destructiveActionLabel}
 					/>
 				</Tooltip>
+				)}
 				<Tooltip content="Close" side="bottom" asChild>
 					<Button
 						variant="ghost"

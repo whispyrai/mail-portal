@@ -8,12 +8,12 @@
  * Includes: DO stub helpers, sender validation, message-ID generation,
  * threading, HTML utilities, and tool-logic (getFullEmail / getFullThread).
  */
-import type { MailboxDO } from "../durableObject";
-import type { EmailFull } from "./schemas";
-import { Folders } from "../../shared/folders";
-export { buildThreadToken, extractThreadToken } from "./thread-token";
-import type { Env } from "../types";
-import { formatQuotedDate } from "../../shared/dates";
+import type { MailboxDO } from "../durableObject/index.ts";
+import type { EmailFull } from "./schemas.ts";
+import { Folders } from "../../shared/folders.ts";
+export { buildThreadToken, extractThreadToken } from "./thread-token.ts";
+import type { Env } from "../types.ts";
+import { formatQuotedDate } from "../../shared/dates.ts";
 
 // ── DO Stub ────────────────────────────────────────────────────────
 

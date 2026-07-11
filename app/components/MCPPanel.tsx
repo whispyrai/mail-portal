@@ -10,7 +10,6 @@ import {
 	WrenchIcon,
 } from "@phosphor-icons/react";
 import { useState } from "react";
-import { useParams } from "react-router";
 
 function CopyButton({ text }: { text: string }) {
 	const [copied, setCopied] = useState(false);
@@ -52,14 +51,11 @@ const TOOLS = [
 	{ name: "get_thread", desc: "Load a conversation thread" },
 	{ name: "search_emails", desc: "Search emails by query" },
 	{ name: "draft_reply", desc: "Draft a reply to an email" },
-	{ name: "send_reply", desc: "Send a reply" },
-	{ name: "send_email", desc: "Send a new email" },
-	{ name: "mark_email_read", desc: "Mark email as read/unread" },
-	{ name: "move_email", desc: "Move email to a folder" },
+	{ name: "create_draft", desc: "Create a reviewable draft" },
+	{ name: "update_draft", desc: "Update a draft safely" },
 ];
 
 export default function MCPPanel() {
-	const { mailboxId } = useParams<{ mailboxId: string }>();
 	const baseUrl =
 		typeof window !== "undefined" ? window.location.origin : "https://your-app.workers.dev";
 	const mcpUrl = `${baseUrl}/mcp`;
@@ -89,9 +85,9 @@ export default function MCPPanel() {
 					</div>
 					<p className="text-xs text-kumo-subtle leading-relaxed">
 						This email agent exposes an MCP server so AI coding
-						assistants can manage your inbox directly — read emails,
-						search, draft replies, and send messages using natural
-						language.
+						assistants can read and search mail, then create drafts for
+						you to review. Sending, moving, and deleting stay in this
+						portal.
 					</p>
 				</div>
 

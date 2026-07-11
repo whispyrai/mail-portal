@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PushSubscriptionSchema } from "./schemas.ts";
+import { PushSubscriptionSchema, SendEmailRequestSchema } from "./schemas.ts";
 
 function encodeBase64Url(bytes: Uint8Array): string {
 	let binary = "";
@@ -49,4 +49,48 @@ test("PushSubscriptionSchema rejects malformed or incorrectly sized keys", () =>
 	for (const candidate of cases) {
 		assert.equal(PushSubscriptionSchema.safeParse(candidate).success, false);
 	}
+});
+
+test("browser send requests require a stable idempotency key", () => {
+	const base = {
+		to: "person@example.com",
+		from: "team@example.com",
+		subject: "Hello",
+		text: "Hello",
+	};
+
+	assert.equal(SendEmailRequestSchema.safeParse(base).success, false);
+	assert.equal(
+		SendEmailRequestSchema.safeParse({
+			...base,
+			idempotency_key: "logical-send-1",
+		}).success,
+		true,
+	);
+});
+
+test("draft-backed sends require the captured draft version", () => {
+	const base = {
+		to: "person@example.com",
+		from: "team@example.com",
+		subject: "Hello",
+		text: "Hello",
+		idempotency_key: "logical-send-1",
+	};
+
+	assert.equal(
+		SendEmailRequestSchema.safeParse({
+			...base,
+			source_draft_id: "draft-1",
+		}).success,
+		false,
+	);
+	assert.equal(
+		SendEmailRequestSchema.safeParse({
+			...base,
+			source_draft_id: "draft-1",
+			source_draft_version: 3,
+		}).success,
+		true,
+	);
 });

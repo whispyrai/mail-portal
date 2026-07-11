@@ -1,0 +1,57 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+	buildMailPaletteCommands,
+	filterMailPaletteCommands,
+	shouldOpenMailCommandPalette,
+} from "./command-palette.ts";
+
+test("palette includes core commands and context-valid triage", () => {
+	const inbox = buildMailPaletteCommands({ folderId: "inbox", hasSelectedMessage: true });
+	const ids = inbox.map((command) => command.id);
+	assert.deepEqual(ids.slice(0, 11), [
+		"compose",
+		"search",
+		"inbox",
+		"sent",
+		"drafts",
+		"archive-folder",
+		"trash-folder",
+		"outbox",
+		"refresh",
+		"shortcuts",
+		"toggle-read",
+	]);
+	assert.ok(ids.includes("archive-selected"));
+	assert.ok(ids.includes("trash-selected"));
+
+	const outbox = buildMailPaletteCommands({ folderId: "outbox", hasSelectedMessage: true });
+	assert.ok(!outbox.some((command) => command.group === "Current conversation"));
+	const noSelection = buildMailPaletteCommands({ folderId: "inbox", hasSelectedMessage: false });
+	assert.ok(!noSelection.some((command) => command.group === "Current conversation"));
+});
+
+test("search ranks title matches and finds descriptions and aliases", () => {
+	const commands = buildMailPaletteCommands({ folderId: "inbox", hasSelectedMessage: true });
+	assert.equal(filterMailPaletteCommands(commands, "compose")[0]?.id, "compose");
+	assert.equal(filterMailPaletteCommands(commands, "new message")[0]?.id, "compose");
+	assert.equal(filterMailPaletteCommands(commands, "queued")[0]?.id, "outbox");
+	assert.deepEqual(filterMailPaletteCommands(commands, "does-not-exist"), []);
+});
+
+test("Cmd/Ctrl+K never opens while typing, composing, or using unrelated modifiers", () => {
+	const base = {
+		key: "k",
+		metaKey: true,
+		ctrlKey: false,
+		altKey: false,
+		isComposing: false,
+		isTextEntry: false,
+	};
+	assert.equal(shouldOpenMailCommandPalette(base), true);
+	assert.equal(shouldOpenMailCommandPalette({ ...base, metaKey: false, ctrlKey: true }), true);
+	assert.equal(shouldOpenMailCommandPalette({ ...base, isTextEntry: true }), false);
+	assert.equal(shouldOpenMailCommandPalette({ ...base, isComposing: true }), false);
+	assert.equal(shouldOpenMailCommandPalette({ ...base, altKey: true }), false);
+	assert.equal(shouldOpenMailCommandPalette({ ...base, key: "j" }), false);
+});

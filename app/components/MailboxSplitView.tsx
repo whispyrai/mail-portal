@@ -19,8 +19,9 @@ export default function MailboxSplitView({
 	const isPanelOpen = selectedEmailId !== null;
 
 	return (
-		<div className="flex h-full">
-			<div
+		<div className="flex h-full min-h-0 min-w-0 overflow-hidden">
+			<section
+				aria-label="Message list"
 				className={`flex flex-col min-w-0 shrink-0 ${
 					isPanelOpen
 						? "hidden md:flex md:w-[380px] md:border-r md:border-kumo-line"
@@ -28,11 +29,14 @@ export default function MailboxSplitView({
 				}`}
 			>
 				{children}
-			</div>
+			</section>
 			{isPanelOpen && selectedEmailId && (
-				<div className="flex-1 flex flex-col min-w-0 overflow-hidden w-full md:w-auto">
+				<section
+					aria-label="Conversation"
+					className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden w-full md:w-auto"
+				>
 					<EmailPanel emailId={selectedEmailId} />
-				</div>
+				</section>
 			)}
 		</div>
 	);

@@ -19,10 +19,11 @@ export function useSearchEmails(
 	mailboxId: string | undefined,
 	query: string,
 	page: number,
+	labelId = "",
 ) {
 	return useQuery<{ results: Email[]; totalCount: number }>({
-		queryKey: mailboxId && query
-			? queryKeys.search.results(mailboxId, query, page)
+		queryKey: mailboxId && (query || labelId)
+			? queryKeys.search.results(mailboxId, query, page, labelId)
 			: ["search", "_disabled"],
 		queryFn: async () => {
 			const parsed = parseSearchQuery(query);
@@ -42,6 +43,7 @@ export function useSearchEmails(
 			if (parsed.is_starred !== undefined)
 				params.is_starred = String(parsed.is_starred);
 			if (parsed.has_attachment) params.has_attachment = "true";
+			if (labelId) params.label_id = labelId;
 
 			const data = await api.searchEmails(mailboxId!, params) as
 				| SearchResponse
@@ -55,6 +57,6 @@ export function useSearchEmails(
 			const arr = Array.isArray(data) ? data : [];
 			return { results: arr, totalCount: arr.length };
 		},
-		enabled: !!mailboxId && !!query,
+		enabled: !!mailboxId && !!(query || labelId),
 	});
 }

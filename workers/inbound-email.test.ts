@@ -19,6 +19,22 @@ function rawEmail(headers: string, body = "Hello from the Internet.") {
 	};
 }
 
+function mailboxRegistry(active = true) {
+	return {
+		prepare() {
+			return {
+				bind() {
+					return {
+						async first() {
+							return active ? { id: "registered" } : null;
+						},
+					};
+				},
+			};
+		},
+	};
+}
+
 test("inbound delivery uses the SMTP envelope recipient when the visible To header differs", async () => {
 	const mailboxAddress = "hesham@wiserchat.ai";
 	const stored: Array<{ folder: string; email: Record<string, unknown> }> = [];
@@ -39,6 +55,7 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
 		BRAND: "wiser",
 		DOMAINS: "wiserchat.ai,test.wiserchat.ai",
 		EMAIL_ADDRESSES: [],
+		DB: mailboxRegistry(),
 		BUCKET: {
 			async head(key: string) {
 				return key === `mailboxes/${mailboxAddress}.json` ? {} : null;
@@ -201,6 +218,7 @@ test("inbound push payload uses the active brand's notification assets", async (
 		BRAND: "wiser",
 		DOMAINS: "wiserchat.ai",
 		EMAIL_ADDRESSES: [],
+		DB: mailboxRegistry(),
 		BUCKET: {
 			async head() {
 				return {};
@@ -237,4 +255,42 @@ test("inbound push payload uses the active brand's notification assets", async (
 
 	assert.equal(pushPayload?.icon, "/wiser-icon-192.png");
 	assert.equal(pushPayload?.badge, "/wiser-badge-96.png");
+});
+
+test("inbound delivery rejects a deactivated mailbox before reading the message", async () => {
+	let rawWasRead = false;
+	let rejection: string | undefined;
+	const mailboxAddress = "closed@wiserchat.ai";
+	const message = {
+		from: "sender@example.com",
+		to: mailboxAddress,
+		get raw() {
+			rawWasRead = true;
+			return rawEmail("From: sender@example.com").raw;
+		},
+		rawSize: 100,
+		setReject(reason: string) {
+			rejection = reason;
+		},
+	};
+	const env = {
+		DOMAINS: "wiserchat.ai",
+		EMAIL_ADDRESSES: [],
+		DB: mailboxRegistry(false),
+		BUCKET: {
+			async head() {
+				return {};
+			},
+		},
+		MAILBOX: {
+			idFromName() {
+				assert.fail("inactive recipient must not resolve a Durable Object");
+			},
+		},
+	};
+
+	await receiveEmail(message, env as never, { waitUntil() {} } as never);
+
+	assert.match(rejection ?? "", /mailbox unavailable/i);
+	assert.equal(rawWasRead, false);
 });

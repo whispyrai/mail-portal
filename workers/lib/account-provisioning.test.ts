@@ -21,10 +21,13 @@ function userFrom(input: CreateUserInput): User {
 		email: input.email,
 		password_hash: input.passwordHash,
 		password_salt: input.passwordSalt,
+		session_version: 1,
 		role: input.role,
 		is_active: 1,
 		mailbox_address: input.mailboxAddress,
 		mcp_token_hash: null,
+		recovery_email: input.recoveryEmail ?? null,
+		ownership_confirmed_at: input.ownershipConfirmedAt ?? null,
 		created_at: 1,
 		updated_at: 1,
 	};

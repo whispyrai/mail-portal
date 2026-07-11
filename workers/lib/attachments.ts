@@ -13,6 +13,7 @@
  * route already use).
  */
 import type { Env } from "../types";
+import type { ActivityActor } from "./activity.ts";
 import { ATTACHMENT_LIMITS, validateAttachmentSet } from "../../shared/attachments.ts";
 
 /** Metadata for one stored attachment, shaped for the DO `attachments` table. */
@@ -50,6 +51,23 @@ export type AttachmentRef =
 			disposition?: "attachment" | "inline";
 	  };
 
+/**
+ * Capture the source-draft attachment identities represented by a send. Any
+ * upload or attachment owned by another email receives a non-matching marker,
+ * forcing cancellation to recover the immutable snapshot conservatively.
+ */
+export function sourceDraftAttachmentIds(
+	draftId: string | undefined,
+	refs: AttachmentRef[] | undefined,
+): string[] | undefined {
+	if (!draftId) return undefined;
+	return (refs ?? []).map((ref) =>
+		ref.kind === "existing" && ref.emailId === draftId
+			? ref.attachmentId
+			: `!${ref.kind}:${ref.kind === "upload" ? ref.uploadId : `${ref.emailId}:${ref.attachmentId}`}`,
+	);
+}
+
 /** R2 key for a freshly uploaded file not yet attached to a sent email. */
 export function uploadKey(mailboxId: string, uploadId: string): string {
 	return `uploads/${mailboxId.toLowerCase()}/${uploadId}`;
@@ -84,6 +102,11 @@ type StubForResolve = {
 	getAttachment: (
 		id: string,
 	) => Promise<{ filename: string; mimetype: string; size: number; email_id: string } | null>;
+	queueAttachmentCleanup?: (
+		emailId: string,
+		keys: string[],
+		actor?: ActivityActor,
+	) => Promise<void>;
 };
 
 type ResolvedSource = {
@@ -94,14 +117,81 @@ type ResolvedSource = {
 	stagingKey?: string; // present for `upload` refs; deleted after promotion
 };
 
+export type AttachmentPromotion = {
+	sesAttachments: SesAttachmentInput[];
+	storedMetadata: StoredAttachment[];
+	/** Upload staging objects retained until the database enqueue commits. */
+	stagingKeys: string[];
+	/** Permanent copies to remove if the database enqueue does not commit. */
+	destinationKeys: string[];
+};
+
+async function cleanupOrQueue(
+	bucket: Env["BUCKET"],
+	stub: StubForResolve,
+	emailId: string,
+	keys: string[],
+	actor: ActivityActor,
+) {
+	if (keys.length === 0) return;
+	try {
+		await bucket.delete(keys);
+	} catch (error) {
+		if (!stub.queueAttachmentCleanup) throw error;
+		await stub.queueAttachmentCleanup(emailId, keys, actor);
+	}
+}
+
+/** Complete a committed promotion by deleting its now-redundant upload staging. */
+export async function completeAttachmentPromotion(
+	bucket: Env["BUCKET"],
+	stub: StubForResolve,
+	emailId: string,
+	promotion: AttachmentPromotion,
+	actor: ActivityActor = { kind: "system" },
+) {
+	await cleanupOrQueue(bucket, stub, emailId, promotion.stagingKeys, actor);
+}
+
+/** Roll back an uncommitted promotion without touching retryable staging data. */
+export async function rollbackAttachmentPromotion(
+	bucket: Env["BUCKET"],
+	stub: StubForResolve,
+	emailId: string,
+	promotion: AttachmentPromotion,
+	actor: ActivityActor = { kind: "system" },
+) {
+	await cleanupOrQueue(bucket, stub, emailId, promotion.destinationKeys, actor);
+}
+
+/** Delete replaced permanent objects, with the durable cleanup queue as fallback. */
+export async function cleanupStoredAttachmentObjects(
+	bucket: Env["BUCKET"],
+	stub: StubForResolve,
+	emailId: string,
+	attachments: Array<{ id: string; filename: string }>,
+	actor: ActivityActor = { kind: "system" },
+) {
+	await cleanupOrQueue(
+		bucket,
+		stub,
+		emailId,
+		attachments.map((attachment) =>
+			attachmentKey(emailId, attachment.id, attachment.filename),
+		),
+		actor,
+	);
+}
+
 /**
  * Resolve attachment references to deliverable + storable form.
  *
  * Reads each ref's bytes from R2, enforces the shared count/size limits against
  * the real resolved sizes, base64-encodes for SES, writes a fresh permanent
- * copy under `attachments/{newEmailId}/...`, and deletes staging objects for
- * `upload` refs. Throws on a missing/expired upload or a limit violation — the
- * caller maps the throw to a 400.
+ * copy under `attachments/{newEmailId}/...`, and returns an explicit promotion
+ * receipt. Upload staging remains intact until the caller confirms its durable
+ * database write, so a failed enqueue can be retried without re-uploading.
+ * Throws on a missing/expired upload or a limit violation.
  */
 export async function resolveAndPromoteAttachments(
 	bucket: Env["BUCKET"],
@@ -109,8 +199,16 @@ export async function resolveAndPromoteAttachments(
 	mailboxId: string,
 	newEmailId: string,
 	refs: AttachmentRef[] | undefined,
-): Promise<{ sesAttachments: SesAttachmentInput[]; storedMetadata: StoredAttachment[] }> {
-	if (!refs?.length) return { sesAttachments: [], storedMetadata: [] };
+	actor: ActivityActor = { kind: "system" },
+): Promise<AttachmentPromotion> {
+	if (!refs?.length) {
+		return {
+			sesAttachments: [],
+			storedMetadata: [],
+			stagingKeys: [],
+			destinationKeys: [],
+		};
+	}
 	if (refs.length > ATTACHMENT_LIMITS.maxFiles) {
 		throw new Error(`Too many files: max ${ATTACHMENT_LIMITS.maxFiles} per message.`);
 	}
@@ -161,32 +259,44 @@ export async function resolveAndPromoteAttachments(
 	// Pass 2: promote to permanent storage + build the SES + DB payloads.
 	const sesAttachments: SesAttachmentInput[] = [];
 	const storedMetadata: StoredAttachment[] = [];
-	for (const s of sources) {
-		const attachmentId = crypto.randomUUID();
-		await bucket.put(attachmentKey(newEmailId, attachmentId, s.filename), s.bytes);
-		sesAttachments.push({
-			content: arrayBufferToBase64(s.bytes),
-			filename: s.filename,
-			type: s.mimetype,
-			disposition: s.disposition,
-		});
-		storedMetadata.push({
-			id: attachmentId,
-			email_id: newEmailId,
-			filename: s.filename,
-			mimetype: s.mimetype,
-			size: s.bytes.byteLength,
-			content_id: null,
-			disposition: s.disposition,
-		});
+	const destinationKeys: string[] = [];
+	try {
+		for (const s of sources) {
+			const attachmentId = crypto.randomUUID();
+			const destinationKey = attachmentKey(
+				newEmailId,
+				attachmentId,
+				s.filename,
+			);
+			await bucket.put(destinationKey, s.bytes);
+			destinationKeys.push(destinationKey);
+			sesAttachments.push({
+				content: arrayBufferToBase64(s.bytes),
+				filename: s.filename,
+				type: s.mimetype,
+				disposition: s.disposition,
+			});
+			storedMetadata.push({
+				id: attachmentId,
+				email_id: newEmailId,
+				filename: s.filename,
+				mimetype: s.mimetype,
+				size: s.bytes.byteLength,
+				content_id: null,
+				disposition: s.disposition,
+			});
+		}
+	} catch (error) {
+		await cleanupOrQueue(bucket, stub, newEmailId, destinationKeys, actor);
+		throw error;
 	}
 
-	// Best-effort staging cleanup; the R2 lifecycle rule on `uploads/` is the backstop.
-	await Promise.all(
-		sources
-			.filter((s) => s.stagingKey)
-			.map((s) => bucket.delete(s.stagingKey!).catch(() => {})),
-	);
-
-	return { sesAttachments, storedMetadata };
+	return {
+		sesAttachments,
+		storedMetadata,
+		stagingKeys: sources.flatMap((source) =>
+			source.stagingKey ? [source.stagingKey] : [],
+		),
+		destinationKeys,
+	};
 }

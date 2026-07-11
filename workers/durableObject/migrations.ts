@@ -186,6 +186,235 @@ export const mailboxMigrations: Migration[] = [
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-        `,
+		`,
+	},
+	{
+		name: "10_add_safe_trash_and_activity_events",
+		sql: txn(`
+			ALTER TABLE emails ADD COLUMN previous_folder_id TEXT;
+			ALTER TABLE emails ADD COLUMN trashed_at TEXT;
+
+			CREATE TABLE activity_events (
+				id TEXT PRIMARY KEY,
+				actor_kind TEXT NOT NULL,
+				actor_id TEXT,
+				action TEXT NOT NULL,
+				entity_type TEXT NOT NULL,
+				entity_id TEXT NOT NULL,
+				metadata_json TEXT,
+				occurred_at TEXT NOT NULL
+			);
+
+			CREATE INDEX idx_activity_events_entity
+				ON activity_events(entity_type, entity_id, occurred_at DESC);
+			CREATE INDEX idx_activity_events_occurred_at
+				ON activity_events(occurred_at DESC);
+		`),
+	},
+	{
+		name: "11_add_truthful_outbox_storage",
+		sql: txn(`
+			-- Preserve a user-created folder that already owns the reserved ID,
+			-- including every message that references it.
+			DROP TABLE IF EXISTS _outbox_folder_map;
+			CREATE TABLE _outbox_folder_map (
+				old_id TEXT PRIMARY KEY,
+				new_id TEXT NOT NULL UNIQUE,
+				new_name TEXT NOT NULL UNIQUE,
+				is_deletable INTEGER NOT NULL
+			);
+			INSERT INTO _outbox_folder_map
+				(old_id, new_id, new_name, is_deletable)
+			SELECT id,
+				'outbox_legacy_' || lower(hex(randomblob(8))),
+				name || ' (Legacy ' || lower(hex(randomblob(8))) || ')',
+				is_deletable
+			FROM folders
+			WHERE id = 'outbox';
+
+			INSERT INTO folders (id, name, is_deletable)
+			SELECT new_id, new_name, is_deletable
+			FROM _outbox_folder_map;
+			UPDATE emails
+			SET folder_id = (
+				SELECT new_id FROM _outbox_folder_map WHERE old_id = 'outbox'
+			)
+			WHERE folder_id = 'outbox';
+			DELETE FROM folders WHERE id = 'outbox';
+
+			-- Preserve a custom folder that already uses the reserved display name.
+			UPDATE folders
+			SET name = 'Outbox (Legacy ' || lower(hex(randomblob(8))) || ')'
+			WHERE name = 'Outbox';
+
+			INSERT INTO folders (id, name, is_deletable)
+			VALUES ('outbox', 'Outbox', 0)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				is_deletable = 0;
+			DROP TABLE _outbox_folder_map;
+
+			ALTER TABLE emails
+				ADD COLUMN draft_version INTEGER NOT NULL DEFAULT 1;
+
+			CREATE TABLE outbound_deliveries (
+				id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL UNIQUE,
+				source_draft_id TEXT,
+				source_draft_version INTEGER,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				kind TEXT NOT NULL,
+				source TEXT NOT NULL,
+				actor_kind TEXT NOT NULL,
+				actor_id TEXT,
+				status TEXT NOT NULL,
+				available_at TEXT NOT NULL,
+				undo_until TEXT NOT NULL,
+				scheduled_for TEXT,
+				next_attempt_at TEXT,
+				attempt_count INTEGER NOT NULL DEFAULT 0,
+				max_attempts INTEGER NOT NULL DEFAULT 4,
+				lease_token TEXT,
+				lease_expires_at TEXT,
+				ses_message_id TEXT,
+				last_error_code TEXT,
+				last_error_message TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				sent_at TEXT,
+				failed_at TEXT,
+				unknown_at TEXT,
+				cancelled_at TEXT,
+				FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE RESTRICT
+			);
+
+			CREATE TABLE outbound_delivery_attempts (
+				id TEXT PRIMARY KEY,
+				delivery_id TEXT NOT NULL,
+				attempt_number INTEGER NOT NULL,
+				status TEXT NOT NULL,
+				lease_token TEXT NOT NULL,
+				started_at TEXT NOT NULL,
+				finished_at TEXT,
+				ses_message_id TEXT,
+				http_status INTEGER,
+				error_code TEXT,
+				error_message TEXT,
+				FOREIGN KEY(delivery_id) REFERENCES outbound_deliveries(id) ON DELETE CASCADE,
+				UNIQUE(delivery_id, attempt_number)
+			);
+
+			CREATE INDEX idx_outbound_deliveries_status_available
+				ON outbound_deliveries(status, available_at);
+			CREATE INDEX idx_outbound_deliveries_status_next_attempt
+				ON outbound_deliveries(status, next_attempt_at);
+			CREATE INDEX idx_outbound_deliveries_source_draft
+				ON outbound_deliveries(source_draft_id);
+			CREATE INDEX idx_outbound_deliveries_scheduled_for
+				ON outbound_deliveries(scheduled_for);
+			CREATE INDEX idx_outbound_deliveries_status_lease
+				ON outbound_deliveries(status, lease_expires_at);
+			CREATE INDEX idx_outbound_deliveries_ses_message_id
+				ON outbound_deliveries(ses_message_id);
+			CREATE INDEX idx_outbound_attempts_delivery
+				ON outbound_delivery_attempts(delivery_id, attempt_number);
+		`),
+	},
+	{
+		name: "12_scope_push_subscriptions_to_users",
+		sql: txn(`
+			ALTER TABLE push_subscriptions ADD COLUMN user_id TEXT;
+			-- Legacy endpoint capabilities have no trustworthy user identity. Drop
+			-- them fail-closed; the authenticated client rebinds the browser's
+			-- existing PushSubscription without prompting for permission again.
+			DELETE FROM push_subscriptions WHERE user_id IS NULL;
+			CREATE INDEX idx_push_subscriptions_user_id
+				ON push_subscriptions(user_id);
+		`),
+	},
+	{
+		name: "13_index_truthful_outbox_runtime_queries",
+		sql: txn(`
+			CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_status_lease
+				ON outbound_deliveries(status, lease_expires_at);
+			CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_ses_message_id
+				ON outbound_deliveries(ses_message_id);
+		`),
+	},
+	{
+		name: "14_add_retired_outbound_folder",
+		sql: txn(`
+			-- Preserve a user-created folder that already owns the reserved ID,
+			-- including every message that references it.
+			DROP TABLE IF EXISTS _retired_outbound_folder_map;
+			CREATE TABLE _retired_outbound_folder_map (
+				old_id TEXT PRIMARY KEY,
+				new_id TEXT NOT NULL UNIQUE,
+				new_name TEXT NOT NULL UNIQUE,
+				is_deletable INTEGER NOT NULL
+			);
+			INSERT INTO _retired_outbound_folder_map
+				(old_id, new_id, new_name, is_deletable)
+			SELECT id,
+				'_cancelled_outbound_legacy_' || lower(hex(randomblob(8))),
+				name || ' (Legacy ' || lower(hex(randomblob(8))) || ')',
+				is_deletable
+			FROM folders
+			WHERE id = '_cancelled_outbound';
+
+			INSERT INTO folders (id, name, is_deletable)
+			SELECT new_id, new_name, is_deletable
+			FROM _retired_outbound_folder_map;
+			UPDATE emails
+			SET folder_id = (
+				SELECT new_id FROM _retired_outbound_folder_map
+				WHERE old_id = '_cancelled_outbound'
+			)
+			WHERE folder_id = '_cancelled_outbound';
+			DELETE FROM folders WHERE id = '_cancelled_outbound';
+
+			-- Preserve a custom folder that already uses the reserved display name.
+			UPDATE folders
+			SET name = 'Retired Outbound Snapshots (Legacy ' ||
+				lower(hex(randomblob(8))) || ')'
+			WHERE name = 'Retired Outbound Snapshots';
+
+			INSERT INTO folders (id, name, is_deletable)
+			VALUES ('_cancelled_outbound', 'Retired Outbound Snapshots', 0)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				is_deletable = 0;
+			DROP TABLE _retired_outbound_folder_map;
+		`),
+	},
+	{
+		name: "15_add_mailbox_labels",
+		sql: txn(`
+			CREATE TABLE labels (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				normalized_name TEXT NOT NULL UNIQUE,
+				color TEXT NOT NULL CHECK (color IN (
+					'gray', 'red', 'orange', 'yellow', 'green',
+					'teal', 'blue', 'purple', 'pink'
+				)),
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE TABLE email_labels (
+				email_id TEXT NOT NULL,
+				label_id TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				PRIMARY KEY (email_id, label_id),
+				FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE,
+				FOREIGN KEY(label_id) REFERENCES labels(id) ON DELETE CASCADE
+			);
+
+			CREATE INDEX idx_email_labels_label_id
+				ON email_labels(label_id, email_id);
+			CREATE INDEX idx_email_labels_email_id
+				ON email_labels(email_id, label_id);
+		`),
 	},
 ];

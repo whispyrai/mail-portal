@@ -8,16 +8,21 @@ import {
 	CaretLeftIcon,
 	FileIcon,
 	FolderIcon,
+	HourglassMediumIcon,
 	PaperPlaneTiltIcon,
 	PencilSimpleIcon,
 	PlusIcon,
+	TagIcon,
 	TrashIcon,
 	TrayIcon,
 } from "@phosphor-icons/react";
 import { useMemo, useState } from "react";
-import { NavLink, useNavigate, useParams } from "react-router";
+import { NavLink, useNavigate, useParams, useSearchParams } from "react-router";
 import { Folders, SYSTEM_FOLDER_IDS } from "shared/folders";
+import ManageLabelsDialog from "~/components/labels/ManageLabelsDialog";
+import SavedViewsSidebarSection from "~/components/SavedViewsSidebarSection";
 import { useCreateFolder, useFolders } from "~/queries/folders";
+import { useLabels } from "~/queries/labels";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
 
@@ -25,6 +30,7 @@ const FOLDER_ICONS: Record<string, React.ReactNode> = {
 	[Folders.INBOX]: <TrayIcon size={18} weight="regular" />,
 	[Folders.SENT]: <PaperPlaneTiltIcon size={18} weight="regular" />,
 	[Folders.DRAFT]: <FileIcon size={18} weight="regular" />,
+	[Folders.OUTBOX]: <HourglassMediumIcon size={18} weight="regular" />,
 	[Folders.ARCHIVE]: <ArchiveIcon size={18} weight="regular" />,
 	[Folders.TRASH]: <TrashIcon size={18} weight="regular" />,
 };
@@ -33,6 +39,7 @@ const SYSTEM_FOLDER_LINKS = [
 	{ id: Folders.INBOX, label: "Inbox" },
 	{ id: Folders.SENT, label: "Sent" },
 	{ id: Folders.DRAFT, label: "Drafts" },
+	{ id: Folders.OUTBOX, label: "Outbox" },
 	{ id: Folders.ARCHIVE, label: "Archive" },
 	{ id: Folders.TRASH, label: "Trash" },
 ];
@@ -43,6 +50,7 @@ interface FolderLinkProps {
 	label: string;
 	unreadCount?: number;
 	onClick?: () => void;
+	active?: boolean;
 }
 
 function FolderLink({
@@ -51,6 +59,7 @@ function FolderLink({
 	label,
 	unreadCount,
 	onClick,
+	active,
 }: FolderLinkProps) {
 	return (
 		<NavLink
@@ -58,7 +67,7 @@ function FolderLink({
 			onClick={onClick}
 			className={({ isActive }) =>
 				`flex items-center gap-3 py-2 px-3 rounded-md text-sm transition-colors ${
-					isActive
+					(active ?? isActive)
 						? "bg-kumo-fill font-semibold text-kumo-default"
 						: "text-kumo-strong hover:bg-kumo-tint"
 				}`
@@ -74,18 +83,27 @@ function FolderLink({
 }
 
 export default function Sidebar() {
-	const { mailboxId } = useParams<{ mailboxId: string }>();
+	const { mailboxId, folder: currentFolder } = useParams<{
+		mailboxId: string;
+		folder: string;
+	}>();
+	const [searchParams] = useSearchParams();
 	const navigate = useNavigate();
 	const { data: folders = [] } = useFolders(mailboxId);
+	const { data: labels = [] } = useLabels(mailboxId);
 	const createFolderMutation = useCreateFolder();
 	const { startCompose, closeSidebar } = useUIStore();
 	const { data: currentMailbox } = useMailbox(mailboxId);
 	const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
+	const [isManageLabelsOpen, setIsManageLabelsOpen] = useState(false);
 	const [newFolderName, setNewFolderName] = useState("");
+	const selectedLabelId = searchParams.get("label_id");
 
 	const customFolders = useMemo(
 		() =>
-			folders.filter((f) => !(SYSTEM_FOLDER_IDS as readonly string[]).includes(f.id)),
+			folders.filter(
+				(f) => !(SYSTEM_FOLDER_IDS as readonly string[]).includes(f.id),
+			),
 		[folders],
 	);
 
@@ -166,6 +184,7 @@ export default function Sidebar() {
 						icon={FOLDER_ICONS[folder.id]}
 						label={folder.label}
 						unreadCount={getUnreadCount(folder.id)}
+						active={!selectedLabelId && folder.id === currentFolder}
 						onClick={handleNavClick}
 					/>
 				))}
@@ -195,6 +214,7 @@ export default function Sidebar() {
 								icon={<FolderIcon size={18} />}
 								label={folder.name}
 								unreadCount={folder.unreadCount}
+								active={!selectedLabelId && folder.id === currentFolder}
 								onClick={handleNavClick}
 							/>
 						))}
@@ -221,7 +241,64 @@ export default function Sidebar() {
 						</div>
 					</div>
 				)}
+
+				{mailboxId && (
+					<SavedViewsSidebarSection
+						mailboxId={mailboxId}
+						onNavigate={handleNavClick}
+					/>
+				)}
+
+				<div className="pt-5">
+					<div className="flex items-center justify-between px-3 mb-1.5">
+						<span className="text-xs uppercase tracking-wider font-semibold text-kumo-subtle">
+							Labels
+						</span>
+						<Tooltip content="Manage labels" asChild>
+							<Button
+								variant="ghost"
+								shape="square"
+								size="sm"
+								icon={<PlusIcon size={16} />}
+								onClick={() => setIsManageLabelsOpen(true)}
+								aria-label="Manage mailbox labels"
+							/>
+						</Tooltip>
+					</div>
+					{labels.map((label) => (
+						<FolderLink
+							key={label.id}
+							to={`/mailbox/${mailboxId}/emails/${currentFolder || Folders.INBOX}?label_id=${encodeURIComponent(label.id)}`}
+							icon={
+								<TagIcon
+									size={18}
+									weight={selectedLabelId === label.id ? "fill" : "regular"}
+								/>
+							}
+							label={label.name}
+							active={selectedLabelId === label.id}
+							onClick={handleNavClick}
+						/>
+					))}
+					{labels.length === 0 && (
+						<button
+							type="button"
+							className="w-full rounded-md px-3 py-2 text-left text-sm text-kumo-subtle hover:bg-kumo-tint"
+							onClick={() => setIsManageLabelsOpen(true)}
+						>
+							Create your first label
+						</button>
+					)}
+				</div>
 			</nav>
+
+			{mailboxId && (
+				<ManageLabelsDialog
+					mailboxId={mailboxId}
+					open={isManageLabelsOpen}
+					onOpenChange={setIsManageLabelsOpen}
+				/>
+			)}
 
 			{/* Create folder dialog */}
 			<Dialog.Root

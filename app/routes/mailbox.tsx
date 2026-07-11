@@ -9,8 +9,11 @@ import { Outlet, useParams } from "react-router";
 import AgentSidebar from "~/components/AgentSidebar";
 import ComposeEmail from "~/components/ComposeEmail";
 import Header from "~/components/Header";
+import MailKeyboardController from "~/components/MailKeyboardController";
+import MailCommandPalette from "~/components/MailCommandPalette";
 import Sidebar from "~/components/Sidebar";
 import { useMailNotifications } from "~/hooks/useMailNotifications";
+import { useRebindExistingPushSubscription } from "~/hooks/pwa/usePushSubscription";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
 
@@ -20,6 +23,7 @@ export default function MailboxRoute() {
 	useMailbox(mailboxId);
 	// New-mail toasts + unread tab-title counter, scoped to this mailbox.
 	useMailNotifications(mailboxId);
+	useRebindExistingPushSubscription(mailboxId);
 	const prevMailboxIdRef = useRef<string | undefined>(undefined);
 	const {
 		isSidebarOpen,
@@ -50,6 +54,8 @@ export default function MailboxRoute() {
 
 	return (
 		<div className="flex h-screen overflow-hidden">
+			<MailKeyboardController />
+			<MailCommandPalette />
 			{/* Mobile sidebar overlay backdrop */}
 			{isSidebarOpen && (
 				<div

@@ -78,6 +78,32 @@ export const AttachmentRefSchema = z.discriminatedUnion("kind", [
 	}),
 ]);
 
+export const SaveDraftRequestSchema = z
+	.object({
+		to: z.string().optional(),
+		cc: z.string().optional(),
+		bcc: z.string().optional(),
+		subject: z.string().optional(),
+		body: z.string(),
+		in_reply_to: z.string().optional(),
+		thread_id: z.string().optional(),
+		draft_id: z.string().optional(),
+		draft_version: z.number().int().min(1).optional(),
+		attachments: z
+			.array(AttachmentRefSchema)
+			.max(ATTACHMENT_LIMITS.maxFiles)
+			.optional(),
+	})
+	.refine(
+		(data) =>
+			(data.draft_id === undefined) ===
+			(data.draft_version === undefined),
+		{
+			message: "Draft ID and version must be provided together",
+			path: ["draft_version"],
+		},
+	);
+
 export const SendEmailRequestSchema = z
 	.object({
 		to: RecipientFieldSchema,
@@ -94,14 +120,32 @@ export const SendEmailRequestSchema = z
 		in_reply_to: z.string().optional(),
 		references: z.array(z.string()).optional(),
 		thread_id: z.string().optional(),
+		source_draft_id: z.string().optional(),
+		source_draft_version: z.number().int().min(1).optional(),
+		idempotency_key: z.string().min(8),
+		scheduled_for: z.string().datetime().optional(),
 	})
 	.refine((data) => data.html || data.text, {
 		message: "Either 'html' or 'text' must be provided",
-	});
+	})
+	.refine(
+		(data) =>
+			(data.source_draft_id === undefined) ===
+			(data.source_draft_version === undefined),
+		{
+			message: "Source draft ID and version must be provided together",
+			path: ["source_draft_version"],
+		},
+	);
 
 export const SendEmailResponseSchema = z.object({
+	deliveryId: z.string(),
 	id: z.string(),
+	emailId: z.string(),
 	status: z.string(),
+	undoUntil: z.string().datetime(),
+	scheduledFor: z.string().datetime().nullable(),
+	replayed: z.boolean(),
 });
 
 const P256dhSchema = z.string().refine(

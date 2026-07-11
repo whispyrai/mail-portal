@@ -158,6 +158,7 @@ export default function ThreadMessage({
 
 				<div className="md:ml-[42px]">
 					<EmailIframe
+						messageId={email.id}
 						body={rewriteInlineImages(
 							email.body || "",
 							mailboxId || "",

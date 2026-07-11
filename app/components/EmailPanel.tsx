@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { useKumoToastManager } from "@cloudflare/kumo";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { Folders } from "shared/folders";
 import EmailPanelDialogs from "~/components/email-panel/EmailPanelDialogs";
@@ -11,13 +11,18 @@ import EmailPanelHeader from "~/components/email-panel/EmailPanelHeader";
 import EmailPanelToolbar from "~/components/email-panel/EmailPanelToolbar";
 import SingleMessageView from "~/components/email-panel/SingleMessageView";
 import ThreadMessage from "~/components/email-panel/ThreadMessage";
+import LabelChip from "~/components/labels/LabelChip";
+import LabelPicker from "~/components/labels/LabelPicker";
+import OutboundDeliveryActions from "~/components/OutboundDeliveryActions";
 import { splitEmailList, toEmailListValue, getNonInlineAttachments } from "~/lib/utils";
 import api from "~/services/api";
-import { useAiDraftReply, useDeleteEmail, useEmail, useMoveEmail, useReplyToEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
+import { useAiDraftReply, useCancelOutboundDelivery, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
 import { useMailbox } from "~/queries/mailboxes";
+import { useLabels, useMutateLabels } from "~/queries/labels";
 import { useUIStore } from "~/hooks/useUIStore";
-import type { Email, Folder, Mailbox } from "~/types";
+import type { Email, Folder, Label, Mailbox } from "~/types";
+import { LogicalSendIdentity } from "~/lib/compose-send-identity";
 
 function EmailPanelSkeleton() {
 	return (
@@ -37,10 +42,15 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	};
 	const updateEmail = useUpdateEmail();
 	const deleteEmailMut = useDeleteEmail();
+	const discardDraftMut = useDiscardDraft();
+	const restoreEmailMut = useRestoreEmail();
 	const moveEmailMut = useMoveEmail();
 	const sendEmailMut = useSendEmail();
 	const replyMut = useReplyToEmail();
+	const cancelOutboundMut = useCancelOutboundDelivery();
 	const aiDraftMut = useAiDraftReply();
+	const mutateLabels = useMutateLabels();
+	const { data: labels = [] } = useLabels(mailboxId);
 	const { data: folders = [] } = useFolders(mailboxId) as { data?: Folder[] };
 	const { data: currentMailbox } = useMailbox(mailboxId) as {
 		data?: Mailbox;
@@ -49,10 +59,21 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const toastManager = useKumoToastManager();
 	const [isSending, setIsSending] = useState(false);
 	const [isDrafting, setIsDrafting] = useState(false);
+	const draftSendIdentityRef = useRef(new LogicalSendIdentity());
 	const [sourceViewEmail, setSourceViewEmail] = useState<Email | null>(null);
 	const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
 	const [previewImage, setPreviewImage] = useState<{ url: string; filename: string } | null>(null);
 	const isDraftFolder = folder === Folders.DRAFT;
+	const isOutboxFolder = folder === Folders.OUTBOX || email?.folder_id === Folders.OUTBOX;
+	const isTrashFolder = folder === Folders.TRASH || email?.folder_id === Folders.TRASH;
+	const { data: outboundDeliveries = [] } = useOutboundDeliveries(
+		mailboxId,
+		email ? [email] : [],
+		isOutboxFolder,
+	);
+	const outboundDelivery = outboundDeliveries.find(
+		(delivery) => delivery.emailId === emailId,
+	);
 
 	const threadReplies = useMemo(() => {
 		if (!threadRepliesRaw || !email) return [];
@@ -86,12 +107,51 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	}, [allMessages, draftMessageIds, currentMailbox?.email, email]);
 
 	const moveToFolders = useMemo(() => { const cur = folder || email?.folder_id; return folders.filter((f) => f.id !== cur); }, [folders, folder, email?.folder_id]);
+	const selectedLabelIds = useMemo(
+		() => new Set((email?.labels ?? []).map((label) => label.id)),
+		[email?.labels],
+	);
 
 	if (!email) return <EmailPanelSkeleton />;
 
 	const toggleStar = () => { if (mailboxId) updateEmail.mutate({ mailboxId, id: email.id, data: { starred: !email.starred } }); };
 	const handleMove = (folderId: string) => { if (mailboxId) { moveEmailMut.mutate({ mailboxId, id: email.id, folderId }); closePanel(); } };
-	const handleDelete = () => { if (mailboxId) { if (!window.confirm("Are you sure you want to delete this email?")) return; deleteEmailMut.mutate({ mailboxId, id: email.id }); closePanel(); } };
+	const handleDelete = () => {
+		if (!mailboxId) return;
+		const confirmed = window.confirm("Move this email to Trash?");
+		if (!confirmed) return;
+		deleteEmailMut.mutate(
+			{ mailboxId, id: email.id },
+			{
+				onSuccess: () => {
+					toastManager.add({ title: "Email moved to Trash" });
+					closePanel();
+				},
+				onError: () =>
+					toastManager.add({
+						title: "Failed to move email to Trash",
+						variant: "error",
+					}),
+			},
+		);
+	};
+	const handleRestore = () => {
+		if (!mailboxId) return;
+		restoreEmailMut.mutate(
+			{ mailboxId, id: email.id },
+			{
+				onSuccess: () => {
+					toastManager.add({ title: "Email restored" });
+					closePanel();
+				},
+				onError: () =>
+					toastManager.add({
+						title: "Failed to restore email",
+						variant: "error",
+					}),
+			},
+		);
+	};
 
 	const handleEditDraft = (draftMsg?: Email) => {
 		const target = draftMsg || email;
@@ -103,9 +163,20 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		const target = draftMsg || email;
 		if (!mailboxId) return;
 		if (!window.confirm("Discard this draft?")) return;
-		deleteEmailMut.mutate({ mailboxId, id: target.id });
-		toastManager.add({ title: "Draft discarded" });
-		if (target.id === emailId) closePanel();
+		discardDraftMut.mutate(
+			{ mailboxId, id: target.id },
+			{
+				onSuccess: () => {
+					toastManager.add({ title: "Draft discarded" });
+					if (target.id === emailId) closePanel();
+				},
+				onError: () =>
+					toastManager.add({
+						title: "Failed to discard draft",
+						variant: "error",
+					}),
+			},
+		);
 	};
 
 	const handleSendDraft = async (draftMsg?: Email) => {
@@ -113,8 +184,10 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		if (!mailboxId || !currentMailbox) return;
 		setIsSending(true);
 		try {
-			if (!target.recipient || !target.subject) { try { const fresh = await api.getEmail(mailboxId, target.id) as Email; if (fresh) target = fresh; } catch {} }
+			const fresh = await api.getEmail(mailboxId, target.id) as Email;
+			if (fresh) target = fresh;
 			if (!target.recipient) { toastManager.add({ title: "Cannot send: no recipient set on this draft.", variant: "error" }); return; }
+			if (!target.draft_version) { toastManager.add({ title: "Reload this draft before sending it.", variant: "error" }); return; }
 			const toRecipients = splitEmailList(target.recipient);
 			if (toRecipients.length === 0) { toastManager.add({ title: "Cannot send: no valid recipient set on this draft.", variant: "error" }); return; }
 			const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
@@ -124,7 +197,9 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			const attachmentRefs = getNonInlineAttachments(target.attachments).map(
 				(a) => ({ kind: "existing" as const, emailId: target.id, attachmentId: a.id }),
 			);
-			const emailData = {
+			const sendPayload = {
+				source_draft_id: target.id,
+				source_draft_version: target.draft_version,
 				to: toEmailListValue(toRecipients),
 				cc: toEmailListValue(splitEmailList(target.cc)),
 				bcc: toEmailListValue(splitEmailList(target.bcc)),
@@ -134,9 +209,36 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				text: target.body ? target.body.replace(/<[^>]*>/g, "").trim() : "",
 				attachments: attachmentRefs,
 			};
-			if (originalEmail) await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
-			await deleteEmailMut.mutateAsync({ mailboxId, id: target.id });
-			toastManager.add({ title: "Email sent!" });
+			const emailData = {
+				...sendPayload,
+				idempotency_key: draftSendIdentityRef.current.keyFor(sendPayload),
+			};
+			const result = originalEmail
+				? await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData })
+				: await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+			toastManager.add({
+				title: "Email queued. Draft kept until delivery is confirmed.",
+				timeout: 10_000,
+				actions: [
+					{
+						children: "Undo",
+						variant: "secondary",
+						size: "sm",
+						onClick: () =>
+							cancelOutboundMut.mutate(
+								{ mailboxId, deliveryId: result.deliveryId },
+								{
+									onSuccess: () => toastManager.add({ title: "Send cancelled" }),
+									onError: (error) =>
+										toastManager.add({
+											title: error instanceof Error ? error.message : "Could not cancel send",
+											variant: "error",
+										}),
+								},
+							),
+					},
+				],
+			});
 			if (isDraftFolder) closePanel();
 		} catch (err) {
 			const message = (err instanceof Error ? err.message : null) || "Failed to send email.";
@@ -182,6 +284,33 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		}
 	};
 
+	const handleLabelToggle = (label: Label, selected: boolean) => {
+		const folderId = email.folder_id ?? folder;
+		if (!mailboxId || !folderId) return;
+		mutateLabels.mutate(
+			{
+				mailboxId,
+				labelId: label.id,
+				action: selected ? "apply" : "remove",
+				targets: [{ emailId: email.id, folderId }],
+			},
+			{
+				onSuccess: (result) => {
+					const outcome = result.results[0];
+					toastManager.add({
+						title: outcome?.status === "updated"
+							? `${selected ? "Applied" : "Removed"} ${label.name}`
+							: outcome?.status === "outbound_delivery_active"
+								? "Labels cannot change while delivery is active"
+								: "This message is no longer available in this folder",
+						variant: outcome?.status === "updated" ? undefined : "error",
+					});
+				},
+				onError: () => toastManager.add({ title: "Label change failed", variant: "error" }),
+			},
+		);
+	};
+
 	const hasThread = allMessages.length > 1;
 
 	return (
@@ -190,6 +319,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				email={email}
 				mailboxId={mailboxId}
 				isDraftFolder={isDraftFolder}
+				isOutboxFolder={isOutboxFolder}
 				isSending={isSending}
 				isDrafting={isDrafting}
 				moveToFolders={moveToFolders}
@@ -219,14 +349,42 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				}}
 				onMove={handleMove}
 				onViewSource={() => setSourceViewEmail(email)}
-				onDelete={handleDelete}
+				onDelete={isDraftFolder ? () => handleDeleteDraft() : handleDelete}
+				onRestore={handleRestore}
+				isTrashFolder={isTrashFolder}
 			/>
+
+			{isOutboxFolder && mailboxId && outboundDelivery && (
+				<div className="border-b border-kumo-line bg-kumo-tint px-4 py-3 md:px-6">
+					<OutboundDeliveryActions
+						mailboxId={mailboxId}
+						delivery={outboundDelivery}
+					/>
+				</div>
+			)}
 
 			<EmailPanelHeader
 				subject={email.subject}
 				messageCount={allMessages.length}
 				showThreadCount={hasThread}
 			/>
+
+			<div className="flex min-h-12 flex-wrap items-center gap-2 border-b border-kumo-line px-4 py-2 md:px-6">
+				<span className="text-xs font-semibold uppercase tracking-wide text-kumo-subtle">Labels</span>
+				{(email.labels ?? []).map((label) => <LabelChip key={label.id} label={label} />)}
+				{(email.labels ?? []).length === 0 && (
+					<span className="text-sm text-kumo-subtle">None</span>
+				)}
+				<div className="ms-auto">
+					<LabelPicker
+						labels={labels}
+						selectedIds={selectedLabelIds}
+						onToggle={handleLabelToggle}
+						disabled={mutateLabels.isPending}
+						buttonLabel="Edit labels"
+					/>
+				</div>
+			</div>
 
 			<div className="flex-1 overflow-y-auto">
 				{hasThread ? (
