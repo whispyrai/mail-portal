@@ -78,4 +78,4 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Next gate
 
-The reviewed Files slice is ready for checkpoint after `517e432`. Build the permission-aware projection and change-feed substrate next so semantic search, mail-derived People and relationship intelligence, Automation Rules, reliable realtime, and offline reconciliation can share one bounded authorization-aware source of truth. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
+The reviewed Files slice is checkpointed at `c979282`. Build the permission-aware projection and change-feed substrate next so semantic search, mail-derived People and relationship intelligence, Automation Rules, reliable realtime, and offline reconciliation can share one bounded authorization-aware source of truth. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
