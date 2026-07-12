@@ -80,7 +80,7 @@ Status: in progress
 - Incremental conversation summaries and semantic indexing.
 - Natural-language and semantic search with Message/attachment citations.
 - Evidence-backed follow-up and Commitment insights.
-- Versioned rules with dry run, explanation, audit, retry, and loop prevention.
+- Versioned inbound-only deterministic rules with dry run, explanation, audit, retry, loop prevention, retained tests, and restore-as-draft are implemented.
 - AI approval inbox, policy scopes, run history, evaluation datasets, budgets, and alerts.
 - Preserve MCP/future CLI behind the same policy layer.
 
@@ -88,9 +88,9 @@ Exit: every AI result is permission-filtered, attributable, explainable, measure
 
 ## Phase 5: standalone mail intelligence graph
 
-Status: pending
+Status: in progress
 
-- Mail-derived people, domains/organizations, relationship timelines, related Conversations, and attachment context.
+- Mail-derived People, relationship timelines, related Conversations, attachment context, and cited actor-private Relationship Briefs are implemented; explicit alias correction and domain views remain pending.
 - Permission-aware semantic retrieval over portal-owned mail and files.
 - Evidence, correction, invalidation, and provenance for derived facts.
 - No integration with Whispyr CRM or WiserChat application code or data.
