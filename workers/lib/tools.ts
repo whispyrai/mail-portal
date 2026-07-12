@@ -35,6 +35,7 @@ import type {
 	OutboundDeliveryStatus,
 	OutboundDeliverySource,
 } from "./outbound-delivery-contract.ts";
+import { validateResolvedInlineImages } from "./inline-image-authority.ts";
 
 // ── Type casts for DO methods not on the base stub type ────────────
 type MailboxSearchStub = {
@@ -219,6 +220,8 @@ export async function toolDraftReply(
 	if (params.isPlainText) {
 		processedBody = textToHtml(processedBody);
 	}
+	const inlineMapping = validateResolvedInlineImages(processedBody, []);
+	if (!inlineMapping.ok) return { error: inlineMapping.error };
 
 	const draftId = crypto.randomUUID();
 
@@ -301,6 +304,8 @@ export async function toolDraftEmail(
 	if (params.isPlainText) {
 		processedBody = textToHtml(processedBody);
 	}
+	const inlineMapping = validateResolvedInlineImages(processedBody, []);
+	if (!inlineMapping.ok) return { error: inlineMapping.error };
 
 	const draftId = crypto.randomUUID();
 
@@ -376,6 +381,11 @@ export async function toolUpdateDraft(
 	if (!verifiedBody) {
 		return { error: "Draft verification failed — keeping existing draft unchanged. Please try again." };
 	}
+	const inlineMapping = validateResolvedInlineImages(
+		verifiedBody,
+		oldDraft.attachments ?? [],
+	);
+	if (!inlineMapping.ok) return { error: inlineMapping.error };
 
 	const result = await stub.updateDraft(
 		params.draftId,
@@ -455,12 +465,27 @@ export async function toolDiscardDraft(
 	actor: ActivityActor = { kind: "system" },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	const result = await stub.discardDraft(draftId, actor);
+	const draft = await stub.getEmail(draftId);
+	if (!draft) return { error: "Draft not found" };
+	if (draft.folder_id !== Folders.DRAFT) {
+		return { error: "Cannot discard: email is not a draft" };
+	}
+	const result = await stub.discardDraft(
+		draftId,
+		draft.draft_version ?? 1,
+		actor,
+	);
 	if (result === null) {
 		return { error: "Draft not found" };
 	}
 	if (result.status === "not_draft") {
 		return { error: "Cannot discard: email is not a draft" };
+	}
+	if (result.status === "version_conflict") {
+		return {
+			error: "Draft changed before it could be discarded. Retry with the latest draft.",
+			currentVersion: result.currentVersion,
+		};
 	}
 	if (result.attachments.length > 0) {
 		const keys = result.attachments.map((attachment) =>
@@ -547,6 +572,8 @@ export async function toolSendReply(
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
+	const inlineMapping = validateResolvedInlineImages(sanitizedBody, []);
+	if (!inlineMapping.ok) return { error: inlineMapping.error };
 	const quotedBlock = buildQuotedReplyBlock({
 		date: originalEmail.date,
 		sender: originalEmail.sender || params.to,
@@ -627,6 +654,8 @@ export async function toolSendEmail(
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
+	const inlineMapping = validateResolvedInlineImages(sanitizedBody, []);
+	if (!inlineMapping.ok) return { error: inlineMapping.error };
 
 	const { requestedAt, undoUntil } = outboundTiming();
 	const result = await (stub as unknown as OutboundEnqueueStub).enqueueOutbound(

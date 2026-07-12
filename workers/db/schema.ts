@@ -36,11 +36,16 @@ export const emails = sqliteTable("emails", {
 	thread_id: text("thread_id"),
 	message_id: text("message_id"),
 	raw_headers: text("raw_headers"),
+	recipient_memory_origin: text("recipient_memory_origin", {
+		enum: ["live_inbound", "accepted_outbound", "admin_import"],
+	}),
 	previous_folder_id: text("previous_folder_id"),
 	trashed_at: text("trashed_at"),
 	snooze_source_folder_id: text("snooze_source_folder_id"),
 	snoozed_until: text("snoozed_until"),
 	draft_version: integer("draft_version").notNull().default(1),
+	draft_create_key: text("draft_create_key"),
+	draft_create_fingerprint: text("draft_create_fingerprint"),
 });
 
 export const snoozeReplyWakeQueue = sqliteTable("snooze_reply_wake_queue", {
@@ -67,6 +72,37 @@ export const followUpReplyCompletionQueue = sqliteTable(
 		),
 	],
 );
+
+export const recipientInteractions = sqliteTable(
+	"recipient_interactions",
+	{
+		source_email_id: text("source_email_id")
+			.notNull()
+			.references(() => emails.id, { onDelete: "cascade" }),
+		address: text("address").notNull(),
+		direction: text("direction", { enum: ["sent", "received"] }).notNull(),
+		occurred_at: text("occurred_at").notNull(),
+	},
+	(table) => [
+		primaryKey({
+			columns: [table.source_email_id, table.address, table.direction],
+		}),
+		index("idx_recipient_interactions_address").on(
+			table.address,
+			table.direction,
+			table.occurred_at,
+		),
+		index("idx_recipient_interactions_occurred").on(
+			table.occurred_at,
+			table.address,
+		),
+	],
+);
+
+export const recipientInteractionMeta = sqliteTable("recipient_interaction_meta", {
+	key: text("key").primaryKey(),
+	value: text("value").notNull(),
+});
 
 export const attachments = sqliteTable("attachments", {
 	id: text("id").primaryKey(),

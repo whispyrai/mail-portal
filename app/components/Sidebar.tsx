@@ -5,6 +5,7 @@
 import { Badge, Button, Dialog, Input, Tooltip } from "@cloudflare/kumo";
 import {
 	ArchiveIcon,
+	CalendarCheckIcon,
 	CaretLeftIcon,
 	ClockIcon,
 	FileIcon,
@@ -180,6 +181,13 @@ export default function Sidebar() {
 
 			{/* Navigation */}
 			<nav className="flex-1 overflow-y-auto px-2 space-y-0.5">
+				<FolderLink
+					to={`/mailbox/${mailboxId}/today`}
+					icon={<CalendarCheckIcon size={18} weight="regular" />}
+					label="Today"
+					onClick={handleNavClick}
+				/>
+				<div className="my-2 border-t border-kumo-line" aria-hidden="true" />
 				{SYSTEM_FOLDER_LINKS.map((folder) => (
 					<FolderLink
 						key={folder.id}

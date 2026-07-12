@@ -10,6 +10,7 @@ import {
 	LinkSimpleIcon,
 	ListBulletsIcon,
 	ListNumbersIcon,
+	ImageIcon,
 	MinusIcon,
 	QuotesIcon,
 	TextBIcon,
@@ -19,37 +20,108 @@ import {
 } from "@phosphor-icons/react";
 import { Color } from "@tiptap/extension-color";
 import Highlight from "@tiptap/extension-highlight";
-import TiptapImage from "@tiptap/extension-image";
 import LinkExtension from "@tiptap/extension-link";
 import TextAlign from "@tiptap/extension-text-align";
 import { TextStyle } from "@tiptap/extension-text-style";
 import Underline from "@tiptap/extension-underline";
-import { EditorContent, useEditor } from "@tiptap/react";
+import { EditorContent, useEditor, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import { consumeComposeEditorFileTransfer } from "~/lib/compose-file-transfer";
+import {
+	MANAGED_INLINE_IMAGE_VERSION,
+	type InlineImageInsertion,
+} from "~/lib/compose-inline-images";
+import { InlineImagePreviewRegistry } from "~/lib/inline-image-preview-registry";
+import { ManagedInlineImage } from "./ManagedInlineImage";
 
 interface RichTextEditorProps {
 	value: string;
 	onChange: (value: string) => void;
+	onFiles?: (files: File[]) => void;
+	onInlineImages?: (files: File[]) => InlineImageInsertion[];
+	inlineImagePreviews?: Readonly<Record<string, string>>;
 }
 
 export default function RichTextEditor({
 	value,
 	onChange,
+	onFiles,
+	onInlineImages,
+	inlineImagePreviews = {},
 }: RichTextEditorProps) {
+	const onFilesRef = useRef(onFiles);
+	onFilesRef.current = onFiles;
+	const onInlineImagesRef = useRef(onInlineImages);
+	onInlineImagesRef.current = onInlineImages;
+	const editorRef = useRef<Editor | null>(null);
+	const imageInputRef = useRef<HTMLInputElement>(null);
+	const previewRegistryRef = useRef<InlineImagePreviewRegistry | null>(null);
+	if (!previewRegistryRef.current) {
+		previewRegistryRef.current = new InlineImagePreviewRegistry();
+	}
+	const previewRegistry = previewRegistryRef.current;
+
+	const insertInlineImages = useCallback(
+		(insertions: InlineImageInsertion[], position: number) => {
+			if (insertions.length === 0 || !editorRef.current) return;
+			editorRef.current
+				.chain()
+				.insertContentAt(position, insertions.map((insertion) => ({
+					type: "image",
+					attrs: {
+						src: `cid:${insertion.contentId}`,
+						alt: insertion.alt,
+						managed: MANAGED_INLINE_IMAGE_VERSION,
+					},
+				})))
+				.run();
+		},
+		[],
+	);
+
+	const consumeEditorFiles = useCallback((
+		event: ClipboardEvent | DragEvent,
+		position: number,
+	) => {
+		if (!onFilesRef.current && !onInlineImagesRef.current) return false;
+		const result = consumeComposeEditorFileTransfer(event, {
+			addInlineImages: (files) => {
+				if (onInlineImagesRef.current) return onInlineImagesRef.current(files);
+				onFilesRef.current?.(files);
+				return [];
+			},
+		});
+		if (result.consumed) insertInlineImages(result.inlineInsertions, position);
+		return result.consumed;
+	}, [insertInlineImages]);
+
 	const editor = useEditor({
 		extensions: [
 			StarterKit,
 			Underline,
 			TextAlign.configure({ types: ["heading", "paragraph"] }),
 			LinkExtension.configure({ openOnClick: false }),
-			TiptapImage,
+				ManagedInlineImage.configure({
+					inline: true,
+					previewRegistry,
+			}),
 			TextStyle,
 			Color,
 			Highlight.configure({ multicolor: true }),
 		],
 		content: value,
 		editorProps: {
+			handlePaste: (view, event) => {
+				return consumeEditorFiles(event, view.state.selection.from);
+			},
+			handleDrop: (view, event) => {
+				const position = view.posAtCoords({
+					left: event.clientX,
+					top: event.clientY,
+				})?.pos ?? view.state.selection.from;
+				return consumeEditorFiles(event, position);
+			},
 			attributes: {
 				"aria-label": "Message body",
 				class:
@@ -60,10 +132,15 @@ export default function RichTextEditor({
 			onChange(editor.getHTML());
 		},
 	});
+	editorRef.current = editor;
+
+	useEffect(() => {
+		previewRegistry.replace(inlineImagePreviews);
+	}, [inlineImagePreviews, previewRegistry]);
 
 	useEffect(() => {
 		if (editor && !editor.isDestroyed && value !== editor.getHTML()) {
-			editor.commands.setContent(value);
+			editor.commands.setContent(value, { emitUpdate: false });
 			// Place cursor at the start of the document (above quoted text)
 			const rafId = requestAnimationFrame(() => {
 				if (!editor.isDestroyed) {
@@ -203,6 +280,32 @@ export default function RichTextEditor({
 						aria-label="Horizontal rule"
 					/>
 				</Tooltip>
+				<Tooltip content="Insert image" side="bottom" asChild>
+					<Button
+						type="button"
+						variant="ghost"
+						shape="square"
+						size="sm"
+						icon={<ImageIcon size={16} />}
+						onClick={() => imageInputRef.current?.click()}
+						aria-label="Insert image"
+					/>
+				</Tooltip>
+				<input
+					ref={imageInputRef}
+					type="file"
+					accept="image/*"
+					multiple
+					className="hidden"
+					aria-label="Choose images to insert"
+					onChange={(event) => {
+						const files = Array.from(event.target.files ?? []);
+						const position = editor.state.selection.from;
+						const insertions = onInlineImagesRef.current?.(files) ?? [];
+						insertInlineImages(insertions, position);
+						event.target.value = "";
+					}}
+				/>
 
 				<div className="mx-1 h-5 w-px bg-kumo-fill" />
 

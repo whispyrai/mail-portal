@@ -46,11 +46,29 @@ function fixture(access: boolean | ((userId: string) => boolean) = true) {
 		baselineMessageDate: "2026-07-11T10:00:00.000Z",
 	};
 	const store: FollowUpReminderStore = {
-		async list(ownerUserId, mailboxAddress, limit) {
-			calls.push({ method: "list", args: [ownerUserId, mailboxAddress, limit] });
-			return [...rows.values()].filter(
-				(row) => row.ownerUserId === ownerUserId && row.mailboxAddress === mailboxAddress,
-			);
+		async list(input) {
+			calls.push({ method: "list", args: [input] });
+			const matching = [...rows.values()]
+				.filter(
+					(row) => row.ownerUserId === input.ownerUserId && row.mailboxAddress === input.mailboxAddress,
+				)
+				.filter((row) => {
+					if (!input.cursor) return true;
+					const due = Date.parse(row.remindAt);
+					return due > input.cursor.remindAt ||
+						(due === input.cursor.remindAt && row.id > input.cursor.id);
+				})
+				.sort((left, right) =>
+					Date.parse(left.remindAt) - Date.parse(right.remindAt) ||
+					left.id.localeCompare(right.id));
+			const page = matching.slice(0, input.limit);
+			const last = page.at(-1);
+			return {
+				reminders: page,
+				nextCursor: matching.length > input.limit && last
+					? { remindAt: Date.parse(last.remindAt), id: last.id }
+					: null,
+			};
 		},
 		async findCreateReplay(input) {
 			const prior = createKeys.get(`${input.ownerUserId}:${input.idempotencyKey}`);
@@ -172,7 +190,12 @@ test("personal reminders are owner scoped and require live mailbox access", asyn
 	await allowed.service.list("user-1", MAILBOX, 50);
 	assert.deepEqual(
 		allowed.calls.filter((call) => call.method === "list")[0]?.args,
-		["user-1", MAILBOX, 50],
+		[{
+			ownerUserId: "user-1",
+			mailboxAddress: MAILBOX,
+			limit: 50,
+			cursor: null,
+		}],
 	);
 
 	const denied = fixture(false);
@@ -181,6 +204,32 @@ test("personal reminders are owner scoped and require live mailbox access", asyn
 		(error: unknown) => error instanceof FollowUpReminderError && error.code === "FORBIDDEN",
 	);
 	assert.equal(denied.calls.some((call) => call.method === "createOrReplay"), false);
+});
+
+test("reminder list cursors are opaque, Unicode-safe, and recheck live access", async () => {
+	const state = fixture();
+	state.rows.set("first", reminder({ id: "first", conversationKey: "thread-first" }));
+	state.rows.set("réponse", reminder({ id: "réponse", conversationKey: "thread-unicode" }));
+	const firstPage = await state.service.list("user-1", MAILBOX, 1);
+	assert.equal(firstPage.reminders.length, 1);
+	assert.ok(firstPage.nextCursor);
+	const secondPage = await state.service.list(
+		"user-1",
+		MAILBOX,
+		1,
+		firstPage.nextCursor,
+	);
+	assert.equal(secondPage.reminders.length, 1);
+	assert.equal(secondPage.nextCursor, null);
+	assert.equal(
+		state.calls.filter((call) => call.method === "canAccessMailbox").length,
+		2,
+	);
+	await assert.rejects(
+		() => state.service.list("user-1", MAILBOX, 1, "not-a-real-cursor"),
+		(error: unknown) =>
+			error instanceof FollowUpReminderError && error.code === "INVALID",
+	);
 });
 
 test("create is bounded, idempotent, and allows one active reminder per personal conversation", async () => {

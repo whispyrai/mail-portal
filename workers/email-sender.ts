@@ -157,7 +157,9 @@ function buildSimpleContent(params: SendEmailParams): Record<string, unknown> {
 			// Force base64 in the MIME SES assembles. The default (SEVEN_BIT) mangles
 			// any non-7-bit payload — i.e. every PDF, image, or office document.
 			ContentTransferEncoding: "BASE64",
-			...(att.contentId ? { ContentId: att.contentId } : {}),
+			...(att.disposition === "inline" && att.contentId
+				? { ContentId: att.contentId }
+				: {}),
 		}));
 	}
 

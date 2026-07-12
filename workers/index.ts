@@ -32,6 +32,10 @@ import { sharedMailboxAdminApp } from "./routes/shared-mailbox-admin";
 import { savedViewsApp } from "./routes/saved-views";
 import { snoozeRoutes } from "./routes/snooze";
 import { conversationIntelligenceApp } from "./routes/conversation-intelligence";
+import { followUpReminderRoutes } from "./routes/follow-up-reminders";
+import { searchRoutes } from "./routes/search";
+import { recipientSuggestionRoutes } from "./routes/recipient-suggestions";
+import { mailboxSignatureSettingsRoutes } from "./routes/mailbox-signature-settings";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -67,6 +71,12 @@ import {
 	isAddressInConfiguredMailDomains,
 	normalizeMailAddress,
 } from "./lib/mail-address";
+import {
+	MailboxSettingsConflictError,
+	MailboxSettingsNotFoundError,
+	mergeGeneralMailboxSettings,
+	updateMailboxSettings,
+} from "./lib/mailbox-settings-store";
 
 type AppContext = Context<MailboxContext>;
 
@@ -77,6 +87,10 @@ const CreateMailboxBody = z.object({
 	name: z.string().min(1),
 	settings: z.record(z.any()).optional(), // unvalidated — agentSystemPrompt goes straight to AI
 });
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
 // -- Helpers --------------------------------------------------------
 
@@ -189,6 +203,10 @@ app.route("/api/v1/admin", sharedMailboxAdminApp);
 app.route("/", savedViewsApp);
 app.route("/", snoozeRoutes);
 app.route("/", conversationIntelligenceApp);
+app.route("/", followUpReminderRoutes);
+app.route("/", searchRoutes);
+app.route("/", recipientSuggestionRoutes);
+app.route("/", mailboxSignatureSettingsRoutes);
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");
@@ -275,14 +293,27 @@ app.get("/api/v1/mailboxes/:mailboxId", async (c) => {
 
 app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const mailboxId = c.req.param("mailboxId")!;
-	const { settings } = (await c.req.json()) as {
-		settings: Record<string, unknown>;
-	};
-	const key = `mailboxes/${mailboxId}.json`;
-	if (!(await c.env.BUCKET.head(key)))
-		return c.json({ error: "Not found" }, 404);
-	await c.env.BUCKET.put(key, JSON.stringify(settings));
-	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
+	const body = await c.req.json().catch(() => null);
+	const requested = isRecord(body) ? body.settings : null;
+	if (!isRecord(requested)) {
+		return c.json({ error: "Mailbox settings are invalid", code: "INVALID" }, 400);
+	}
+	try {
+		const settings = await updateMailboxSettings(
+			c.env.BUCKET,
+			mailboxId,
+			(current) => mergeGeneralMailboxSettings(current, requested),
+		);
+		return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
+	} catch (error) {
+		if (error instanceof MailboxSettingsNotFoundError) {
+			return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
+		}
+		if (error instanceof MailboxSettingsConflictError) {
+			return c.json({ error: error.message, code: "SETTINGS_CONFLICT" }, 409);
+		}
+		return c.json({ error: "Mailbox settings are unavailable", code: "SETTINGS_UNAVAILABLE" }, 500);
+	}
 });
 
 app.delete("/api/v1/mailboxes/:mailboxId", async (c: AppContext) => {
@@ -624,34 +655,6 @@ app.delete(
 		return ok ? c.body(null, 204) : c.json({ error: "Not found" }, 404);
 	},
 );
-
-// -- Search ---------------------------------------------------------
-
-app.get("/api/v1/mailboxes/:mailboxId/search", async (c: AppContext) => {
-	const searchOpts: Record<string, unknown> = {
-		query: c.req.query("query") || "",
-		folder: c.req.query("folder"),
-		label_id: c.req.query("label_id"),
-		from: c.req.query("from"),
-		to: c.req.query("to"),
-		subject: c.req.query("subject"),
-		date_start: c.req.query("date_start"),
-		date_end: c.req.query("date_end"),
-		is_read: boolQuery(c, "is_read"),
-		is_starred: boolQuery(c, "is_starred"),
-		has_attachment: boolQuery(c, "has_attachment"),
-		sortColumn: c.req.query("sortColumn"),
-		sortDirection: c.req.query("sortDirection"),
-	};
-	const stub = c.var.mailboxStub as any;
-	const emails = await stub.searchEmails({
-		...searchOpts,
-		page: intQuery(c, "page"),
-		limit: intQuery(c, "limit"),
-	});
-	const totalCount = await stub.countSearchResults(searchOpts);
-	return c.json({ emails, totalCount });
-});
 
 // -- Attachments ----------------------------------------------------
 

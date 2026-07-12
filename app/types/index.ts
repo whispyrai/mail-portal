@@ -98,8 +98,18 @@ export interface Attachment {
  * stored against another email (e.g. a draft being sent).
  */
 export type AttachmentRef =
-	| { kind: "upload"; uploadId: string }
-	| { kind: "existing"; emailId: string; attachmentId: string };
+	| {
+			kind: "upload";
+			uploadId: string;
+			disposition?: "attachment" | "inline";
+			contentId?: string;
+	  }
+	| {
+			kind: "existing";
+			emailId: string;
+			attachmentId: string;
+			disposition?: "attachment" | "inline";
+	  };
 
 export interface Folder {
 	id: string;
@@ -150,4 +160,5 @@ export interface OutboundEnqueueResponse {
 	undoUntil: string;
 	scheduledFor: string | null;
 	replayed: boolean;
+	outcome: "enqueued" | "active_replay" | "terminal_replay";
 }

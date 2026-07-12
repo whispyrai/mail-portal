@@ -12,6 +12,7 @@ import {
 } from "./lib/mail-address.ts";
 import { resolveBrand } from "./routes/brand.ts";
 import type { Env } from "./types.ts";
+import { RecipientMemoryOrigins } from "../shared/recipient-suggestions.ts";
 
 async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	if (streamSize > MAX_EMAIL_SIZE) {
@@ -87,6 +88,8 @@ export async function receiveEmail(
 		read: false,
 		wakeSnoozedOnReply: true,
 		followUpMailboxAddress: mailboxId,
+		mailboxAddress: mailboxId,
+		recipientMemoryOrigin: RecipientMemoryOrigins.LIVE_INBOUND,
 	});
 
 	ctx.waitUntil(

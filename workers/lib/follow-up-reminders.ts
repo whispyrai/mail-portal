@@ -78,8 +78,23 @@ export type ReminderStoreMutationResult =
 	| { status: "not_found" | "idempotency_conflict" }
 	| { status: "state_conflict"; reminder: FollowUpReminder };
 
+export type FollowUpReminderStoreCursor = {
+	remindAt: number;
+	id: string;
+};
+
+export type FollowUpReminderStorePage = {
+	reminders: FollowUpReminder[];
+	nextCursor: FollowUpReminderStoreCursor | null;
+};
+
 export interface FollowUpReminderStore {
-	list(ownerUserId: string, mailboxAddress: string, limit: number): Promise<FollowUpReminder[]>;
+	list(input: {
+		ownerUserId: string;
+		mailboxAddress: string;
+		limit: number;
+		cursor: FollowUpReminderStoreCursor | null;
+	}): Promise<FollowUpReminderStorePage>;
 	findCreateReplay(input: {
 		ownerUserId: string;
 		idempotencyKey: string;
@@ -139,6 +154,44 @@ function fingerprint(values: readonly unknown[]) {
 	return JSON.stringify(values);
 }
 
+const ReminderListCursorSchema = z.object({
+	remindAt: z.number().int().nonnegative(),
+	id: boundedId,
+}).strict();
+
+function decodeListCursor(cursor: string | undefined): FollowUpReminderStoreCursor | null {
+	if (cursor === undefined) return null;
+	if (cursor.length < 1 || cursor.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
+		throw new FollowUpReminderError("INVALID", "Reminder list cursor is invalid");
+	}
+	try {
+		const encoded = cursor.replace(/-/g, "+").replace(/_/g, "/");
+		const padding = "=".repeat((4 - encoded.length % 4) % 4);
+		const bytes = Uint8Array.from(
+			atob(encoded + padding),
+			(character) => character.charCodeAt(0),
+		);
+		const parsed = ReminderListCursorSchema.safeParse(
+			JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+		);
+		if (parsed.success) return parsed.data;
+	} catch {
+		// All malformed and non-canonical cursors share one stable public error.
+	}
+	throw new FollowUpReminderError("INVALID", "Reminder list cursor is invalid");
+}
+
+function encodeListCursor(cursor: FollowUpReminderStoreCursor | null): string | null {
+	if (!cursor) return null;
+	const bytes = new TextEncoder().encode(JSON.stringify(cursor));
+	let encoded = "";
+	for (const byte of bytes) encoded += String.fromCharCode(byte);
+	return btoa(encoded)
+		.replace(/\+/g, "-")
+		.replace(/\//g, "_")
+		.replace(/=+$/, "");
+}
+
 export function createFollowUpReminderService(
 	dependencies: FollowUpReminderServiceDependencies,
 ) {
@@ -165,11 +218,25 @@ export function createFollowUpReminderService(
 	}
 
 	return {
-		async list(userId: string, mailboxAddress: string, limit = 100) {
+		async list(
+			userId: string,
+			mailboxAddress: string,
+			limit = 100,
+			cursor?: string,
+		) {
 			const mailbox = mailboxAddress.toLowerCase();
 			await requireAccess(userId, mailbox);
 			const boundedLimit = z.number().int().min(1).max(100).parse(limit);
-			return dependencies.store.list(userId, mailbox, boundedLimit);
+			const page = await dependencies.store.list({
+				ownerUserId: userId,
+				mailboxAddress: mailbox,
+				limit: boundedLimit,
+				cursor: decodeListCursor(cursor),
+			});
+			return {
+				reminders: page.reminders,
+				nextCursor: encodeListCursor(page.nextCursor),
+			};
 		},
 
 		async create(userId: string, mailboxAddress: string, input: unknown) {

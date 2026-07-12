@@ -26,7 +26,27 @@ export type MailboxContext = {
 	};
 };
 
+/** Settings-only routes authorize themselves and must never resolve a mailbox DO. */
+export function bypassMailboxContentAuthorization(method: string, pathname: string): boolean {
+	const parts = pathname.split("/").filter(Boolean);
+	return (
+		method === "GET" &&
+		parts.length === 5 &&
+		parts[0] === "api" && parts[1] === "v1" && parts[2] === "mailboxes" &&
+		parts[4] === "settings"
+	) || (
+		method === "PATCH" &&
+		parts.length === 6 &&
+		parts[0] === "api" && parts[1] === "v1" && parts[2] === "mailboxes" &&
+		parts[4] === "settings" && parts[5] === "signature"
+	);
+}
+
 export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) => {
+	if (bypassMailboxContentAuthorization(c.req.method, new URL(c.req.url).pathname)) {
+		await next();
+		return;
+	}
 	const rawId = c.req.param("mailboxId");
 	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
 	const mailboxId = decodeURIComponent(rawId);

@@ -6,152 +6,325 @@
  * Composer attachment state for the upload-first model. Holds the unified list
  * of attachments (freshly picked files that upload to staging, plus files
  * hydrated from a reopened draft), validates against the shared limits, tracks
- * per-file upload status, and produces the lightweight references the send /
- * reply / draft endpoints expect.
+ * per-file upload status, and retains the source needed for explicit retries.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import api from "~/services/api";
-import { validateSingleFile, validateAttachmentSet } from "shared/attachments";
-import { getNonInlineAttachments } from "~/lib/utils";
-import type { Attachment, AttachmentRef } from "~/types";
+import {
+	recoverComposeAttachments,
+	reconcileSavedComposeAttachments,
+	type ComposeAttachmentRecord,
+} from "~/lib/compose-attachment-policy";
+import { planComposeAttachmentAdmission } from "~/lib/compose-attachment-admission";
+import { ComposeUploadAttemptRegistry } from "~/lib/compose-upload-attempts";
+import {
+	generateClientInlineContentId,
+	type InlineImageInsertion,
+} from "~/lib/compose-inline-images";
+import { ComposeInlinePreviewUrls } from "~/lib/compose-inline-preview-urls";
+import type { Attachment } from "~/types";
+import { isInlineImageMimeType } from "../../shared/content-id";
 
-export interface ComposeAttachment {
-	/** Stable client-side id for React keys and status updates. */
-	localId: string;
-	filename: string;
-	mimetype: string;
-	size: number;
-	status: "uploading" | "ready" | "error";
-	error?: string;
-	/** Set once a freshly picked file finishes uploading to staging. */
-	uploadId?: string;
-	/** Set when the chip came from a reopened draft (already stored in R2). */
-	existing?: { emailId: string; attachmentId: string };
-}
-
-/** Map ready attachments to send references. Errored/uploading chips are skipped. */
-export function attachmentsToRefs(attachments: ComposeAttachment[]): AttachmentRef[] {
-	const refs: AttachmentRef[] = [];
-	for (const a of attachments) {
-		if (a.status !== "ready") continue;
-		if (a.existing) {
-			refs.push({ kind: "existing", emailId: a.existing.emailId, attachmentId: a.existing.attachmentId });
-		} else if (a.uploadId) {
-			refs.push({ kind: "upload", uploadId: a.uploadId });
-		}
-	}
-	return refs;
-}
-
+export type ComposeAttachment = ComposeAttachmentRecord;
 function newLocalId(): string {
 	return crypto.randomUUID();
 }
 
 export function useAttachments(mailboxId: string | undefined) {
 	const [attachments, setAttachments] = useState<ComposeAttachment[]>([]);
-	// Mirror to a ref so addFiles can read the latest list for limit math without
-	// depending on a possibly-stale closure.
-	const attachmentsRef = useRef(attachments);
-	useEffect(() => {
-		attachmentsRef.current = attachments;
-	}, [attachments]);
+	const [inlineImagePreviews, setInlineImagePreviews] = useState<
+		Record<string, string>
+	>({});
+	const attachmentsRef = useRef<ComposeAttachment[]>([]);
+	const uploadAttemptsRef = useRef(new ComposeUploadAttemptRegistry());
+	const previewUrlsRef = useRef<ComposeInlinePreviewUrls | null>(null);
+	if (!previewUrlsRef.current) {
+		previewUrlsRef.current = new ComposeInlinePreviewUrls({
+			createObjectURL: (file) => URL.createObjectURL(file),
+			revokeObjectURL: (url) => URL.revokeObjectURL(url),
+		});
+	}
+	const previewUrls = previewUrlsRef.current;
+	const commitAttachments = useCallback(
+		(
+			update:
+				| ComposeAttachment[]
+				| ((current: ComposeAttachment[]) => ComposeAttachment[]),
+		) => {
+			const nextAttachments =
+				typeof update === "function" ? update(attachmentsRef.current) : update;
+			attachmentsRef.current = nextAttachments;
+			setAttachments(nextAttachments);
+			setInlineImagePreviews(previewUrls.reconcile(nextAttachments, mailboxId));
+			return nextAttachments;
+		},
+		[mailboxId, previewUrls],
+	);
+	useEffect(() => () => {
+		uploadAttemptsRef.current.abortAll();
+		previewUrlsRef.current?.releaseAll();
+	}, []);
 
 	const uploadOne = useCallback(
 		async (localId: string, file: File) => {
-			if (!mailboxId) return;
+			const attempts = uploadAttemptsRef.current;
+			const { token, signal } = attempts.begin(localId);
+			if (!mailboxId) {
+				if (!attempts.isCurrent(localId, token)) return;
+				commitAttachments((prev) =>
+					prev.map((attachment) =>
+						attachment.localId === localId
+							? {
+								...attachment,
+								status: "error",
+								error: "No mailbox is available for this upload.",
+							  }
+							: attachment,
+					),
+				);
+				attempts.finish(localId, token);
+				return;
+			}
 			try {
-				const res = await api.uploadAttachment(mailboxId, file);
-				setAttachments((prev) =>
+				const res = await api.uploadAttachment(mailboxId, file, signal);
+				if (!attempts.isCurrent(localId, token)) return;
+				commitAttachments((prev) =>
 					prev.map((a) =>
-						a.localId === localId
-							? { ...a, status: "ready", uploadId: res.uploadId, filename: res.filename, mimetype: res.mimetype, size: res.size }
+						a.localId === localId && a.status === "uploading"
+							? {
+								...a,
+								status: "ready",
+								error: undefined,
+								uploadId: res.uploadId,
+								filename: res.filename,
+								mimetype: res.mimetype,
+								size: res.size,
+							  }
 							: a,
 					),
 				);
 			} catch (e) {
+				if (!attempts.isCurrent(localId, token)) return;
 				const msg = e instanceof Error ? e.message : "Upload failed.";
-				setAttachments((prev) =>
-					prev.map((a) => (a.localId === localId ? { ...a, status: "error", error: msg } : a)),
+				commitAttachments((prev) =>
+					prev.map((a) =>
+						a.localId === localId && a.status === "uploading"
+							? { ...a, status: "error", error: msg, uploadId: undefined }
+							: a,
+					),
 				);
+			} finally {
+				attempts.finish(localId, token);
 			}
 		},
-		[mailboxId],
+		[commitAttachments, mailboxId],
 	);
 
-	const addFiles = useCallback(
-		(files: FileList | File[]) => {
+	const admitFiles = useCallback(
+		(
+			files: FileList | File[],
+			dispositionFor: (file: File) => "attachment" | "inline",
+		): InlineImageInsertion[] => {
 			const incoming = Array.from(files);
-			if (incoming.length === 0) return;
+			if (incoming.length === 0) return [];
 
-			// Limit math runs against everything already accepted (not the errored chips).
-			const working = attachmentsRef.current
-				.filter((a) => a.status !== "error")
-				.map((a) => ({ filename: a.filename, size: a.size }));
-
+			const admission = planComposeAttachmentAdmission(
+				attachmentsRef.current,
+				incoming.map((file) => ({ filename: file.name, size: file.size })),
+			);
 			const created: ComposeAttachment[] = [];
 			const toUpload: { localId: string; file: File }[] = [];
+			const insertions: InlineImageInsertion[] = [];
 
-			for (const file of incoming) {
+			for (const decision of admission.decisions) {
+				const file = incoming[decision.index];
+				if (!file) continue;
 				const localId = newLocalId();
-				const base = {
+				const disposition = dispositionFor(file);
+				const contentId = disposition === "inline"
+					? generateClientInlineContentId()
+					: undefined;
+				const base: Omit<
+					ComposeAttachment,
+					"status" | "error" | "uploadId" | "existing"
+				> = {
 					localId,
 					filename: file.name,
 					mimetype: file.type || "application/octet-stream",
 					size: file.size,
+					file,
+					disposition,
+					contentId,
 				};
-				const single = validateSingleFile({ filename: file.name, size: file.size });
-				if (single) {
-					created.push({ ...base, status: "error", error: single });
+				if (!decision.accepted) {
+					created.push({
+						...base,
+						status: "rejected",
+						error: decision.error ?? "This file could not be attached.",
+					});
 					continue;
 				}
-				const setErr = validateAttachmentSet([...working, { filename: file.name, size: file.size }]);
-				if (setErr) {
-					created.push({ ...base, status: "error", error: setErr });
-					continue;
-				}
-				working.push({ filename: file.name, size: file.size });
 				created.push({ ...base, status: "uploading" });
 				toUpload.push({ localId, file });
+				if (disposition === "inline" && contentId) {
+					insertions.push({ contentId, alt: file.name });
+				}
 			}
 
-			setAttachments((prev) => [...prev, ...created]);
-			for (const u of toUpload) void uploadOne(u.localId, u.file);
+			const nextAttachments = [...attachmentsRef.current, ...created];
+			commitAttachments(nextAttachments);
+			for (const upload of toUpload) void uploadOne(upload.localId, upload.file);
+			return insertions;
 		},
-		[uploadOne],
+		[commitAttachments, uploadOne],
+	);
+
+	const addFiles = useCallback(
+		(files: FileList | File[]) => {
+			admitFiles(files, () => "attachment");
+		},
+		[admitFiles],
+	);
+
+	const addInlineImages = useCallback(
+		(files: FileList | File[]) =>
+			admitFiles(files, (file) =>
+				isInlineImageMimeType(file.type) ? "inline" : "attachment"
+			),
+		[admitFiles],
+	);
+
+	const retryAttachment = useCallback(
+		(localId: string) => {
+			uploadAttemptsRef.current.abort(localId);
+			const attachment = attachmentsRef.current.find(
+				(candidate) => candidate.localId === localId,
+			);
+			if (!attachment) return;
+			if (!attachment.file) {
+				commitAttachments((prev) =>
+					prev.map((candidate) =>
+						candidate.localId === localId
+							? {
+								...candidate,
+								status: "error",
+								error:
+									"This stored file cannot be retried. Remove it and attach the original file again.",
+							  }
+							: candidate,
+					),
+				);
+				return;
+			}
+
+			const retryAdmission = planComposeAttachmentAdmission(
+				attachmentsRef.current.filter(
+					(candidate) => candidate.localId !== localId,
+				),
+				[{ filename: attachment.file.name, size: attachment.file.size }],
+			);
+			const validationError = retryAdmission.decisions[0]?.error;
+
+			if (validationError) {
+				commitAttachments((prev) =>
+					prev.map((candidate) =>
+						candidate.localId === localId
+							? {
+								...candidate,
+								status: "rejected",
+								error: validationError,
+								uploadId: undefined,
+							  }
+							: candidate,
+					),
+				);
+				return;
+			}
+
+			commitAttachments((prev) =>
+				prev.map((candidate) =>
+					candidate.localId === localId
+						? {
+							...candidate,
+							status: "uploading",
+							error: undefined,
+							uploadId: undefined,
+							existing: undefined,
+						  }
+						: candidate,
+				),
+			);
+			void uploadOne(localId, attachment.file);
+		},
+		[commitAttachments, uploadOne],
 	);
 
 	const removeAttachment = useCallback((localId: string) => {
 		// Staging objects for removed uploads are reaped by the R2 lifecycle rule.
-		setAttachments((prev) => prev.filter((a) => a.localId !== localId));
-	}, []);
+		uploadAttemptsRef.current.abort(localId);
+		previewUrlsRef.current?.release(localId);
+		commitAttachments((prev) => prev.filter((a) => a.localId !== localId));
+	}, [commitAttachments]);
 
 	/** Seed chips from a reopened draft's stored attachments (references, no re-upload). */
 	const hydrateFromDraft = useCallback((emailId: string, draftAttachments?: Attachment[]) => {
-		const files = getNonInlineAttachments(draftAttachments);
-		setAttachments(
-			files.map((a) => ({
-				localId: newLocalId(),
-				filename: a.filename,
-				mimetype: a.mimetype,
-				size: a.size,
-				status: "ready" as const,
-				existing: { emailId, attachmentId: a.id },
-			})),
-		);
-	}, []);
+		uploadAttemptsRef.current.abortAll();
+		previewUrlsRef.current?.releaseAll();
+		const hydrated: ComposeAttachment[] = (draftAttachments ?? []).map((a) => ({
+			localId: newLocalId(),
+			filename: a.filename,
+			mimetype: a.mimetype,
+			size: a.size,
+			status: "ready",
+			disposition: a.disposition === "inline" ? "inline" : "attachment",
+			contentId: a.content_id,
+			existing: { emailId, attachmentId: a.id },
+		}));
+		commitAttachments(hydrated);
+	}, [commitAttachments]);
 
-	const reset = useCallback(() => setAttachments([]), []);
+	const reconcileSavedDraft = useCallback(
+		(
+			emailId: string,
+			snapshot: ComposeAttachment[],
+			draftAttachments?: Attachment[],
+		) => {
+			const reconciled = reconcileSavedComposeAttachments(
+				attachmentsRef.current,
+				snapshot,
+				emailId,
+				draftAttachments ?? [],
+			);
+			commitAttachments(reconciled);
+			return reconciled;
+		},
+		[commitAttachments],
+	);
+
+	const reset = useCallback(() => {
+		uploadAttemptsRef.current.abortAll();
+		previewUrlsRef.current?.releaseAll();
+		commitAttachments([]);
+	}, [commitAttachments]);
+	const restore = useCallback((value: ComposeAttachment[]) => {
+		uploadAttemptsRef.current.abortAll();
+		previewUrlsRef.current?.releaseAll();
+		commitAttachments(recoverComposeAttachments(value));
+	}, [commitAttachments]);
 
 	const isUploading = attachments.some((a) => a.status === "uploading");
-	const hasError = attachments.some((a) => a.status === "error");
 
 	return {
 		attachments,
 		addFiles,
+		addInlineImages,
+		inlineImagePreviews,
 		removeAttachment,
+		retryAttachment,
 		hydrateFromDraft,
+		reconcileSavedDraft,
 		reset,
+		restore,
 		isUploading,
-		hasError,
 	};
 }

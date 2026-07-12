@@ -13,6 +13,7 @@ import {
 	deriveImportThreadId,
 	normalizeEmailDate,
 } from "./parse.ts";
+import { RecipientMemoryOrigins } from "../../../shared/recipient-suggestions.ts";
 
 /** Import one parsed Zoho message without duplicating an earlier run. */
 export async function importParsedEmail(
@@ -48,6 +49,7 @@ export async function importParsedEmail(
 			inReplyTo: parsed.inReplyTo,
 			references: parsed.references,
 		}),
+		recipientMemoryOrigin: RecipientMemoryOrigins.ADMIN_IMPORT,
 	});
 
 	return { status: "imported" as const, id, folder };

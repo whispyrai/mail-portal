@@ -102,6 +102,35 @@ test("saved view definitions are bounded and preserve every supported filter", (
   });
 });
 
+test("saved views preserve the exact Search v2 grammar", () => {
+	const searchQuery =
+		'renewal "signed proposal" from:alice from:bob filename:terms.pdf';
+	const definition = parseSavedViewDefinition({
+		name: "Renewals",
+		filters: { searchQuery },
+		sort: { column: "date", direction: "DESC" },
+	});
+	assert.deepEqual(savedViewSearchParams(definition), {
+		q: searchQuery,
+		sortColumn: "date",
+		sortDirection: "DESC",
+	});
+});
+
+test("saved views preserve Search v2 default relevance ordering", () => {
+	const definition = parseSavedViewDefinition({
+		name: "Relevant renewals",
+		filters: {
+			searchQuery: "renewal proposal",
+			useDefaultSearchOrder: true,
+		},
+		sort: { column: "date", direction: "DESC" },
+	});
+	assert.deepEqual(savedViewSearchParams(definition), {
+		q: "renewal proposal",
+	});
+});
+
 test("invalid, oversized, unsupported, and broadening filters fail closed", () => {
   for (const input of [
     { name: "", filters: {}, sort: { column: "date", direction: "DESC" } },

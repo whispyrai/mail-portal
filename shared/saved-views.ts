@@ -11,6 +11,11 @@ export type SavedViewSortColumn = (typeof SAVED_VIEW_SORT_COLUMNS)[number];
 export type SavedViewSortDirection = "ASC" | "DESC";
 
 export interface SavedViewFilters {
+  /** Exact Search v2 grammar, including repeated filters and quoted phrases. */
+  searchQuery?: string;
+  /** Apply Search v2's relevance/recency order instead of the D1 sort placeholder. */
+  useDefaultSearchOrder?: true;
+  /** Legacy free-text filter retained for existing saved records. */
   query?: string;
   folder?: string;
   from?: string;
@@ -47,6 +52,7 @@ export function savedViewSearchParams(
 ): Record<string, string> {
   const { filters, sort } = definition;
   return {
+	...(filters.searchQuery ? { q: filters.searchQuery } : {}),
     ...(filters.query ? { query: filters.query } : {}),
     ...(filters.folder ? { folder: filters.folder } : {}),
     ...(filters.from ? { from: filters.from } : {}),
@@ -64,7 +70,8 @@ export function savedViewSearchParams(
     // Never omit an unknown label ID. The mailbox query deliberately returns
     // no matches for unknown or removed IDs instead of broadening the view.
     ...(filters.labelId ? { label_id: filters.labelId } : {}),
-    sortColumn: sort.column,
-    sortDirection: sort.direction,
+    ...(!filters.useDefaultSearchOrder
+      ? { sortColumn: sort.column, sortDirection: sort.direction }
+      : {}),
   };
 }

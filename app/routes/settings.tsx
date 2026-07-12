@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { useMailbox, useUpdateMailbox } from "~/queries/mailboxes";
 import { PushNotificationsSection } from "~/components/settings/push-notifications/PushNotificationsSection";
+import { SignatureSettingsCard } from "~/components/settings/SignatureSettingsCard";
 
 // Placeholder shown in the textarea when no custom prompt is set.
 // The authoritative default prompt lives in workers/agent/index.ts (DEFAULT_SYSTEM_PROMPT).
@@ -34,9 +35,8 @@ export default function SettingsRoute() {
 		if (!mailbox || !mailboxId) return;
 		setIsSaving(true);
 		const settings = {
-			...mailbox.settings,
 			fromName: displayName,
-			agentSystemPrompt: agentPrompt.trim() || undefined,
+			agentSystemPrompt: agentPrompt.trim(),
 		};
 		try {
 			await updateMailboxMutation.mutateAsync({ mailboxId, settings });
@@ -57,8 +57,9 @@ export default function SettingsRoute() {
 
 	if (!mailbox) {
 		return (
-			<div className="flex justify-center py-20">
-				<Loader size="lg" />
+			<div className="max-w-2xl space-y-6 px-4 py-4 md:px-8 md:py-6 h-full overflow-y-auto">
+				<h1 className="text-lg font-semibold text-kumo-default">Settings</h1>
+				{mailboxId ? <SignatureSettingsCard mailboxId={mailboxId} /> : <Loader size="lg" />}
 			</div>
 		);
 	}
@@ -84,6 +85,8 @@ export default function SettingsRoute() {
 						<Input label="Email" type="email" value={mailbox.email} disabled />
 					</div>
 				</div>
+
+				<SignatureSettingsCard mailboxId={mailboxId ?? mailbox.id} />
 
 				{/* Push notifications (WISER-240) — self-managed, independent of Save. */}
 				<PushNotificationsSection mailboxId={mailboxId} />

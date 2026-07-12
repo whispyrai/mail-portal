@@ -1,6 +1,7 @@
 import type { Env } from "../types.ts";
 import type { OutboundMessageSnapshot } from "./outbound-delivery-contract.ts";
 import { attachmentKey } from "./attachments.ts";
+import { contentIdForDisposition } from "../../shared/content-id.ts";
 
 export type CancelledSnapshotAttachment = {
 	id: string;
@@ -104,7 +105,15 @@ export async function prepareRecoveredDraftAttachments(
 			const destinationKey = attachmentKey(draftId, id, attachment.filename);
 			await bucket.put(destinationKey, await object.arrayBuffer());
 			copiedKeys.push(destinationKey);
-			recovered.push({ ...attachment, id, email_id: draftId });
+			recovered.push({
+				...attachment,
+				id,
+				email_id: draftId,
+				content_id: contentIdForDisposition(
+					attachment.disposition,
+					attachment.content_id,
+				),
+			});
 		}
 		return { draftId, attachments: recovered };
 	} catch (error) {

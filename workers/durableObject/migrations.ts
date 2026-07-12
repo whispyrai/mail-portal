@@ -490,4 +490,39 @@ export const mailboxMigrations: Migration[] = [
 				ON follow_up_reply_completion_queue(next_attempt_at, inbound_message_id);
 		`),
 	},
+	{
+		name: "18_add_recipient_memory",
+		sql: txn(`
+			ALTER TABLE emails ADD COLUMN recipient_memory_origin TEXT
+				CHECK(recipient_memory_origin IN (
+					'live_inbound', 'accepted_outbound', 'admin_import'
+				));
+			CREATE TABLE recipient_interactions (
+				source_email_id TEXT NOT NULL,
+				address TEXT NOT NULL COLLATE NOCASE,
+				direction TEXT NOT NULL CHECK(direction IN ('sent', 'received')),
+				occurred_at TEXT NOT NULL,
+				PRIMARY KEY(source_email_id, address, direction),
+				FOREIGN KEY(source_email_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_recipient_interactions_address
+				ON recipient_interactions(address, direction, occurred_at DESC);
+			CREATE INDEX idx_recipient_interactions_occurred
+				ON recipient_interactions(occurred_at DESC, address);
+			CREATE TABLE recipient_interaction_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
+		`),
+	},
+	{
+		name: "19_add_draft_create_replay",
+		sql: txn(`
+			ALTER TABLE emails ADD COLUMN draft_create_key TEXT;
+			ALTER TABLE emails ADD COLUMN draft_create_fingerprint TEXT;
+			CREATE UNIQUE INDEX idx_emails_draft_create_key
+				ON emails(draft_create_key)
+				WHERE draft_create_key IS NOT NULL;
+		`),
+	},
 ];

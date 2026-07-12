@@ -24,9 +24,10 @@ function testApp(
 		| {
 				status: "discarded";
 				attachments: Array<{ id: string; filename: string }>;
-		  }
-		| { status: "not_draft" }
-		| null = null,
+			  }
+			| { status: "not_draft" }
+			| { status: "version_conflict"; currentVersion: number }
+			| null = null,
 	moveResult:
 		| boolean
 		| { status: "outbound_delivery_active"; deliveryId: string }
@@ -47,8 +48,9 @@ function testApp(
 			assert.deepEqual(actor, { kind: "user", id: "user-1" });
 			return restoreResult;
 		},
-		async discardDraft(id: string, actor: unknown) {
+		async discardDraft(id: string, expectedVersion: number, actor: unknown) {
 			assert.equal(id, "email-1");
+			assert.equal(expectedVersion, 7);
 			assert.deepEqual(actor, { kind: "user", id: "user-1" });
 			return discardResult;
 		},
@@ -207,7 +209,11 @@ test("discarding a draft permanently removes its stored attachment objects", asy
 
 	const response = await app.request(
 		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/drafts/email-1`,
-		{ method: "DELETE" },
+		{
+			method: "DELETE",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ draft_version: 7 }),
+		},
 		env as never,
 	);
 
@@ -227,12 +233,41 @@ test("discarding a non-draft is rejected without deleting attachment objects", a
 
 	const response = await app.request(
 		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/drafts/email-1`,
-		{ method: "DELETE" },
+		{
+			method: "DELETE",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ draft_version: 7 }),
+		},
 		env as never,
 	);
 
 	assert.equal(response.status, 409);
 	assert.deepEqual(await response.json(), { error: "Email is not a draft" });
+	assert.deepEqual(deletedObjects, []);
+});
+
+test("discarding a stale shared draft revision preserves the newer draft", async () => {
+	const { app, env, deletedObjects } = testApp(
+		{ status: "trashed" },
+		null,
+		{ status: "version_conflict", currentVersion: 8 },
+	);
+	const response = await app.request(
+		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/drafts/email-1`,
+		{
+			method: "DELETE",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ draft_version: 7 }),
+		},
+		env as never,
+	);
+
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "Draft changed in another session. Reload it before discarding.",
+		code: "draft_version_conflict",
+		currentVersion: 8,
+	});
 	assert.deepEqual(deletedObjects, []);
 });
 
@@ -252,7 +287,11 @@ test("failed draft attachment cleanup is persisted for retry without misreportin
 	try {
 		const response = await app.request(
 			`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/drafts/email-1`,
-			{ method: "DELETE" },
+			{
+				method: "DELETE",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ draft_version: 7 }),
+			},
 			env as never,
 		);
 		assert.equal(response.status, 200);

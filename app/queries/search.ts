@@ -3,12 +3,16 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { useQuery } from "@tanstack/react-query";
-import { parseSearchQuery } from "~/lib/search-parser";
+import {
+	SEARCH_PAGE_SIZE,
+	searchRequestParams,
+	shouldRetrySearch,
+} from "~/lib/mail-search-request";
 import api from "~/services/api";
 import type { Email } from "~/types";
 import { queryKeys } from "./keys";
 
-export const SEARCH_PAGE_SIZE = 25;
+export { SEARCH_PAGE_SIZE } from "~/lib/mail-search-request";
 
 interface SearchResponse {
 	emails: Email[];
@@ -20,31 +24,21 @@ export function useSearchEmails(
 	query: string,
 	page: number,
 	labelId = "",
+	sortColumn = "",
+	sortDirection = "",
 ) {
 	return useQuery<{ results: Email[]; totalCount: number }>({
 		queryKey: mailboxId && (query || labelId)
-			? queryKeys.search.results(mailboxId, query, page, labelId)
+			? [...queryKeys.search.results(mailboxId, query, page, labelId), sortColumn, sortDirection]
 			: ["search", "_disabled"],
 		queryFn: async () => {
-			const parsed = parseSearchQuery(query);
-			const params: Record<string, string> = {
-				page: String(page),
-				limit: String(SEARCH_PAGE_SIZE),
-			};
-			if (parsed.query) params.query = parsed.query;
-			if (parsed.from) params.from = parsed.from;
-			if (parsed.to) params.to = parsed.to;
-			if (parsed.subject) params.subject = parsed.subject;
-			if (parsed.folder) params.folder = parsed.folder;
-			if (parsed.date_start) params.date_start = parsed.date_start;
-			if (parsed.date_end) params.date_end = parsed.date_end;
-			if (parsed.is_read !== undefined)
-				params.is_read = String(parsed.is_read);
-			if (parsed.is_starred !== undefined)
-				params.is_starred = String(parsed.is_starred);
-			if (parsed.has_attachment) params.has_attachment = "true";
-			if (labelId) params.label_id = labelId;
-
+			const params = searchRequestParams({
+				query,
+				page,
+				labelId,
+				sortColumn,
+				sortDirection,
+			});
 			const data = await api.searchEmails(mailboxId!, params) as
 				| SearchResponse
 				| Email[];
@@ -58,5 +52,6 @@ export function useSearchEmails(
 			return { results: arr, totalCount: arr.length };
 		},
 		enabled: !!mailboxId && !!(query || labelId),
+		retry: shouldRetrySearch,
 	});
 }

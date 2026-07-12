@@ -4,11 +4,11 @@
 
 import { Button, Tooltip } from "@cloudflare/kumo";
 import { RobotIcon } from "@phosphor-icons/react";
-import { useEffect, useRef } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Outlet, useParams } from "react-router";
 import AgentSidebar from "~/components/AgentSidebar";
-import ComposeEmail from "~/components/ComposeEmail";
 import Header from "~/components/Header";
+import LazyLoadBoundary from "~/components/LazyLoadBoundary";
 import MailKeyboardController from "~/components/MailKeyboardController";
 import MailCommandPalette from "~/components/MailCommandPalette";
 import Sidebar from "~/components/Sidebar";
@@ -16,6 +16,93 @@ import { useMailNotifications } from "~/hooks/useMailNotifications";
 import { useRebindExistingPushSubscription } from "~/hooks/pwa/usePushSubscription";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
+import { hasComposeRecovery } from "~/lib/compose-recovery";
+
+function confirmDiscardPendingCompose(hasValuableSeed: boolean): boolean {
+	return !hasValuableSeed && !hasComposeRecovery() || window.confirm(
+		"Discard this unsaved message? This cannot be undone.",
+	);
+}
+
+function ComposeLoadingFallback({
+	onCancel,
+	hasValuableSeed,
+}: {
+	onCancel: () => void;
+	hasValuableSeed: boolean;
+}) {
+	useEffect(() => {
+		const handleEscape = (event: KeyboardEvent) => {
+			if (
+				event.key === "Escape" &&
+				confirmDiscardPendingCompose(hasValuableSeed)
+			) {
+				onCancel();
+			}
+		};
+		document.addEventListener("keydown", handleEscape);
+		return () => document.removeEventListener("keydown", handleEscape);
+	}, [hasValuableSeed, onCancel]);
+
+	return (
+		<div
+			className="fixed inset-0 z-50 grid place-items-center bg-kumo-contrast/20 p-4"
+			role="status"
+			aria-live="polite"
+		>
+			<div className="flex flex-col items-center gap-3 rounded-lg border border-kumo-line bg-kumo-base px-5 py-4 text-sm text-kumo-subtle shadow-lg">
+				<span>Opening composer...</span>
+					<Button
+						variant="secondary"
+						onClick={() => {
+							if (confirmDiscardPendingCompose(hasValuableSeed)) onCancel();
+						}}
+						className="min-h-11"
+					>
+						Discard and close
+					</Button>
+			</div>
+		</div>
+	);
+}
+
+function ComposeLoadError({
+	onClose,
+	onRetry,
+	hasValuableSeed,
+}: {
+	onClose: () => void;
+	onRetry: () => void;
+	hasValuableSeed: boolean;
+}) {
+	return (
+		<div className="fixed inset-0 z-50 grid place-items-center bg-kumo-contrast/20 p-4">
+			<div
+				className="w-full max-w-sm rounded-lg border border-kumo-line bg-kumo-base p-5 shadow-lg"
+				role="alert"
+			>
+				<h2 className="font-semibold text-kumo-default">Composer could not open</h2>
+				<p className="mt-2 text-sm text-kumo-subtle">
+					Your message is held in this tab. Retry the composer, or explicitly discard it.
+				</p>
+				<div className="mt-4 flex flex-wrap justify-end gap-2">
+						<Button
+							variant="secondary"
+							onClick={() => {
+								if (confirmDiscardPendingCompose(hasValuableSeed)) onClose();
+							}}
+							className="min-h-11"
+						>
+							Discard and close
+						</Button>
+						<Button onClick={onRetry} className="min-h-11">
+							Retry composer
+					</Button>
+				</div>
+			</div>
+		</div>
+	);
+}
 
 export default function MailboxRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
@@ -25,14 +112,30 @@ export default function MailboxRoute() {
 	useMailNotifications(mailboxId);
 	useRebindExistingPushSubscription(mailboxId);
 	const prevMailboxIdRef = useRef<string | undefined>(undefined);
+	const [composeRetryKey, setComposeRetryKey] = useState(0);
+	const ComposeEmail = useMemo(
+		() => lazy(() => import("~/components/ComposeEmail")),
+		[composeRetryKey],
+	);
 	const {
 		isSidebarOpen,
 		closeSidebar,
+		isComposing,
+		closeCompose,
+		composeOptions,
 		isAgentPanelOpen,
 		toggleAgentPanel,
 		hydrateAgentPanel,
 		closePanel,
 	} = useUIStore();
+	const hasValuableComposeSeed = Boolean(
+		composeOptions.draftEmail &&
+			(!composeOptions.draftEmail.id ||
+				composeOptions.draftEmail.subject ||
+				composeOptions.draftEmail.recipient ||
+				composeOptions.draftEmail.body ||
+				composeOptions.draftEmail.attachments?.length),
+	);
 
 	// Load the persisted agent-panel preference once on the client.
 	useEffect(() => {
@@ -117,7 +220,29 @@ export default function MailboxRoute() {
 				</div>
 			)}
 
-			<ComposeEmail />
+			{isComposing ? (
+					<LazyLoadBoundary
+						fallback={
+							<ComposeLoadError
+								onClose={closeCompose}
+								onRetry={() => setComposeRetryKey((key) => key + 1)}
+								hasValuableSeed={hasValuableComposeSeed}
+							/>
+						}
+						resetKey={`${isComposing}:${composeRetryKey}`}
+					>
+						<Suspense
+							fallback={
+								<ComposeLoadingFallback
+									onCancel={closeCompose}
+									hasValuableSeed={hasValuableComposeSeed}
+								/>
+							}
+						>
+						<ComposeEmail />
+					</Suspense>
+				</LazyLoadBoundary>
+			) : null}
 		</div>
 	);
 }

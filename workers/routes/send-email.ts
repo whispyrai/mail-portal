@@ -15,6 +15,8 @@ import type { MailboxContext } from "../lib/mailbox.ts";
 import { reconcileAmbiguousOutboundEnqueue } from "../lib/outbound-enqueue-recovery.ts";
 import { SendEmailRequestSchema } from "../lib/schemas.ts";
 import { validateOutboundSchedule } from "../../shared/outbound-schedule.ts";
+import { outboundEnqueueOutcome } from "../lib/outbound-delivery-service.ts";
+import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -58,6 +60,7 @@ export async function handleSendEmail(c: AppContext) {
 				undoUntil: existing.undoUntil,
 				scheduledFor: existing.scheduledFor ?? null,
 				replayed: true,
+				outcome: outboundEnqueueOutcome(existing, true),
 			},
 			202,
 		);
@@ -99,6 +102,20 @@ export async function handleSendEmail(c: AppContext) {
 		(error) => ({ ok: false as const, error: (error as Error).message }),
 	);
 	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	const inlineMapping = validateResolvedInlineImages(html ?? "", resolved.storedMetadata);
+	if (!inlineMapping.ok) {
+		await rollbackAttachmentPromotion(
+			c.env.BUCKET,
+			stub,
+			messageId,
+			resolved,
+			actor,
+		);
+		return c.json(
+			{ error: inlineMapping.error, code: inlineMapping.code },
+			400,
+		);
+	}
 	const timing = validateOutboundSchedule(scheduled_for);
 	if (!timing.ok) {
 		await rollbackAttachmentPromotion(
@@ -211,6 +228,7 @@ export async function handleSendEmail(c: AppContext) {
 			undoUntil: result.delivery.undoUntil,
 			scheduledFor: result.delivery.scheduledFor ?? null,
 			replayed: result.replayed,
+			outcome: result.outcome,
 		},
 		202,
 	);

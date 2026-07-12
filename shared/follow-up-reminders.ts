@@ -21,10 +21,28 @@ export interface FollowUpReminder {
 	resolvedAt: number | null;
 }
 
-export interface FollowUpReminderGroups {
-	today: FollowUpReminder[];
-	overdue: FollowUpReminder[];
-	upcoming: FollowUpReminder[];
+/** Bounded mail-derived context. It is projected live and never stored in D1. */
+export type FollowUpReminderPreview = {
+	subject: string;
+	counterparty: string;
+};
+
+/** Client-facing reminder row with a safe missing-baseline fallback. */
+export type FollowUpReminderView = FollowUpReminder & {
+	preview: FollowUpReminderPreview | null;
+};
+
+export type FollowUpReminderListPage = {
+	reminders: FollowUpReminderView[];
+	nextCursor: string | null;
+};
+
+export interface FollowUpReminderGroups<
+	TReminder extends FollowUpReminder = FollowUpReminder,
+> {
+	today: TReminder[];
+	overdue: TReminder[];
+	upcoming: TReminder[];
 }
 
 function chronological(left: FollowUpReminder, right: FollowUpReminder) {
@@ -36,16 +54,16 @@ function chronological(left: FollowUpReminder, right: FollowUpReminder) {
  * The caller supplies tomorrowStart in the user's display timezone. This keeps
  * grouping deterministic and makes the domain independent of server timezone.
  */
-export function groupFollowUpReminders(
-	reminders: readonly FollowUpReminder[],
+export function groupFollowUpReminders<TReminder extends FollowUpReminder>(
+	reminders: readonly TReminder[],
 	boundaries: { now: string; tomorrowStart: string },
-): FollowUpReminderGroups {
+): FollowUpReminderGroups<TReminder> {
 	const now = Date.parse(boundaries.now);
 	const tomorrowStart = Date.parse(boundaries.tomorrowStart);
 	if (!Number.isFinite(now) || !Number.isFinite(tomorrowStart) || tomorrowStart <= now) {
 		throw new Error("Valid reminder grouping boundaries are required");
 	}
-	const groups: FollowUpReminderGroups = {
+	const groups: FollowUpReminderGroups<TReminder> = {
 		today: [],
 		overdue: [],
 		upcoming: [],

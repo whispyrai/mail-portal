@@ -38,3 +38,20 @@ test("reset starts a new compose action even when the content is identical", () 
 	identity.reset();
 	assert.equal(identity.keyFor(payload), "send-key-2");
 });
+
+test("an exact source-draft retry reuses its key after the composer reloads", () => {
+	const values = new Map<string, string>();
+	const storage = {
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => values.set(key, value),
+	};
+	const payload = { source_draft_id: "draft-1", source_draft_version: 4 };
+	const first = new LogicalSendIdentity(() => "stable-send-key", storage);
+	const reloaded = new LogicalSendIdentity(() => "must-not-be-used", storage);
+
+	assert.equal(first.keyFor(payload, "send:draft-1:4:now"), "stable-send-key");
+	assert.equal(
+		reloaded.keyFor(payload, "send:draft-1:4:now"),
+		"stable-send-key",
+	);
+});

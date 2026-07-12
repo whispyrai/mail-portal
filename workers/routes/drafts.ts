@@ -6,12 +6,41 @@ import {
 	completeAttachmentPromotion,
 	resolveAndPromoteAttachments,
 	rollbackAttachmentPromotion,
+	type StoredAttachment,
 } from "../lib/attachments.ts";
 import type { MailboxContext } from "../lib/mailbox.ts";
 import { SaveDraftRequestSchema } from "../lib/schemas.ts";
 import { reconcileAmbiguousDraftSave } from "../lib/draft-save-recovery.ts";
+import { contentIdForDisposition } from "../../shared/content-id.ts";
+import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
 
 type AppContext = Context<MailboxContext>;
+
+async function draftCreateFingerprint(input: {
+	to?: string;
+	cc?: string;
+	bcc?: string;
+	subject?: string;
+	body: string;
+	in_reply_to?: string;
+	thread_id?: string;
+	attachments?: unknown[];
+}): Promise<string> {
+	const bytes = new TextEncoder().encode(JSON.stringify([
+		input.to ?? "",
+		input.cc ?? "",
+		input.bcc ?? "",
+		input.subject ?? "",
+		input.body,
+		input.in_reply_to ?? null,
+		input.thread_id ?? null,
+		input.attachments ?? [],
+	]));
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return [...new Uint8Array(digest)]
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
 
 export async function handleSaveDraft(c: AppContext) {
 	const parsed = SaveDraftRequestSchema.safeParse(await c.req.json());
@@ -26,6 +55,7 @@ export async function handleSaveDraft(c: AppContext) {
 		body,
 		in_reply_to,
 		thread_id,
+		draft_create_key,
 		draft_id,
 		draft_version,
 		attachments,
@@ -33,19 +63,95 @@ export async function handleSaveDraft(c: AppContext) {
 	const mailboxId = c.req.param("mailboxId") ?? "";
 	const stub = c.var.mailboxStub;
 	const actor = actorFromSession(c.get("session"));
+	const createFingerprint = draft_create_key
+		? await draftCreateFingerprint(parsed.data)
+		: undefined;
+	if (draft_create_key && createFingerprint) {
+		const replay = await stub.getDraftCreateReplay(
+			draft_create_key,
+			createFingerprint,
+		);
+		if (replay.status === "superseded") {
+			return c.json(
+				{
+					error: "The original draft save was superseded by a newer revision.",
+					code: "draft_create_superseded",
+					draftId: replay.draftId,
+					currentVersion: replay.currentVersion,
+				},
+				409,
+			);
+		}
+		if (replay.status === "conflict") {
+			return c.json(
+				{
+					error: "Draft create key was already used for different content.",
+					code: "draft_create_conflict",
+					draftId: replay.draftId,
+					currentVersion: replay.currentVersion,
+				},
+				409,
+			);
+		}
+		if (replay.status === "replay") {
+			const saved = await stub.getEmail(replay.draftId);
+			if (!saved || saved.folder_id !== Folders.DRAFT) {
+				return c.json({ error: "Draft replay is unavailable" }, 409);
+			}
+			return c.json({ ...saved, replayed: true });
+		}
+	}
 	const id = draft_id ?? crypto.randomUUID();
 	const priorDraft = draft_id ? await stub.getEmail(draft_id) : null;
-	const promotion = await resolveAndPromoteAttachments(
+	const priorAttachments = new Map(
+		(priorDraft?.attachments ?? []).map((attachment) => [attachment.id, attachment]),
+	);
+	const retainedAttachments: StoredAttachment[] = [];
+	const retainedAttachmentIds = new Set<string>();
+	const attachmentsToPromote = (attachments ?? []).filter((ref) => {
+		if (ref.kind !== "existing" || ref.emailId !== id) return true;
+		const existing = priorAttachments.get(ref.attachmentId);
+		if (!existing) return true;
+		const disposition =
+			existing.disposition === "inline" ? "inline" : "attachment";
+		retainedAttachmentIds.add(existing.id);
+		retainedAttachments.push({
+			id: existing.id,
+			email_id: id,
+			filename: existing.filename,
+			mimetype: existing.mimetype,
+			size: existing.size,
+			content_id: contentIdForDisposition(disposition, existing.content_id),
+			disposition,
+		});
+		return false;
+	});
+	const newPromotion = await resolveAndPromoteAttachments(
 		c.env.BUCKET,
 		stub,
 		mailboxId,
 		id,
-		attachments,
+		attachmentsToPromote,
 		actor,
 	).catch((error: Error) => error);
-	if (promotion instanceof Error) {
-		return c.json({ error: promotion.message }, 400);
+	if (newPromotion instanceof Error) {
+		return c.json({ error: newPromotion.message }, 400);
 	}
+	const promotion = {
+		...newPromotion,
+		storedMetadata: [...retainedAttachments, ...newPromotion.storedMetadata],
+	};
+	const inlineMapping = validateResolvedInlineImages(body, promotion.storedMetadata);
+	if (!inlineMapping.ok) {
+		await rollbackAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor);
+		return c.json(
+			{ error: inlineMapping.error, code: inlineMapping.code },
+			400,
+		);
+	}
+	const replacedAttachments = (priorDraft?.attachments ?? []).filter(
+		(attachment) => !retainedAttachmentIds.has(attachment.id),
+	);
 
 	let result;
 	try {
@@ -53,6 +159,8 @@ export async function handleSaveDraft(c: AppContext) {
 			{
 				id,
 				expectedVersion: draft_version,
+				createKey: draft_create_key,
+				createFingerprint,
 				subject: subject ?? "",
 				sender: mailboxId.toLowerCase(),
 				recipient: (to ?? "").toLowerCase(),
@@ -72,7 +180,7 @@ export async function handleSaveDraft(c: AppContext) {
 			draftId: id,
 			expectedCommittedVersion: (draft_version ?? 0) + 1,
 			promotion,
-			replacedAttachments: priorDraft?.attachments ?? [],
+				replacedAttachments,
 			actor,
 		});
 		if (reconciliation.status === "committed") {
@@ -83,6 +191,35 @@ export async function handleSaveDraft(c: AppContext) {
 
 	if (result.status !== "saved") {
 		await rollbackAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor);
+		if (result.status === "creation_superseded") {
+			return c.json(
+				{
+					error: "The original draft save was superseded by a newer revision.",
+					code: "draft_create_superseded",
+					draftId: result.draftId,
+					currentVersion: result.currentVersion,
+				},
+				409,
+			);
+		}
+		if (result.status === "creation_replay") {
+			const saved = await stub.getEmail(result.draftId);
+			if (!saved || saved.folder_id !== Folders.DRAFT) {
+				return c.json({ error: "Draft replay is unavailable" }, 409);
+			}
+			return c.json({ ...saved, replayed: true });
+		}
+		if (result.status === "creation_conflict") {
+			return c.json(
+				{
+					error: "Draft create key was already used for different content.",
+					code: "draft_create_conflict",
+					draftId: result.draftId,
+					currentVersion: result.currentVersion,
+				},
+				409,
+			);
+		}
 		if (result.status === "version_conflict") {
 			return c.json(
 				{
@@ -103,7 +240,9 @@ export async function handleSaveDraft(c: AppContext) {
 		c.env.BUCKET,
 		stub,
 		id,
-		result.replacedAttachments,
+		result.replacedAttachments.filter(
+			(attachment) => !retainedAttachmentIds.has(attachment.id),
+		),
 		actor,
 	);
 	const saved = await stub.getEmail(id);

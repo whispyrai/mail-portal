@@ -610,16 +610,16 @@ export default function EmailListRoute() {
 		);
 	};
 
-	const handleDiscardDraft = (e: React.MouseEvent, emailId: string) => {
+	const handleDiscardDraft = (e: React.MouseEvent, email: Email) => {
 		e.preventDefault();
 		e.stopPropagation();
 		if (!mailboxId || !window.confirm("Discard this draft?")) return;
 		discardDraft.mutate(
-			{ mailboxId, id: emailId },
+			{ mailboxId, id: email.id, version: email.draft_version ?? 1 },
 			{
 				onSuccess: () => {
 					toastManager.add({ title: "Draft discarded" });
-					if (selectedEmailId === emailId) closePanel();
+						if (selectedEmailId === email.id) closePanel();
 				},
 				onError: () =>
 					toastManager.add({
@@ -1264,7 +1264,7 @@ export default function EmailListRoute() {
 															folder === Folders.TRASH
 																? handleRestore(e, email.id)
 																: folder === Folders.DRAFT
-																	? handleDiscardDraft(e, email.id)
+																			? handleDiscardDraft(e, email)
 																	: handleDelete(e, email.id)
 														}
 														aria-label={

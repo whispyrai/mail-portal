@@ -36,6 +36,8 @@ const isoDate = z
 
 const SavedViewFiltersSchema = z
   .object({
+	searchQuery: boundedText(500).optional(),
+	useDefaultSearchOrder: z.literal(true).optional(),
     query: boundedText(500).optional(),
     folder: boundedText(128).optional(),
     from: boundedText(320).optional(),

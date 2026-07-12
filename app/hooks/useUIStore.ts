@@ -4,6 +4,7 @@
 
 import { create } from "zustand";
 import type { Email } from "~/types";
+import { clearComposeRecovery } from "../lib/compose-recovery.ts";
 
 export type ComposeMode = "new" | "reply" | "reply-all" | "forward";
 
@@ -24,7 +25,7 @@ interface UIState {
 	selectEmail: (id: string | null) => void;
 	startCompose: (options?: ComposeOptions) => void;
 	closePanel: () => void;
-	closeCompose: () => void;
+	closeCompose: (restorePreviousSelection?: boolean) => void;
 
 	// Compose options
 	composeOptions: ComposeOptions;
@@ -63,10 +64,15 @@ export const useUIStore = create<UIState>((set, get) => ({
 	// hydration mismatch.
 	isAgentPanelOpen: false,
 
-	selectEmail: (id) => set({ selectedEmailId: id, isComposing: false }),
+	selectEmail: (id) =>
+		set((state) => ({
+			selectedEmailId: id,
+			isComposing: state.isComposing,
+		})),
 
 	startCompose: (options) =>
 		set((state) => {
+			clearComposeRecovery();
 			const mode = options?.mode || "new";
 			const isReplyOrForward = mode === "reply" || mode === "reply-all" || mode === "forward";
 			return {
@@ -79,15 +85,30 @@ export const useUIStore = create<UIState>((set, get) => ({
 			};
 		}),
 
-	closePanel: () => set({ selectedEmailId: null, isComposing: false, _previousEmailId: null, composeOptions: { mode: "new" as const, originalEmail: null } }),
+	closePanel: () =>
+		set((state) =>
+			state.isComposing
+				? { selectedEmailId: null }
+				: {
+						selectedEmailId: null,
+						isComposing: false,
+						_previousEmailId: null,
+						composeOptions: { mode: "new" as const, originalEmail: null },
+					},
+		),
 
-	closeCompose: () =>
-		set((state) => ({
+	closeCompose: (restorePreviousSelection = true) =>
+		set((state) => {
+			clearComposeRecovery();
+			return {
 			isComposing: false,
-			selectedEmailId: state._previousEmailId,
+			selectedEmailId: restorePreviousSelection
+				? state._previousEmailId
+				: null,
 			_previousEmailId: null,
 			composeOptions: { mode: "new" as const, originalEmail: null },
-		})),
+			};
+		}),
 
 	openSidebar: () => set({ isSidebarOpen: true }),
 	closeSidebar: () => set({ isSidebarOpen: false }),

@@ -15,6 +15,10 @@
 import type { Env } from "../types";
 import type { ActivityActor } from "./activity.ts";
 import { ATTACHMENT_LIMITS, validateAttachmentSet } from "../../shared/attachments.ts";
+import {
+	contentIdForDisposition,
+	isInlineImageMimeType,
+} from "../../shared/content-id.ts";
 
 /** Metadata for one stored attachment, shaped for the DO `attachments` table. */
 export type StoredAttachment = {
@@ -43,7 +47,12 @@ type SesAttachmentInput = {
  *    being sent, where the draft already owns the R2 objects).
  */
 export type AttachmentRef =
-	| { kind: "upload"; uploadId: string; disposition?: "attachment" | "inline" }
+	| {
+			kind: "upload";
+			uploadId: string;
+			disposition?: "attachment" | "inline";
+			contentId?: string;
+	  }
 	| {
 			kind: "existing";
 			emailId: string;
@@ -101,7 +110,14 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
 type StubForResolve = {
 	getAttachment: (
 		id: string,
-	) => Promise<{ filename: string; mimetype: string; size: number; email_id: string } | null>;
+	) => Promise<{
+		filename: string;
+		mimetype: string;
+		size: number;
+		email_id: string;
+		content_id?: string | null;
+		disposition?: string | null;
+	} | null>;
 	queueAttachmentCleanup?: (
 		emailId: string,
 		keys: string[],
@@ -114,6 +130,7 @@ type ResolvedSource = {
 	filename: string;
 	mimetype: string;
 	disposition: "attachment" | "inline";
+	contentId: string | null;
 	stagingKey?: string; // present for `upload` refs; deleted after promotion
 };
 
@@ -216,10 +233,9 @@ export async function resolveAndPromoteAttachments(
 	// Pass 1: locate each source and pull its bytes + metadata.
 	const sources: ResolvedSource[] = [];
 	for (const ref of refs) {
-		const disposition: "attachment" | "inline" =
-			ref.disposition === "inline" ? "inline" : "attachment";
-
 		if (ref.kind === "upload") {
+			const disposition: "attachment" | "inline" =
+				ref.disposition === "inline" ? "inline" : "attachment";
 			const key = uploadKey(mailboxId, ref.uploadId);
 			const obj = await bucket.get(key);
 			if (!obj) {
@@ -228,16 +244,29 @@ export async function resolveAndPromoteAttachments(
 				);
 			}
 			const meta = obj.customMetadata ?? {};
+			const mimetype =
+				meta.type || obj.httpMetadata?.contentType || "application/octet-stream";
+			if (disposition === "inline" && !isInlineImageMimeType(mimetype)) {
+				throw new Error("Fresh inline attachments must use an image MIME type.");
+			}
 			sources.push({
 				bytes: await obj.arrayBuffer(),
 				filename: sanitizeFilename(meta.filename || "untitled"),
-				mimetype: meta.type || obj.httpMetadata?.contentType || "application/octet-stream",
+				mimetype,
 				disposition,
+				contentId: contentIdForDisposition(disposition, ref.contentId),
 				stagingKey: key,
 			});
 		} else {
 			const att = await stub.getAttachment(ref.attachmentId);
 			if (!att) throw new Error("A referenced attachment no longer exists.");
+			if (att.email_id !== ref.emailId) {
+				throw new Error(
+					"A referenced attachment does not belong to the referenced email.",
+				);
+			}
+			const disposition: "attachment" | "inline" =
+				att.disposition === "inline" ? "inline" : "attachment";
 			const safe = sanitizeFilename(att.filename);
 			const obj = await bucket.get(attachmentKey(att.email_id, ref.attachmentId, safe));
 			if (!obj) throw new Error("A referenced attachment file is missing.");
@@ -246,6 +275,7 @@ export async function resolveAndPromoteAttachments(
 				filename: safe,
 				mimetype: att.mimetype || "application/octet-stream",
 				disposition,
+				contentId: contentIdForDisposition(disposition, att.content_id),
 			});
 		}
 	}
@@ -275,6 +305,9 @@ export async function resolveAndPromoteAttachments(
 				filename: s.filename,
 				type: s.mimetype,
 				disposition: s.disposition,
+				...(s.disposition === "inline" && s.contentId
+					? { contentId: s.contentId }
+					: {}),
 			});
 			storedMetadata.push({
 				id: attachmentId,
@@ -282,7 +315,7 @@ export async function resolveAndPromoteAttachments(
 				filename: s.filename,
 				mimetype: s.mimetype,
 				size: s.bytes.byteLength,
-				content_id: null,
+				content_id: s.contentId,
 				disposition: s.disposition,
 			});
 		}

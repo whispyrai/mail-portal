@@ -11,8 +11,10 @@
  * Zod schemas: used across route handlers to eliminate duplication.
  */
 import { z } from "zod";
+import { RECIPIENT_MEMORY_LIMITS } from "../../shared/recipient-suggestions.ts";
 import { ATTACHMENT_LIMITS } from "../../shared/attachments.ts";
 import { decodeBase64Url } from "../../shared/base64url.ts";
+import { isCanonicalContentId } from "../../shared/content-id.ts";
 
 // ── TypeScript Interfaces ──────────────────────────────────────────
 
@@ -53,8 +55,15 @@ export interface AttachmentInfo {
 
 const RecipientFieldSchema = z.union([
 	z.string().email(),
-	z.array(z.string().email()).min(1),
+	z.array(z.string().email())
+		.min(1)
+		.max(RECIPIENT_MEMORY_LIMITS.maxRecipientsPerMessage),
 ]);
+
+function recipientCount(value: string | string[] | undefined): number {
+	if (!value) return 0;
+	return Array.isArray(value) ? value.length : 1;
+}
 
 export const ErrorResponseSchema = z.object({
 	error: z.string(),
@@ -64,18 +73,45 @@ export const ErrorResponseSchema = z.object({
  * A reference to a file to attach (the upload-first model). The client sends
  * these instead of the bytes; the server resolves them from R2 at send time.
  */
-export const AttachmentRefSchema = z.discriminatedUnion("kind", [
-	z.object({
+const UploadAttachmentRefSchema = z
+	.object({
 		kind: z.literal("upload"),
 		uploadId: z.string().min(1),
 		disposition: z.enum(["attachment", "inline"]).optional(),
-	}),
-	z.object({
+		contentId: z.string().optional(),
+	})
+	.strict()
+	.superRefine((ref, context) => {
+		if (ref.disposition === "inline") {
+			if (!ref.contentId || !isCanonicalContentId(ref.contentId)) {
+				context.addIssue({
+					code: z.ZodIssueCode.custom,
+					path: ["contentId"],
+					message: "Inline uploads require a valid Content-ID",
+				});
+			}
+		} else if (ref.contentId !== undefined) {
+			context.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ["contentId"],
+				message: "Content-ID is only valid for inline uploads",
+			});
+		}
+	});
+
+const ExistingAttachmentRefSchema = z
+	.object({
 		kind: z.literal("existing"),
 		emailId: z.string().min(1),
 		attachmentId: z.string().min(1),
 		disposition: z.enum(["attachment", "inline"]).optional(),
-	}),
+		contentId: z.never().optional(),
+	})
+	.strict();
+
+export const AttachmentRefSchema = z.union([
+	UploadAttachmentRefSchema,
+	ExistingAttachmentRefSchema,
 ]);
 
 export const SaveDraftRequestSchema = z
@@ -87,6 +123,7 @@ export const SaveDraftRequestSchema = z
 		body: z.string(),
 		in_reply_to: z.string().optional(),
 		thread_id: z.string().optional(),
+		draft_create_key: z.string().min(1).max(128).optional(),
 		draft_id: z.string().optional(),
 		draft_version: z.number().int().min(1).optional(),
 		attachments: z
@@ -102,7 +139,11 @@ export const SaveDraftRequestSchema = z
 			message: "Draft ID and version must be provided together",
 			path: ["draft_version"],
 		},
-	);
+	)
+	.refine((data) => !(data.draft_create_key && data.draft_id), {
+		message: "Draft create key cannot be combined with an existing draft identity",
+		path: ["draft_create_key"],
+	});
 
 export const SendEmailRequestSchema = z
 	.object({
@@ -128,6 +169,17 @@ export const SendEmailRequestSchema = z
 	.refine((data) => data.html || data.text, {
 		message: "Either 'html' or 'text' must be provided",
 	})
+	.refine(
+		(data) =>
+			recipientCount(data.to) +
+			recipientCount(data.cc) +
+			recipientCount(data.bcc) <=
+			RECIPIENT_MEMORY_LIMITS.maxRecipientsPerMessage,
+		{
+			message: `A message cannot contain more than ${RECIPIENT_MEMORY_LIMITS.maxRecipientsPerMessage} recipients`,
+			path: ["to"],
+		},
+	)
 	.refine(
 		(data) =>
 			(data.source_draft_id === undefined) ===

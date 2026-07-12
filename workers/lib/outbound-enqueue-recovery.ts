@@ -5,6 +5,10 @@ import {
 	rollbackAttachmentPromotion,
 	type AttachmentPromotion,
 } from "./attachments.ts";
+import {
+	outboundEnqueueOutcome,
+	type OutboundEnqueueOutcome,
+} from "./outbound-delivery-service.ts";
 
 type AuthoritativeDelivery = {
 	id: string;
@@ -32,7 +36,12 @@ type RecoveryStub = {
 };
 
 export type AmbiguousEnqueueResolution =
-	| { status: "committed"; delivery: AuthoritativeDelivery; replayed: true }
+	| {
+			status: "committed";
+			delivery: AuthoritativeDelivery;
+			replayed: true;
+			outcome: OutboundEnqueueOutcome;
+	  }
 	| { status: "not_committed" }
 	| { status: "indeterminate" };
 
@@ -100,5 +109,10 @@ export async function reconcileAmbiguousOutboundEnqueue(input: {
 		input.promotion,
 		input.actor,
 	);
-	return { status: "committed", delivery, replayed: true };
+	return {
+		status: "committed",
+		delivery,
+		replayed: true,
+		outcome: outboundEnqueueOutcome(delivery, true),
+	};
 }

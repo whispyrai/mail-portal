@@ -6,13 +6,17 @@ import { resolveUnambiguousThreadReference } from "./thread-reference.ts";
 
 function dependencies() {
 	const created: Array<Record<string, unknown>> = [];
+	const storedAttachments: Array<Array<Record<string, unknown>>> = [];
 	const value: EmailStorageDependencies = {
 		bucket: {
 			async put() {},
 			async delete() {},
 		},
 		mailbox: {
-			async createEmail(_folder, email) { created.push(email); },
+			async createEmail(_folder, email, attachments) {
+				created.push(email);
+				storedAttachments.push(attachments);
+			},
 			async resolveCanonicalThreadId(ids) {
 				return resolveUnambiguousThreadReference(ids, created.map((email) => ({
 					id: String(email.id),
@@ -23,7 +27,7 @@ function dependencies() {
 			async getEmail() { return null; },
 		},
 	};
-	return { value, created };
+	return { value, created, storedAttachments };
 }
 
 function parsed(overrides: Partial<Email> = {}): Email {
@@ -146,4 +150,33 @@ test("multiple distinct app thread tokens fail closed to a new conversation", as
 	});
 	assert.equal(state.created[0]!.thread_id, "ambiguous");
 	assert.equal(state.created[0]!.snooze_wake_thread_id, null);
+});
+
+test("ingest preserves legitimate inline CID and erases ordinary CID", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed({
+		attachments: [
+			{
+				filename: "diagram.png",
+				mimeType: "image/png",
+				content: new Uint8Array([1]).buffer,
+				disposition: "inline",
+				contentId: "diagram@example.com",
+			},
+			{
+				filename: "proposal.pdf",
+				mimeType: "application/pdf",
+				content: new Uint8Array([2]).buffer,
+				disposition: "attachment",
+				contentId: "legacy-ordinary@example.com",
+			},
+		],
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "mail-with-attachments",
+	});
+
+	assert.equal(state.storedAttachments[0]?.[0]?.content_id, "diagram@example.com");
+	assert.equal(state.storedAttachments[0]?.[1]?.content_id, null);
 });

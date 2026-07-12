@@ -21,6 +21,7 @@ function testApp(options: {
 	const markedThreads: string[] = [];
 	let idempotencyLookups = 0;
 	const stub = {
+		async getAttachment() { return null; },
 		async getEmail(id: string) {
 			if (id === "original-1") {
 				return {
@@ -128,6 +129,7 @@ test("reply snapshots the message and source draft into the truthful outbox", as
 		undoUntil: enqueued[0]!.undoUntil,
 		scheduledFor: null,
 		replayed: false,
+		outcome: "enqueued",
 	});
 	assert.deepEqual(enqueued[0]!.actor, { kind: "user", id: "user-1" });
 	assert.equal(enqueued[0]!.source, "ui");
@@ -325,6 +327,7 @@ test("an enqueue response lost after commit reconciles the authoritative deliver
 		undoUntil,
 		scheduledFor: null,
 		replayed: true,
+		outcome: "active_replay",
 	});
 });
 
@@ -347,4 +350,69 @@ test("browser replies without an idempotency key are rejected", async () => {
 
 	assert.equal(response.status, 400);
 	assert.equal(enqueued.length, 0);
+});
+
+test("reply and forward APIs reject duplicate or malformed inline mappings before enqueue", async () => {
+	const cases = [
+		{
+			path: "reply",
+			html: '<img src="cid:chart@mail-portal.local" data-mail-inline-image="v1"><img src="cid:chart@mail-portal.local" data-mail-inline-image="v1">',
+			code: "inline_image_duplicate_body_cid",
+		},
+		{
+			path: "forward",
+			html: '<img src="cid:chart@mail-portal.local" data-mail-inline-image="v1>',
+			code: "inline_html_malformed",
+		},
+	] as const;
+
+	for (const item of cases) {
+		const { app, enqueued } = testApp();
+		const stagingKey = `uploads/${mailboxId}/upload-${item.path}`;
+		const objects = new Map<string, ArrayBuffer>([
+			[stagingKey, new Uint8Array([1, 2, 3]).buffer],
+		]);
+		const response = await app.request(
+			`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails/original-1/${item.path}`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					to: "customer@example.com",
+					from: mailboxId,
+					subject: "Inline authority",
+					html: item.html,
+					attachments: [{
+						kind: "upload",
+						uploadId: `upload-${item.path}`,
+						disposition: "inline",
+						contentId: "chart@mail-portal.local",
+					}],
+					idempotency_key: `inline-${item.path}-authority`,
+				}),
+			},
+			{
+				BUCKET: {
+					async get(key: string) {
+						const bytes = objects.get(key);
+						return bytes ? {
+							customMetadata: { filename: "chart.png", type: "image/png" },
+							httpMetadata: {},
+							async arrayBuffer() { return bytes.slice(0); },
+						} : null;
+					},
+					async put(key: string, bytes: ArrayBuffer) { objects.set(key, bytes.slice(0)); },
+					async delete(keys: string | string[]) {
+						for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
+					},
+				},
+			} as never,
+		);
+
+		assert.equal(response.status, 400, item.path);
+		assert.equal((await response.json() as { code: string }).code, item.code);
+		assert.equal(enqueued.length, 0);
+		assert.equal(objects.has(stagingKey), true);
+		assert.equal(objects.size, 1);
+	}
 });

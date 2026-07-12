@@ -3,7 +3,11 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Badge, Button, Loader, Pagination, Tooltip } from "@cloudflare/kumo";
-import { ArrowLeftIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
+import {
+	ArrowLeftIcon,
+	MagnifyingGlassIcon,
+	PaperclipIcon,
+} from "@phosphor-icons/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
@@ -19,24 +23,22 @@ import { useUIStore } from "~/hooks/useUIStore";
 import type { Email } from "~/types";
 import { MAIL_COMMAND_EVENT } from "~/components/MailKeyboardController";
 import type { MailCommand } from "~/lib/mail-keyboard";
+import { parseSearchQuery, searchHighlightTerms } from "~/lib/search-parser";
 
 function highlightTerms(text: string, query: string): React.ReactNode {
 	if (!query || !text) return text;
-	const freeText = query
-		.replace(/\b(?:from|to|subject|in|is|has|before|after):"[^"]*"/gi, "")
-		.replace(/\b(?:from|to|subject|in|is|has|before|after):\S+/gi, "")
-		.trim();
-	if (!freeText) return text;
 	try {
-		const escaped = freeText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-		const regex = new RegExp(`(${escaped})`, "gi");
+		const terms = searchHighlightTerms(parseSearchQuery(query));
+		if (!terms.length) return text;
+		const escaped = terms.map((term) =>
+			term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+		);
+		const regex = new RegExp(`(${escaped.join("|")})`, "gi");
 		const parts = text.split(regex);
 		if (parts.length === 1) return text;
-		// Use case-insensitive string comparison instead of regex.test() with g flag,
-		// which has stateful lastIndex causing alternating true/false results.
-		const lowerEscaped = escaped.toLowerCase();
+		const highlights = new Set(terms.map((term) => term.toLowerCase()));
 		return parts.map((part, i) =>
-			part.toLowerCase() === lowerEscaped ? (
+			highlights.has(part.toLowerCase()) ? (
 				<mark
 					key={i}
 					className="bg-kumo-warning-tint text-kumo-default rounded-sm px-0.5"
@@ -61,6 +63,8 @@ export default function SearchResultsRoute() {
 	const updateEmail = useUpdateEmail();
 	const urlQuery = searchParams.get("q") || "";
 	const labelId = searchParams.get("label_id") || "";
+	const sortColumn = searchParams.get("sortColumn") || "";
+	const sortDirection = searchParams.get("sortDirection") || "";
 	const { data: labels = [] } = useLabels(mailboxId);
 	const selectedLabel = labels.find((label) => label.id === labelId);
 	const currentViewDefinition = useMemo(
@@ -69,8 +73,8 @@ export default function SearchResultsRoute() {
 	);
 	const [page, setPage] = useState(1);
 	const searchKey = useMemo(
-		() => `${mailboxId ?? ""}::${urlQuery}::${labelId}`,
-		[mailboxId, urlQuery, labelId],
+		() => `${mailboxId ?? ""}::${urlQuery}::${labelId}::${sortColumn}::${sortDirection}`,
+		[mailboxId, urlQuery, labelId, sortColumn, sortDirection],
 	);
 	const prevSearchKeyRef = useRef(searchKey);
 	const searchChanged = prevSearchKeyRef.current !== searchKey;
@@ -86,11 +90,20 @@ export default function SearchResultsRoute() {
 		closePanel();
 	}, [closePanel, searchChanged, searchKey]);
 
-	const { data: searchData, isLoading } = useSearchEmails(
+	const {
+		data: searchData,
+		isLoading,
+		isFetching,
+		isError,
+		error,
+		refetch,
+	} = useSearchEmails(
 		mailboxId,
 		urlQuery,
 		currentPage,
 		labelId,
+		sortColumn,
+		sortDirection,
 	);
 	const results = searchData?.results ?? [];
 	const totalCount = searchData?.totalCount ?? 0;
@@ -120,6 +133,8 @@ export default function SearchResultsRoute() {
 			draft: "Drafts",
 			archive: "Archive",
 			trash: "Trash",
+			outbox: "Outbox",
+			snoozed: "Snoozed",
 		};
 		return map[name.toLowerCase()] || name;
 	};
@@ -142,7 +157,7 @@ export default function SearchResultsRoute() {
 						<h1 className="text-lg font-semibold text-kumo-default truncate">
 							Search Results
 						</h1>
-						{!isLoading && (
+						{!isLoading && !isError && (
 							<span className="text-sm text-kumo-subtle">
 								{totalCount} result{totalCount !== 1 ? "s" : ""}
 								{urlQuery ? ` for "${urlQuery}"` : ""}
@@ -189,6 +204,33 @@ export default function SearchResultsRoute() {
 						<div className="flex justify-center py-16">
 							<Loader size="lg" />
 						</div>
+					) : isError ? (
+						<div
+							role="alert"
+							className="mx-auto flex max-w-md flex-col items-center px-6 py-20 text-center"
+						>
+							<MagnifyingGlassIcon
+								size={44}
+								weight="thin"
+								className="text-kumo-subtle"
+							/>
+							<h2 className="mt-4 text-base font-semibold text-kumo-default">
+								Search unavailable
+							</h2>
+							<p className="mt-2 text-sm text-kumo-subtle">
+								{error instanceof Error
+									? error.message
+									: "We couldn't complete this search."}
+							</p>
+							<Button
+								className="mt-4"
+								variant="secondary"
+								disabled={isFetching}
+								onClick={() => refetch()}
+							>
+								{isFetching ? "Trying again…" : "Try again"}
+							</Button>
+						</div>
 					) : results.length === 0 ? (
 						<div className="flex flex-col items-center justify-center py-24 px-6 text-center">
 							<div className="mb-4">
@@ -218,6 +260,8 @@ export default function SearchResultsRoute() {
 									<code className="bg-kumo-tint px-1 rounded">
 										before:2025-01-01
 									</code>
+									, <code className="bg-kumo-tint px-1 rounded">filename:proposal.pdf</code>, or{" "}
+									<code className="bg-kumo-tint px-1 rounded">"exact phrase"</code>
 								</p>
 							)}
 						</div>
@@ -228,6 +272,9 @@ export default function SearchResultsRoute() {
 								const snippet = getSnippetText(email.snippet, 120);
 								const folderName = (email as Email & { folder_name?: string })
 									.folder_name;
+								const matchedAttachment = (
+									email as Email & { matched_attachment_filename?: string | null }
+								).matched_attachment_filename;
 								return (
 									<div
 										key={email.id}
@@ -278,6 +325,12 @@ export default function SearchResultsRoute() {
 													{highlightTerms(snippet, urlQuery)}
 												</div>
 											)}
+											{matchedAttachment && (
+												<div className="mt-1 flex items-center gap-1 truncate text-xs text-kumo-subtle">
+													<PaperclipIcon size={13} className="shrink-0" />
+													<span className="truncate">{highlightTerms(matchedAttachment, urlQuery)}</span>
+												</div>
+											)}
 										</div>
 									</div>
 								);
@@ -285,7 +338,7 @@ export default function SearchResultsRoute() {
 						</div>
 					)}
 				</div>
-				{totalCount > SEARCH_PAGE_SIZE && (
+				{!isError && totalCount > SEARCH_PAGE_SIZE && (
 					<div className="flex justify-center py-3 border-t border-kumo-line shrink-0">
 						<Pagination
 							page={currentPage}

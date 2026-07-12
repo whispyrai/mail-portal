@@ -16,13 +16,17 @@ import LabelPicker from "~/components/labels/LabelPicker";
 import OutboundDeliveryActions from "~/components/OutboundDeliveryActions";
 import ConversationIntelligenceCard from "~/components/ConversationIntelligenceCard";
 import SnoozeDialog from "~/components/SnoozeDialog";
-import { splitEmailList, toEmailListValue, getNonInlineAttachments } from "~/lib/utils";
+import { FollowUpReminderControl } from "~/components/FollowUpReminderDialog";
+import { splitEmailList, toEmailListValue } from "~/lib/utils";
+import { evaluateStoredDraftAttachments } from "~/lib/compose-attachment-policy";
+import { planComposeEnqueueResult } from "~/lib/outbound-enqueue-outcome";
 import api from "~/services/api";
-import { useAiDraftReply, useCancelOutboundDelivery, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
+import { useAiDraftReply, useCancelOutboundDelivery, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSaveDraft, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
 import { useMailbox } from "~/queries/mailboxes";
 import { useLabels, useMutateLabels } from "~/queries/labels";
 import { useUnsnooze } from "~/queries/snooze";
+import { useFollowUpReminders } from "~/queries/follow-up-reminders";
 import { useUIStore } from "~/hooks/useUIStore";
 import type { Email, Folder, Label, Mailbox } from "~/types";
 import { LogicalSendIdentity } from "~/lib/compose-send-identity";
@@ -50,11 +54,13 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const moveEmailMut = useMoveEmail();
 	const sendEmailMut = useSendEmail();
 	const replyMut = useReplyToEmail();
+	const saveDraftMut = useSaveDraft();
 	const cancelOutboundMut = useCancelOutboundDelivery();
 	const aiDraftMut = useAiDraftReply();
 	const mutateLabels = useMutateLabels();
 	const unsnooze = useUnsnooze();
 	const { data: labels = [] } = useLabels(mailboxId);
+	const { data: followUpReminders = [] } = useFollowUpReminders(mailboxId);
 	const { data: folders = [] } = useFolders(mailboxId) as { data?: Folder[] };
 	const { data: currentMailbox } = useMailbox(mailboxId) as {
 		data?: Mailbox;
@@ -128,6 +134,16 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	if (!email) return <EmailPanelSkeleton />;
 
 	const snoozeFolderId = email.folder_id ?? folder ?? Folders.INBOX;
+	const reminderConversationKey = email.thread_id?.trim() || email.id;
+	const activeFollowUpReminder = followUpReminders.find(
+		(reminder) => reminder.conversationKey === reminderConversationKey,
+	);
+	const canSetFollowUpReminder = new Set<string>([
+		Folders.INBOX,
+		Folders.SENT,
+		Folders.ARCHIVE,
+		Folders.SNOOZED,
+	]).has(snoozeFolderId);
 	const snoozeConversationId = email.conversation_id ?? email.thread_id;
 	const canSnooze = !isSnoozedFolder && !isDraftFolder && !isOutboxFolder &&
 		!isTrashFolder && !new Set<string>([Folders.SENT, Folders.SPAM]).has(snoozeFolderId) &&
@@ -208,7 +224,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		if (!mailboxId) return;
 		if (!window.confirm("Discard this draft?")) return;
 		discardDraftMut.mutate(
-			{ mailboxId, id: target.id },
+			{ mailboxId, id: target.id, version: target.draft_version ?? 1 },
 			{
 				onSuccess: () => {
 					toastManager.add({ title: "Draft discarded" });
@@ -230,40 +246,83 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		try {
 			const fresh = await api.getEmail(mailboxId, target.id) as Email;
 			if (fresh) target = fresh;
-			if (!target.recipient) { toastManager.add({ title: "Cannot send: no recipient set on this draft.", variant: "error" }); return; }
-			if (!target.draft_version) { toastManager.add({ title: "Reload this draft before sending it.", variant: "error" }); return; }
-			const toRecipients = splitEmailList(target.recipient);
-			if (toRecipients.length === 0) { toastManager.add({ title: "Cannot send: no valid recipient set on this draft.", variant: "error" }); return; }
 			const fromName = currentMailbox.settings?.fromName || currentMailbox.name;
 			const from = fromName && fromName !== currentMailbox.email ? { email: currentMailbox.email, name: fromName } : currentMailbox.email;
-			const originalEmail = target.in_reply_to ? allMessages.find((msg) => msg.id === target.in_reply_to) : undefined;
-			// Carry the draft's stored attachments through as existing references.
-			const attachmentRefs = getNonInlineAttachments(target.attachments).map(
-				(a) => ({ kind: "existing" as const, emailId: target.id, attachmentId: a.id }),
-			);
-			const sendPayload = {
-				source_draft_id: target.id,
-				source_draft_version: target.draft_version,
-				to: toEmailListValue(toRecipients),
-				cc: toEmailListValue(splitEmailList(target.cc)),
-				bcc: toEmailListValue(splitEmailList(target.bcc)),
-				from,
-				subject: target.subject || "(no subject)",
-				html: target.body || "",
-				text: target.body ? target.body.replace(/<[^>]*>/g, "").trim() : "",
-				attachments: attachmentRefs,
+			const enqueueDraft = async (draft: Email) => {
+				if (!draft.recipient) {
+					throw new Error("Cannot send: no recipient set on this draft.");
+				}
+				if (!draft.draft_version) {
+					throw new Error("Reload this draft before sending it.");
+				}
+				const toRecipients = splitEmailList(draft.recipient);
+				if (toRecipients.length === 0) {
+					throw new Error("Cannot send: no valid recipient set on this draft.");
+				}
+				const attachmentPolicy = evaluateStoredDraftAttachments(
+					draft.id,
+					draft.attachments,
+					draft.body ?? "",
+				);
+				if (!attachmentPolicy.ok) throw new Error(attachmentPolicy.error);
+				const sendPayload = {
+					source_draft_id: draft.id,
+					source_draft_version: draft.draft_version,
+					to: toEmailListValue(toRecipients),
+					cc: toEmailListValue(splitEmailList(draft.cc)),
+					bcc: toEmailListValue(splitEmailList(draft.bcc)),
+					from,
+					subject: draft.subject || "(no subject)",
+					html: draft.body || "",
+					text: draft.body ? draft.body.replace(/<[^>]*>/g, "").trim() : "",
+					attachments: attachmentPolicy.refs,
+				};
+				const emailData = {
+					...sendPayload,
+					idempotency_key: draftSendIdentityRef.current.keyFor(sendPayload),
+				};
+				const originalEmail = draft.in_reply_to
+					? allMessages.find((msg) => msg.id === draft.in_reply_to)
+					: undefined;
+				const result = originalEmail
+					? await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData })
+					: await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+				return { result, attachmentPolicy };
 			};
-			const emailData = {
-				...sendPayload,
-				idempotency_key: draftSendIdentityRef.current.keyFor(sendPayload),
-			};
-			const result = originalEmail
-				? await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData })
-				: await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+
+			let { result, attachmentPolicy } = await enqueueDraft(target);
+			let enqueuePlan = planComposeEnqueueResult(result);
+			if (enqueuePlan.action === "renew_revision_and_resend") {
+				target = await saveDraftMut.mutateAsync({
+					mailboxId,
+					draft: {
+						to: target.recipient,
+						cc: target.cc,
+						bcc: target.bcc,
+						subject: target.subject,
+						body: target.body || "",
+						in_reply_to: target.in_reply_to || undefined,
+						thread_id: target.thread_id || undefined,
+						draft_id: target.id,
+						draft_version: target.draft_version,
+						attachments: attachmentPolicy.refs,
+					},
+				});
+				draftSendIdentityRef.current.reset();
+				({ result, attachmentPolicy } = await enqueueDraft(target));
+				enqueuePlan = planComposeEnqueueResult(result);
+			}
+			if (enqueuePlan.action !== "finish") {
+				const message = enqueuePlan.action === "block"
+					? enqueuePlan.message
+					: "A prior delivery still owns this draft revision. Review it before sending again.";
+				toastManager.add({ title: message, variant: "error" });
+				return;
+			}
 			toastManager.add({
-				title: "Email queued. Draft kept until delivery is confirmed.",
+				title: enqueuePlan.title ?? "Email queued. Draft kept until delivery is confirmed.",
 				timeout: 10_000,
-				actions: [
+				actions: enqueuePlan.canUndo ? [
 					{
 						children: "Undo",
 						variant: "secondary",
@@ -281,7 +340,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 								},
 							),
 					},
-				],
+				] : [],
 			});
 			if (isDraftFolder) closePanel();
 		} catch (err) {
@@ -424,7 +483,14 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				{(email.labels ?? []).length === 0 && (
 					<span className="text-sm text-kumo-subtle">None</span>
 				)}
-				<div className="ms-auto">
+				<div className="ms-auto flex flex-wrap items-center justify-end gap-1">
+					{mailboxId && canSetFollowUpReminder && (
+						<FollowUpReminderControl
+							mailboxId={mailboxId}
+							emailId={email.id}
+							reminder={activeFollowUpReminder}
+						/>
+					)}
 					<LabelPicker
 						labels={labels}
 						selectedIds={selectedLabelIds}

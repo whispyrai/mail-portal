@@ -100,8 +100,11 @@ function put<T>(url: string, body?: unknown) {
 	});
 }
 
-function del<T>(url: string) {
-	return request<T>(url, { method: "DELETE" });
+function del<T>(url: string, body?: unknown) {
+	return request<T>(url, {
+		method: "DELETE",
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
 }
 
 // ---------- Typed response shapes ----------
@@ -210,10 +213,11 @@ const api = {
 		post<{ status: "restored"; folderId: string }>(
 			`/api/v1/mailboxes/${mailboxId}/emails/${id}/restore`,
 		),
-	discardDraft: (mailboxId: string, id: string) =>
-		del<{ status: "discarded" }>(
-			`/api/v1/mailboxes/${mailboxId}/drafts/${id}`,
-		),
+		discardDraft: (mailboxId: string, id: string, version: number) =>
+			del<{ status: "discarded" }>(
+				`/api/v1/mailboxes/${mailboxId}/drafts/${id}`,
+				{ draft_version: version },
+			),
 	moveEmail: (mailboxId: string, id: string, folderId: string) =>
 		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${id}/move`, { folderId }),
 	getThread: (mailboxId: string, threadId: string, opts?: { signal?: AbortSignal }) =>
@@ -271,6 +275,7 @@ const api = {
 	uploadAttachment: async (
 		mailboxId: string,
 		file: File,
+		signal?: AbortSignal,
 	): Promise<{ uploadId: string; filename: string; mimetype: string; size: number }> => {
 		const params = new URLSearchParams({
 			filename: file.name,
@@ -281,6 +286,7 @@ const api = {
 			{
 				method: "POST",
 				body: file,
+				signal,
 				headers: { "Content-Type": file.type || "application/octet-stream" },
 			},
 		);
@@ -300,11 +306,12 @@ const api = {
 			body: string;
 			in_reply_to?: string;
 			thread_id?: string;
-			draft_id?: string;
-			draft_version?: number;
-			attachments?: AttachmentRef[];
-		},
-	) => post<Email>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
+				draft_id?: string;
+				draft_version?: number;
+				draft_create_key?: string;
+				attachments?: AttachmentRef[];
+			},
+		) => post<Email & { replayed?: boolean }>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
 	replyToEmail: (mailboxId: string, emailId: string, email: unknown) =>
 		post<OutboundEnqueueResponse>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email),
 	forwardEmail: (mailboxId: string, emailId: string, email: unknown) =>

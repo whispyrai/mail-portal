@@ -210,6 +210,47 @@ test("pending attachment metadata must exactly cover the immutable snapshot", ()
 	);
 });
 
+test("pending rows preserve inline CID and erase ordinary legacy CID", () => {
+	const withAttachments = snapshot({ attachmentIds: ["inline-1", "ordinary-1"] });
+	const rows = pendingAttachmentsToRows("email-1", withAttachments, [
+		{
+			id: "inline-1",
+			filename: "diagram.png",
+			mimetype: "image/png",
+			size: 3,
+			disposition: "inline",
+			contentId: "diagram@example.com",
+		},
+		{
+			id: "ordinary-1",
+			filename: "proposal.pdf",
+			mimetype: "application/pdf",
+			size: 4,
+			disposition: "attachment",
+			content_id: "legacy-ordinary@example.com",
+		},
+	]);
+
+	assert.equal(rows[0]?.content_id, "diagram@example.com");
+	assert.equal(rows[1]?.content_id, null);
+});
+
+test("outbound attachment projection includes CID only for authoritative inline metadata", () => {
+	const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+	assert.match(
+		source,
+		/attachment\.disposition === "inline" && attachment\.content_id[\s\S]*?\{ contentId: attachment\.content_id \}/,
+	);
+});
+
+test("the Durable Object validates authoritative inline mappings before outbox mutation", () => {
+	const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+	assert.match(
+		source,
+		/async enqueueOutbound\([\s\S]*?validateResolvedInlineImages\([\s\S]*?if \(!inlineMapping\.ok\)[\s\S]*?this\.#outboxService\(attachments, emailId\)\.enqueue\(command\)/,
+	);
+});
+
 test("accepted reconciliation also finds an exact source draft after the email moved", () => {
 	const source = readFileSync(
 		new URL("./outbound-storage.ts", import.meta.url),

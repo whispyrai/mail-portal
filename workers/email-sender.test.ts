@@ -68,6 +68,60 @@ test("SES request carries mailbox and delivery correlation tags", async () => {
 	assert.equal(payload?.ConfigurationSetName, "mail-portal-events");
 });
 
+test("SES serializes inline Content-ID without adding one to ordinary attachments", async () => {
+	let payload: {
+		Content?: { Simple?: { Attachments?: unknown } };
+	} | undefined;
+	const outcome = await sendEmailWithOutcome(
+		env,
+		{
+			...params,
+			attachments: [
+				{
+					content: "AQID",
+					filename: "diagram.png",
+					type: "image/png",
+					disposition: "inline",
+					contentId: "diagram-1@mail-portal.local",
+				},
+				{
+					content: "BAUG",
+					filename: "proposal.pdf",
+					type: "application/pdf",
+					disposition: "attachment",
+					contentId: "legacy-ordinary@example.com",
+				},
+			],
+		},
+		{
+			createTransport: () =>
+				transport(async (_url, request) => {
+					payload = JSON.parse(String(request.body));
+					return Response.json({ MessageId: "ses-message-1" });
+				}),
+		},
+	);
+
+	assert.equal(outcome.kind, "accepted");
+	assert.deepEqual(payload?.Content?.Simple?.Attachments, [
+		{
+			RawContent: "AQID",
+			FileName: "diagram.png",
+			ContentType: "image/png",
+			ContentDisposition: "INLINE",
+			ContentTransferEncoding: "BASE64",
+			ContentId: "diagram-1@mail-portal.local",
+		},
+		{
+			RawContent: "BAUG",
+			FileName: "proposal.pdf",
+			ContentType: "application/pdf",
+			ContentDisposition: "ATTACHMENT",
+			ContentTransferEncoding: "BASE64",
+		},
+	]);
+});
+
 test("an explicit SES HTTP rejection preserves its status and response detail", async () => {
 	const outcome = await sendEmailWithOutcome(env, params, {
 		createTransport: () =>

@@ -48,6 +48,10 @@ export interface OutboundDeliveryAttempt {
  */
 export interface OutboundDeliveryTransaction {
 	findDeliveryByIdempotencyKey(key: string): StoredOutboundDelivery | null;
+	findDeliveryBySourceDraft?(
+		id: string,
+		version: number,
+	): StoredOutboundDelivery | null;
 	/** Must execute in the same transaction as snapshot + delivery insertion. */
 	assertSourceDraftVersion(
 		id: string,
@@ -92,6 +96,24 @@ export interface EnqueuedDelivery {
 	delivery: StoredOutboundDelivery;
 	snapshot: OutboundMessageSnapshot;
 	replayed: boolean;
+	outcome: OutboundEnqueueOutcome;
+}
+
+export type OutboundEnqueueOutcome =
+	| "enqueued"
+	| "active_replay"
+	| "terminal_replay";
+
+export function outboundEnqueueOutcome(
+	delivery: { status: string },
+	replayed: boolean,
+): OutboundEnqueueOutcome {
+	if (!replayed) return "enqueued";
+	return delivery.status === "queued" ||
+		delivery.status === "sending" ||
+		delivery.status === "retrying"
+		? "active_replay"
+		: "terminal_replay";
 }
 
 export interface ClaimedDelivery {
@@ -199,13 +221,42 @@ export class TruthfulOutboxService {
 				if (!snapshot) {
 					throw new Error(`Missing outbox snapshot for ${existing.id}`);
 				}
-				return { delivery: existing, snapshot, replayed: true };
+				return {
+					delivery: existing,
+					snapshot,
+					replayed: true,
+					outcome: outboundEnqueueOutcome(existing, true),
+				};
+			}
+			const sourceDraft = validateSourceDraftReference(command.snapshot);
+			if (sourceDraft.draftId !== undefined) {
+				const sameDraft = tx.findDeliveryBySourceDraft
+					? tx.findDeliveryBySourceDraft(
+							sourceDraft.draftId,
+							sourceDraft.draftVersion!,
+						)
+					: tx.listDeliveries().find(
+							(delivery) =>
+								delivery.draftId === sourceDraft.draftId &&
+								delivery.draftVersion === sourceDraft.draftVersion,
+						) ?? null;
+				if (sameDraft) {
+					const snapshot = tx.getSnapshot(sameDraft.emailId);
+					if (!snapshot) {
+						throw new Error(`Missing outbox snapshot for ${sameDraft.id}`);
+					}
+					return {
+						delivery: sameDraft,
+						snapshot,
+						replayed: true,
+						outcome: outboundEnqueueOutcome(sameDraft, true),
+					};
+				}
 			}
 
 			const deliveryId = this.#createId("delivery");
 			const emailId = this.#createId("email");
 			const snapshot = structuredClone(command.snapshot);
-			const sourceDraft = validateSourceDraftReference(snapshot);
 			if (sourceDraft.draftId !== undefined) {
 				const assertion = tx.assertSourceDraftVersion(
 					sourceDraft.draftId,
@@ -246,7 +297,12 @@ export class TruthfulOutboxService {
 
 			tx.insertSnapshot(emailId, snapshot);
 			tx.insertDelivery(delivery);
-			return { delivery, snapshot, replayed: false };
+			return {
+				delivery,
+				snapshot,
+				replayed: false,
+				outcome: "enqueued",
+			};
 		});
 	}
 

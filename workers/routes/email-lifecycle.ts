@@ -49,14 +49,35 @@ export async function handleRestoreEmail(c: AppContext) {
 /** Permanently remove a draft only through the explicit discard action. */
 export async function handleDiscardDraft(c: AppContext) {
 	const id = c.req.param("id")!;
+	const body = await c.req.json().catch(() => null) as
+		| { draft_version?: unknown }
+		| null;
+	if (
+		!body ||
+		!Number.isInteger(body.draft_version) ||
+		Number(body.draft_version) < 1
+	) {
+		return c.json({ error: "Draft version is required" }, 400);
+	}
 	const actor = actorFromSession(c.get("session"));
 	const result = await c.var.mailboxStub.discardDraft(
 		id,
+		Number(body.draft_version),
 		actor,
 	);
 	if (result === null) return c.json({ error: "Draft not found" }, 404);
 	if (result.status === "not_draft") {
 		return c.json({ error: "Email is not a draft" }, 409);
+	}
+	if (result.status === "version_conflict") {
+		return c.json(
+			{
+				error: "Draft changed in another session. Reload it before discarding.",
+				code: "draft_version_conflict",
+				currentVersion: result.currentVersion,
+			},
+			409,
+		);
 	}
 	if (result.attachments.length > 0) {
 		const keys = result.attachments.map((attachment) =>

@@ -32,7 +32,10 @@ import { sendWebPush } from "../lib/push/send";
 import { fanOutPush } from "../lib/push/fanout";
 import type { PushPayload } from "../lib/push/types";
 import type { ActivityActor } from "../lib/activity";
-import { normalizeSearchSort } from "../lib/search-sort";
+import {
+	buildMailSearchPlan,
+	type MailSearchOptions,
+} from "../lib/mail-search";
 import {
 	outboundDeliveryBlocksGenericLifecycle,
 	planMove,
@@ -93,11 +96,25 @@ import { finalizeCommittedSnooze } from "../lib/snooze-liveness.ts";
 import { resolveUnambiguousThreadReference } from "../lib/thread-reference.ts";
 import { readConversationIntelligenceEvidenceProjection } from "../lib/conversation-intelligence-evidence.ts";
 import { readStoredReminderAnchor } from "../lib/follow-up-reminder-anchor.ts";
+import { readFollowUpReminderPreviews } from "../lib/follow-up-reminder-previews.ts";
 import { followUpReminderD1Store } from "../lib/follow-up-reminders-d1.ts";
+import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
 import {
 	processOneFollowUpReplyCompletion,
 	type FollowUpReplyQueueRepository,
 } from "../lib/follow-up-reminder-queue.ts";
+import {
+	readRecipientSuggestions,
+	recipientMemoryFolderEligible,
+	recordRecipientInteractions,
+	seedRecipientInteractions,
+	storedEmailInteraction,
+} from "../lib/recipient-memory.ts";
+import {
+	RecipientMemoryOrigins,
+	type RecipientMemoryOrigin,
+} from "../../shared/recipient-suggestions.ts";
+import { classifyDraftCreateReplay } from "../lib/draft-create-replay.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -140,22 +157,6 @@ const SORT_COLUMN_MAP = {
 	(typeof schema.emails)[keyof typeof schema.emails]
 >;
 
-interface SearchFilterOptions {
-	query: string;
-	label_id?: string;
-	folder?: string;
-	from?: string;
-	to?: string;
-	subject?: string;
-	date_start?: string;
-	date_end?: string;
-	is_read?: boolean;
-	is_starred?: boolean;
-	has_attachment?: boolean;
-	sortColumn?: unknown;
-	sortDirection?: unknown;
-}
-
 interface GetEmailsOptions {
 	folder?: string;
 	label_id?: string;
@@ -182,6 +183,7 @@ interface EmailData {
 	thread_id?: string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
+	recipient_memory_origin?: RecipientMemoryOrigin | null;
 	snooze_wake_thread_id?: string | null;
 	follow_up_reply_mailbox_address?: string | null;
 }
@@ -778,6 +780,19 @@ export class MailboxDO extends DurableObject<Env> {
 		return readStoredReminderAnchor(this.ctx.storage.sql, emailId);
 	}
 
+	/** Project one bounded page of display-only reminder context. */
+	async getFollowUpReminderPreviews(
+		baselineMessageIds: string[],
+		mailboxAddress: string,
+	) {
+		await this.#selfHealSnoozes();
+		return readFollowUpReminderPreviews(
+			this.ctx.storage.sql,
+			mailboxAddress,
+			baselineMessageIds,
+		);
+	}
+
 	async updateEmail(
 		id: string,
 		{ read, starred }: { read?: boolean; starred?: boolean },
@@ -1293,9 +1308,17 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	/** Permanently remove only a draft the user explicitly chose to discard. */
-	async discardDraft(id: string, actor: ActivityActor = { kind: "system" }) {
+	async discardDraft(
+		id: string,
+		expectedVersion: number,
+		actor: ActivityActor = { kind: "system" },
+	) {
 		const email = this.db
-			.select({ id: schema.emails.id, folder_id: schema.emails.folder_id })
+			.select({
+				id: schema.emails.id,
+				folder_id: schema.emails.folder_id,
+				draft_version: schema.emails.draft_version,
+			})
 			.from(schema.emails)
 			.where(eq(schema.emails.id, id))
 			.get();
@@ -1303,6 +1326,12 @@ export class MailboxDO extends DurableObject<Env> {
 		if (!email) return null;
 		if (email.folder_id !== Folders.DRAFT) {
 			return { status: "not_draft" as const };
+		}
+		if (email.draft_version !== expectedVersion) {
+			return {
+				status: "version_conflict" as const,
+				currentVersion: email.draft_version,
+			};
 		}
 
 		const emailAttachments = this.db
@@ -1316,7 +1345,15 @@ export class MailboxDO extends DurableObject<Env> {
 		const occurredAt = new Date().toISOString();
 
 		this.ctx.storage.transactionSync(() => {
-			this.db.delete(schema.emails).where(eq(schema.emails.id, id)).run();
+			this.db
+				.delete(schema.emails)
+				.where(
+					and(
+						eq(schema.emails.id, id),
+						eq(schema.emails.draft_version, expectedVersion),
+					),
+				)
+				.run();
 			this.#recordActivity(
 				actor,
 				"draft_discarded",
@@ -1383,6 +1420,37 @@ export class MailboxDO extends DurableObject<Env> {
 		};
 	}
 
+	#getDraftCreateRecord(createKey: string): {
+		id: string;
+		fingerprint: string;
+		draftVersion: number;
+	} | null {
+		const row = this.db
+			.select({
+				id: schema.emails.id,
+				fingerprint: schema.emails.draft_create_fingerprint,
+				draft_version: schema.emails.draft_version,
+			})
+			.from(schema.emails)
+			.where(eq(schema.emails.draft_create_key, createKey))
+			.limit(1)
+			.get();
+		return row?.fingerprint
+			? {
+					id: row.id,
+					fingerprint: row.fingerprint,
+					draftVersion: row.draft_version,
+				}
+			: null;
+	}
+
+	async getDraftCreateReplay(createKey: string, fingerprint: string) {
+		return classifyDraftCreateReplay(
+			this.#getDraftCreateRecord(createKey),
+			fingerprint,
+		);
+	}
+
 	/**
 	 * Create or replace a draft in one SQL transaction. Existing drafts require
 	 * an exact expected version so two browser sessions cannot silently replace
@@ -1392,6 +1460,8 @@ export class MailboxDO extends DurableObject<Env> {
 		input: {
 			id: string;
 			expectedVersion?: number;
+			createKey?: string;
+			createFingerprint?: string;
 			subject: string;
 			sender: string;
 			recipient: string;
@@ -1405,6 +1475,21 @@ export class MailboxDO extends DurableObject<Env> {
 		actor: ActivityActor = { kind: "system" },
 	) {
 		return this.ctx.storage.transactionSync(() => {
+			if (input.createKey && input.createFingerprint) {
+				const replay = classifyDraftCreateReplay(
+					this.#getDraftCreateRecord(input.createKey),
+					input.createFingerprint,
+				);
+				if (replay.status === "replay") {
+					return { status: "creation_replay" as const, draftId: replay.draftId };
+				}
+				if (replay.status === "conflict") {
+					return { ...replay, status: "creation_conflict" as const };
+				}
+				if (replay.status === "superseded") {
+					return { ...replay, status: "creation_superseded" as const };
+				}
+			}
 			const existing = this.db
 				.select({
 					id: schema.emails.id,
@@ -1487,6 +1572,8 @@ export class MailboxDO extends DurableObject<Env> {
 						body: input.body,
 						in_reply_to: input.in_reply_to,
 						thread_id: input.thread_id,
+						draft_create_key: input.createKey ?? null,
+						draft_create_fingerprint: input.createFingerprint ?? null,
 						draft_version: draftVersion,
 					})
 					.run();
@@ -2186,143 +2273,12 @@ export class MailboxDO extends DurableObject<Env> {
 		return true;
 	}
 
-	// ── Search (raw SQL, dynamic condition builder) ───────────────
+	// ── Search ────────────────────────────────────────────────────
 
-	/**
-	 * Build WHERE conditions and params for search queries.
-	 * Shared between searchEmails and countSearchResults.
-	 */
-	#buildSearchConditions(
-		options: SearchFilterOptions,
-		tableAlias = "",
-	): { conditions: string[]; params: (string | number)[] } {
-		const {
-			query,
-			folder,
-			label_id,
-			from,
-			to,
-			subject,
-			date_start,
-			date_end,
-			is_read,
-			is_starred,
-			has_attachment,
-		} = options;
-		const prefix = tableAlias ? `${tableAlias}.` : "";
-		const conditions: string[] = [];
-		const params: (string | number)[] = [];
-		let paramIdx = 0;
-
-		const addParam = (value: string | number) => {
-			paramIdx++;
-			params.push(value);
-			return `?${paramIdx}`;
-		};
-		conditions.push(
-			`${prefix}folder_id <> '${InternalFolders.RETIRED_OUTBOUND}'`,
-		);
-
-		if (query) {
-			const p1 = addParam(`%${query}%`);
-			const p2 = addParam(`%${query}%`);
-			const p3 = addParam(`%${query}%`);
-			const p4 = addParam(`%${query}%`);
-			conditions.push(
-				`(${prefix}subject LIKE ${p1} OR ${prefix}body LIKE ${p2} OR ${prefix}sender LIKE ${p3} OR ${prefix}recipient LIKE ${p4} OR ${prefix}cc LIKE ${p4} OR ${prefix}bcc LIKE ${p4})`,
-			);
-		}
-		if (folder) {
-			const p = addParam(folder);
-			conditions.push(
-				`${prefix}folder_id = (SELECT id FROM folders WHERE name = ${p} OR id = ${p} LIMIT 1)`,
-			);
-		}
-		if (label_id) {
-			const p = addParam(label_id);
-			conditions.push(
-				`EXISTS (SELECT 1 FROM email_labels el WHERE el.email_id = ${prefix}id AND el.label_id = ${p})`,
-			);
-		}
-		if (from) {
-			const p = addParam(`%${from}%`);
-			conditions.push(`${prefix}sender LIKE ${p}`);
-		}
-		if (to) {
-			const p = addParam(`%${to}%`);
-			conditions.push(
-				`(${prefix}recipient LIKE ${p} OR ${prefix}cc LIKE ${p} OR ${prefix}bcc LIKE ${p})`,
-			);
-		}
-		if (subject) {
-			const p = addParam(`%${subject}%`);
-			conditions.push(`${prefix}subject LIKE ${p}`);
-		}
-		if (date_start) {
-			const p = addParam(date_start);
-			conditions.push(`${prefix}date >= ${p}`);
-		}
-		if (date_end) {
-			const p = addParam(date_end);
-			conditions.push(`${prefix}date <= ${p}`);
-		}
-		if (is_read !== undefined) {
-			const p = addParam(is_read ? 1 : 0);
-			conditions.push(`${prefix}read = ${p}`);
-		}
-		if (is_starred !== undefined) {
-			const p = addParam(is_starred ? 1 : 0);
-			conditions.push(`${prefix}starred = ${p}`);
-		}
-		if (has_attachment) {
-			conditions.push(
-				`${prefix}id IN (SELECT DISTINCT email_id FROM attachments)`,
-			);
-		}
-
-		return { conditions, params };
-	}
-
-	async searchEmails(
-		options: SearchFilterOptions & { page?: number; limit?: number },
-	) {
+	async searchEmails(options: MailSearchOptions) {
 		await this.#selfHealSnoozes();
-		const {
-			page = 1,
-			limit: rawLimit = 25,
-			sortColumn: rawSortColumn,
-			sortDirection: rawSortDirection,
-		} = options;
-		const limit = Math.min(Math.max(rawLimit, 1), 100);
-		const { conditions, params } = this.#buildSearchConditions(options, "e");
-		const sort = normalizeSearchSort(rawSortColumn, rawSortDirection);
-		const orderColumns = {
-			date: "e.date",
-			sender: "e.sender",
-			recipient: "e.recipient",
-			subject: "e.subject",
-			read: "e.read",
-			starred: "e.starred",
-		} as const;
-
-		const where =
-			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-		const offset = (page - 1) * limit;
-
-		const query = `
-			SELECT e.id, e.subject, e.sender, e.recipient, e.cc, e.bcc, e.date,
-				e.read, e.starred, e.in_reply_to, e.email_references,
-				e.thread_id, e.folder_id, e.snooze_source_folder_id, e.snoozed_until,
-				SUBSTR(e.body, 1, 300) as snippet,
-				f.name as folder_name
-			FROM emails e
-			LEFT JOIN folders f ON e.folder_id = f.id
-			${where}
-			ORDER BY ${orderColumns[sort.column]} ${sort.direction}, e.id ASC
-			LIMIT ?${params.length + 1} OFFSET ?${params.length + 2}`;
-		params.push(limit, offset);
-
-		const result = this.ctx.storage.sql.exec(query, ...params);
+		const plan = buildMailSearchPlan(options);
+		const result = this.ctx.storage.sql.exec(plan.dataSql, ...plan.dataParams);
 		const rows = [...result] as any[];
 		const labelsByEmail = this.#labelsForEmailIds(
 			rows.map((row) => String(row.id)),
@@ -2338,15 +2294,12 @@ export class MailboxDO extends DurableObject<Env> {
 	/**
 	 * Count total search results matching the given filters (for pagination).
 	 */
-	async countSearchResults(options: SearchFilterOptions) {
+	async countSearchResults(options: MailSearchOptions) {
 		await this.#selfHealSnoozes();
-		const { conditions, params } = this.#buildSearchConditions(options);
-
-		const where =
-			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-		const query = `SELECT COUNT(*) as total FROM emails ${where}`;
-
-		const row = [...this.ctx.storage.sql.exec(query, ...params)][0] as
+		const plan = buildMailSearchPlan(options);
+		const row = [
+			...this.ctx.storage.sql.exec(plan.countSql, ...plan.countParams),
+		][0] as
 			| { total: number }
 			| undefined;
 		return row?.total ?? 0;
@@ -2420,6 +2373,7 @@ export class MailboxDO extends DurableObject<Env> {
 		email: EmailData,
 		attachments: AttachmentData[],
 		actor?: ActivityActor,
+		mailboxAddress?: string,
 	) {
 		// Resolve folder name or ID to the actual folder ID.
 		const folderRow = this.db
@@ -2461,11 +2415,26 @@ export class MailboxDO extends DurableObject<Env> {
 					thread_id: email.thread_id ?? null,
 					message_id: email.message_id ?? null,
 					raw_headers: email.raw_headers ?? null,
+					recipient_memory_origin: email.recipient_memory_origin ?? null,
 				})
 				.run();
 
 			if (attachments.length > 0) {
 				this.db.insert(schema.attachments).values(attachments).run();
+			}
+			if (
+				mailboxAddress &&
+				email.recipient_memory_origin === RecipientMemoryOrigins.LIVE_INBOUND &&
+				recipientMemoryFolderEligible(folderId)
+			) {
+				const interaction = storedEmailInteraction(email, mailboxAddress);
+				recordRecipientInteractions(this.ctx.storage.sql, {
+					sourceEmailId: email.id,
+					direction: interaction.direction,
+					occurredAt: email.date,
+					mailboxAddress,
+					addresses: interaction.addresses,
+				});
 			}
 			if (folderId === Folders.INBOX && email.snooze_wake_thread_id) {
 				this.ctx.storage.sql.exec(
@@ -2558,6 +2527,15 @@ export class MailboxDO extends DurableObject<Env> {
 		attachments: readonly PendingOutboundAttachment[],
 		emailId: string,
 	) {
+		const inlineMapping = validateResolvedInlineImages(
+			command.snapshot.html ?? "",
+			attachments,
+		);
+		if (!inlineMapping.ok) {
+			const error = new Error(inlineMapping.error);
+			error.name = "InlineImageMappingError";
+			throw error;
+		}
 		const result = this.#outboxService(attachments, emailId).enqueue(command);
 		await finalizeCommittedOutboundMutation({
 			ensureAlarm: () => this.#ensureOutboundAlarm(),
@@ -3235,6 +3213,12 @@ export class MailboxDO extends DurableObject<Env> {
 		actor: OutboundDeliveryActor,
 		at: string,
 	) {
+		const snapshotRow = this.db
+			.select({ raw_headers: schema.emails.raw_headers })
+			.from(schema.emails)
+			.where(eq(schema.emails.id, emailId))
+			.get();
+		const snapshot = deserializeOutboundSnapshot(snapshotRow?.raw_headers ?? null);
 		this.ctx.storage.transactionSync(() => {
 			this.db
 				.update(schema.emails)
@@ -3243,9 +3227,20 @@ export class MailboxDO extends DurableObject<Env> {
 					date: at,
 					message_id: sesMessageId,
 					read: 1,
+					recipient_memory_origin:
+						RecipientMemoryOrigins.ACCEPTED_OUTBOUND,
 				})
 				.where(eq(schema.emails.id, emailId))
 				.run();
+			if (snapshot) {
+				recordRecipientInteractions(this.ctx.storage.sql, {
+					sourceEmailId: emailId,
+					direction: "sent",
+					occurredAt: at,
+					mailboxAddress: snapshot.mailboxId,
+					addresses: [...snapshot.to, ...snapshot.cc, ...snapshot.bcc],
+				});
+			}
 			this.#recordActivity(
 				actor,
 				"outbound_provider_accepted",
@@ -3255,6 +3250,22 @@ export class MailboxDO extends DurableObject<Env> {
 				at,
 			);
 		});
+	}
+
+	async getRecipientSuggestions(
+		mailboxAddress: string,
+		query: string,
+		limit: number,
+	) {
+		this.ctx.storage.transactionSync(() => {
+			seedRecipientInteractions(this.ctx.storage.sql, mailboxAddress);
+		});
+		return readRecipientSuggestions(
+			this.ctx.storage.sql,
+			mailboxAddress,
+			query,
+			limit,
+		);
 	}
 
 	async #consumeAcceptedSourceDraft(
@@ -3299,7 +3310,7 @@ export class MailboxDO extends DurableObject<Env> {
 						attachment.disposition === "inline"
 							? ("inline" as const)
 							: ("attachment" as const),
-					...(attachment.content_id
+					...(attachment.disposition === "inline" && attachment.content_id
 						? { contentId: attachment.content_id }
 						: {}),
 				};

@@ -22,6 +22,11 @@ import type { MailboxContext } from "../lib/mailbox.ts";
 import { actorFromSession } from "../lib/activity.ts";
 import { reconcileAmbiguousOutboundEnqueue } from "../lib/outbound-enqueue-recovery.ts";
 import { validateOutboundSchedule } from "../../shared/outbound-schedule.ts";
+import {
+	outboundEnqueueOutcome,
+	type OutboundEnqueueOutcome,
+} from "../lib/outbound-delivery-service.ts";
+import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
 
 type AppContext = Context<MailboxContext>;
 type RateLimitStub = { checkSendRateLimit: () => Promise<string | null> };
@@ -42,6 +47,10 @@ function deliveryResponse(
 		scheduledFor?: string;
 	},
 	replayed: boolean,
+	outcome: OutboundEnqueueOutcome = outboundEnqueueOutcome(
+		delivery,
+		replayed,
+	),
 ) {
 	return {
 		deliveryId: delivery.id,
@@ -51,6 +60,7 @@ function deliveryResponse(
 		undoUntil: delivery.undoUntil,
 		scheduledFor: delivery.scheduledFor ?? null,
 		replayed,
+		outcome,
 	};
 }
 
@@ -136,6 +146,20 @@ export async function handleReplyEmail(c: AppContext) {
 		(e) => ({ ok: false as const, error: (e as Error).message }),
 	);
 	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	const inlineMapping = validateResolvedInlineImages(html ?? "", resolved.storedMetadata);
+	if (!inlineMapping.ok) {
+		await rollbackAttachmentPromotion(
+			c.env.BUCKET,
+			stub,
+			messageId,
+			resolved,
+			actor,
+		);
+		return c.json(
+			{ error: inlineMapping.error, code: inlineMapping.code },
+			400,
+		);
+	}
 	const timing = validateOutboundSchedule(scheduled_for);
 	if (!timing.ok) {
 		await rollbackAttachmentPromotion(
@@ -211,7 +235,10 @@ export async function handleReplyEmail(c: AppContext) {
 
 	await stub.markThreadRead(thread_id, actor);
 
-	return c.json(deliveryResponse(result.delivery, result.replayed), 202);
+	return c.json(
+		deliveryResponse(result.delivery, result.replayed, result.outcome),
+		202,
+	);
 }
 
 export async function handleForwardEmail(c: AppContext) {
@@ -289,6 +316,20 @@ export async function handleForwardEmail(c: AppContext) {
 		(e) => ({ ok: false as const, error: (e as Error).message }),
 	);
 	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	const inlineMapping = validateResolvedInlineImages(html ?? "", resolved.storedMetadata);
+	if (!inlineMapping.ok) {
+		await rollbackAttachmentPromotion(
+			c.env.BUCKET,
+			stub,
+			messageId,
+			resolved,
+			actor,
+		);
+		return c.json(
+			{ error: inlineMapping.error, code: inlineMapping.code },
+			400,
+		);
+	}
 	const timing = validateOutboundSchedule(scheduled_for);
 	if (!timing.ok) {
 		await rollbackAttachmentPromotion(
@@ -360,5 +401,8 @@ export async function handleForwardEmail(c: AppContext) {
 		await completeAttachmentPromotion(c.env.BUCKET, stub, messageId, resolved, actor);
 	}
 
-	return c.json(deliveryResponse(result.delivery, result.replayed), 202);
+	return c.json(
+		deliveryResponse(result.delivery, result.replayed, result.outcome),
+		202,
+	);
 }

@@ -1,4 +1,7 @@
-import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
+import type {
+	FollowUpReminder,
+	FollowUpReminderListPage,
+} from "../../shared/follow-up-reminders.ts";
 import type { Env } from "../types.ts";
 import { mailboxAccess } from "./mailbox-access.ts";
 import {
@@ -109,17 +112,34 @@ export function followUpReminderD1Store(
 	}
 
 	return {
-		async list(ownerUserId, mailboxAddress, limit) {
+		async list({ ownerUserId, mailboxAddress, limit, cursor }) {
 			const result = await env.DB.prepare(
 				`SELECT ${REMINDER_COLUMNS}
 				 FROM follow_up_reminders
 				 WHERE owner_user_id = ? AND mailbox_address = ? AND state = 'active'
+				   AND (? IS NULL OR remind_at > ? OR (remind_at = ? AND id > ?))
 				 ORDER BY remind_at ASC, id ASC
 				 LIMIT ?`,
 			)
-				.bind(ownerUserId, mailboxAddress, limit)
+				.bind(
+					ownerUserId,
+					mailboxAddress,
+					cursor?.remindAt ?? null,
+					cursor?.remindAt ?? null,
+					cursor?.remindAt ?? null,
+					cursor?.id ?? null,
+					limit + 1,
+				)
 				.all<ReminderRow>();
-			return result.results.map(fromRow);
+			const hasMore = result.results.length > limit;
+			const rows = hasMore ? result.results.slice(0, limit) : result.results;
+			const last = rows.at(-1);
+			return {
+				reminders: rows.map(fromRow),
+				nextCursor: hasMore && last
+					? { remindAt: last.remind_at, id: last.id }
+					: null,
+			};
 		},
 
 		async findCreateReplay({ ownerUserId, idempotencyKey, fingerprint }) {
@@ -333,7 +353,7 @@ export function followUpReminderD1Store(
 }
 
 export function followUpReminderService(env: Env) {
-	return createFollowUpReminderService({
+	const service = createFollowUpReminderService({
 		store: followUpReminderD1Store(env),
 		canAccessMailbox: (userId, mailboxAddress) =>
 			mailboxAccess(env).canAccessMailbox(userId, mailboxAddress),
@@ -342,4 +362,49 @@ export function followUpReminderService(env: Env) {
 			return stub.getFollowUpReminderAnchor(emailId);
 		},
 	});
+	return {
+		...service,
+		async list(
+			userId: string,
+			mailboxAddress: string,
+			limit = 100,
+			cursor?: string,
+		): Promise<FollowUpReminderListPage> {
+			// The domain service performs the live access check before any mail
+			// content is projected by the mailbox Durable Object.
+			const page = await service.list(
+				userId,
+				mailboxAddress,
+				limit,
+				cursor,
+			);
+			if (page.reminders.length === 0) {
+				return { reminders: [], nextCursor: page.nextCursor };
+			}
+			const mailbox = mailboxAddress.toLowerCase();
+			const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailbox));
+			const projected = await stub.getFollowUpReminderPreviews(
+				page.reminders.map((reminder) => reminder.baselineMessageId),
+				mailbox,
+			);
+			const previews = new Map(
+				projected.map((preview) => [preview.baselineMessageId, preview]),
+			);
+			return {
+				reminders: page.reminders.map((reminder) => {
+					const projectedPreview = previews.get(reminder.baselineMessageId);
+					return {
+						...reminder,
+						preview: projectedPreview
+							? {
+									subject: projectedPreview.subject,
+									counterparty: projectedPreview.counterparty,
+								}
+							: null,
+					};
+				}),
+				nextCursor: page.nextCursor,
+			};
+		},
+	};
 }

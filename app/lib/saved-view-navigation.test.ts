@@ -5,6 +5,15 @@ import {
   definitionFromSearchView,
   savedViewRoute,
 } from "./saved-view-navigation.ts";
+import { savedViewSearchParams } from "../../shared/saved-views.ts";
+import { buildMailSearchPlan } from "../../workers/lib/mail-search.ts";
+import { searchOptionsFromUrl } from "../../workers/routes/search.ts";
+
+function appliedSearchSql(params: Record<string, string>): string {
+	const url = new URL("https://mail.example.com/search");
+	url.search = new URLSearchParams(params).toString();
+	return buildMailSearchPlan(searchOptionsFromUrl(url)).dataSql;
+}
 
 test("folder views preserve label and sort filters", () => {
   const definition = definitionFromFolderView({
@@ -19,21 +28,42 @@ test("folder views preserve label and sort filters", () => {
   });
 });
 
-test("search views compose every current structured operator without dropping labels", () => {
+test("search views preserve the exact strict grammar without dropping labels", () => {
+	const query =
+		'renewal "signed proposal" from:client@example.com from:legal@example.com filename:terms.pdf in:inbox is:unread is:starred has:attachment after:2026-01-01 before:2026-02-01';
   const definition = definitionFromSearchView({
-    query:
-      "renewal from:client@example.com in:inbox is:unread is:starred has:attachment after:2026-01-01 before:2026-02-01",
+    query,
     searchParams: new URLSearchParams("label_id=label_vip"),
   });
-  assert.equal(definition.filters.query, "renewal");
-  assert.equal(definition.filters.from, "client@example.com");
-  assert.equal(definition.filters.folder, "inbox");
-  assert.equal(definition.filters.isRead, false);
-  assert.equal(definition.filters.isStarred, true);
-  assert.equal(definition.filters.hasAttachment, true);
+  assert.equal(definition.filters.searchQuery, query);
   assert.equal(definition.filters.labelId, "label_vip");
-  assert.match(definition.filters.dateStart!, /^2026-01-01/);
-  assert.match(definition.filters.dateEnd!, /^2026-02-01/);
+	assert.equal(definition.filters.useDefaultSearchOrder, true);
+	const appliedParams = savedViewSearchParams(definition);
+	assert.deepEqual(appliedParams, {
+		q: query,
+		label_id: "label_vip",
+	});
+	assert.match(
+		appliedSearchSql(appliedParams),
+		/ORDER BY relevance DESC, e\.date DESC, e\.id ASC/,
+	);
+});
+
+test("search views retain an explicitly selected sort through application", () => {
+	const definition = definitionFromSearchView({
+		query: "renewal",
+		searchParams: new URLSearchParams(
+			"sortColumn=sender&sortDirection=ASC",
+		),
+	});
+	assert.equal(definition.filters.useDefaultSearchOrder, undefined);
+	const appliedParams = savedViewSearchParams(definition);
+	assert.deepEqual(appliedParams, {
+		q: "renewal",
+		sortColumn: "sender",
+		sortDirection: "ASC",
+	});
+	assert.match(appliedSearchSql(appliedParams), /ORDER BY e\.sender ASC, e\.id ASC/);
 });
 
 test("unsupported sort values fail closed to deterministic date ordering", () => {

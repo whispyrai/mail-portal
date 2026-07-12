@@ -12,8 +12,14 @@ import {
   SparkleIcon,
   XIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
-import { useParams } from "react-router";
+import {
+  type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useBlocker, useParams } from "react-router";
 import { useComposeForm } from "~/hooks/useComposeForm";
 import { useUIStore } from "~/hooks/useUIStore";
 import { useBrand } from "~/hooks/useBrand";
@@ -27,8 +33,17 @@ import {
   parseAndValidateLocalSchedule,
   scheduleHorizonEnd,
 } from "~/lib/send-later";
+import {
+  planComposeShortcut,
+  type ComposeShortcutOrigin,
+} from "~/lib/compose-shortcuts";
+import {
+  consumeComposeFileTransfer,
+  transferContainsFiles,
+} from "~/lib/compose-file-transfer";
 import RichTextEditor from "./RichTextEditor";
 import ComposeAttachments from "./ComposeAttachments";
+import RecipientCombobox from "./RecipientCombobox";
 
 /**
  * The composer. A single roomy centered modal used for new mail, replies,
@@ -42,7 +57,7 @@ export default function ComposeEmail() {
     folder: string;
   }>();
 
-  const { isComposing, closeCompose, composeOptions } = useUIStore();
+  const { isComposing, composeOptions } = useUIStore();
   const { brand, name } = useBrand();
   const assistantCopy = assistantCopyFor(brand, name);
   const aiComposeMut = useAiDraftCompose();
@@ -76,27 +91,58 @@ export default function ComposeEmail() {
     subject,
     setSubject,
     body,
-    setBody,
+    handleBodyChange,
+    applyAiBody,
+    canInsertSignature,
+    insertSignature,
     error,
     isSavingDraft,
     isSending,
     formTitle,
     handleSaveDraft,
     handleSend,
+    isMissingAttachmentWarningOpen,
+    confirmMissingAttachment,
+    cancelMissingAttachment,
+    requestClose,
+    requestDiscard,
+    closePrompt,
+    keepEditing,
+    saveAndClose,
+    discardAndClose,
+    discardLocalAndClose,
+    isResolvingClose,
+    draftStatusLabel,
+    hasPersistedDraft,
+    hasUnconfirmedWork,
+    mailboxChanged,
+    originMailboxId,
     attachments,
     addFiles,
+		addInlineImages,
+		inlineImagePreviews,
     removeAttachment,
+    retryAttachment,
     isUploading,
+    hasAttachmentIssue,
   } = useComposeForm(mailboxId, folder);
+  const recipientValues = { to, cc, bcc };
+  const navigationBlocker = useBlocker(isComposing && hasUnconfirmedWork);
+  const handledBlockedNavigationRef = useRef(false);
+  const composeFormRef = useRef<HTMLFormElement>(null);
+  const fileDragDepthRef = useRef(0);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const sendButtonLabel = isSending
     ? scheduledFor
       ? "Scheduling…"
       : "Sending…"
     : isUploading
       ? "Uploading…"
-      : scheduledFor
-        ? "Schedule"
-        : "Send";
+      : hasAttachmentIssue
+        ? "Fix attachments"
+        : scheduledFor
+          ? "Schedule"
+          : "Send";
 
   useEffect(() => {
     if (!isComposing) return;
@@ -104,6 +150,79 @@ export default function ComposeEmail() {
     setShowCustomSchedule(false);
     setCustomScheduleError(null);
   }, [composeOptions, isComposing]);
+
+  useEffect(() => {
+    if (navigationBlocker.state === "unblocked") {
+      handledBlockedNavigationRef.current = false;
+      return;
+    }
+    if (
+      navigationBlocker.state === "blocked" &&
+      !handledBlockedNavigationRef.current
+    ) {
+      handledBlockedNavigationRef.current = true;
+      void requestClose(() => navigationBlocker.proceed());
+    }
+  }, [navigationBlocker, requestClose]);
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      let origin: ComposeShortcutOrigin = "outside";
+      if (target && composeFormRef.current?.contains(target)) {
+        if (target.closest('[data-compose-shortcut-surface="ai-panel"]')) {
+          origin = "ai-panel";
+        } else if (
+          target.closest(
+            '[data-compose-shortcut-surface="nested-overlay"], [role="menu"], [role="listbox"]',
+          )
+        ) {
+          origin = "nested-overlay";
+        } else {
+          origin = "primary";
+        }
+      }
+      const action = planComposeShortcut({
+        key: event.key,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        altKey: event.altKey,
+        shiftKey: event.shiftKey,
+        repeat: event.repeat,
+        isImeComposing: event.isComposing,
+        composeActive: isComposing,
+        defaultPrevented: event.defaultPrevented,
+        origin,
+        hasBlockingState: Boolean(
+          closePrompt ||
+          showCustomSchedule ||
+          isMissingAttachmentWarningOpen ||
+          isResolvingClose
+        ),
+      });
+      if (action === "ignore" || action === "ai-generate") return;
+      event.preventDefault();
+      if (action === "submit") {
+        composeFormRef.current?.requestSubmit();
+      } else if (action === "save") {
+        void handleSaveDraft();
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [
+    closePrompt,
+    handleSaveDraft,
+    isComposing,
+    isMissingAttachmentWarningOpen,
+    isResolvingClose,
+    showCustomSchedule,
+  ]);
+
+  const handleKeepEditing = () => {
+    keepEditing();
+    if (navigationBlocker.state === "blocked") navigationBlocker.reset();
+  };
 
   const choosePreset = (date: Date) => {
     setScheduledFor(date.toISOString());
@@ -137,14 +256,14 @@ export default function ComposeEmail() {
   };
 
   const handleAiGenerate = async () => {
-    if (!mailboxId || !aiPrompt.trim()) return;
+    if (!originMailboxId || !aiPrompt.trim()) return;
     try {
       const draft = await aiComposeMut.mutateAsync({
-        mailboxId,
+        mailboxId: originMailboxId,
         prompt: aiPrompt.trim(),
       });
       if (draft.subject) setSubject(draft.subject);
-      if (draft.body) setBody(draft.body);
+      if (draft.body) applyAiBody(draft.body);
       setShowAiPrompt(false);
       setAiPrompt("");
     } catch {
@@ -152,11 +271,48 @@ export default function ComposeEmail() {
     }
   };
 
+  const acceptTransferredFiles = (files: File[]) => {
+    fileDragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    addFiles(files);
+  };
+
+  const handleOuterPaste = (event: ReactClipboardEvent<HTMLFormElement>) => {
+    consumeComposeFileTransfer(event, acceptTransferredFiles);
+  };
+
+  const handleOuterDragEnter = (event: ReactDragEvent<HTMLFormElement>) => {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  };
+
+  const handleOuterDragOver = (event: ReactDragEvent<HTMLFormElement>) => {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleOuterDragLeave = () => {
+    if (fileDragDepthRef.current === 0) return;
+    fileDragDepthRef.current -= 1;
+    if (fileDragDepthRef.current === 0) setIsDraggingFiles(false);
+  };
+
+  const handleOuterDrop = (event: ReactDragEvent<HTMLFormElement>) => {
+    fileDragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    consumeComposeFileTransfer(event, acceptTransferredFiles);
+  };
+
   return (
     <>
       <Dialog.Root
         open={isComposing}
-        onOpenChange={(open) => !open && !isSending && closeCompose()}
+        onOpenChange={(open) => {
+          if (!open && !isSending) void requestClose();
+        }}
       >
         <Dialog
           size="lg"
@@ -164,27 +320,54 @@ export default function ComposeEmail() {
         >
           {/* Header */}
           <div className="flex items-center justify-between border-b border-kumo-line px-4 py-3 sm:px-6 sm:py-4 shrink-0">
-            <Dialog.Title className="text-lg font-semibold text-kumo-default">
-              {formTitle}
-            </Dialog.Title>
+            <div className="min-w-0">
+              <Dialog.Title className="text-lg font-semibold text-kumo-default">
+                {formTitle}
+              </Dialog.Title>
+              <div
+                role="status"
+                aria-live="polite"
+                className={`mt-0.5 text-xs ${
+                  draftStatusLabel === "Save failed"
+                    ? "font-semibold text-kumo-danger"
+                    : "text-kumo-subtle"
+                }`}
+              >
+                {draftStatusLabel}
+              </div>
+            </div>
             <Button
               variant="ghost"
               shape="square"
               size="sm"
               icon={<XIcon size={18} />}
               className="min-h-11 min-w-11"
-              onClick={() => !isSending && closeCompose()}
-              disabled={isSending}
+              onClick={() => void requestClose()}
+              disabled={isSending || isResolvingClose}
               aria-label="Close compose"
             />
           </div>
 
           <form
-            onSubmit={(e) =>
-              handleSend(e, closeCompose, scheduledFor ?? undefined)
-            }
-            className="flex flex-col flex-1 min-h-0"
+            ref={composeFormRef}
+            data-compose-shortcut-surface="primary"
+            onSubmit={(e) => handleSend(e, scheduledFor ?? undefined)}
+            onPaste={handleOuterPaste}
+            onDragEnter={handleOuterDragEnter}
+            onDragOver={handleOuterDragOver}
+            onDragLeave={handleOuterDragLeave}
+            onDrop={handleOuterDrop}
+            className="relative flex flex-col flex-1 min-h-0"
           >
+            {isDraggingFiles && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="pointer-events-none absolute inset-3 z-30 flex items-center justify-center rounded-xl border-2 border-dashed border-kumo-brand/50 bg-white/90 px-6 text-center text-sm font-semibold text-kumo-brand shadow-sm"
+              >
+                Drop files to attach
+              </div>
+            )}
             <div role="status" aria-live="polite" className="sr-only">
               {isSending
                 ? "Sending message"
@@ -192,6 +375,8 @@ export default function ComposeEmail() {
                   ? "Saving draft"
                   : isUploading
                     ? "Uploading attachments"
+                    : hasAttachmentIssue
+                      ? "Attachments need attention"
                     : aiComposeMut.isPending
                       ? "Generating draft"
                       : ""}
@@ -203,16 +388,26 @@ export default function ComposeEmail() {
                 </div>
               )}
 
+              {mailboxChanged && (
+                <Banner
+                  variant="alert"
+                  text="You changed mailboxes. This draft is still saving to the mailbox where you started it."
+                />
+              )}
+
               {/* Recipients */}
               <div className="flex min-w-0 items-end gap-2 sm:gap-3">
                 <div className="flex-1">
-                  <Input
+                  <RecipientCombobox
+                    id="compose-to"
                     label="To"
-                    type="text"
+                    field="to"
+                    mailboxId={originMailboxId ?? ""}
+                    recipients={recipientValues}
                     placeholder="recipient@example.com, another@example.com"
                     value={to}
                     autoFocus
-                    onChange={(e) => setTo(e.target.value)}
+                    onChange={setTo}
                     required
                   />
                 </div>
@@ -228,20 +423,26 @@ export default function ComposeEmail() {
               </div>
 
               {showCcBcc && (
-                <Input
+                <RecipientCombobox
+                  id="compose-cc"
                   label="Cc"
-                  type="text"
+                  field="cc"
+                  mailboxId={originMailboxId ?? ""}
+                  recipients={recipientValues}
                   value={cc}
-                  onChange={(e) => setCc(e.target.value)}
+                  onChange={setCc}
                   placeholder="Separate multiple addresses with commas"
                 />
               )}
               {showCcBcc && (
-                <Input
+                <RecipientCombobox
+                  id="compose-bcc"
                   label="Bcc"
-                  type="text"
+                  field="bcc"
+                  mailboxId={originMailboxId ?? ""}
+                  recipients={recipientValues}
                   value={bcc}
-                  onChange={(e) => setBcc(e.target.value)}
+                  onChange={setBcc}
                   placeholder="Separate multiple addresses with commas"
                 />
               )}
@@ -268,7 +469,10 @@ export default function ComposeEmail() {
                       Generate with AI
                     </button>
                   ) : (
-                    <div className="rounded-lg border border-kumo-line bg-kumo-recessed p-3 space-y-2">
+                    <div
+                      data-compose-shortcut-surface="ai-panel"
+                      className="rounded-lg border border-kumo-line bg-kumo-recessed p-3 space-y-2"
+                    >
                       <label
                         htmlFor="ai-compose-prompt"
                         className="text-xs font-medium text-kumo-subtle"
@@ -281,8 +485,24 @@ export default function ComposeEmail() {
                         value={aiPrompt}
                         onChange={(e) => setAiPrompt(e.target.value)}
                         onKeyDown={(e) => {
-                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey))
-                            handleAiGenerate();
+                          const action = planComposeShortcut({
+                            key: e.key,
+                            metaKey: e.metaKey,
+                            ctrlKey: e.ctrlKey,
+                            altKey: e.altKey,
+                            shiftKey: e.shiftKey,
+                            repeat: e.repeat,
+                            isImeComposing: e.nativeEvent.isComposing,
+                            composeActive: isComposing,
+                            hasBlockingState: false,
+                            defaultPrevented: e.defaultPrevented,
+                            origin: "ai-prompt",
+                          });
+                          if (action === "ai-generate") {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void handleAiGenerate();
+                          }
                           if (e.key === "Escape") setShowAiPrompt(false);
                         }}
                         placeholder={assistantCopy.composePlaceholder}
@@ -331,15 +551,37 @@ export default function ComposeEmail() {
               )}
 
               {/* Body */}
+              {canInsertSignature && (
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="min-h-11"
+                    aria-label="Insert signature"
+                    onClick={insertSignature}
+                  >
+                    Insert signature
+                  </Button>
+                </div>
+              )}
               <div className="h-[38dvh] min-h-[220px] sm:h-[42vh] sm:min-h-[280px]">
-                <RichTextEditor value={body} onChange={setBody} />
+                <RichTextEditor
+                  value={body}
+                  onChange={handleBodyChange}
+                  onFiles={acceptTransferredFiles}
+					onInlineImages={addInlineImages}
+					inlineImagePreviews={inlineImagePreviews}
+                />
               </div>
 
               {/* Attachments */}
               <ComposeAttachments
                 attachments={attachments}
+                bodyHtml={body}
                 onAddFiles={addFiles}
                 onRemove={removeAttachment}
+                onRetry={retryAttachment}
                 disabled={isSending}
               />
             </div>
@@ -373,8 +615,8 @@ export default function ComposeEmail() {
                 type="button"
                 variant="ghost"
                 className="min-h-11"
-                onClick={() => !isSending && closeCompose()}
-                disabled={isSending}
+                onClick={requestDiscard}
+                disabled={isSending || isResolvingClose}
               >
                 Discard
               </Button>
@@ -384,9 +626,16 @@ export default function ComposeEmail() {
                   variant="secondary"
                   className="min-h-11 min-w-0 flex-1 sm:flex-none"
                   loading={isSavingDraft}
-                  disabled={isSending || isUploading}
+                  disabled={
+                    isSending ||
+                    isResolvingClose ||
+                    isUploading ||
+                    hasAttachmentIssue
+                  }
                   icon={<FloppyDiskIcon size={16} />}
                   onClick={handleSaveDraft}
+                  aria-keyshortcuts="Meta+S Control+S"
+                  title="Save draft (⌘/Ctrl+S)"
                 >
                   {isSavingDraft ? "Saving…" : "Save draft"}
                 </Button>
@@ -396,8 +645,16 @@ export default function ComposeEmail() {
                     variant="primary"
                     className="min-h-11 min-w-0 flex-1 rounded-r-none sm:min-w-24"
                     loading={isSending}
-                    disabled={isSavingDraft || isSending || isUploading}
+                    disabled={
+                      isSavingDraft ||
+                      isSending ||
+                      isResolvingClose ||
+                      isUploading ||
+                      hasAttachmentIssue
+                    }
                     icon={<PaperPlaneTiltIcon size={16} />}
+                    aria-keyshortcuts="Meta+Enter Control+Enter"
+                    title="Send (⌘/Ctrl+Enter)"
                   >
                     {sendButtonLabel}
                   </Button>
@@ -411,7 +668,13 @@ export default function ComposeEmail() {
                           className="min-h-11 min-w-11 rounded-l-none border-l border-kumo-line/30"
                           icon={<CaretDownIcon size={16} />}
                           aria-label="Send options"
-                          disabled={isSavingDraft || isSending || isUploading}
+                          disabled={
+                            isSavingDraft ||
+                            isSending ||
+                            isResolvingClose ||
+                            isUploading ||
+                            hasAttachmentIssue
+                          }
                         />
                       }
                     />
@@ -455,6 +718,117 @@ export default function ComposeEmail() {
               </div>
             </div>
           </form>
+        </Dialog>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={isMissingAttachmentWarningOpen}
+        onOpenChange={(open) => {
+          if (!open && !isSending) cancelMissingAttachment();
+        }}
+      >
+        <Dialog size="sm" className="w-[calc(100vw-1rem)] p-0 sm:w-[440px]">
+          <div className="border-b border-kumo-line px-4 py-4 sm:px-5">
+            <Dialog.Title className="text-base font-semibold text-kumo-default">
+              Send without an attachment?
+            </Dialog.Title>
+            <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
+              Your message says an attachment is included, but no ready file is attached.
+            </Dialog.Description>
+          </div>
+          <div className="flex flex-wrap justify-end gap-2 px-4 py-4 sm:px-5">
+            <Button
+              type="button"
+              variant="secondary"
+              className="min-h-11"
+              disabled={isSending}
+              onClick={cancelMissingAttachment}
+            >
+              Back
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              className="min-h-11"
+              loading={isSending}
+              disabled={isSending}
+              onClick={confirmMissingAttachment}
+            >
+              Send anyway
+            </Button>
+          </div>
+        </Dialog>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={Boolean(closePrompt)}
+        onOpenChange={(open) => {
+          if (!open && !isResolvingClose) handleKeepEditing();
+        }}
+      >
+        <Dialog size="sm" className="w-[calc(100vw-1rem)] p-0 sm:w-[440px]">
+          <div className="border-b border-kumo-line px-4 py-4 sm:px-5">
+            <Dialog.Title className="text-base font-semibold text-kumo-default">
+              {closePrompt?.reason === "save-failed"
+                ? "Draft is not safely saved"
+                : closePrompt?.reason === "access-revoked"
+                  ? "Mailbox access was removed"
+                : closePrompt?.reason === "discard"
+                  ? hasPersistedDraft
+                    ? "Discard this draft?"
+                    : "Discard these changes?"
+                  : "Save before closing?"}
+            </Dialog.Title>
+            <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
+              {closePrompt?.message ||
+                (closePrompt?.reason === "discard"
+                  ? hasPersistedDraft
+                    ? "Discard permanently removes the saved draft and its attachments. This cannot be undone."
+                    : "These unsaved changes will be removed. This cannot be undone."
+                  : "Save the latest changes, keep editing, or deliberately discard the draft.")}
+            </Dialog.Description>
+          </div>
+          <div className="flex flex-wrap justify-end gap-2 px-4 py-4 sm:px-5">
+            <Button
+              type="button"
+              variant="ghost"
+              className="min-h-11"
+              disabled={isResolvingClose}
+              onClick={handleKeepEditing}
+            >
+              Keep editing
+            </Button>
+            {closePrompt?.reason !== "access-revoked" && (
+              <Button
+                type="button"
+                variant="secondary"
+                className="min-h-11"
+                loading={isResolvingClose && isSavingDraft}
+                disabled={isResolvingClose}
+                onClick={() => void saveAndClose()}
+              >
+                Save and close
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="destructive"
+              className="min-h-11"
+              loading={isResolvingClose && !isSavingDraft}
+              disabled={isResolvingClose}
+              onClick={() =>
+                closePrompt?.reason === "access-revoked"
+                  ? discardLocalAndClose()
+                  : void discardAndClose()
+              }
+            >
+              {closePrompt?.reason === "access-revoked"
+                ? "Discard local changes and close"
+                : hasPersistedDraft
+                  ? "Discard draft"
+                  : "Discard changes"}
+            </Button>
+          </div>
         </Dialog>
       </Dialog.Root>
 

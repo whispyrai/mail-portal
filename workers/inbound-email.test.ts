@@ -40,14 +40,24 @@ function mailboxRegistry(active = true) {
 
 test("inbound delivery uses the SMTP envelope recipient when the visible To header differs", async () => {
 	const mailboxAddress = "hesham@wiserchat.ai";
-	const stored: Array<{ folder: string; email: Record<string, unknown> }> = [];
+	const stored: Array<{
+		folder: string;
+		email: Record<string, unknown>;
+		memoryMailbox?: string;
+	}> = [];
 	const background: Promise<unknown>[] = [];
 	const mailbox = {
 		async resolveCanonicalThreadId() {
 			return null;
 		},
-		async createEmail(folder: string, email: Record<string, unknown>) {
-			stored.push({ folder, email });
+		async createEmail(
+			folder: string,
+			email: Record<string, unknown>,
+			_attachments: unknown[],
+			_actor: undefined,
+			memoryMailbox?: string,
+		) {
+			stored.push({ folder, email, memoryMailbox });
 		},
 		async getEmail() {
 			return null;
@@ -107,6 +117,8 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
 		stored[0].email.follow_up_reply_mailbox_address,
 		mailboxAddress,
 	);
+	assert.equal(stored[0].email.recipient_memory_origin, "live_inbound");
+	assert.equal(stored[0].memoryMailbox, mailboxAddress);
 });
 
 test("inbound delivery permanently rejects an unprovisioned envelope recipient without reading the message", async () => {

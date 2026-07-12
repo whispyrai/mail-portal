@@ -12,7 +12,7 @@ const source = [{
 	filename: "proposal.pdf",
 	mimetype: "application/pdf",
 	size: 4,
-	content_id: null,
+	content_id: "legacy-ordinary@example.com",
 	disposition: "attachment",
 }, {
 	id: "attachment-2",
@@ -20,8 +20,8 @@ const source = [{
 	filename: "terms.txt",
 	mimetype: "text/plain",
 	size: 3,
-	content_id: null,
-	disposition: "attachment",
+	content_id: "legacy-inline@example.com",
+	disposition: "inline",
 }];
 
 class MemoryBucket {
@@ -59,6 +59,8 @@ test("cancel recovery copies every attachment before returning draft metadata", 
 		{ id: "recovered_attachment-1", email_id: "draft_recovered_snapshot-1" },
 		{ id: "recovered_attachment-2", email_id: "draft_recovered_snapshot-1" },
 	]);
+	assert.equal(result.attachments[0]?.content_id, null);
+	assert.equal(result.attachments[1]?.content_id, "legacy-inline@example.com");
 	assert.equal(bucket.objects.has("attachments/snapshot-1/attachment-1/proposal.pdf"), true);
 	assert.equal(bucket.objects.has("attachments/draft_recovered_snapshot-1/recovered_attachment-1/proposal.pdf"), true);
 });

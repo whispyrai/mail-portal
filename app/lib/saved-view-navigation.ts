@@ -3,7 +3,6 @@ import {
   type SavedViewFilters,
   type SavedViewSort,
 } from "../../shared/saved-views.ts";
-import { parseSearchQuery } from "./search-parser.ts";
 
 function sortFromParams(searchParams: URLSearchParams): SavedViewSort {
   const column = searchParams.get("sortColumn");
@@ -18,6 +17,16 @@ function sortFromParams(searchParams: URLSearchParams): SavedViewSort {
         : "date",
     direction: direction === "ASC" || direction === "DESC" ? direction : "DESC",
   };
+}
+
+function hasExplicitSort(searchParams: URLSearchParams): boolean {
+  const column = searchParams.get("sortColumn");
+  return Boolean(
+    column &&
+      SAVED_VIEW_SORT_COLUMNS.includes(
+        column as (typeof SAVED_VIEW_SORT_COLUMNS)[number],
+      ),
+  );
 }
 
 function labelFilter(
@@ -44,22 +53,13 @@ export function definitionFromSearchView(input: {
   query: string;
   searchParams: URLSearchParams;
 }) {
-  const parsed = parseSearchQuery(input.query);
   return {
     filters: {
-      ...(parsed.query ? { query: parsed.query } : {}),
-      ...(parsed.folder ? { folder: parsed.folder } : {}),
-      ...(parsed.from ? { from: parsed.from } : {}),
-      ...(parsed.to ? { to: parsed.to } : {}),
-      ...(parsed.subject ? { subject: parsed.subject } : {}),
-      ...(parsed.date_start ? { dateStart: parsed.date_start } : {}),
-      ...(parsed.date_end ? { dateEnd: parsed.date_end } : {}),
-      ...(parsed.is_read !== undefined ? { isRead: parsed.is_read } : {}),
-      ...(parsed.is_starred !== undefined
-        ? { isStarred: parsed.is_starred }
-        : {}),
-      ...(parsed.has_attachment ? { hasAttachment: true as const } : {}),
+		...(input.query.trim() ? { searchQuery: input.query.trim() } : {}),
       ...labelFilter(input.searchParams),
+		...(!hasExplicitSort(input.searchParams)
+			? { useDefaultSearchOrder: true as const }
+			: {}),
     },
     sort: sortFromParams(input.searchParams),
   };

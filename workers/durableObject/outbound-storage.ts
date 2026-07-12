@@ -19,6 +19,7 @@ import type {
 	OutboundMessageSnapshot,
 } from "../lib/outbound-delivery-contract.ts";
 import { cancellationRecoveryPending } from "../lib/outbound-dispatch-policy.ts";
+import { contentIdForDisposition } from "../../shared/content-id.ts";
 
 const OUTBOX_FOLDER_ID = "outbox";
 const SNAPSHOT_ENVELOPE_KIND = "mail-portal/outbound-snapshot";
@@ -314,6 +315,24 @@ export class DurableObjectOutboundDeliveryTransaction
 			.select()
 			.from(schema.outboundDeliveries)
 			.where(eq(schema.outboundDeliveries.idempotency_key, key))
+			.get();
+		return row ? this.#hydrateDelivery(row) : null;
+	}
+
+	findDeliveryBySourceDraft(
+		id: string,
+		version: number,
+	): StoredOutboundDelivery | null {
+		const row = this.#db
+			.select()
+			.from(schema.outboundDeliveries)
+			.where(
+				and(
+					eq(schema.outboundDeliveries.source_draft_id, id),
+					eq(schema.outboundDeliveries.source_draft_version, version),
+				),
+			)
+			.limit(1)
 			.get();
 		return row ? this.#hydrateDelivery(row) : null;
 	}
@@ -700,14 +719,18 @@ export function pendingAttachmentsToRows(
 		if (!attachment) {
 			throw new Error(`Missing pending attachment metadata for ${id}`);
 		}
+		const disposition = attachment.disposition ?? "attachment";
 		return {
 			id,
 			email_id: emailId,
 			filename: attachment.filename,
 			mimetype: attachment.mimetype,
 			size: attachment.size,
-			content_id: attachment.contentId ?? attachment.content_id ?? null,
-			disposition: attachment.disposition ?? "attachment",
+			content_id: contentIdForDisposition(
+				disposition,
+				attachment.contentId ?? attachment.content_id,
+			),
+			disposition,
 		};
 	});
 }

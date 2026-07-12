@@ -3,7 +3,10 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import test from "node:test";
 import type { Env } from "../types.ts";
-import { followUpReminderD1Store } from "./follow-up-reminders-d1.ts";
+import {
+	followUpReminderD1Store,
+	followUpReminderService,
+} from "./follow-up-reminders-d1.ts";
 import {
 	FollowUpReminderError,
 	createFollowUpReminderService,
@@ -33,6 +36,10 @@ class Statement {
 
 	async all<T>() {
 		return { success: true, results: this.statement().all(...this.#values) as T[] };
+	}
+
+	async raw<T extends unknown[]>() {
+		return this.statement().all(...this.#values).map((row) => Object.values(row)) as T[];
 	}
 
 	async run() {
@@ -75,6 +82,8 @@ function fixture() {
 	for (const migration of [
 		"0001_create_users.sql",
 		"0003_create_mailbox_access.sql",
+		"0005_auth_security.sql",
+		"0006_credential_recovery.sql",
 		"0008_create_follow_up_reminders.sql",
 	]) {
 		db.exec(readFileSync(new URL(`../../migrations/${migration}`, import.meta.url), "utf8"));
@@ -126,8 +135,8 @@ const createInput = {
 test("D1 reminder store preserves owner scope, create idempotency, and active uniqueness", async () => {
 	const { db, service } = fixture();
 	const created = await service.create("user-1", MAILBOX, createInput);
-	assert.equal((await service.list("user-1", MAILBOX)).length, 1);
-	assert.equal((await service.list("user-2", MAILBOX)).length, 0);
+	assert.equal((await service.list("user-1", MAILBOX)).reminders.length, 1);
+	assert.equal((await service.list("user-2", MAILBOX)).reminders.length, 0);
 	assert.deepEqual(await service.create("user-1", MAILBOX, createInput), created);
 	await assert.rejects(
 		() => service.create("user-1", MAILBOX, { ...createInput, remindAt: "2026-07-13T09:00:00.000Z" }),
@@ -136,6 +145,111 @@ test("D1 reminder store preserves owner scope, create idempotency, and active un
 	await assert.rejects(
 		() => service.create("user-1", MAILBOX, { ...createInput, idempotencyKey: "create-reminder-2" }),
 		(error: unknown) => error instanceof FollowUpReminderError && error.code === "ACTIVE_CONFLICT",
+	);
+	db.close();
+});
+
+test("D1 reminder pages traverse more than 100 rows without gaps or duplicates", async () => {
+	const { db, service } = fixture();
+	const insert = db.prepare(
+		`INSERT INTO follow_up_reminders
+		 (id, owner_user_id, mailbox_address, conversation_key,
+		  baseline_message_id, baseline_message_date, remind_at, state,
+		  resolution_reason, create_idempotency_key, create_fingerprint,
+		  create_result_json, version, created_at, updated_at, resolved_at)
+		 VALUES (?, 'user-1', ?, ?, ?, ?, ?, 'active', NULL, ?, 'fingerprint',
+		         '{}', 1, ?, ?, NULL)`,
+	);
+	for (let index = 0; index < 205; index++) {
+		const id = `reminder-${String(index).padStart(3, "0")}`;
+		insert.run(
+			id,
+			MAILBOX,
+			`thread-${index}`,
+			`message-${index}`,
+			NOW - 1_000,
+			NOW + Math.floor(index / 3) * 1_000,
+			`create-${index}`,
+			NOW,
+			NOW,
+		);
+	}
+
+	const listed: string[] = [];
+	const cursors = new Set<string>();
+	let cursor: string | undefined;
+	do {
+		const page = await service.list("user-1", MAILBOX, 37, cursor);
+		assert.ok(page.reminders.length <= 37);
+		listed.push(...page.reminders.map((row) => row.id));
+		cursor = page.nextCursor ?? undefined;
+		if (cursor) {
+			assert.equal(cursors.has(cursor), false);
+			cursors.add(cursor);
+		}
+	} while (cursor);
+
+	assert.equal(listed.length, 205);
+	assert.equal(new Set(listed).size, 205);
+	assert.deepEqual(
+		listed,
+		Array.from({ length: 205 }, (_, index) => `reminder-${String(index).padStart(3, "0")}`),
+	);
+	db.close();
+});
+
+test("authorized reminder pages merge one bounded mailbox preview projection", async () => {
+	const { db } = fixture();
+	const projectionCalls: string[][] = [];
+	const env = {
+		DB: d1(db),
+		MAILBOX: {
+			idFromName(name: string) {
+				return name;
+			},
+			get() {
+				return {
+					async getFollowUpReminderAnchor(emailId: string) {
+						return {
+							conversationKey: `thread-${emailId}`,
+							baselineMessageId: emailId,
+							baselineMessageDate: "2026-07-11T10:00:00.000Z",
+						};
+					},
+					async getFollowUpReminderPreviews(ids: string[], mailboxAddress: string) {
+						assert.equal(mailboxAddress, MAILBOX);
+						projectionCalls.push(ids);
+						return [{
+							baselineMessageId: "message-1",
+							subject: "Proposal",
+							counterparty: "Client <client@example.com>",
+						}];
+					},
+				};
+			},
+		},
+	} as unknown as Env;
+	const service = followUpReminderService(env);
+	await service.create("user-1", MAILBOX, createInput);
+	await service.create("user-1", MAILBOX, {
+		...createInput,
+		emailId: "message-missing",
+		idempotencyKey: "create-reminder-2",
+	});
+
+	const page = await service.list("user-1", MAILBOX, 100);
+	assert.equal(projectionCalls.length, 1);
+	assert.deepEqual(new Set(projectionCalls[0]), new Set(["message-1", "message-missing"]));
+	assert.deepEqual(
+		page.reminders.find((row) => row.baselineMessageId === "message-1")?.preview,
+		{
+			subject: "Proposal",
+			counterparty: "Client <client@example.com>",
+		},
+	);
+	assert.equal(
+		page.reminders.find((row) => row.baselineMessageId === "message-missing")?.preview,
+		null,
 	);
 	db.close();
 });

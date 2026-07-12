@@ -5,6 +5,8 @@
 import type { Email } from "postal-mime";
 import { extractThreadTokens } from "./thread-token.ts";
 import { sanitizeFilename, type StoredAttachment } from "./attachments.ts";
+import type { RecipientMemoryOrigin } from "../../shared/recipient-suggestions.ts";
+import { contentIdForDisposition } from "../../shared/content-id.ts";
 
 export const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
@@ -23,6 +25,7 @@ type StoredEmail = {
 	thread_id: string;
 	message_id: string | null;
 	raw_headers: string;
+	recipient_memory_origin: RecipientMemoryOrigin;
 	/** Exact live RFC/token thread identity allowed to wake Snoozed mail. */
 	snooze_wake_thread_id: string | null;
 	follow_up_reply_mailbox_address: string | null;
@@ -38,6 +41,8 @@ type MailboxEmailStore = {
 		folder: string,
 		email: StoredEmail,
 		attachments: StoredAttachment[],
+		actor?: undefined,
+		mailboxAddress?: string,
 	): Promise<unknown>;
 	resolveCanonicalThreadId(messageIds: string[]): Promise<string | null>;
 	getEmail(id: string): Promise<unknown | null>;
@@ -62,6 +67,8 @@ type StoreParsedEmailOptions = {
 	threadId?: string;
 	wakeSnoozedOnReply?: boolean;
 	followUpMailboxAddress?: string;
+	mailboxAddress?: string;
+	recipientMemoryOrigin: RecipientMemoryOrigin;
 };
 
 function messageIds(value: string | undefined): string[] {
@@ -91,8 +98,8 @@ function boundedRfcThreadCandidates(
 
 /**
  * Persist one parsed email through the shared live-receive and import path.
- * Callers choose identity, folder, date, read state, and an optional imported
- * thread id; this module owns attachment storage and the stored row shape.
+ * Callers choose identity, folder, date, read state, provenance, and an optional
+ * imported thread id; this module owns attachment storage and the stored row shape.
  */
 export async function storeParsedEmail(
 	dependencies: EmailStorageDependencies,
@@ -110,6 +117,7 @@ export async function storeParsedEmail(
 			const key = `attachments/${messageId}/${attachmentId}/${filename}`;
 			attachmentKeys.push(key);
 			await dependencies.bucket.put(key, attachment.content);
+			const disposition = attachment.disposition ?? "attachment";
 			attachmentData.push({
 				id: attachmentId,
 				email_id: messageId,
@@ -119,8 +127,8 @@ export async function storeParsedEmail(
 					typeof attachment.content === "string"
 						? attachment.content.length
 						: attachment.content.byteLength,
-				content_id: attachment.contentId ?? null,
-				disposition: attachment.disposition ?? "attachment",
+				content_id: contentIdForDisposition(disposition, attachment.contentId),
+				disposition,
 			});
 		}
 
@@ -158,11 +166,14 @@ export async function storeParsedEmail(
 				thread_id: threadId,
 				message_id: messageIds(parsed.messageId)[0] ?? null,
 				raw_headers: JSON.stringify(parsed.headers),
+				recipient_memory_origin: options.recipientMemoryOrigin,
 				snooze_wake_thread_id: snoozeWakeThreadId,
 				follow_up_reply_mailbox_address:
 					options.followUpMailboxAddress?.toLowerCase() ?? null,
 			},
 			attachmentData,
+			undefined,
+			options.mailboxAddress,
 		);
 		return {
 			conversationKey: threadId,

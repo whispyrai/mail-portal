@@ -143,6 +143,37 @@ test("repeating a mailbox-scoped idempotency key replays one atomic enqueue", ()
 	assert.equal(service.list().length, 1);
 });
 
+test("a source draft revision can authorize only one delivery even when the client key changes", () => {
+	const { service } = createService();
+	const first = service.enqueue(command());
+	const replay = service.enqueue(
+		command({ idempotencyKey: "new-key-after-reload" }),
+	);
+
+	assert.equal(replay.replayed, true);
+	assert.equal(replay.delivery.id, first.delivery.id);
+	assert.equal(service.list().length, 1);
+});
+
+test("a cancelled source-revision replay is explicit and never masquerades as a new enqueue", () => {
+	const { service } = createService();
+	const first = service.enqueue(command());
+	service.cancel(
+		first.delivery.id,
+		{ kind: "user", id: "user-1" },
+		"2026-07-11T10:00:05.000Z",
+	);
+
+	const replay = service.enqueue(
+		command({ idempotencyKey: "deliberate-send-after-undo" }),
+	);
+
+	assert.equal(replay.outcome, "terminal_replay");
+	assert.equal(replay.delivery.status, "cancelled");
+	assert.equal(replay.delivery.id, first.delivery.id);
+	assert.equal(service.list().length, 1);
+});
+
 test("direct compose enqueues and sends without inventing a source draft", () => {
 	const { service } = createService();
 	const { draftId: _draftId, draftVersion: _draftVersion, ...directSnapshot } =
@@ -415,7 +446,7 @@ test("cancelling queued mail prevents dispatch and retains the recoverable draft
 });
 
 test("a definitive failure retains the draft and an explicit retry creates a new attempt", () => {
-	const { service } = createService();
+	const { service, storage } = createService();
 	service.enqueue(command());
 	const claimed = service.claimNext(
 		"2026-07-11T10:00:10.000Z",
@@ -436,6 +467,14 @@ test("a definitive failure retains the draft and an explicit retry creates a new
 	assert.equal(failed.delivery.status, "failed");
 	assert.equal(failed.sourceDraftAction, "retain");
 
+	const replay = service.enqueue(
+		command({ idempotencyKey: "send-after-definitive-failure" }),
+	);
+	assert.equal(replay.outcome, "terminal_replay");
+	assert.equal(replay.delivery.status, "failed");
+	assert.equal(replay.delivery.id, failed.delivery.id);
+	assert.equal(storage.deliveries.size, 1);
+
 	const retried = service.retryFailed(
 		failed.delivery.id,
 		{ kind: "user", id: "user-1" },
@@ -449,7 +488,7 @@ test("a definitive failure retains the draft and an explicit retry creates a new
 });
 
 test("an ambiguous outcome retains the draft and retry requires duplicate-risk acknowledgement", () => {
-	const { service } = createService();
+	const { service, storage } = createService();
 	service.enqueue(command());
 	const claimed = service.claimNext(
 		"2026-07-11T10:00:10.000Z",
@@ -468,6 +507,15 @@ test("an ambiguous outcome retains the draft and retry requires duplicate-risk a
 	);
 	assert.equal(unknown.delivery.status, "unknown");
 	assert.equal(unknown.sourceDraftAction, "retain");
+
+	const replay = service.enqueue(
+		command({ idempotencyKey: "send-after-ambiguous-outcome" }),
+	);
+	assert.equal(replay.outcome, "terminal_replay");
+	assert.equal(replay.delivery.status, "unknown");
+	assert.equal(replay.delivery.id, unknown.delivery.id);
+	assert.equal(storage.deliveries.size, 1);
+
 	assert.throws(
 		() =>
 			service.retryUnknown(

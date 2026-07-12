@@ -347,8 +347,8 @@ export function useRestoreEmail() {
 export function useDiscardDraft() {
 	const invalidate = useInvalidateEmailData();
 	return useMutation({
-		mutationFn: ({ mailboxId, id }: { mailboxId: string; id: string }) =>
-			api.discardDraft(mailboxId, id),
+		mutationFn: ({ mailboxId, id, version }: { mailboxId: string; id: string; version: number }) =>
+			api.discardDraft(mailboxId, id, version),
 		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),
 	});
 }
@@ -384,6 +384,7 @@ export function useSaveDraft() {
 				thread_id?: string;
 				draft_id?: string;
 				draft_version?: number;
+				draft_create_key?: string;
 				attachments?: AttachmentRef[];
 			};
 		}) => api.saveDraft(mailboxId, draft),

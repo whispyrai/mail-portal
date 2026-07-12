@@ -94,6 +94,53 @@ test("MCP compose is accepted into the truthful outbox without direct delivery",
 	);
 });
 
+test("MCP and agent send tools cannot enqueue CID bodies without attachment support", async () => {
+	const { env, enqueued } = testEnvironment({
+		original: {
+			id: "original-1",
+			date: "2026-07-11T08:00:00.000Z",
+			sender: "customer@example.com",
+			recipient: "team@example.com",
+			subject: "Question",
+			body: "Original body",
+			message_id: "customer-message@example.com",
+			thread_id: "thread-1",
+		},
+	});
+	const bodyHtml = '<img src="cid:missing@mail-portal.local" data-mail-inline-image="v1">';
+	const compose = await toolSendEmail(
+		env,
+		"team@example.com",
+		{
+			to: "customer@example.com",
+			subject: "Broken CID",
+			bodyHtml,
+			idempotencyKey: "mcp-cid-without-attachment",
+		},
+		{ kind: "mcp", id: "user-1" },
+	);
+	const reply = await toolSendReply(
+		env,
+		"team@example.com",
+		{
+			originalEmailId: "original-1",
+			to: "customer@example.com",
+			subject: "Re: Broken CID",
+			bodyHtml,
+			idempotencyKey: "agent-cid-without-attachment",
+		},
+		{ kind: "agent", id: "user-2" },
+	);
+
+	assert.deepEqual(compose, {
+		error: "An inline image in the message is missing its attachment (missing@mail-portal.local).",
+	});
+	assert.deepEqual(reply, {
+		error: "An inline image in the message is missing its attachment (missing@mail-portal.local).",
+	});
+	assert.equal(enqueued.length, 0);
+});
+
 test("an MCP transport retry returns the existing truthful state without enqueueing again", async () => {
 	const existingDelivery = {
 		id: "delivery-existing",

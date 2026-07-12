@@ -32,9 +32,9 @@ test("Send now stays the default while scheduling joins the immutable enqueue pa
   assert.match(composer, /scheduledFor/);
   assert.match(composer, /Send now/);
   assert.match(formHook, /scheduled_for: scheduledFor/);
-  assert.match(formHook, /keyFor\(sendPayload\)/);
+  assert.match(formHook, /keyFor\([\s\S]*?sendPayload,[\s\S]*?sendPersistenceKey/);
   assert.ok(
     formHook.indexOf("scheduled_for: scheduledFor") <
-      formHook.indexOf("keyFor(sendPayload)"),
+			formHook.indexOf("sendIdentityRef.current.keyFor("),
   );
 });
