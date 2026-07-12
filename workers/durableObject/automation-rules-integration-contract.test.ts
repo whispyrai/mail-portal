@@ -20,9 +20,10 @@ test("only live receive supplies the explicit Automation trigger through shared 
 test("Message acceptance reserves durable provenance before isolating captured-version failure", () => {
 	assert.match(durableObject, /captureLiveInbound\(email\.id, email\.date\)/u);
 	const reservation = automationModule.indexOf("INSERT INTO automation_runs");
-	const savepoint = automationModule.indexOf("SAVEPOINT automation_rule_snapshot", reservation);
-	assert.ok(reservation >= 0 && savepoint > reservation);
-	assert.match(automationModule, /ROLLBACK TO SAVEPOINT automation_rule_snapshot/u);
+	const validation = automationModule.indexOf("parseAutomationRuleDefinition(JSON.parse", reservation);
+	const snapshotWrite = automationModule.indexOf("INSERT INTO automation_run_rules", validation);
+	assert.ok(reservation >= 0 && validation > reservation && snapshotWrite > validation);
+	assert.doesNotMatch(automationModule, /\bSAVEPOINT\b|\bROLLBACK TO\b/u);
 	assert.match(automationModule, /failure_category = 'capture_failed'/u);
 	assert.match(durableObject, /capture failed after Message acceptance/u);
 });

@@ -1325,6 +1325,13 @@ export function createAutomationRulesModule(input: {
 	}
 
 	function captureLiveInbound(messageId: string, acceptedAt: string) {
+		const acceptedAtMs = Date.parse(acceptedAt);
+		if (
+			!messageId ||
+			messageId.length > 300 ||
+			!Number.isFinite(acceptedAtMs) ||
+			new Date(acceptedAtMs).toISOString() !== acceptedAt
+		) throw new AutomationRuleError("INVALID", "Automation Run trigger is invalid");
 		const existing = first<{
 			id: string;
 			state: AutomationRunState;
@@ -1359,66 +1366,34 @@ export function createAutomationRulesModule(input: {
 			acceptedAt,
 			acceptedAt,
 		);
-		storage.sql.exec("SAVEPOINT automation_rule_snapshot");
+		const rules = [...storage.sql.exec<VersionRow & { id: string; name: string; position: number }>(
+			`SELECT r.id, r.name, r.position, v.rule_id AS ruleId, v.version,
+			        v.definition_json AS definitionJson,
+			        v.definition_fingerprint AS definitionFingerprint,
+			        v.created_by AS createdBy, v.created_at AS createdAt
+			 FROM automation_rules r
+			 JOIN automation_rule_versions v
+			   ON v.rule_id = r.id AND v.version = r.active_version
+			 WHERE r.state = 'enabled'
+			 ORDER BY r.position ASC, r.id ASC
+			 LIMIT ?`,
+			AUTOMATION_RUNTIME_LIMITS.maxEnabledRules,
+		)];
+		let validatedRules: Array<
+			VersionRow & { id: string; name: string; position: number; activeName: string }
+		>;
 		try {
-			const rules = [...storage.sql.exec<VersionRow & { id: string; name: string; position: number }>(
-				`SELECT r.id, r.name, r.position, v.rule_id AS ruleId, v.version,
-				        v.definition_json AS definitionJson,
-				        v.definition_fingerprint AS definitionFingerprint,
-				        v.created_by AS createdBy, v.created_at AS createdAt
-				 FROM automation_rules r
-				 JOIN automation_rule_versions v
-				   ON v.rule_id = r.id AND v.version = r.active_version
-				 WHERE r.state = 'enabled'
-				 ORDER BY r.position ASC, r.id ASC
-				 LIMIT ?`,
-				AUTOMATION_RUNTIME_LIMITS.maxEnabledRules,
-			)];
-			for (const [ordinal, rule] of rules.entries()) {
-				storage.sql.exec(
-					`INSERT INTO automation_run_rules
-					 (run_id, ordinal, rule_id, rule_name, rule_version, definition_json, definition_fingerprint)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					runId,
-					ordinal,
-					rule.id,
-					rule.name,
-					rule.version,
-					rule.definitionJson,
-					rule.definitionFingerprint,
-				);
-				storage.sql.exec(
-					`INSERT OR IGNORE INTO automation_run_label_refs(run_id, label_id)
-					 SELECT ?, label_id FROM automation_rule_label_refs
-					 WHERE rule_id = ? AND version = ?`,
-					runId,
-					rule.id,
-					rule.version,
-				);
-				storage.sql.exec(
-					`INSERT OR IGNORE INTO automation_run_folder_refs(run_id, folder_id)
-					 SELECT ?, folder_id FROM automation_rule_folder_refs
-					 WHERE rule_id = ? AND version = ?`,
-					runId,
-					rule.id,
-					rule.version,
-				);
-			}
-			const runState: AutomationRunState = rules.length === 0 ? "no_match" : "pending";
-			storage.sql.exec(
-				`UPDATE automation_runs SET state = ?, next_attempt_at = ?, completed_at = ?,
-				 failure_category = NULL, updated_at = ? WHERE id = ?`,
-				runState,
-				rules.length === 0 ? null : acceptedAt,
-				rules.length === 0 ? acceptedAt : null,
-				acceptedAt,
-				runId,
-			);
-			storage.sql.exec("RELEASE SAVEPOINT automation_rule_snapshot");
-			return { runId, state: runState, replayed: false, captureFailed: false };
+			// Validate every immutable definition before copying any snapshot rows.
+			// Semantic corruption becomes a durable failed run; storage failures still
+			// escape so the outer Message transaction can roll back and retry safely.
+			validatedRules = rules.map((rule) => {
+				const definition = parseAutomationRuleDefinition(JSON.parse(rule.definitionJson));
+				if (!/^[a-f0-9]{64}$/u.test(rule.definitionFingerprint)) {
+					throw new AutomationRuleError("INVALID", "Stored Automation Rule fingerprint is invalid");
+				}
+				return { ...rule, activeName: definition.name };
+			});
 		} catch (error) {
-			storage.sql.exec("ROLLBACK TO SAVEPOINT automation_rule_snapshot");
-			storage.sql.exec("RELEASE SAVEPOINT automation_rule_snapshot");
 			storage.sql.exec(
 				`UPDATE automation_runs SET state = 'failed', next_attempt_at = NULL,
 				 completed_at = ?, failure_category = 'capture_failed', updated_at = ?
@@ -1427,6 +1402,7 @@ export function createAutomationRulesModule(input: {
 				acceptedAt,
 				runId,
 			);
+			pruneHistory(acceptedAtMs);
 			return {
 				runId,
 				state: "failed" as const,
@@ -1435,6 +1411,48 @@ export function createAutomationRulesModule(input: {
 				error: error instanceof Error ? error.message : String(error),
 			};
 		}
+		for (const [ordinal, rule] of validatedRules.entries()) {
+			storage.sql.exec(
+				`INSERT INTO automation_run_rules
+				 (run_id, ordinal, rule_id, rule_name, rule_version, definition_json, definition_fingerprint)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				runId,
+				ordinal,
+				rule.id,
+				rule.activeName,
+				rule.version,
+				rule.definitionJson,
+				rule.definitionFingerprint,
+			);
+			storage.sql.exec(
+				`INSERT OR IGNORE INTO automation_run_label_refs(run_id, label_id)
+				 SELECT ?, label_id FROM automation_rule_label_refs
+				 WHERE rule_id = ? AND version = ?`,
+				runId,
+				rule.id,
+				rule.version,
+			);
+			storage.sql.exec(
+				`INSERT OR IGNORE INTO automation_run_folder_refs(run_id, folder_id)
+				 SELECT ?, folder_id FROM automation_rule_folder_refs
+				 WHERE rule_id = ? AND version = ?`,
+				runId,
+				rule.id,
+				rule.version,
+			);
+		}
+		const runState: AutomationRunState = validatedRules.length === 0 ? "no_match" : "pending";
+		storage.sql.exec(
+			`UPDATE automation_runs SET state = ?, next_attempt_at = ?, completed_at = ?,
+			 failure_category = NULL, updated_at = ? WHERE id = ?`,
+			runState,
+			validatedRules.length === 0 ? null : acceptedAt,
+			validatedRules.length === 0 ? acceptedAt : null,
+			acceptedAt,
+			runId,
+		);
+		if (runState === "no_match") pruneHistory(acceptedAtMs);
+		return { runId, state: runState, replayed: false, captureFailed: false, error: undefined };
 	}
 
 	function claimNextRun(): AutomationRunClaim | null {

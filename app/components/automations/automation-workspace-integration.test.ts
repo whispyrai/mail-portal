@@ -13,8 +13,11 @@ test("Automations exposes URL-owned Rules and Run history without action replay"
 	assert.match(source, /useAutomationRun\(mailboxId, selectedRunId/);
 	assert.match(source, /Ruleset generation/);
 	assert.match(source, /version \{result\.ruleVersion\}/);
-	assert.match(source, /fetchNextPage\(\)/);
+	assert.match(source, /fetchNextPage/);
 	assert.match(source, /Load older runs/);
+	assert.match(source, /Older runs could not be loaded/);
+	assert.match(source, /Loaded results remain available/);
+	assert.match(source, /cancelRefetch: false/);
 });
 
 test("Shared read-only and safety copy remain visible product contracts", () => {

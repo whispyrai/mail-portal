@@ -38,6 +38,7 @@ function fixture() {
 			query: string,
 			...bindings: (ArrayBuffer | string | number | null)[]
 		) {
+			assert.ok(bindings.length <= 100, `query exceeded Cloudflare's 100-bind limit: ${bindings.length}`);
 			return database.prepare(query).all(...bindings) as T[];
 		},
 	};

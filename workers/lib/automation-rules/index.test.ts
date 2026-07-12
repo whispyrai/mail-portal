@@ -8,6 +8,7 @@ import type {
 } from "../../../shared/automation-rules.ts";
 import { mailboxMigrations } from "../../durableObject/migrations.ts";
 import {
+	AUTOMATION_RUNTIME_LIMITS,
 	AutomationRuleError,
 	createAutomationRulesModule,
 	evaluateAutomationRule,
@@ -511,7 +512,7 @@ test("expired and corrupt claims cannot mutate or poison later due runs", async 
 	database.close();
 });
 
-test("capture failure keeps a terminal run and rolls back every partial rule snapshot", async () => {
+test("semantic capture failure keeps a terminal run and writes no partial rule snapshot", async () => {
 	const database = migratedDatabase();
 	const storage = databaseStorage(database);
 	const now = Date.parse("2026-07-12T12:00:00.000Z");
@@ -541,11 +542,9 @@ test("capture failure keeps a terminal run and rolls back every partial rule sna
 		INSERT INTO emails(id, folder_id, subject, sender, recipient, date, body, thread_id)
 		VALUES (?, 'inbox', 'Mail', 'sender@example.com', 'team@example.com', ?, '', ?)
 	`).run("message-capture-failure", canonical(now), "conversation-capture-failure");
-	database.exec(`
-		CREATE TRIGGER reject_captured_rule BEFORE INSERT ON automation_run_rules BEGIN
-			SELECT RAISE(ABORT, 'simulated snapshot failure');
-		END;
-	`);
+	database.prepare(
+		"UPDATE automation_rule_versions SET definition_json = '{' WHERE rule_id = ? AND version = 1",
+	).run(draft.id);
 	const captured = module.captureLiveInbound("message-capture-failure", canonical(now));
 	assert.equal(captured.state, "failed");
 	assert.equal(captured.captureFailed, true);
@@ -561,6 +560,88 @@ test("capture failure keeps a terminal run and rolls back every partial rule sna
 		0,
 	);
 	assert.equal(module.captureLiveInbound("message-capture-failure", canonical(now)).replayed, true);
+	database.close();
+});
+
+test("capture snapshots the immutable active name while a renamed draft is pending", async () => {
+	const database = migratedDatabase();
+	const storage = databaseStorage(database);
+	const now = Date.parse("2026-07-12T12:00:00.000Z");
+	let id = 0;
+	const module = createAutomationRulesModule({
+		storage,
+		now: () => now,
+		createId: (prefix) => `${prefix}-${++id}`,
+	});
+	const activeDefinition = definition("Active name");
+	const draft = await module.createDraft({
+		definition: activeDefinition,
+		actorId: "user-1",
+		expectedOrderRevision: 0,
+	});
+	await module.dryRun({
+		definition: activeDefinition,
+		contexts: [planningContext()],
+		orderedRules: [],
+		proposedOrdinal: 0,
+		actorId: "user-1",
+		ruleId: draft.id,
+		ruleVersion: 1,
+		acknowledgedZero: false,
+	});
+	const enabled = module.enable({
+		ruleId: draft.id,
+		actorId: "user-1",
+		expectedRevision: draft.revision,
+	});
+	await module.updateDraft({
+		ruleId: draft.id,
+		definition: definition("Renamed draft"),
+		actorId: "user-1",
+		expectedRevision: enabled.revision,
+	});
+	database.prepare(`
+		INSERT INTO emails(id, folder_id, subject, sender, recipient, date, body, thread_id)
+		VALUES (?, 'inbox', 'Mail', 'sender@example.com', 'team@example.com', ?, '', ?)
+	`).run("message-active-name", canonical(now), "conversation-active-name");
+	module.captureLiveInbound("message-active-name", canonical(now));
+	const claim = module.claimNextRun();
+	assert.ok(claim);
+	assert.equal(claim.rules[0]?.version, 1);
+	assert.equal(claim.rules[0]?.ruleName, "Active name");
+	assert.equal(claim.rules[0]?.definition.name, "Active name");
+	database.close();
+});
+
+test("terminal capture performs bounded retention even when no rule execution is scheduled", () => {
+	const database = migratedDatabase();
+	const storage = databaseStorage(database);
+	const now = Date.parse("2026-07-12T12:00:00.000Z");
+	const old = canonical(now - AUTOMATION_RUNTIME_LIMITS.liveRetentionMs - 1);
+	for (let index = 0; index < AUTOMATION_RUNTIME_LIMITS.pruneBatch + 1; index += 1) {
+		database.prepare(`
+			INSERT INTO emails(id, folder_id, subject, sender, recipient, date, body, thread_id)
+			VALUES (?, 'inbox', 'Old', 'sender@example.com', 'team@example.com', ?, '', ?)
+		`).run(`old-message-${index}`, old, `old-conversation-${index}`);
+		database.prepare(`
+			INSERT INTO automation_runs
+			 (id, trigger_kind, trigger_message_id, ruleset_generation, state, attempt_count,
+			  completed_at, created_at, updated_at)
+			 VALUES (?, 'live_inbound', ?, 0, 'no_match', 0, ?, ?, ?)
+		`).run(`automation:old-message-${index}`, `old-message-${index}`, old, old, old);
+	}
+	database.prepare(`
+		INSERT INTO emails(id, folder_id, subject, sender, recipient, date, body, thread_id)
+		VALUES (?, 'inbox', 'New', 'sender@example.com', 'team@example.com', ?, '', ?)
+	`).run("new-terminal-message", canonical(now), "new-terminal-conversation");
+	const module = createAutomationRulesModule({ storage, now: () => now });
+	assert.equal(module.captureLiveInbound("new-terminal-message", canonical(now)).state, "no_match");
+	assert.equal(
+		database.prepare("SELECT COUNT(*) AS count FROM automation_runs WHERE completed_at = ?")
+			.get(old)?.count,
+		1,
+	);
+	assert.equal(module.getRun("automation:new-terminal-message").state, "no_match");
 	database.close();
 });
 

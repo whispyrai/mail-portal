@@ -12,6 +12,7 @@ import type {
 export const AUTOMATION_MAILBOX_RUNTIME_LIMITS = {
 	conversationMessages: 200,
 	dryRunMessages: 100,
+	messageSqlBatch: 90,
 } as const;
 
 type MessageRow = {
@@ -100,18 +101,28 @@ function currentInboxScope(
 		!rows.some((row) => row.id === message.id)
 	) return null;
 	const ids = rows.map((row) => row.id);
-	const placeholders = ids.map(() => "?").join(", ");
-	const existingLabelIds = [...sql.exec<{ labelId: string }>(
-		`SELECT label_id AS labelId FROM email_labels
-		 WHERE email_id IN (${placeholders})
-		 GROUP BY label_id HAVING COUNT(DISTINCT email_id) = ?
-		 ORDER BY label_id ASC`,
-		...ids,
-		ids.length,
-	)].map((row) => row.labelId);
+	let fullySatisfiedLabels: Set<string> | null = null;
+	for (const chunk of chunks(ids, AUTOMATION_MAILBOX_RUNTIME_LIMITS.messageSqlBatch)) {
+		const chunkLabels = new Set([...sql.exec<{ labelId: string }>(
+			`SELECT label_id AS labelId FROM email_labels
+			 WHERE email_id IN (${placeholders(chunk)})
+			 GROUP BY label_id HAVING COUNT(DISTINCT email_id) = ?
+			 ORDER BY label_id ASC`,
+			...chunk,
+			chunk.length,
+		)].map((row) => row.labelId));
+		if (fullySatisfiedLabels === null) {
+			fullySatisfiedLabels = chunkLabels;
+		} else {
+			const previous: Set<string> = fullySatisfiedLabels;
+			fullySatisfiedLabels = new Set(
+				Array.from(previous).filter((labelId: string) => chunkLabels.has(labelId)),
+			);
+		}
+	}
 	return {
 		conversationMessageIds: ids,
-		existingLabelIds,
+		existingLabelIds: [...(fullySatisfiedLabels ?? [])].sort(),
 		triggerIsStarred: message.starred === 1,
 	};
 }
@@ -166,6 +177,14 @@ function placeholders(values: readonly string[]): string {
 	return values.map(() => "?").join(", ");
 }
 
+function chunks<T>(values: readonly T[], size: number): T[][] {
+	const result: T[][] = [];
+	for (let start = 0; start < values.length; start += size) {
+		result.push(values.slice(start, start + size));
+	}
+	return result;
+}
+
 export function applyAutomationActionPlan(
 	sql: AutomationRulesSql,
 	claim: AutomationRunClaim,
@@ -176,21 +195,24 @@ export function applyAutomationActionPlan(
 	const scope = context.currentInboxScope;
 	if (!scope) return;
 	const messageIds = scope.conversationMessageIds;
-	const messagePlaceholders = placeholders(messageIds);
+	const messageBatches = chunks(messageIds, AUTOMATION_MAILBOX_RUNTIME_LIMITS.messageSqlBatch);
 	const occurredAt = new Date().toISOString();
 
 	for (const item of plan.applyLabels) {
-		const inserted = [...sql.exec<{ emailId: string }>(
-			`INSERT OR IGNORE INTO email_labels(email_id, label_id, created_at)
-			 SELECT id, ?, ? FROM emails
-			 WHERE id IN (${messagePlaceholders}) AND folder_id = ?
-			 RETURNING email_id AS emailId`,
-			item.labelId,
-			occurredAt,
-			...messageIds,
-			Folders.INBOX,
-		)];
-		if (inserted.length > 0) {
+		let insertedCount = 0;
+		for (const batch of messageBatches) {
+			insertedCount += [...sql.exec<{ emailId: string }>(
+				`INSERT OR IGNORE INTO email_labels(email_id, label_id, created_at)
+				 SELECT id, ?, ? FROM emails
+				 WHERE id IN (${placeholders(batch)}) AND folder_id = ?
+				 RETURNING email_id AS emailId`,
+				item.labelId,
+				occurredAt,
+				...batch,
+				Folders.INBOX,
+			)].length;
+		}
+		if (insertedCount > 0) {
 			recordActivity({
 				actor: { kind: "rule", id: item.ruleId },
 				action: "label_applied",
@@ -198,7 +220,7 @@ export function applyAutomationActionPlan(
 				entityId: context.snapshot.conversationId,
 				metadata: {
 					labelId: item.labelId,
-					affectedCount: inserted.length,
+					affectedCount: insertedCount,
 					automationRunId: claim.id,
 					ruleVersion: item.ruleVersion,
 				},
@@ -227,14 +249,17 @@ export function applyAutomationActionPlan(
 	}
 
 	if (plan.move) {
-		const moved = [...sql.exec<{ id: string }>(
-			`UPDATE emails SET folder_id = ?, previous_folder_id = NULL, trashed_at = NULL
-			 WHERE id IN (${messagePlaceholders}) AND folder_id = ? RETURNING id`,
-			plan.move.folderId,
-			...messageIds,
-			Folders.INBOX,
-		)];
-		if (moved.length > 0) {
+		let movedCount = 0;
+		for (const batch of messageBatches) {
+			movedCount += [...sql.exec<{ id: string }>(
+				`UPDATE emails SET folder_id = ?, previous_folder_id = NULL, trashed_at = NULL
+				 WHERE id IN (${placeholders(batch)}) AND folder_id = ? RETURNING id`,
+				plan.move.folderId,
+				...batch,
+				Folders.INBOX,
+			)].length;
+		}
+		if (movedCount > 0) {
 			recordActivity({
 				actor: { kind: "rule", id: plan.move.ruleId },
 				action: "email_moved",
@@ -243,7 +268,7 @@ export function applyAutomationActionPlan(
 				metadata: {
 					fromFolderId: Folders.INBOX,
 					toFolderId: plan.move.folderId,
-					affectedCount: moved.length,
+					affectedCount: movedCount,
 					automationRunId: claim.id,
 					ruleVersion: plan.move.ruleVersion,
 				},

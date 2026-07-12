@@ -102,9 +102,9 @@ export function useAutomationRuns(
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (page) => page.nextCursor ?? undefined,
 		enabled: enabled && Boolean(mailboxId),
-		refetchInterval: (query) => query.state.data?.pages.some((page) => page.runs.some(
+		refetchInterval: (query) => query.state.data?.pages[0]?.runs.some(
 			(run) => run.state === "pending" || run.state === "processing",
-		)) ? 5_000 : false,
+		) ? 5_000 : false,
 		retry: (count, error) => !isAutomationAccessRevoked(error) && count < 2,
 	});
 }
