@@ -13,6 +13,7 @@ export type ConversationActivityCode =
 	| "starred"
 	| "unstarred"
 	| "archived"
+	| "moved"
 	| "trashed"
 	| "restored"
 	| "snoozed"
@@ -36,6 +37,7 @@ export const CONVERSATION_ACTIVITY_LABELS = {
 	starred: "Starred",
 	unstarred: "Unstarred",
 	archived: "Archived",
+	moved: "Moved to folder",
 	trashed: "Moved to Trash",
 	restored: "Restored",
 	snoozed: "Snoozed",

@@ -8,6 +8,7 @@ const mailboxId = "hello@wiserchat.ai";
 
 function testApp(result: "deleted" | "not_found" | "protected" | "not_empty") {
 	const stub = {
+		async getAutomationTargetUsage() { return []; },
 		async deleteFolder(id: string, actor: unknown) {
 			assert.equal(id, "projects");
 			assert.deepEqual(actor, { kind: "user", id: "user-1" });

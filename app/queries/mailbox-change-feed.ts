@@ -84,6 +84,7 @@ function writeCursor(
 
 type InvalidatedQueryRoot =
 	| "attachments"
+	| "automations"
 	| "conversation-activity"
 	| "emails"
 	| "folders"
@@ -118,6 +119,8 @@ const INVALIDATED_ROOTS_BY_RESOURCE: Record<MailboxChange["resource"], readonly 
 	message_label: ["conversation-activity", "emails", "saved-view-results", "search"],
 	delivery: ["conversation-activity", "emails", "outbound"],
 	delivery_attempt: ["conversation-activity", "emails", "outbound"],
+	automation_rule: ["automations"],
+	automation_run: ["automations"],
 };
 
 export function invalidateMailboxChangeQueries(

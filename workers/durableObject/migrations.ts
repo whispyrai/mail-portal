@@ -773,4 +773,325 @@ export const mailboxMigrations: Migration[] = [
 				ON push_notification_deliveries(target_user_id, updated_at DESC, notification_id);
 		`),
 	},
+	{
+		name: "26_add_inbound_automation_rules",
+		sql: txn(`
+			CREATE TABLE automation_rule_state (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				ruleset_generation INTEGER NOT NULL DEFAULT 0 CHECK(ruleset_generation >= 0),
+				order_revision INTEGER NOT NULL DEFAULT 0 CHECK(order_revision >= 0),
+				updated_at TEXT NOT NULL
+			);
+			INSERT INTO automation_rule_state(id, ruleset_generation, order_revision, updated_at)
+			VALUES (1, 0, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+			CREATE TABLE automation_rules (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				normalized_name TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN (
+					'draft', 'enabled', 'disabled', 'needs_attention', 'archived'
+				)),
+				active_version INTEGER,
+				draft_version INTEGER,
+				next_version INTEGER NOT NULL DEFAULT 1 CHECK(next_version >= 1),
+				position INTEGER NOT NULL CHECK(position >= 0),
+				revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+				created_by TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_by TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				archived_by TEXT,
+				archived_at TEXT
+			);
+			CREATE UNIQUE INDEX idx_automation_rules_active_name
+				ON automation_rules(normalized_name) WHERE state <> 'archived';
+			CREATE INDEX idx_automation_rules_order
+				ON automation_rules(state, position, id);
+
+			CREATE TABLE automation_rule_versions (
+				rule_id TEXT NOT NULL,
+				version INTEGER NOT NULL CHECK(version >= 1),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+				definition_json TEXT NOT NULL,
+				definition_fingerprint TEXT NOT NULL,
+				created_by TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				PRIMARY KEY(rule_id, version),
+				FOREIGN KEY(rule_id) REFERENCES automation_rules(id) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_automation_rule_versions_created
+				ON automation_rule_versions(rule_id, created_at);
+
+			CREATE TABLE automation_rule_label_refs (
+				rule_id TEXT NOT NULL,
+				version INTEGER NOT NULL,
+				label_id TEXT NOT NULL,
+				PRIMARY KEY(rule_id, version, label_id),
+				FOREIGN KEY(rule_id, version) REFERENCES automation_rule_versions(rule_id, version) ON DELETE CASCADE,
+				FOREIGN KEY(label_id) REFERENCES labels(id) ON DELETE RESTRICT
+			);
+			CREATE INDEX idx_automation_rule_label_target
+				ON automation_rule_label_refs(label_id, rule_id);
+
+			CREATE TABLE automation_rule_folder_refs (
+				rule_id TEXT NOT NULL,
+				version INTEGER NOT NULL,
+				folder_id TEXT NOT NULL,
+				PRIMARY KEY(rule_id, version, folder_id),
+				FOREIGN KEY(rule_id, version) REFERENCES automation_rule_versions(rule_id, version) ON DELETE CASCADE,
+				FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE RESTRICT
+			);
+			CREATE INDEX idx_automation_rule_folder_target
+				ON automation_rule_folder_refs(folder_id, rule_id);
+
+			CREATE TABLE automation_runs (
+				id TEXT PRIMARY KEY,
+				trigger_kind TEXT NOT NULL CHECK(trigger_kind = 'live_inbound'),
+				trigger_message_id TEXT NOT NULL UNIQUE,
+				ruleset_generation INTEGER NOT NULL,
+				state TEXT NOT NULL CHECK(state IN (
+					'pending', 'processing', 'no_match', 'applied',
+					'applied_with_skips', 'failed'
+				)),
+				attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+				next_attempt_at TEXT,
+				lease_token TEXT,
+				lease_expires_at TEXT,
+				started_at TEXT,
+				completed_at TEXT,
+				evaluated_count INTEGER NOT NULL DEFAULT 0,
+				matched_count INTEGER NOT NULL DEFAULT 0,
+				applied_count INTEGER NOT NULL DEFAULT 0,
+				stopped_by_rule_id TEXT,
+				failure_category TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				FOREIGN KEY(trigger_message_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_automation_runs_due
+				ON automation_runs(state, next_attempt_at, id);
+			CREATE INDEX idx_automation_runs_lease
+				ON automation_runs(state, lease_expires_at, id);
+			CREATE INDEX idx_automation_runs_history
+				ON automation_runs(completed_at, id);
+
+			CREATE TABLE automation_run_rules (
+				run_id TEXT NOT NULL,
+				ordinal INTEGER NOT NULL,
+				rule_id TEXT NOT NULL,
+				rule_name TEXT NOT NULL,
+				rule_version INTEGER NOT NULL,
+				definition_json TEXT NOT NULL,
+				definition_fingerprint TEXT NOT NULL,
+				PRIMARY KEY(run_id, ordinal),
+				FOREIGN KEY(run_id) REFERENCES automation_runs(id) ON DELETE CASCADE
+			);
+			CREATE UNIQUE INDEX idx_automation_run_rules_identity
+				ON automation_run_rules(run_id, rule_id);
+
+			CREATE TABLE automation_run_results (
+				run_id TEXT NOT NULL,
+				ordinal INTEGER NOT NULL,
+				rule_id TEXT NOT NULL,
+				rule_name TEXT NOT NULL,
+				rule_version INTEGER NOT NULL,
+				outcome TEXT NOT NULL CHECK(outcome IN (
+					'not_matched', 'applied', 'already_satisfied', 'skipped_conflict',
+					'skipped_invalid_target', 'skipped_scope_changed', 'stopped'
+				)),
+				matched_condition_indexes_json TEXT NOT NULL,
+				planned_actions_json TEXT NOT NULL,
+				action_results_json TEXT NOT NULL,
+				failure_category TEXT,
+				attempt_count INTEGER NOT NULL,
+				created_at TEXT NOT NULL,
+				PRIMARY KEY(run_id, ordinal),
+				FOREIGN KEY(run_id) REFERENCES automation_runs(id) ON DELETE CASCADE
+			);
+
+			CREATE TABLE automation_run_label_refs (
+				run_id TEXT NOT NULL,
+				label_id TEXT NOT NULL,
+				PRIMARY KEY(run_id, label_id),
+				FOREIGN KEY(run_id) REFERENCES automation_runs(id) ON DELETE CASCADE,
+				FOREIGN KEY(label_id) REFERENCES labels(id) ON DELETE RESTRICT
+			);
+			CREATE INDEX idx_automation_run_label_target
+				ON automation_run_label_refs(label_id, run_id);
+
+			CREATE TABLE automation_run_folder_refs (
+				run_id TEXT NOT NULL,
+				folder_id TEXT NOT NULL,
+				PRIMARY KEY(run_id, folder_id),
+				FOREIGN KEY(run_id) REFERENCES automation_runs(id) ON DELETE CASCADE,
+				FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE RESTRICT
+			);
+			CREATE INDEX idx_automation_run_folder_target
+				ON automation_run_folder_refs(folder_id, run_id);
+
+			CREATE TABLE automation_rule_tests (
+				id TEXT PRIMARY KEY,
+				actor_id TEXT NOT NULL,
+				rule_id TEXT,
+				rule_version INTEGER,
+				definition_json TEXT NOT NULL,
+				definition_fingerprint TEXT NOT NULL,
+				evaluated_count INTEGER NOT NULL CHECK(evaluated_count >= 0),
+				matched_count INTEGER NOT NULL CHECK(matched_count >= 0),
+				acknowledged_zero INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged_zero IN (0, 1)),
+				result_json TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				expires_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_automation_rule_tests_rule_created
+				ON automation_rule_tests(rule_id, created_at);
+			CREATE INDEX idx_automation_rule_tests_retention
+				ON automation_rule_tests(expires_at, created_at, id);
+
+			DROP TRIGGER mailbox_changes_emails_insert;
+			DROP TRIGGER mailbox_changes_emails_update;
+			DROP TRIGGER mailbox_changes_emails_delete;
+			DROP TRIGGER mailbox_changes_attachments_insert;
+			DROP TRIGGER mailbox_changes_attachments_update;
+			DROP TRIGGER mailbox_changes_attachments_delete;
+			DROP TRIGGER mailbox_changes_folders_insert;
+			DROP TRIGGER mailbox_changes_folders_update;
+			DROP TRIGGER mailbox_changes_folders_delete;
+			DROP TRIGGER mailbox_changes_labels_insert;
+			DROP TRIGGER mailbox_changes_labels_update;
+			DROP TRIGGER mailbox_changes_labels_delete;
+			DROP TRIGGER mailbox_changes_email_labels_insert;
+			DROP TRIGGER mailbox_changes_email_labels_update;
+			DROP TRIGGER mailbox_changes_email_labels_delete;
+			DROP TRIGGER mailbox_changes_deliveries_insert;
+			DROP TRIGGER mailbox_changes_deliveries_update;
+			DROP TRIGGER mailbox_changes_deliveries_delete;
+			DROP TRIGGER mailbox_changes_delivery_attempts_insert;
+			DROP TRIGGER mailbox_changes_delivery_attempts_update;
+			DROP TRIGGER mailbox_changes_delivery_attempts_delete;
+
+			ALTER TABLE mailbox_changes RENAME TO mailbox_changes_v1;
+			CREATE TABLE mailbox_changes (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+				committed_at TEXT NOT NULL,
+				resource TEXT NOT NULL CHECK(resource IN (
+					'message', 'attachment', 'folder', 'label', 'message_label',
+					'delivery', 'delivery_attempt', 'automation_rule', 'automation_run'
+				)),
+				entity_id TEXT NOT NULL,
+				parent_id TEXT,
+				operation TEXT NOT NULL CHECK(operation IN ('created', 'updated', 'deleted'))
+			);
+			INSERT INTO mailbox_changes(sequence, schema_version, committed_at, resource, entity_id, parent_id, operation)
+			SELECT sequence, schema_version, committed_at, resource, entity_id, parent_id, operation
+			FROM mailbox_changes_v1 ORDER BY sequence;
+			DROP TABLE mailbox_changes_v1;
+
+			CREATE TRIGGER mailbox_changes_emails_insert AFTER INSERT ON emails BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_emails_update AFTER UPDATE ON emails BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_emails_delete AFTER DELETE ON emails BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', OLD.id, NULL, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_attachments_insert AFTER INSERT ON attachments BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'attachment', NEW.id, NEW.email_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_attachments_update AFTER UPDATE ON attachments BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'attachment', NEW.id, NEW.email_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_attachments_delete AFTER DELETE ON attachments BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'attachment', OLD.id, OLD.email_id, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_folders_insert AFTER INSERT ON folders BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'folder', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_folders_update AFTER UPDATE ON folders BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'folder', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_folders_delete AFTER DELETE ON folders BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'folder', OLD.id, NULL, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_labels_insert AFTER INSERT ON labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'label', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_labels_update AFTER UPDATE ON labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'label', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_labels_delete AFTER DELETE ON labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'label', OLD.id, NULL, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_email_labels_insert AFTER INSERT ON email_labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message_label', NEW.email_id || ':' || NEW.label_id, NEW.email_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_email_labels_update AFTER UPDATE ON email_labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message_label', NEW.email_id || ':' || NEW.label_id, NEW.email_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_email_labels_delete AFTER DELETE ON email_labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message_label', OLD.email_id || ':' || OLD.label_id, OLD.email_id, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_deliveries_insert AFTER INSERT ON outbound_deliveries BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery', NEW.id, NEW.email_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_deliveries_update AFTER UPDATE ON outbound_deliveries BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery', NEW.id, NEW.email_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_deliveries_delete AFTER DELETE ON outbound_deliveries BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery', OLD.id, OLD.email_id, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_delivery_attempts_insert AFTER INSERT ON outbound_delivery_attempts BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', NEW.id, NEW.delivery_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_delivery_attempts_update AFTER UPDATE ON outbound_delivery_attempts BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', NEW.id, NEW.delivery_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_delivery_attempts_delete AFTER DELETE ON outbound_delivery_attempts BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', OLD.id, OLD.delivery_id, 'deleted');
+			END;
+			CREATE TRIGGER mailbox_changes_automation_rules_insert AFTER INSERT ON automation_rules BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'automation_rule', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_automation_rules_update AFTER UPDATE ON automation_rules BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'automation_rule', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_automation_runs_insert AFTER INSERT ON automation_runs BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'automation_run', NEW.id, NEW.trigger_message_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_automation_runs_terminal_update
+			AFTER UPDATE OF state ON automation_runs
+			WHEN OLD.state <> NEW.state AND NEW.state IN ('no_match', 'applied', 'applied_with_skips', 'failed')
+			BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'automation_run', NEW.id, NEW.trigger_message_id, 'updated');
+			END;
+		`),
+	},
 ];

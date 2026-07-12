@@ -58,7 +58,7 @@ export function validateStoredPushPayload(
 		throw new Error("Push payload is invalid");
 	}
 	const mailboxId = input.mailboxId.trim().toLowerCase();
-	const expectedClick = `/mailbox/${encodeURIComponent(mailboxId)}/emails/inbox?email=${encodeURIComponent(input.emailId)}`;
+	const expectedClick = `/mailbox/${encodeURIComponent(mailboxId)}/open/${encodeURIComponent(input.emailId)}`;
 	if (
 		data.emailId !== input.emailId ||
 		data.mailboxId !== mailboxId ||

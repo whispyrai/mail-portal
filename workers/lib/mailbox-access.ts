@@ -122,6 +122,21 @@ export function createMailboxAccess(store: MailboxAccessStore) {
 	}
 
 	return {
+		async canManageAutomationRules(
+			userId: string,
+			mailboxId: string,
+		): Promise<boolean> {
+			const [user, row] = await Promise.all([
+				store.getUser(userId),
+				store.getMailboxAccessRow(userId, mailboxId.toLowerCase()),
+			]);
+			if (!user || user.is_active !== 1 || !row || row.is_active !== 1) {
+				return false;
+			}
+			if (row.type === "PERSONAL") return row.owner_user_id === userId;
+			return user.role === "ADMIN" && row.membership_user_id === userId;
+		},
+
 		async canManageMailboxSettings(
 			userId: string,
 			mailboxId: string,

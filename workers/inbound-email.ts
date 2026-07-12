@@ -100,6 +100,7 @@ export async function receiveEmail(
 		followUpMailboxAddress: mailboxId,
 		mailboxAddress: mailboxId,
 		recipientMemoryOrigin: RecipientMemoryOrigins.LIVE_INBOUND,
+		automationTrigger: "live_inbound",
 		pushNotification,
 	});
 

@@ -27,6 +27,7 @@ function appWith(stub: Record<string, (...args: any[]) => any>) {
 test("active mailbox members can create, list, update, and delete mailbox labels", async () => {
 	const calls: unknown[][] = [];
 	const app = appWith({
+		async getAutomationTargetUsage() { return []; },
 		async listLabels() { return [{ id: "label-1", name: "Priority", color: "red" }]; },
 		async createLabel(...args: unknown[]) { calls.push(["create", ...args]); return { id: "label-1", name: "Priority", color: "red" }; },
 		async updateLabel(...args: unknown[]) { calls.push(["update", ...args]); return { id: "label-1", name: "Urgent", color: "orange" }; },
@@ -38,6 +39,21 @@ test("active mailbox members can create, list, update, and delete mailbox labels
 	assert.equal((await app.request("/labels/label-1", { method: "DELETE" })).status, 204);
 	assert.equal(calls.length, 3);
 	assert.deepEqual((calls[0]![3] as { kind: string; id: string }), { kind: "user", id: "user-1" });
+});
+
+test("label deletion reports the bounded Automation target conflict", async () => {
+	let deleted = false;
+	const app = appWith({
+		async getAutomationTargetUsage() { return ["Vendor invoices"]; },
+		async deleteLabel() { deleted = true; return true; },
+	});
+	const response = await app.request("/labels/label-1", { method: "DELETE" });
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "Target is used by Automation Rule: Vendor invoices",
+		code: "RULE_TARGET_IN_USE",
+	});
+	assert.equal(deleted, false);
 });
 
 test("label mutations validate bounded targets and preserve partial mailbox results", async () => {

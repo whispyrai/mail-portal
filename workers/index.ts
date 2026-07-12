@@ -48,6 +48,8 @@ import { mailPeopleRoutes } from "./routes/mail-people";
 import { relationshipBriefRoutes } from "./routes/relationship-brief";
 import { pushHealthRoutes } from "./routes/push-health";
 import { pushSubscriptionRoutes } from "./routes/push-subscriptions";
+import { mailboxMessageLocationRoutes } from "./routes/mailbox-message-location";
+import { automationRuleRoutes } from "./routes/automation-rules";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -160,6 +162,8 @@ app.route("/", mailPeopleRoutes);
 app.route("/", relationshipBriefRoutes);
 app.route("/", pushHealthRoutes);
 app.route("/", pushSubscriptionRoutes);
+app.route("/", mailboxMessageLocationRoutes);
+app.route("/", automationRuleRoutes);
 
 // -- Config ---------------------------------------------------------
 

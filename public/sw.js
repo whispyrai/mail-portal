@@ -14,7 +14,7 @@
 // Bump SW_VERSION when the handler shape changes; combined with the
 // `Cache-Control: no-cache` on this file, browsers refetch + swap on next load.
 
-const SW_VERSION = "notif-v2";
+const SW_VERSION = "notif-v3";
 
 self.addEventListener("install", () => {
 	// Take over immediately instead of waiting for every old tab to close.

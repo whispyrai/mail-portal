@@ -16,6 +16,8 @@ export const MAILBOX_CHANGE_RESOURCES = [
 	"message_label",
 	"delivery",
 	"delivery_attempt",
+	"automation_rule",
+	"automation_run",
 ] as const;
 
 export const MAILBOX_CHANGE_OPERATIONS = ["created", "updated", "deleted"] as const;

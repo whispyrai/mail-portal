@@ -185,7 +185,19 @@ function codeForEvent(
 			return metadata.folderId === "inbox" ? "message_received" : null;
 		case "email_updated": {
 			const keys = Object.keys(metadata);
-			if (keys.length !== 1) return null;
+			const stateKeys = keys.filter((key) => key === "read" || key === "starred");
+			if (
+				stateKeys.length !== 1 ||
+				keys.some((key) => !new Set([
+					"read",
+					"starred",
+					"automationRunId",
+					"ruleVersion",
+				]).has(key)) ||
+				("automationRunId" in metadata &&
+					boundedIdentifier(metadata.automationRunId, 200) === null) ||
+				("ruleVersion" in metadata && !safeInteger(metadata.ruleVersion))
+			) return null;
 			if (typeof metadata.read === "boolean") {
 				return metadata.read ? "marked_read" : "marked_unread";
 			}
@@ -219,7 +231,9 @@ function codeForEvent(
 				? "archived"
 				: metadata.toFolderId === "trash"
 					? "trashed"
-					: null;
+					: boundedIdentifier(metadata.toFolderId, 128) === null
+						? null
+						: "moved";
 		case "conversation_snoozed":
 		case "email_snoozed":
 			return typeof metadata.wakeAt === "string" ? "snoozed" : null;

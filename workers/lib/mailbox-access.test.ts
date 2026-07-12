@@ -171,6 +171,46 @@ test("Personal Mailbox owners can manage settings without granting admins conten
 	assert.equal(await access.canAccessMailbox(admin.id, personal.id), false);
 });
 
+test("Automation Rules require ownership or a Shared Mailbox admin membership", async () => {
+	const owner = user("owner");
+	const member = user("member");
+	const adminMember = user("admin-member", "ADMIN");
+	const adminNonmember = user("admin-nonmember", "ADMIN");
+	const inactiveAdmin = user("inactive-admin", "ADMIN", false);
+	const personal = mailbox("personal", "PERSONAL", owner.id);
+	const shared = mailbox("shared", "SHARED", null);
+	const access = createMailboxAccess(
+		memoryStore({
+			users: [owner, member, adminMember, adminNonmember, inactiveAdmin],
+			mailboxes: [personal, shared],
+			memberships: [
+				{ mailboxId: shared.id, userId: member.id },
+				{ mailboxId: shared.id, userId: adminMember.id },
+				{ mailboxId: shared.id, userId: inactiveAdmin.id },
+			],
+		}),
+	);
+
+	assert.equal(await access.canManageAutomationRules(owner.id, personal.id), true);
+	assert.equal(
+		await access.canManageAutomationRules(adminMember.id, personal.id),
+		false,
+	);
+	assert.equal(await access.canManageAutomationRules(member.id, shared.id), false);
+	assert.equal(
+		await access.canManageAutomationRules(adminMember.id, shared.id),
+		true,
+	);
+	assert.equal(
+		await access.canManageAutomationRules(adminNonmember.id, shared.id),
+		false,
+	);
+	assert.equal(
+		await access.canManageAutomationRules(inactiveAdmin.id, shared.id),
+		false,
+	);
+});
+
 test("Inactive users and inactive mailboxes are never accessible", async () => {
 	const inactiveMember = user("inactive-member", "AGENT", false);
 	const activeMember = user("active-member");

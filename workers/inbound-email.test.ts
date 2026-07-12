@@ -118,6 +118,7 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
 		mailboxAddress,
 	);
 	assert.equal(stored[0].email.recipient_memory_origin, "live_inbound");
+	assert.equal(stored[0].email.automation_trigger, "live_inbound");
 	assert.equal(stored[0].email.sender_name, "Sender");
 	assert.equal(stored[0].memoryMailbox, mailboxAddress);
 });

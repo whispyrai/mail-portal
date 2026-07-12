@@ -109,6 +109,15 @@ test("canonical scope includes Message, thread, Conversation, and authoritative 
 		entityId: "root",
 	});
 	insertEvent(database, {
+		id: "event-custom-move",
+		action: "email_moved",
+		entityType: "conversation",
+		entityId: "root",
+		metadata: { fromFolderId: "inbox", toFolderId: "projects", affectedCount: 2 },
+		actorKind: "rule",
+		actorId: "rule-1",
+	});
+	insertEvent(database, {
 		id: "event-delivery",
 		action: "outbound_enqueued",
 		entityType: "outbound_delivery",
@@ -145,7 +154,17 @@ test("canonical scope includes Message, thread, Conversation, and authoritative 
 	if (result.state !== "ready") return;
 	assert.deepEqual(
 		new Set(result.items.map((item) => item.id)),
-		new Set(["event-message", "event-thread", "event-conversation", "event-delivery"]),
+		new Set([
+			"event-message",
+			"event-thread",
+			"event-conversation",
+			"event-custom-move",
+			"event-delivery",
+		]),
+	);
+	assert.equal(
+		result.items.find((item) => item.id === "event-custom-move")?.code,
+		"moved",
 	);
 	assert.equal(
 		result.items.find((item) => item.id === "event-delivery")?.code,
@@ -190,7 +209,13 @@ test("unknown, malformed, deleted-row, and ambiguous events are omitted", () => 
 		action: "email_updated",
 		entityType: "email",
 		entityId: "root",
-		metadata: { starred: true },
+		metadata: {
+			starred: true,
+			automationRunId: "automation:message-1",
+			ruleVersion: 2,
+		},
+		actorKind: "rule",
+		actorId: "rule-1",
 	});
 	const result = readConversationActivityProjection(sql, {
 		emailId: "root",

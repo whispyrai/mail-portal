@@ -239,6 +239,25 @@ test("attachment changes refresh People evidence without refetching the People l
 	assert.equal(queryClient.getQueryState(timeline)?.isInvalidated, true);
 });
 
+test("Automation Rule and Run changes refresh only the mailbox Automation workspace", async () => {
+	const mailboxId = "team@example.com";
+	for (const resource of ["automation_rule", "automation_run"] as const) {
+		const queryClient = new QueryClient();
+		const automations = ["automations", mailboxId, "rules"] as const;
+		const otherMailbox = ["automations", "other@example.com", "rules"] as const;
+		const emailList = ["emails", mailboxId, "inbox"] as const;
+		for (const key of [automations, otherMailbox, emailList]) {
+			queryClient.setQueryData(key, { ready: true });
+		}
+
+		await invalidateMailboxChangeQueries(queryClient, mailboxId, [change(resource)]);
+
+		assert.equal(queryClient.getQueryState(automations)?.isInvalidated, true);
+		assert.equal(queryClient.getQueryState(otherMailbox)?.isInvalidated, false);
+		assert.equal(queryClient.getQueryState(emailList)?.isInvalidated, false);
+	}
+});
+
 test("deterministic Message and attachment changes never auto-invalidate a paid relationship brief", async () => {
 	const mailboxId = "team@example.com";
 	const queryClient = new QueryClient();

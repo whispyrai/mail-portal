@@ -4,6 +4,7 @@
 
 import {
 	check,
+	foreignKey,
 	index,
 	integer,
 	primaryKey,
@@ -174,8 +175,10 @@ export const mailboxChanges = sqliteTable("mailbox_changes", {
 			"folder",
 			"label",
 			"message_label",
-			"delivery",
-			"delivery_attempt",
+				"delivery",
+				"delivery_attempt",
+				"automation_rule",
+				"automation_run",
 		],
 	}).notNull(),
 	entity_id: text("entity_id").notNull(),
@@ -427,3 +430,210 @@ export const pushNotificationDeliveries = sqliteTable(
 		),
 	],
 );
+
+export const automationRuleState = sqliteTable("automation_rule_state", {
+	id: integer("id").primaryKey(),
+	ruleset_generation: integer("ruleset_generation").notNull().default(0),
+	order_revision: integer("order_revision").notNull().default(0),
+	updated_at: text("updated_at").notNull(),
+}, (table) => [
+	check("automation_rule_state_singleton", sql`${table.id} = 1`),
+	check("automation_rule_state_generation_nonnegative", sql`${table.ruleset_generation} >= 0`),
+	check("automation_rule_state_order_revision_nonnegative", sql`${table.order_revision} >= 0`),
+]);
+
+export const automationRules = sqliteTable("automation_rules", {
+	id: text("id").primaryKey(),
+	name: text("name").notNull(),
+	normalized_name: text("normalized_name").notNull(),
+	state: text("state", {
+		enum: ["draft", "enabled", "disabled", "needs_attention", "archived"],
+	}).notNull(),
+	active_version: integer("active_version"),
+	draft_version: integer("draft_version"),
+	next_version: integer("next_version").notNull().default(1),
+	position: integer("position").notNull(),
+	revision: integer("revision").notNull().default(1),
+	created_by: text("created_by").notNull(),
+	created_at: text("created_at").notNull(),
+	updated_by: text("updated_by").notNull(),
+	updated_at: text("updated_at").notNull(),
+	archived_by: text("archived_by"),
+	archived_at: text("archived_at"),
+}, (table) => [
+	check(
+		"automation_rules_state_closed",
+		sql`${table.state} IN ('draft', 'enabled', 'disabled', 'needs_attention', 'archived')`,
+	),
+	check("automation_rules_next_version_positive", sql`${table.next_version} >= 1`),
+	check("automation_rules_position_nonnegative", sql`${table.position} >= 0`),
+	check("automation_rules_revision_positive", sql`${table.revision} >= 1`),
+	uniqueIndex("idx_automation_rules_active_name")
+		.on(table.normalized_name)
+		.where(sql`${table.state} <> 'archived'`),
+	index("idx_automation_rules_order").on(table.state, table.position, table.id),
+]);
+
+export const automationRuleVersions = sqliteTable("automation_rule_versions", {
+	rule_id: text("rule_id").notNull()
+		.references(() => automationRules.id, { onDelete: "cascade" }),
+	version: integer("version").notNull(),
+	schema_version: integer("schema_version").notNull(),
+	definition_json: text("definition_json").notNull(),
+	definition_fingerprint: text("definition_fingerprint").notNull(),
+	created_by: text("created_by").notNull(),
+	created_at: text("created_at").notNull(),
+}, (table) => [
+	primaryKey({ columns: [table.rule_id, table.version] }),
+	check("automation_rule_versions_version_positive", sql`${table.version} >= 1`),
+	check("automation_rule_versions_schema_v1", sql`${table.schema_version} = 1`),
+	index("idx_automation_rule_versions_created").on(table.rule_id, table.created_at),
+]);
+
+export const automationRuleLabelRefs = sqliteTable("automation_rule_label_refs", {
+	rule_id: text("rule_id").notNull(),
+	version: integer("version").notNull(),
+	label_id: text("label_id").notNull()
+		.references(() => labels.id, { onDelete: "restrict" }),
+}, (table) => [
+	primaryKey({ columns: [table.rule_id, table.version, table.label_id] }),
+	foreignKey({
+		columns: [table.rule_id, table.version],
+		foreignColumns: [automationRuleVersions.rule_id, automationRuleVersions.version],
+	}).onDelete("cascade"),
+	index("idx_automation_rule_label_target").on(table.label_id, table.rule_id),
+]);
+
+export const automationRuleFolderRefs = sqliteTable("automation_rule_folder_refs", {
+	rule_id: text("rule_id").notNull(),
+	version: integer("version").notNull(),
+	folder_id: text("folder_id").notNull()
+		.references(() => folders.id, { onDelete: "restrict" }),
+}, (table) => [
+	primaryKey({ columns: [table.rule_id, table.version, table.folder_id] }),
+	foreignKey({
+		columns: [table.rule_id, table.version],
+		foreignColumns: [automationRuleVersions.rule_id, automationRuleVersions.version],
+	}).onDelete("cascade"),
+	index("idx_automation_rule_folder_target").on(table.folder_id, table.rule_id),
+]);
+
+export const automationRuns = sqliteTable("automation_runs", {
+	id: text("id").primaryKey(),
+	trigger_kind: text("trigger_kind", { enum: ["live_inbound"] }).notNull(),
+	trigger_message_id: text("trigger_message_id").notNull().unique()
+		.references(() => emails.id, { onDelete: "cascade" }),
+	ruleset_generation: integer("ruleset_generation").notNull(),
+	state: text("state", {
+		enum: ["pending", "processing", "no_match", "applied", "applied_with_skips", "failed"],
+	}).notNull(),
+	attempt_count: integer("attempt_count").notNull().default(0),
+	next_attempt_at: text("next_attempt_at"),
+	lease_token: text("lease_token"),
+	lease_expires_at: text("lease_expires_at"),
+	started_at: text("started_at"),
+	completed_at: text("completed_at"),
+	evaluated_count: integer("evaluated_count").notNull().default(0),
+	matched_count: integer("matched_count").notNull().default(0),
+	applied_count: integer("applied_count").notNull().default(0),
+	stopped_by_rule_id: text("stopped_by_rule_id"),
+	failure_category: text("failure_category"),
+	created_at: text("created_at").notNull(),
+	updated_at: text("updated_at").notNull(),
+}, (table) => [
+	check("automation_runs_trigger_live_inbound", sql`${table.trigger_kind} = 'live_inbound'`),
+	check(
+		"automation_runs_state_closed",
+		sql`${table.state} IN ('pending', 'processing', 'no_match', 'applied', 'applied_with_skips', 'failed')`,
+	),
+	check("automation_runs_attempt_nonnegative", sql`${table.attempt_count} >= 0`),
+	index("idx_automation_runs_due").on(table.state, table.next_attempt_at, table.id),
+	index("idx_automation_runs_lease").on(table.state, table.lease_expires_at, table.id),
+	index("idx_automation_runs_history").on(table.completed_at, table.id),
+]);
+
+export const automationRunRules = sqliteTable("automation_run_rules", {
+	run_id: text("run_id").notNull()
+		.references(() => automationRuns.id, { onDelete: "cascade" }),
+	ordinal: integer("ordinal").notNull(),
+	rule_id: text("rule_id").notNull(),
+	rule_name: text("rule_name").notNull(),
+	rule_version: integer("rule_version").notNull(),
+	definition_json: text("definition_json").notNull(),
+	definition_fingerprint: text("definition_fingerprint").notNull(),
+}, (table) => [
+	primaryKey({ columns: [table.run_id, table.ordinal] }),
+	uniqueIndex("idx_automation_run_rules_identity").on(table.run_id, table.rule_id),
+]);
+
+export const automationRunResults = sqliteTable("automation_run_results", {
+	run_id: text("run_id").notNull()
+		.references(() => automationRuns.id, { onDelete: "cascade" }),
+	ordinal: integer("ordinal").notNull(),
+	rule_id: text("rule_id").notNull(),
+	rule_name: text("rule_name").notNull(),
+	rule_version: integer("rule_version").notNull(),
+	outcome: text("outcome", {
+		enum: [
+			"not_matched",
+			"applied",
+			"already_satisfied",
+			"skipped_conflict",
+			"skipped_invalid_target",
+			"skipped_scope_changed",
+			"stopped",
+		],
+	}).notNull(),
+	matched_condition_indexes_json: text("matched_condition_indexes_json").notNull(),
+	planned_actions_json: text("planned_actions_json").notNull(),
+	action_results_json: text("action_results_json").notNull(),
+	failure_category: text("failure_category"),
+	attempt_count: integer("attempt_count").notNull(),
+	created_at: text("created_at").notNull(),
+}, (table) => [
+	primaryKey({ columns: [table.run_id, table.ordinal] }),
+	check(
+		"automation_run_results_outcome_closed",
+		sql`${table.outcome} IN ('not_matched', 'applied', 'already_satisfied', 'skipped_conflict', 'skipped_invalid_target', 'skipped_scope_changed', 'stopped')`,
+	),
+]);
+
+export const automationRunLabelRefs = sqliteTable("automation_run_label_refs", {
+	run_id: text("run_id").notNull()
+		.references(() => automationRuns.id, { onDelete: "cascade" }),
+	label_id: text("label_id").notNull()
+		.references(() => labels.id, { onDelete: "restrict" }),
+}, (table) => [
+	primaryKey({ columns: [table.run_id, table.label_id] }),
+	index("idx_automation_run_label_target").on(table.label_id, table.run_id),
+]);
+
+export const automationRunFolderRefs = sqliteTable("automation_run_folder_refs", {
+	run_id: text("run_id").notNull()
+		.references(() => automationRuns.id, { onDelete: "cascade" }),
+	folder_id: text("folder_id").notNull()
+		.references(() => folders.id, { onDelete: "restrict" }),
+}, (table) => [
+	primaryKey({ columns: [table.run_id, table.folder_id] }),
+	index("idx_automation_run_folder_target").on(table.folder_id, table.run_id),
+]);
+
+export const automationRuleTests = sqliteTable("automation_rule_tests", {
+	id: text("id").primaryKey(),
+	actor_id: text("actor_id").notNull(),
+	rule_id: text("rule_id"),
+	rule_version: integer("rule_version"),
+	definition_json: text("definition_json").notNull(),
+	definition_fingerprint: text("definition_fingerprint").notNull(),
+	evaluated_count: integer("evaluated_count").notNull(),
+	matched_count: integer("matched_count").notNull(),
+	acknowledged_zero: integer("acknowledged_zero").notNull().default(0),
+	result_json: text("result_json").notNull(),
+	created_at: text("created_at").notNull(),
+	expires_at: text("expires_at").notNull(),
+}, (table) => [
+	check("automation_rule_tests_counts_nonnegative", sql`${table.evaluated_count} >= 0 AND ${table.matched_count} >= 0`),
+	check("automation_rule_tests_ack_boolean", sql`${table.acknowledged_zero} IN (0, 1)`),
+	index("idx_automation_rule_tests_rule_created").on(table.rule_id, table.created_at),
+	index("idx_automation_rule_tests_retention").on(table.expires_at, table.created_at, table.id),
+]);

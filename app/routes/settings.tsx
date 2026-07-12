@@ -3,7 +3,12 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Badge, Button, Input, Loader, useKumoToastManager } from "@cloudflare/kumo";
-import { RobotIcon, ArrowCounterClockwiseIcon } from "@phosphor-icons/react";
+import {
+	ArrowCounterClockwiseIcon,
+	ArrowRightIcon,
+	LightningIcon,
+	RobotIcon,
+} from "@phosphor-icons/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
@@ -118,6 +123,31 @@ export default function SettingsRoute() {
 			<h1 className="text-lg font-semibold text-kumo-default mb-6">Settings</h1>
 
 			<div className="space-y-6">
+				{/* First-class destination; Settings provides a discoverability path. */}
+				<div className="rounded-lg border border-kumo-line bg-kumo-base p-5">
+					<div className="flex items-start justify-between gap-4">
+						<div className="flex min-w-0 gap-3">
+							<div className="grid size-10 shrink-0 place-items-center rounded-md bg-kumo-tint text-kumo-default">
+								<LightningIcon size={20} weight="duotone" aria-hidden="true" />
+							</div>
+							<div>
+								<div className="text-sm font-medium text-kumo-default">Automations</div>
+								<p className="mt-1 text-xs leading-5 text-kumo-subtle">
+									Organize future incoming mail with ordered, explainable rules.
+								</p>
+							</div>
+						</div>
+						<Button
+							variant="secondary"
+							icon={<ArrowRightIcon size={16} aria-hidden="true" />}
+							onClick={() => navigate(`/mailbox/${mailboxId}/automations`)}
+							className="min-h-11 shrink-0"
+						>
+							Open
+						</Button>
+					</div>
+				</div>
+
 				{/* Account */}
 				<div className="rounded-lg border border-kumo-line bg-kumo-base p-5">
 					<div className="text-sm font-medium text-kumo-default mb-4">

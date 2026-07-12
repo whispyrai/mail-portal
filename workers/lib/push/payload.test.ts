@@ -66,11 +66,11 @@ test("missing subject → placeholder", () => {
 	assert.equal(p.body, "(no subject)");
 });
 
-test("clickUrl deep-links to the message in the inbox (URL-encoded)", () => {
+test("clickUrl deep-links through the current Message resolver (URL-encoded)", () => {
 	const p = buildPushPayload(base);
 	assert.equal(
 		p.clickUrl,
-		"/mailbox/hesham%40wiserchat.ai/emails/inbox?email=msg-123",
+		"/mailbox/hesham%40wiserchat.ai/open/msg-123",
 	);
 });
 

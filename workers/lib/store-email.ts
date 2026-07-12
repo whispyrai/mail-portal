@@ -32,6 +32,7 @@ type StoredEmail = {
 	/** Exact live RFC/token thread identity allowed to wake Snoozed mail. */
 	snooze_wake_thread_id: string | null;
 	follow_up_reply_mailbox_address: string | null;
+	automation_trigger?: "live_inbound";
 	push_notification?: PushPayload;
 };
 
@@ -74,6 +75,8 @@ type StoreParsedEmailOptions = {
 	mailboxAddress?: string;
 	recipientMemoryOrigin: RecipientMemoryOrigin;
 	pushNotification?: PushPayload;
+	/** Explicit authority to capture an immutable inbound Automation run. */
+	automationTrigger?: "live_inbound";
 	/** Optional write-generation fence for import-only attachment identities. */
 	attachmentIdNamespace?: string;
 };
@@ -184,6 +187,7 @@ export async function storeParsedEmail(
 				snooze_wake_thread_id: snoozeWakeThreadId,
 					follow_up_reply_mailbox_address:
 						options.followUpMailboxAddress?.toLowerCase() ?? null,
+					automation_trigger: options.automationTrigger,
 					push_notification: options.pushNotification,
 			},
 			attachmentData,

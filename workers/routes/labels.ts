@@ -6,6 +6,7 @@ import {
 	LABEL_COLORS,
 	validateLabelMutationTargets,
 } from "../lib/labels.ts";
+import { AutomationRuleError } from "../lib/automation-rules/index.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -25,6 +26,12 @@ const LabelMutationBody = z.object({
 });
 
 function labelError(c: AppContext, error: unknown) {
+	if (
+		(error instanceof AutomationRuleError && error.code === "RULE_TARGET_IN_USE") ||
+		(error instanceof Error && error.name === "AutomationRuleError:RULE_TARGET_IN_USE")
+	) {
+		return c.json({ error: error.message, code: "RULE_TARGET_IN_USE" }, 409);
+	}
 	const message = error instanceof Error ? error.message : "Label operation failed";
 	if (message.includes("UNIQUE constraint failed")) {
 		return c.json({ error: "A label with that name already exists" }, 409);
@@ -68,11 +75,24 @@ export async function handleUpdateLabel(c: AppContext) {
 }
 
 export async function handleDeleteLabel(c: AppContext) {
-	const deleted = await c.var.mailboxStub.deleteLabel(
-		c.req.param("labelId")!,
-		actorFromSession(c.get("session")),
-	);
-	return deleted ? c.body(null, 204) : c.json({ error: "Label not found" }, 404);
+	try {
+		const names = await c.var.mailboxStub.getAutomationTargetUsage({
+			labelId: c.req.param("labelId")!,
+		});
+		if (names.length > 0) {
+			return c.json({
+				error: `Target is used by Automation ${names.length === 1 ? "Rule" : "Rules"}: ${names.join(", ")}`,
+				code: "RULE_TARGET_IN_USE",
+			}, 409);
+		}
+		const deleted = await c.var.mailboxStub.deleteLabel(
+			c.req.param("labelId")!,
+			actorFromSession(c.get("session")),
+		);
+		return deleted ? c.body(null, 204) : c.json({ error: "Label not found" }, 404);
+	} catch (error) {
+		return labelError(c, error);
+	}
 }
 
 export async function handleMutateLabels(c: AppContext) {

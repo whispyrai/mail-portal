@@ -55,6 +55,20 @@ export const queryKeys = {
 		list: (mailboxId: string, emailIdsKey = "") =>
 			["outbound", mailboxId, emailIdsKey] as const,
 	},
+	automations: {
+		all: (mailboxId: string) => ["automations", mailboxId] as const,
+		rules: (mailboxId: string) => ["automations", mailboxId, "rules"] as const,
+		rule: (mailboxId: string, ruleId: string) =>
+			["automations", mailboxId, "rules", ruleId] as const,
+		versions: (mailboxId: string, ruleId: string) =>
+			["automations", mailboxId, "rules", ruleId, "versions"] as const,
+		tests: (mailboxId: string, ruleId: string) =>
+			["automations", mailboxId, "rules", ruleId, "tests"] as const,
+		runs: (mailboxId: string, filters: Record<string, string> = {}) =>
+			["automations", mailboxId, "runs", filters] as const,
+		run: (mailboxId: string, runId: string) =>
+			["automations", mailboxId, "runs", runId] as const,
+	},
 	config: ["config"] as const,
 	currentActor: ["me"] as const,
 };

@@ -11,6 +11,8 @@ export default [
 		route("today", "routes/today.tsx"),
 		route("people", "routes/people.tsx"),
 		route("attachments", "routes/attachments.tsx"),
+		route("automations", "routes/automations.tsx"),
+		route("open/:emailId", "routes/open-message.tsx"),
 		route("emails/:folder", "routes/email-list.tsx"),
 		route("settings", "routes/settings.tsx"),
 		route("search", "routes/search-results.tsx"),

@@ -159,6 +159,20 @@ import {
 } from "../../shared/mail-people.ts";
 import { normalizeMailAddress } from "../lib/mail-address.ts";
 import { readRelationshipBriefEvidence } from "../lib/relationship-brief-evidence.ts";
+import { AUTOMATION_RUN_STATES } from "../../shared/automation-rules.ts";
+import {
+	AutomationRuleError,
+	createAutomationRulesModule,
+	type AutomationRuleVersionRecord,
+	type AutomationRuleRecord,
+	type AutomationDryRunRecord,
+	type AutomationRunRecord,
+} from "../lib/automation-rules/index.ts";
+import {
+	applyAutomationActionPlan,
+	readAutomationDryRunContexts,
+	readAutomationPlanningContext,
+} from "../lib/automation-rules/mailbox-runtime.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -231,6 +245,7 @@ interface EmailData {
 	recipient_memory_origin?: RecipientMemoryOrigin | null;
 	snooze_wake_thread_id?: string | null;
 	follow_up_reply_mailbox_address?: string | null;
+	automation_trigger?: "live_inbound";
 	push_notification?: PushPayload;
 }
 
@@ -301,6 +316,15 @@ export class MailboxDO extends DurableObject<Env> {
 		super(state, env);
 		this.db = drizzle(this.ctx.storage, { schema });
 		applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+	}
+
+	#automationRules() {
+		return createAutomationRulesModule({
+			storage: {
+				sql: this.ctx.storage.sql,
+				transactionSync: (run) => this.ctx.storage.transactionSync(run),
+			},
+		});
 	}
 
 	// ── Email CRUD (Drizzle) ───────────────────────────────────────
@@ -762,6 +786,22 @@ export class MailboxDO extends DurableObject<Env> {
 			attachments: emailAttachments,
 			labels: this.#labelsForEmailIds([id]).get(id) ?? [],
 		};
+	}
+
+	async getEmailLocation(id: string) {
+		if (!id || id.length > 300) return null;
+		const row = this.db
+			.select({
+				emailId: schema.emails.id,
+				folderId: schema.emails.folder_id,
+			})
+			.from(schema.emails)
+			.where(and(
+				eq(schema.emails.id, id),
+				sql`${schema.emails.folder_id} <> ${InternalFolders.RETIRED_OUTBOUND}`,
+			))
+			.get();
+		return row ?? null;
 	}
 
 	/**
@@ -2272,6 +2312,7 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async deleteLabel(id: string, actor: ActivityActor = { kind: "system" }) {
+		this.#assertAutomationTargetUnused({ labelId: id });
 		const now = new Date().toISOString();
 		let deleted: { id: string } | undefined;
 		this.ctx.storage.transactionSync(() => {
@@ -2445,6 +2486,7 @@ export class MailboxDO extends DurableObject<Env> {
 
 		if (!folder) return "not_found" as const;
 		if (folder.is_deletable === 0) return "protected" as const;
+		this.#assertAutomationTargetUnused({ folderId: id });
 
 		let deleted: { id: string } | undefined;
 		const occurredAt = new Date().toISOString();
@@ -2672,6 +2714,8 @@ export class MailboxDO extends DurableObject<Env> {
 		const folderId = folderRow.id;
 		const isSent = folderId === Folders.SENT;
 		let pushTargetCount: number | null = null;
+		let automationRunPending = false;
+		let automationCaptureError: unknown = null;
 
 		// Sent emails are always read — the sender obviously knows what they wrote.
 		// This prevents sent replies from inflating thread_unread_count.
@@ -2702,6 +2746,16 @@ export class MailboxDO extends DurableObject<Env> {
 
 			if (attachments.length > 0) {
 				this.db.insert(schema.attachments).values(attachments).run();
+			}
+			if (email.automation_trigger !== undefined) {
+				if (
+					email.automation_trigger !== "live_inbound" ||
+					folderId !== Folders.INBOX ||
+					email.recipient_memory_origin !== RecipientMemoryOrigins.LIVE_INBOUND
+				) throw new Error("Automation trigger is not eligible for this Message");
+				const captured = this.#automationRules().captureLiveInbound(email.id, email.date);
+				automationRunPending = captured.state === "pending";
+				if (captured.captureFailed) automationCaptureError = captured.error;
 			}
 			if (
 				mailboxAddress &&
@@ -2773,6 +2827,22 @@ export class MailboxDO extends DurableObject<Env> {
 				}).targetCount;
 			}
 		});
+		if (automationCaptureError) {
+			console.error("[automation-rules] capture failed after Message acceptance", {
+				emailId: email.id,
+				error: automationCaptureError instanceof Error
+					? automationCaptureError.message
+					: String(automationCaptureError),
+			});
+		}
+		if (automationRunPending) {
+			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
+				console.error("[automation-rules] failed to schedule durable execution", {
+					emailId: email.id,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		}
 		if (pushTargetCount !== null) {
 			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
 				console.error("[push-outbox] failed to schedule durable delivery", {
@@ -3301,6 +3371,86 @@ export class MailboxDO extends DurableObject<Env> {
 		if (existing === null || timestamp < existing) {
 			await this.ctx.storage.setAlarm(timestamp);
 		}
+	}
+
+	#nextAutomationAlarmAt(): number | null {
+		const row = [...this.ctx.storage.sql.exec<{ dueAt: string | null }>(
+			`SELECT MIN(due_at) AS dueAt FROM (
+			 SELECT next_attempt_at AS due_at FROM automation_runs
+			 WHERE state = 'pending' AND next_attempt_at IS NOT NULL
+			 UNION ALL
+			 SELECT lease_expires_at AS due_at FROM automation_runs
+			 WHERE state = 'processing' AND lease_expires_at IS NOT NULL
+			)`,
+		)][0];
+		if (!row?.dueAt) return null;
+		const timestamp = Date.parse(row.dueAt);
+		return Number.isFinite(timestamp) ? timestamp : null;
+	}
+
+	#processAutomationRulesAlarm(): number | null {
+		const automation = this.#automationRules();
+		for (let processed = 0; processed < 2; processed += 1) {
+			let claim;
+			try {
+				claim = automation.claimNextRun();
+			} catch (error) {
+				console.error("[automation-rules] could not claim due work", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				break;
+			}
+			if (!claim) break;
+			try {
+				const context = readAutomationPlanningContext(
+					this.ctx.storage.sql,
+					claim.triggerMessageId,
+				);
+				if (!context) {
+					automation.failClaim(claim, "message_unavailable", false);
+					continue;
+				}
+				const plan = automation.planRun(claim.rules, context);
+				const finalized = automation.finalizeClaim(claim, plan, (ownedPlan) => {
+					applyAutomationActionPlan(
+						this.ctx.storage.sql,
+						claim,
+						context,
+						ownedPlan,
+						(activity) => this.#recordActivity(
+							activity.actor,
+							activity.action,
+							activity.entityType,
+							activity.entityId,
+							activity.metadata,
+						),
+					);
+				});
+				if (!finalized) {
+					console.warn("[automation-rules] lease expired before finalization", {
+						runId: claim.id,
+					});
+				}
+			} catch (error) {
+				let recorded = false;
+				try {
+					recorded = automation.failClaim(claim, "runtime_failure", true);
+				} catch (failureError) {
+					console.error("[automation-rules] could not persist execution failure", {
+						runId: claim.id,
+						error: failureError instanceof Error
+							? failureError.message
+							: String(failureError),
+					});
+				}
+				console.error("[automation-rules] execution failed", {
+					runId: claim.id,
+					retryScheduled: recorded,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return this.#nextAutomationAlarmAt();
 	}
 
 	#processDueSnoozeBatch(now = Date.now()): number | null {
@@ -4141,6 +4291,16 @@ export class MailboxDO extends DurableObject<Env> {
 	/** Enqueue the next recipient of the head job, persist progress, reschedule. */
 	async alarm(): Promise<void> {
 		const alarmNow = Date.now();
+		try {
+			const nextAutomationAt = this.#processAutomationRulesAlarm();
+			if (nextAutomationAt !== null) {
+				await this.#scheduleAlarmAt(Math.max(Date.now() + 100, nextAutomationAt));
+			}
+		} catch (error) {
+			console.error("[automation-rules] alarm pass failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		const pushVapid = vapidConfig(this.env);
 		const nextPushAt = await processPushOutbox({
 			storage: this.ctx.storage,
@@ -4361,6 +4521,438 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 	}
 
+	// ── Deterministic inbound Automation Rules ─────────────────────
+
+	#automationTargetSets() {
+		return {
+			labels: new Set(
+				[...this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM labels")]
+					.map((row) => row.id),
+			),
+			folders: new Set(
+				[...this.ctx.storage.sql.exec<{ id: string }>(
+					`SELECT id FROM folders
+					 WHERE id = ? OR (is_deletable = 1 AND id <> ?)`,
+					Folders.ARCHIVE,
+					InternalFolders.RETIRED_OUTBOUND,
+				)].map((row) => row.id),
+			),
+		};
+	}
+
+	#automationRuleHistory() {
+		return new Map(
+			[...this.ctx.storage.sql.exec<{
+				ruleId: string;
+				lastRunAt: string;
+				lastMatchedAt: string | null;
+			}>(
+				`SELECT rule_id AS ruleId, MAX(created_at) AS lastRunAt,
+				        MAX(CASE WHEN outcome NOT IN ('not_matched', 'stopped')
+				                 THEN created_at ELSE NULL END) AS lastMatchedAt
+				 FROM automation_run_results GROUP BY rule_id`,
+			)].map((row) => [row.ruleId, row]),
+		);
+	}
+
+	#automationTargetUsage(target: { labelId?: string; folderId?: string }) {
+		const current = this.#automationRules().rulesUsingTarget(target);
+		const referenceTable = target.labelId
+			? "automation_run_label_refs"
+			: "automation_run_folder_refs";
+		const referenceColumn = target.labelId ? "label_id" : "folder_id";
+		const targetId = target.labelId ?? target.folderId;
+		if (!targetId) throw new AutomationRuleError("INVALID", "Automation Rule target is invalid");
+		const pending = [...this.ctx.storage.sql.exec<{ id: string; name: string }>(
+			`SELECT DISTINCT rr.rule_id AS id, rr.rule_name AS name
+			 FROM ${referenceTable} ref
+			 JOIN automation_runs run ON run.id = ref.run_id
+			 JOIN automation_run_rules rr ON rr.run_id = run.id
+			 WHERE ref.${referenceColumn} = ? AND run.state IN ('pending', 'processing')
+			 ORDER BY rr.ordinal ASC, rr.rule_id ASC LIMIT 20`,
+			targetId,
+		)];
+		return [...new Set([...current, ...pending].map((rule) => rule.name))].slice(0, 5);
+	}
+
+	#assertAutomationTargetUnused(target: { labelId?: string; folderId?: string }) {
+		const names = this.#automationTargetUsage(target);
+		if (names.length > 0) {
+			throw new AutomationRuleError(
+				"RULE_TARGET_IN_USE",
+				`Target is used by Automation ${names.length === 1 ? "Rule" : "Rules"}: ${names.join(", ")}`,
+			);
+		}
+	}
+
+	#automationRuleView(
+		rule: AutomationRuleRecord,
+		versions: AutomationRuleVersionRecord[],
+		targets = this.#automationTargetSets(),
+		history = this.#automationRuleHistory(),
+	) {
+		const active = versions.find((version) => version.version === rule.activeVersion) ?? null;
+		const draft = versions.find((version) => version.version === rule.draftVersion) ?? null;
+		let targetHealth: "ready" | "needs_attention" = "ready";
+		for (const version of [active, draft]) {
+			if (!version) continue;
+			for (const action of version.definition.actions) {
+				if (
+					action.kind === "apply_labels" &&
+					action.labelIds.some((labelId) => !targets.labels.has(labelId))
+				) targetHealth = "needs_attention";
+				if (
+					action.kind === "move_to_folder" &&
+					!targets.folders.has(action.folderId)
+				) targetHealth = "needs_attention";
+			}
+		}
+		return {
+			id: rule.id,
+			name: rule.name,
+			state: targetHealth === "needs_attention" && rule.state !== "archived"
+				? ("needs_attention" as const)
+				: rule.state,
+			position: rule.position,
+			revision: rule.revision,
+			activeVersion: rule.activeVersion,
+			draftVersion: rule.draftVersion,
+			activeDefinition: active?.definition ?? null,
+			draftDefinition: draft?.definition ?? null,
+			createdBy: rule.createdBy,
+			createdAt: rule.createdAt,
+			updatedBy: rule.updatedBy,
+			updatedAt: rule.updatedAt,
+			archivedBy: rule.archivedBy,
+			archivedAt: rule.archivedAt,
+			targetHealth,
+			lastRunAt: history.get(rule.id)?.lastRunAt ?? null,
+			lastMatchedAt: history.get(rule.id)?.lastMatchedAt ?? null,
+		};
+	}
+
+	async listAutomationRules(includeArchived = true) {
+		const automation = this.#automationRules();
+		const targets = this.#automationTargetSets();
+		const history = this.#automationRuleHistory();
+		const rules = automation.listRules(includeArchived).map((rule) => {
+			try {
+				return this.#automationRuleView(
+					rule,
+					automation.listVersions(rule.id),
+					targets,
+					history,
+				);
+			} catch {
+				return {
+					...this.#automationRuleView(rule, [], targets, history),
+					state: rule.state === "archived" ? rule.state : ("needs_attention" as const),
+					targetHealth: "needs_attention" as const,
+				};
+			}
+		});
+		return { rules, ...automation.state() };
+	}
+
+	async getAutomationRule(ruleId: string) {
+		const automation = this.#automationRules();
+		const rule = automation.listRules(true).find((candidate) => candidate.id === ruleId);
+		if (!rule) return null;
+		const versions = automation.listVersions(ruleId);
+		return {
+			rule: this.#automationRuleView(rule, versions),
+			versions: versions.map((version) => ({
+				...version,
+				isActive: version.version === rule.activeVersion,
+				isDraft: version.version === rule.draftVersion,
+			})),
+		};
+	}
+
+	async #automationMutationResult(rule: AutomationRuleRecord) {
+		const automation = this.#automationRules();
+		return {
+			rule: this.#automationRuleView(rule, automation.listVersions(rule.id)),
+			...automation.state(),
+		};
+	}
+
+	async createAutomationRuleDraft(input: {
+		definition: unknown;
+		actorId: string;
+		expectedOrderRevision: number;
+	}) {
+		const rule = await this.#automationRules().createDraft(input);
+		return this.#automationMutationResult(rule);
+	}
+
+	async updateAutomationRuleDraft(input: {
+		ruleId: string;
+		definition: unknown;
+		actorId: string;
+		expectedRevision: number;
+	}) {
+		const rule = await this.#automationRules().updateDraft(input);
+		return this.#automationMutationResult(rule);
+	}
+
+	async setAutomationRuleEnabled(input: {
+		ruleId: string;
+		enabled: boolean;
+		actorId: string;
+		expectedRevision: number;
+	}) {
+		const automation = this.#automationRules();
+		const rule = input.enabled
+			? (() => {
+				const current = automation.listRules(true).find((item) => item.id === input.ruleId);
+				if (!current) throw new AutomationRuleError("NOT_FOUND", "Automation Rule was not found");
+				return current.draftVersion === null
+					? automation.setEnabled(input)
+					: automation.enable(input);
+			})()
+			: automation.setEnabled(input);
+		return this.#automationMutationResult(rule);
+	}
+
+	async archiveAutomationRule(input: {
+		ruleId: string;
+		actorId: string;
+		expectedRevision: number;
+	}) {
+		return this.#automationMutationResult(this.#automationRules().archive(input));
+	}
+
+	async reorderAutomationRules(input: {
+		orderedRuleIds: string[];
+		expectedOrderRevision: number;
+		actorId: string;
+	}) {
+		this.#automationRules().reorder(input);
+		return this.listAutomationRules(true);
+	}
+
+	async restoreAutomationRuleVersion(input: {
+		ruleId: string;
+		version: number;
+		actorId: string;
+		expectedRevision: number;
+	}) {
+		const rule = await this.#automationRules().restoreVersion(input);
+		return this.#automationMutationResult(rule);
+	}
+
+	async dryRunAutomationRule(input: {
+		definition: unknown;
+		actorId: string;
+		ruleId?: string;
+		ruleVersion?: number;
+		acknowledgedZero: boolean;
+	}) {
+		const automation = this.#automationRules();
+		const currentRules = automation.listRules(false);
+		const requestedRule = input.ruleId
+			? currentRules.find((rule) => rule.id === input.ruleId)
+			: null;
+		if (input.ruleId && !requestedRule) {
+			throw new AutomationRuleError("NOT_FOUND", "Automation Rule was not found");
+		}
+		if (
+			requestedRule &&
+			(input.ruleVersion !== requestedRule.draftVersion || requestedRule.draftVersion === null)
+		) {
+			throw new AutomationRuleError("CONFLICT", "Automation Rule draft changed; refresh and try again");
+		}
+		const enabled = currentRules.filter((rule) =>
+			rule.state === "enabled" && rule.activeVersion !== null
+		);
+		const orderedRules = enabled.map((rule, ordinal) => {
+			const version = automation.listVersions(rule.id).find(
+				(candidate) => candidate.version === rule.activeVersion,
+			);
+			if (!version) {
+				throw new AutomationRuleError("INVALID", "An active Automation Rule version is unavailable");
+			}
+			return {
+				ordinal,
+				ruleId: rule.id,
+				ruleName: rule.name,
+				version: version.version,
+				definition: version.definition,
+				definitionFingerprint: version.definitionFingerprint,
+			};
+		});
+		const proposedOrdinal = requestedRule
+			? enabled.filter((rule) => rule.id !== requestedRule.id && rule.position < requestedRule.position).length
+			: orderedRules.length;
+		return this.#automationTestView(await automation.dryRun({
+			...input,
+			contexts: readAutomationDryRunContexts(this.ctx.storage.sql, Date.now()),
+			orderedRules,
+			proposedOrdinal,
+		}));
+	}
+
+	async automationRulesUsingTarget(target: { labelId?: string; folderId?: string }) {
+		return this.#automationRules().rulesUsingTarget(target);
+	}
+
+	async getAutomationTargetUsage(target: { labelId?: string; folderId?: string }) {
+		return this.#automationTargetUsage(target);
+	}
+
+	#automationMessageView(messageId: string) {
+		if (!messageId || messageId.length > 300) return null;
+		const row = [...this.ctx.storage.sql.exec<{
+			emailId: string;
+			folderId: string;
+			threadId: string | null;
+			sender: string | null;
+			subject: string | null;
+			date: string | null;
+		}>(
+			`SELECT id AS emailId, folder_id AS folderId, thread_id AS threadId,
+			        sender, subject, date
+			 FROM emails WHERE id = ? AND folder_id <> ? LIMIT 1`,
+			messageId,
+			InternalFolders.RETIRED_OUTBOUND,
+		)][0];
+		if (!row || !row.date || !Number.isFinite(Date.parse(row.date))) return null;
+		return {
+			emailId: row.emailId,
+			folderId: row.folderId,
+			conversationId: row.threadId ?? row.emailId,
+			sender: (row.sender ?? "").slice(0, 320),
+			subject: (row.subject ?? "").slice(0, 998),
+			date: new Date(row.date).toISOString(),
+		};
+	}
+
+	#automationRunView(run: AutomationRunRecord, includeResults = false) {
+		return {
+			...run,
+			message: this.#automationMessageView(run.triggerMessageId),
+			results: includeResults
+				? this.#automationRules().listRunResults(run.id)
+				: undefined,
+		};
+	}
+
+	async listAutomationRuns(input: {
+		state: string | null;
+		beforeCreatedAt: string | null;
+		beforeId: string | null;
+		limit: number;
+	}) {
+		const beforeTime = input.beforeCreatedAt === null
+			? null
+			: Date.parse(input.beforeCreatedAt);
+		if (
+			(input.state !== null && !AUTOMATION_RUN_STATES.includes(
+				input.state as (typeof AUTOMATION_RUN_STATES)[number],
+			)) ||
+			!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+			((input.beforeCreatedAt === null) !== (input.beforeId === null)) ||
+			(input.beforeCreatedAt !== null &&
+				(!Number.isFinite(beforeTime) ||
+					new Date(beforeTime!).toISOString() !== input.beforeCreatedAt)) ||
+			(input.beforeId !== null && (!input.beforeId || input.beforeId.length > 300))
+		) throw new AutomationRuleError("INVALID", "Automation Run query is invalid");
+		const rows = [...this.ctx.storage.sql.exec<AutomationRunRecord>(
+			`SELECT id, trigger_message_id AS triggerMessageId,
+			        ruleset_generation AS rulesetGeneration, state,
+			        attempt_count AS attemptCount, started_at AS startedAt,
+			        completed_at AS completedAt, evaluated_count AS evaluatedCount,
+			        matched_count AS matchedCount, applied_count AS appliedCount,
+			        stopped_by_rule_id AS stoppedByRuleId,
+			        failure_category AS failureCategory,
+			        created_at AS createdAt, updated_at AS updatedAt
+			 FROM automation_runs
+			 WHERE (? IS NULL OR state = ?)
+			   AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+			 ORDER BY created_at DESC, id DESC LIMIT ?`,
+			input.state,
+			input.state,
+			input.beforeCreatedAt,
+			input.beforeCreatedAt,
+			input.beforeCreatedAt,
+			input.beforeId,
+			input.limit + 1,
+		)];
+		const page = rows.slice(0, input.limit);
+		const last = rows.length > input.limit ? page.at(-1) ?? null : null;
+		return {
+			runs: page.map((run) => this.#automationRunView(run)),
+			next: last ? { createdAt: last.createdAt, id: last.id } : null,
+		};
+	}
+
+	async getAutomationRun(runId: string) {
+		try {
+			return this.#automationRunView(this.#automationRules().getRun(runId), true);
+		} catch (error) {
+			if (error instanceof AutomationRuleError && error.code === "NOT_FOUND") return null;
+			throw error;
+		}
+	}
+
+	#automationTestView(test: AutomationDryRunRecord) {
+		return {
+			...test,
+			result: {
+				...test.result,
+				samples: test.result.samples.map((sample) => ({
+					...sample,
+					location: this.#automationMessageView(sample.messageId),
+				})),
+			},
+		};
+	}
+
+	async listAutomationRuleTests(input: {
+		ruleId: string | null;
+		beforeCreatedAt: string | null;
+		beforeId: string | null;
+		limit: number;
+	}) {
+		const beforeTime = input.beforeCreatedAt === null
+			? null
+			: Date.parse(input.beforeCreatedAt);
+		if (
+			(input.ruleId !== null && (!input.ruleId || input.ruleId.length > 300)) ||
+			!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+			((input.beforeCreatedAt === null) !== (input.beforeId === null)) ||
+			(input.beforeCreatedAt !== null &&
+				(!Number.isFinite(beforeTime) ||
+					new Date(beforeTime!).toISOString() !== input.beforeCreatedAt)) ||
+			(input.beforeId !== null && (!input.beforeId || input.beforeId.length > 300))
+		) throw new AutomationRuleError("INVALID", "Automation Rule test query is invalid");
+		const rows = [...this.ctx.storage.sql.exec<{
+			id: string;
+			createdAt: string;
+		}>(
+			`SELECT id, created_at AS createdAt FROM automation_rule_tests
+			 WHERE (? IS NULL OR rule_id = ?)
+			   AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+			 ORDER BY created_at DESC, id DESC LIMIT ?`,
+			input.ruleId,
+			input.ruleId,
+			input.beforeCreatedAt,
+			input.beforeCreatedAt,
+			input.beforeCreatedAt,
+			input.beforeId,
+			input.limit + 1,
+		)];
+		const page = rows.slice(0, input.limit);
+		const automation = this.#automationRules();
+		const tests = page.map((row) => automation.getTest(row.id));
+		const last = rows.length > input.limit ? page.at(-1) ?? null : null;
+		return {
+			tests: tests.map((test) => this.#automationTestView(test)),
+			next: last ? { createdAt: last.createdAt, id: last.id } : null,
+		};
+	}
+
 	// ── Push subscriptions (WISER-240) ─────────────────────────────
 	// Per-device capabilities for this mailbox. Live inbound writes snapshot their
 	// opaque IDs into the durable outbox; alarm dispatch rechecks actor access and
@@ -4471,6 +5063,12 @@ export class MailboxDO extends DurableObject<Env> {
 	async ensurePushAlarm(): Promise<void> {
 		const row = [...this.ctx.storage.sql.exec<{ due_at: string | null }>(
 			`SELECT MIN(due_at) AS due_at FROM (
+			 SELECT next_attempt_at AS due_at FROM automation_runs
+			 WHERE state = 'pending' AND next_attempt_at IS NOT NULL
+			 UNION ALL
+			 SELECT lease_expires_at AS due_at FROM automation_runs
+			 WHERE state = 'processing' AND lease_expires_at IS NOT NULL
+			 UNION ALL
 			 SELECT next_attempt_at AS due_at FROM push_notification_deliveries
 			 WHERE status IN ('pending', 'retrying')
 			 UNION ALL

@@ -70,7 +70,7 @@ export function buildPushPayload(input: BuildPushPayloadInput): PushPayload {
 		body: snippet ? `${subjectText} — ${snippet}` : subjectText,
 		icon,
 		badge,
-		clickUrl: `/mailbox/${encodeURIComponent(mailboxId)}/emails/inbox?email=${encodeURIComponent(emailId)}`,
+		clickUrl: `/mailbox/${encodeURIComponent(mailboxId)}/open/${encodeURIComponent(emailId)}`,
 		data: { emailId, mailboxId },
 	};
 }

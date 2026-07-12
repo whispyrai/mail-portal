@@ -12,6 +12,7 @@ import {
 	FileIcon,
 	FolderIcon,
 	HourglassMediumIcon,
+	LightningIcon,
 	PaperPlaneTiltIcon,
 	PaperclipIcon,
 	PencilSimpleIcon,
@@ -199,6 +200,12 @@ export default function Sidebar() {
 					to={`/mailbox/${mailboxId}/attachments`}
 					icon={<PaperclipIcon size={18} weight="regular" />}
 					label="Files"
+					onClick={handleNavClick}
+				/>
+				<FolderLink
+					to={`/mailbox/${mailboxId}/automations`}
+					icon={<LightningIcon size={18} weight="regular" />}
+					label="Automations"
 					onClick={handleNavClick}
 				/>
 				<div className="my-2 border-t border-kumo-line" aria-hidden="true" />
