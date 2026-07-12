@@ -24,6 +24,7 @@ test("Intelligence card is calm, collapsible, and exposes every cited result sta
   assert.match(card, /Human review required/);
   assert.match(card, /onFocusMessage/);
   assert.match(card, /Refresh intelligence/);
+  assert.match(card, /ConversationQuestion/);
 });
 
 test("card performs only read/refresh intelligence requests and no mailbox mutation", () => {

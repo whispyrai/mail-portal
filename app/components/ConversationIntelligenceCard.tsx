@@ -6,6 +6,7 @@ import {
   ArrowsClockwiseIcon,
 } from "@phosphor-icons/react";
 import { useState } from "react";
+import ConversationQuestion from "~/components/ConversationQuestion";
 import { useConversationIntelligence } from "~/queries/conversation-intelligence";
 import type {
   ConversationIntelligenceResult,
@@ -312,6 +313,12 @@ export default function ConversationIntelligenceCard({
               onFocusMessage={onFocusMessage}
             />
           ) : null}
+          <ConversationQuestion
+            key={`${mailboxId}:${emailId}`}
+            mailboxId={mailboxId}
+            emailId={emailId}
+            onFocusMessage={onFocusMessage}
+          />
         </div>
       )}
     </section>

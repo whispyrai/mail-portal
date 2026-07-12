@@ -18,6 +18,7 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 - Multi-select batch triage, an accessible command palette, responsive and reduced-motion hardening, a DST-safe Send Later interface, mailbox-wide labels, and personal Saved Views are implemented.
 - Account ownership now uses a platform-operator recovery directory, pending-to-claimed setup, owner-initiated recovery, immutable audit, and durable deactivation revocation.
 - Evidence-backed conversation intelligence is live end to end with a dedicated bounded mailbox projection, actual attachment object-size enforcement, cited structured output, mailbox-scoped caching, cheap-tier cost accounting, explicit refresh, and a read-only detail card. Draft, Outbox, and internal snapshots are excluded.
+- Cited Ask This Conversation is live as a manual, stateless, actor-private AI workflow. The model may select only exact bounded excerpts from the current authorized Conversation, the server proves each excerpt against exactly one cited Message or attachment field, and the UI renders escaped quoted evidence with exact-source focus. Live access and evidence fingerprints are rechecked across cache, provider, persistence, and response boundaries.
 - Mailbox-wide Snooze is live with a protected folder, message or anchored-conversation scope, local-time controls, explicit Return and Undo, bounded durable alarms, authoritative inbound reply wake, attribution, keyboard and touch actions, and stale-detail reconciliation for automatic or teammate wake.
 - Private follow-up reminders now run end to end through owner-scoped routes, canonical stored-mail anchors, bounded previews, per-mailbox controls, and a private Today workspace. Inbound replies complete reminders atomically and access-aware retry remains durable.
 - Search v2 is live with a strict server-authoritative grammar, deterministic relevance, filename search, centered snippets, stable pagination, Saved View fidelity, explicit error recovery, and Cloudflare-specific SQL bind and LIKE-pattern bounds.
@@ -58,17 +59,17 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Current verification
 
-- `npm test`: 776/776 passing after proactive cited Today intelligence and the deferred AI writing-assistant boundary.
+- `npm test`: 816/816 passing after extractive cited Ask This Conversation.
 - `npx tsc -b`: passing.
 - `git diff --check`: passing.
-- `npm run build:wiser`: production client and SSR artifacts built; Wrangler emitted the expected non-fatal sandbox log-file and missing-local-secrets warnings.
-- Initial mailbox JavaScript remains deferred at 77.60 kB raw and 21.70 kB gzip. Today is 28.76 kB raw and 8.52 kB gzip; EmailPanel is deferred at 59.82 kB raw and 18.19 kB gzip. ComposeEmail is deferred at 498.06 kB raw and 155.41 kB gzip, below the build advisory, while the optional ComposeAiAssistant loads separately at 7.64 kB raw and 3.38 kB gzip.
+- `npm run build`: production client and SSR artifacts built with the expected non-fatal Wrangler sandbox log-file warning.
+- Initial mailbox JavaScript remains deferred at 77.60 kB raw and 21.70 kB gzip. Today is 28.76 kB raw and 8.52 kB gzip; EmailPanel is deferred at 68.60 kB raw and 20.12 kB gzip after cited Conversation Q&A. ComposeEmail is deferred at 498.06 kB raw and 155.41 kB gzip, below the build advisory, while the optional ComposeAiAssistant loads separately at 7.64 kB raw and 3.38 kB gzip.
 - Local D1 migrations 0001 through 0003 applied successfully to the local Wiser database.
 - Local migration 0004 application is pending because the approved Wrangler escalation was rejected after the Codex usage limit was reached. Migration SQL tests pass.
 - Fresh foundation, delivery, conversation-intelligence, Snooze, follow-up reminder, Search v2, attachment-integrity, deferred-loading, draft-lifecycle, recipient-intelligence, signature, composer-input, and inline-image reviews found no P0 issues. Every reported P1 finding was fixed and covered by targeted regressions.
 - Adversarial Outbox review found eight P1 issues; all eight were fixed and regression coverage was added.
-- Integrated correctness, security, data-integrity, AI-cost, and UX reviews produced further P1 remediation rounds; all reported findings are fixed and covered by targeted regression tests. Independent final compose-refinement, Today-brief, and AI lazy-boundary re-reviews are clean at P0/P1.
+- Integrated correctness, security, data-integrity, AI-cost, and UX reviews produced further P1 remediation rounds; all reported findings are fixed and covered by targeted regression tests. Independent final compose-refinement, Today-brief, AI lazy-boundary, and cited Conversation Q&A re-reviews are clean at P0/P1.
 
 ## Next gate
 
-Checkpoint the completed ComposeEmail AI boundary, then continue with the next research-backed AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
+Checkpoint cited Ask This Conversation, then continue with the next research-backed AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
