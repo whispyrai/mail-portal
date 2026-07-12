@@ -7,6 +7,7 @@ import {
 	type TodayBriefEligibleFolder,
 } from "../../shared/today-brief.ts";
 import { stripHtmlToText } from "./email-helpers.ts";
+import { readMailboxCurrentSequence } from "./mailbox-change-feed.ts";
 
 type SqlValue = ArrayBuffer | string | number | null;
 
@@ -14,7 +15,7 @@ export const TODAY_BRIEF_CANDIDATE_LIMITS = {
 	candidates: TODAY_BRIEF_LIMITS.candidates,
 	messagesPerCandidate: TODAY_BRIEF_LIMITS.messagesPerCandidate,
 	bodyChars: TODAY_BRIEF_LIMITS.messageTextChars,
-	reminderInputs: 100,
+	reminderInputs: 500,
 	conversationKeyChars: TODAY_BRIEF_LIMITS.conversationKeyChars,
 	messageIdChars: TODAY_BRIEF_LIMITS.idChars,
 	addressChars: TODAY_BRIEF_LIMITS.senderChars,
@@ -80,6 +81,44 @@ type EvidenceRow = Omit<ProjectedEvidenceMessage, "text"> & {
 	body: string;
 };
 
+export type GlobalTodayBriefCandidateMetadata = {
+	conversationKey: string;
+	sourceEmailId: string;
+	latestMessageAt: string;
+	subject: string;
+	counterparty: string;
+	reasons: TodayBriefCandidateReason[];
+	reminder: {
+		id: string;
+		version: number;
+		dueAt: string;
+	} | null;
+	unreadInMailbox: boolean;
+};
+
+export type GlobalTodayBriefMailboxMetadata = {
+	sequence: number;
+	totalCandidateCount: number;
+	counts: {
+		privateRemindersDue: number;
+		unreadConversations: number;
+	};
+	candidates: GlobalTodayBriefCandidateMetadata[];
+};
+
+export type GlobalTodayBriefMailboxEvidence = {
+	sequence: number;
+	evidence: Array<{
+		conversationKey: string;
+		messages: TodayBriefCandidateInput["messages"];
+	}>;
+};
+
+export type GlobalTodayBriefEvidenceRequest = {
+	conversationKey: string;
+	sourceEmailId: string;
+};
+
 const eligibleFolders = TODAY_BRIEF_ELIGIBLE_FOLDERS;
 
 const canonicalConversationSql =
@@ -91,23 +130,29 @@ const inboxConversationCte = `
 			${canonicalConversationSql} AS conversationKey,
 			id,
 			SUBSTR(COALESCE(date, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.dateChars}) AS date,
-			ROW_NUMBER() OVER (
-				PARTITION BY ${canonicalConversationSql}
-				ORDER BY COALESCE(unixepoch(date), -1) DESC, id DESC
-			) AS messageRank,
-			SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END) OVER (
-				PARTITION BY ${canonicalConversationSql}
-			) AS unreadMessageCount
+			read
 		FROM emails
 		WHERE folder_id = '${TODAY_BRIEF_ELIGIBLE_FOLDERS[0]}'
 		  AND unixepoch(date) IS NOT NULL
 		  AND LENGTH(id) BETWEEN 1 AND ${TODAY_BRIEF_CANDIDATE_LIMITS.messageIdChars}
 		  AND LENGTH(${canonicalConversationSql}) BETWEEN 1 AND ${TODAY_BRIEF_CANDIDATE_LIMITS.conversationKeyChars}
 		  AND TRIM(COALESCE(sender, '')) <> ''
+	), unread_messages AS (
+		SELECT
+			conversationKey,
+			id,
+			date,
+			ROW_NUMBER() OVER (
+				PARTITION BY conversationKey
+				ORDER BY COALESCE(unixepoch(date), -1) DESC, id DESC
+			) AS unreadMessageRank,
+			COUNT(*) OVER (PARTITION BY conversationKey) AS unreadMessageCount
+		FROM inbox_messages
+		WHERE read = 0
 	), unread_conversations AS (
 		SELECT conversationKey, id, date, unreadMessageCount
-		FROM inbox_messages
-		WHERE messageRank = 1 AND unreadMessageCount > 0
+		FROM unread_messages
+		WHERE unreadMessageRank = 1
 	)`;
 
 function parseBoundaries(boundaries: { now: string; tomorrowStart: string }) {
@@ -326,6 +371,210 @@ function readEvidence(
 		evidence.set(row.conversationKey, messages);
 	}
 	return evidence;
+}
+
+function readGlobalEvidence(
+	sql: TodayBriefSqlReader,
+	requests: readonly GlobalTodayBriefEvidenceRequest[],
+) {
+	if (requests.length === 0) return new Map<string, ProjectedEvidenceMessage[]>();
+	const rows = [...sql.exec<EvidenceRow>(
+		`WITH requested AS (
+			SELECT
+				CAST(json_extract(value, '$.conversationKey') AS TEXT) AS conversationKey,
+				CAST(json_extract(value, '$.sourceEmailId') AS TEXT) AS sourceEmailId
+			FROM json_each(?1)
+		), ranked_messages AS (
+			SELECT
+				requested.conversationKey,
+				emails.id,
+				emails.folder_id AS folderId,
+				SUBSTR(COALESCE(emails.sender, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.addressChars}) AS sender,
+				SUBSTR(COALESCE(emails.recipient, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.addressChars}) AS recipient,
+				SUBSTR(COALESCE(emails.date, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.dateChars}) AS date,
+				SUBSTR(COALESCE(emails.subject, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.subjectChars}) AS subject,
+				SUBSTR(COALESCE(emails.body, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.rawBodyChars}) AS body,
+				ROW_NUMBER() OVER (
+					PARTITION BY requested.conversationKey
+					ORDER BY
+						CASE WHEN emails.id = requested.sourceEmailId THEN 0 ELSE 1 END,
+						COALESCE(unixepoch(emails.date), -1) DESC,
+						emails.id DESC
+				) AS messageRank
+			FROM emails
+			INNER JOIN requested ON ${canonicalConversationSql} = requested.conversationKey
+			WHERE emails.folder_id IN (?2, ?3, ?4, ?5)
+			  AND unixepoch(emails.date) IS NOT NULL
+			  AND LENGTH(emails.id) BETWEEN 1 AND ${TODAY_BRIEF_CANDIDATE_LIMITS.messageIdChars}
+			  AND TRIM(COALESCE(emails.sender, '')) <> ''
+		)
+		SELECT conversationKey, id, folderId, sender, recipient, date, subject, body, messageRank
+		FROM ranked_messages
+		WHERE messageRank <= ${TODAY_BRIEF_CANDIDATE_LIMITS.messagesPerCandidate}
+		ORDER BY conversationKey ASC, messageRank DESC`,
+		JSON.stringify(requests),
+		...eligibleFolders,
+	)];
+	const evidence = new Map<string, ProjectedEvidenceMessage[]>();
+	for (const row of rows) {
+		const messages = evidence.get(row.conversationKey) ?? [];
+		messages.push({
+			id: row.id,
+			folderId: row.folderId,
+			sender: row.sender.trim(),
+			recipient: row.recipient.trim(),
+			date: row.date,
+			subject: row.subject.trim() || "(No subject)",
+			text: stripHtmlToText(row.body).slice(0, TODAY_BRIEF_CANDIDATE_LIMITS.bodyChars),
+		});
+		evidence.set(row.conversationKey, messages);
+	}
+	return evidence;
+}
+
+function readLatestMetadata(
+	sql: TodayBriefSqlReader,
+	conversationKeys: readonly string[],
+) {
+	if (conversationKeys.length === 0) return new Map<string, ProjectedEvidenceMessage>();
+	const rows = [...sql.exec<EvidenceRow>(
+		`WITH candidate_keys AS (
+			SELECT CAST(value AS TEXT) AS conversationKey FROM json_each(?1)
+		), ranked_messages AS (
+			SELECT
+				candidate_keys.conversationKey,
+				emails.id,
+				emails.folder_id AS folderId,
+				SUBSTR(COALESCE(emails.sender, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.addressChars}) AS sender,
+				SUBSTR(COALESCE(emails.recipient, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.addressChars}) AS recipient,
+				SUBSTR(COALESCE(emails.date, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.dateChars}) AS date,
+				SUBSTR(COALESCE(emails.subject, ''), 1, ${TODAY_BRIEF_CANDIDATE_LIMITS.subjectChars}) AS subject,
+				'' AS body,
+				ROW_NUMBER() OVER (
+					PARTITION BY candidate_keys.conversationKey
+					ORDER BY COALESCE(unixepoch(emails.date), -1) DESC, emails.id DESC
+				) AS messageRank
+			FROM emails
+			INNER JOIN candidate_keys
+				ON ${canonicalConversationSql} = candidate_keys.conversationKey
+			WHERE emails.folder_id IN (?2, ?3, ?4, ?5)
+			  AND unixepoch(emails.date) IS NOT NULL
+			  AND LENGTH(emails.id) BETWEEN 1 AND ${TODAY_BRIEF_CANDIDATE_LIMITS.messageIdChars}
+			  AND TRIM(COALESCE(emails.sender, '')) <> ''
+		)
+		SELECT conversationKey, id, folderId, sender, recipient, date, subject, body, messageRank
+		FROM ranked_messages
+		WHERE messageRank = 1
+		ORDER BY conversationKey ASC`,
+		JSON.stringify(conversationKeys),
+		...eligibleFolders,
+	)];
+	return new Map(rows.map((row) => [row.conversationKey, {
+		id: row.id,
+		folderId: row.folderId,
+		sender: row.sender.trim(),
+		recipient: row.recipient.trim(),
+		date: row.date,
+		subject: row.subject.trim() || "(No subject)",
+		text: "",
+	}]));
+}
+
+/** Mutation-free phase one for aggregate Today AI. No body is selected. */
+export function readGlobalTodayBriefMetadata(
+	sql: TodayBriefSqlReader,
+	mailboxAddress: string,
+	reminders: readonly FollowUpReminder[],
+	boundaries: { now: string; tomorrowStart: string },
+): GlobalTodayBriefMailboxMetadata {
+	const mailbox = mailboxAddress.trim().toLowerCase();
+	if (mailbox.length < 3 || mailbox.length > TODAY_BRIEF_LIMITS.mailboxChars) {
+		throw new Error("A valid mailbox is required for global Today brief metadata");
+	}
+	const parsedBoundaries = parseBoundaries(boundaries);
+	const reminderReasons = dueReminderReasons(reminders, parsedBoundaries);
+	const eligibleKeys = eligibleReminderKeys(sql, [...reminderReasons.keys()]);
+	for (const conversationKey of reminderReasons.keys()) {
+		if (!eligibleKeys.has(conversationKey)) reminderReasons.delete(conversationKey);
+	}
+	const unreadCount = unreadConversationCount(sql);
+	const reminderUnreadRows = unreadReminderConversations(sql, [...reminderReasons.keys()]);
+	const topUnreadRows = topUnreadConversations(sql);
+	const unreadByConversation = new Map<string, UnreadReason>();
+	for (const row of [...reminderUnreadRows, ...topUnreadRows]) {
+		unreadByConversation.set(row.conversationKey, unreadRowToReason(row));
+	}
+	const seeds = new Map<string, {
+		conversationKey: string;
+		reminder: ReminderReason | null;
+		unread: UnreadReason | null;
+	}>();
+	for (const [conversationKey, reminder] of reminderReasons) {
+		seeds.set(conversationKey, { conversationKey, reminder, unread: unreadByConversation.get(conversationKey) ?? null });
+	}
+	for (const row of topUnreadRows) {
+		const current = seeds.get(row.conversationKey);
+		if (current) current.unread = unreadRowToReason(row);
+		else seeds.set(row.conversationKey, { conversationKey: row.conversationKey, reminder: null, unread: unreadRowToReason(row) });
+	}
+	const selected = [...seeds.values()].sort(candidateOrder).slice(0, TODAY_BRIEF_CANDIDATE_LIMITS.candidates);
+	const latestByConversation = readLatestMetadata(sql, selected.map((candidate) => candidate.conversationKey));
+	const candidates = selected.flatMap((candidate): GlobalTodayBriefCandidateMetadata[] => {
+		const latest = latestByConversation.get(candidate.conversationKey);
+		if (!latest) return [];
+		const reasons: TodayBriefCandidateReason[] = [];
+		if (candidate.reminder) reasons.push(candidate.reminder.due === "overdue" ? "overdue_reminder" : "today_reminder");
+		if (candidate.unread) reasons.push("unread_in_mailbox");
+		const counterparty = latest.sender.toLowerCase() === mailbox ? latest.recipient : latest.sender;
+		const sourceEmailId = candidate.unread?.latestMessageId ?? latest.id;
+		const latestMessageAt = candidate.unread?.latestMessageAt ?? latest.date;
+		return [{
+			conversationKey: candidate.conversationKey,
+			sourceEmailId,
+			latestMessageAt,
+			subject: latest.subject,
+			counterparty: counterparty || "Unknown correspondent",
+			reasons,
+			reminder: candidate.reminder ? { id: candidate.reminder.id, version: candidate.reminder.version, dueAt: candidate.reminder.remindAt } : null,
+			unreadInMailbox: candidate.unread !== null,
+		}];
+	});
+	return {
+		sequence: readMailboxCurrentSequence(sql),
+		totalCandidateCount: reminderReasons.size + unreadCount - reminderUnreadRows.length,
+		counts: {
+			privateRemindersDue: reminderReasons.size,
+			unreadConversations: unreadCount,
+		},
+		candidates,
+	};
+}
+
+/** Mutation-free phase two for only the globally selected Conversations. */
+export function readGlobalTodayBriefEvidence(
+	sql: TodayBriefSqlReader,
+	requests: readonly GlobalTodayBriefEvidenceRequest[],
+): GlobalTodayBriefMailboxEvidence {
+	const keys = [...new Set(requests.map((request) => request.conversationKey))];
+	if (
+		keys.length !== requests.length ||
+		keys.length > TODAY_BRIEF_LIMITS.candidates ||
+		requests.some((request) =>
+			request.conversationKey.length < 1 ||
+			request.conversationKey.length > TODAY_BRIEF_CANDIDATE_LIMITS.conversationKeyChars ||
+			request.sourceEmailId.length < 1 ||
+			request.sourceEmailId.length > TODAY_BRIEF_CANDIDATE_LIMITS.messageIdChars)
+	) {
+		throw new Error("Global Today brief evidence request is invalid");
+	}
+	const evidence = readGlobalEvidence(sql, requests);
+	return {
+		sequence: readMailboxCurrentSequence(sql),
+		evidence: keys.map((conversationKey) => ({
+			conversationKey,
+			messages: (evidence.get(conversationKey) ?? []).map(({ recipient: _recipient, ...message }) => message),
+		})),
+	};
 }
 
 /**

@@ -42,6 +42,7 @@ import { mailboxSignatureSettingsRoutes } from "./routes/mailbox-signature-setti
 import { aiDraftRoutes } from "./routes/ai-drafts";
 import { todayBriefRoutes } from "./routes/today-brief";
 import { globalTodayRoutes } from "./routes/global-today";
+import { globalTodayBriefRoutes } from "./routes/global-today-brief";
 import { mailboxAttachmentRoutes } from "./routes/mailbox-attachments";
 import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
 import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
@@ -235,6 +236,7 @@ app.route("/", mailboxSignatureSettingsRoutes);
 app.route("/", aiDraftRoutes);
 app.route("/", todayBriefRoutes);
 app.route("/", globalTodayRoutes);
+app.route("/", globalTodayBriefRoutes);
 app.route("/", mailboxAttachmentRoutes);
 app.route("/", mailboxAttachmentByteRoutes);
 app.route("/", mailboxChangeFeedRoutes);

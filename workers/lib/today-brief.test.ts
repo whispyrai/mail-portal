@@ -275,6 +275,19 @@ test("Today brief model codes cannot invent reminder or unread state", () => {
 		() => parseTodayBriefOutput(JSON.stringify(sentCitation), unreadOnly),
 		/authoritative unread state/,
 	);
+
+	const wrongUnreadSource = normalized(1);
+	wrongUnreadSource.candidates[0]!.messages.push({
+		...wrongUnreadSource.candidates[0]!.messages[0]!,
+		id: "read-context",
+	});
+	const wrongSourceOutput = outputFor(wrongUnreadSource);
+	wrongSourceOutput.items[0]!.whyNow = "unread_request";
+	wrongSourceOutput.items[0]!.messageIds = ["read-context"];
+	assert.throws(
+		() => parseTodayBriefOutput(JSON.stringify(wrongSourceOutput), wrongUnreadSource, { requireUnreadSourceCitation: true }),
+		/authoritative unread state/,
+	);
 });
 
 test("Today brief output applies a strict UTF-8 byte bound before parsing", () => {

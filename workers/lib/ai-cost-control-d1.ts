@@ -382,6 +382,34 @@ export async function getCachedAiResponse<T>(
 	}
 }
 
+export async function getLatestCachedAiResponseForScope<T>(
+	env: Env,
+	input: {
+		cacheScope: string;
+		feature: string;
+		now?: number;
+	},
+): Promise<{ cacheKey: string; createdAt: number; value: T } | null> {
+	const config = resolveAiCostControlConfig(env as unknown as AiCostEnvironment);
+	const mailboxScope = cacheScope(input);
+	const row = await env.DB.prepare(
+		`SELECT cache_key, value_json, created_at
+		 FROM ai_response_cache
+		 WHERE environment = ? AND mailbox_scope = ? AND feature = ?
+		   AND expires_at > ?
+		 ORDER BY created_at DESC, cache_key ASC
+		 LIMIT 1`,
+	)
+		.bind(config.environment, mailboxScope, input.feature, input.now ?? Date.now())
+		.first<{ cache_key: string; value_json: string; created_at: number }>();
+	if (!row) return null;
+	try {
+		return { cacheKey: row.cache_key, createdAt: row.created_at, value: JSON.parse(row.value_json) as T };
+	} catch {
+		return null;
+	}
+}
+
 export async function putCachedAiResponse(
 	env: Env,
 	input: {

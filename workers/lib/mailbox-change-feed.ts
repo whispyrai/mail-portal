@@ -7,7 +7,7 @@ import {
 	type NormalizedMailboxChangeQuery,
 } from "../../shared/mailbox-change-feed.ts";
 
-type SqlValue = string | number | null;
+type SqlValue = ArrayBuffer | string | number | null;
 
 export interface MailboxChangeSqlReader {
 	exec<T extends Record<string, SqlValue>>(
@@ -27,7 +27,7 @@ type MailboxChangeRow = {
 	operation: string;
 };
 
-function currentSequence(sql: MailboxChangeSqlReader): number {
+export function readMailboxCurrentSequence(sql: MailboxChangeSqlReader): number {
 	const current = [...sql.exec<CurrentSequenceRow>(
 		"SELECT COALESCE(MAX(sequence), 0) AS currentSequence FROM mailbox_changes",
 	)][0]?.currentSequence ?? 0;
@@ -42,7 +42,7 @@ export function readMailboxChanges(
 	options: NormalizedMailboxChangeQuery,
 ): MailboxChangePage {
 	const validated = validateNormalizedMailboxChangeQuery(options);
-	const current = currentSequence(sql);
+	const current = readMailboxCurrentSequence(sql);
 	if (validated.after === null) {
 		return validateMailboxChangePage(
 			{ changes: [], nextCursor: encodeMailboxChangeCursor(current) },

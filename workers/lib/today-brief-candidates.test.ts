@@ -3,6 +3,8 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
 import {
+	readGlobalTodayBriefEvidence,
+	readGlobalTodayBriefMetadata,
 	readTodayBriefCandidates,
 	TODAY_BRIEF_CANDIDATE_LIMITS,
 } from "./today-brief-candidates.ts";
@@ -25,6 +27,15 @@ function fixture() {
 			id TEXT PRIMARY KEY,
 			email_id TEXT NOT NULL,
 			filename TEXT NOT NULL
+		);
+		CREATE TABLE mailbox_changes (
+			sequence INTEGER PRIMARY KEY,
+			schema_version INTEGER NOT NULL,
+			committed_at TEXT NOT NULL,
+			resource TEXT NOT NULL,
+			entity_id TEXT NOT NULL,
+			parent_id TEXT,
+			operation TEXT NOT NULL
 		);
 	`);
 	const insert = database.prepare(
@@ -96,6 +107,62 @@ const boundaries = {
 	now: "2026-07-12T10:00:00.000Z",
 	tomorrowStart: "2026-07-13T00:00:00.000Z",
 };
+
+test("aggregate metadata is body-free and selected evidence is sequence-bound", () => {
+	const { database, insert, sql } = fixture();
+	insert({
+		id: "latest",
+		threadId: "thread-a",
+		date: "2026-07-12T09:00:00.000Z",
+		body: "private latest body",
+	});
+	insert({
+		id: "older",
+		threadId: "thread-a",
+		folder: "sent",
+		date: "2026-07-12T08:00:00.000Z",
+		read: 1,
+		body: "private older body",
+	});
+	database.prepare(
+		"INSERT INTO mailbox_changes VALUES (7, 1, '2026-07-12T09:00:00.000Z', 'message', 'latest', NULL, 'created')",
+	).run();
+	const metadata = readGlobalTodayBriefMetadata(
+		sql,
+		"team@example.com",
+		[reminder("reminder-a", "thread-a", "2026-07-12T08:30:00.000Z")],
+		boundaries,
+	);
+	assert.equal(metadata.sequence, 7);
+	assert.equal(metadata.totalCandidateCount, 1);
+	assert.equal(metadata.candidates[0]?.conversationKey, "thread-a");
+	assert.equal(JSON.stringify(metadata).includes("private latest body"), false);
+
+	const evidence = readGlobalTodayBriefEvidence(sql, [{ conversationKey: "thread-a", sourceEmailId: "latest" }]);
+	assert.equal(evidence.sequence, 7);
+	assert.deepEqual(evidence.evidence[0]?.messages.map((message) => message.id), ["older", "latest"]);
+	assert.deepEqual(evidence.evidence[0]?.messages.map((message) => message.text), ["private older body", "private latest body"]);
+	database.close();
+});
+
+test("aggregate unread candidates anchor citations to an actually unread Inbox message", () => {
+	const { database, insert, sql } = fixture();
+	insert({ id: "unread-source", threadId: "thread-a", date: "2026-07-12T08:00:00.000Z", read: 0 });
+	insert({ id: "read-inbox", threadId: "thread-a", date: "2026-07-12T10:00:00.000Z", read: 1 });
+	insert({ id: "sent-latest", threadId: "thread-a", folder: "sent", date: "2026-07-12T11:00:00.000Z", read: 1 });
+	const metadata = readGlobalTodayBriefMetadata(sql, "team@example.com", [], boundaries);
+	assert.equal(metadata.candidates[0]?.sourceEmailId, "unread-source");
+	const evidence = readGlobalTodayBriefEvidence(sql, [{ conversationKey: "thread-a", sourceEmailId: "unread-source" }]);
+	assert.deepEqual(evidence.evidence[0]?.messages.map((message) => message.id), ["sent-latest", "unread-source"]);
+	database.close();
+});
+
+test("aggregate metadata accepts the globally supported per-Mailbox reminder capacity", () => {
+	const { database, sql } = fixture();
+	const reminders = Array.from({ length: 101 }, (_, index) => reminder(`reminder-${index}`, `missing-${index}`, "2026-07-12T09:00:00.000Z"));
+	assert.doesNotThrow(() => readGlobalTodayBriefMetadata(sql, "team@example.com", reminders, boundaries));
+	database.close();
+});
 
 test("deduplicates reminder and mailbox-wide unread reasons by canonical thread", () => {
 	const { database, insert, sql } = fixture();

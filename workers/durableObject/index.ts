@@ -126,7 +126,12 @@ import {
 	type RecipientMemoryOrigin,
 } from "../../shared/recipient-suggestions.ts";
 import { classifyDraftCreateReplay } from "../lib/draft-create-replay.ts";
-import { readTodayBriefCandidates } from "../lib/today-brief-candidates.ts";
+import {
+	readGlobalTodayBriefEvidence,
+	readGlobalTodayBriefMetadata,
+	readTodayBriefCandidates,
+	type GlobalTodayBriefEvidenceRequest,
+} from "../lib/today-brief-candidates.ts";
 import { readGlobalTodayMailboxSnapshot } from "../lib/global-today-mailbox-snapshot.ts";
 import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
 import {
@@ -143,7 +148,7 @@ import {
 	readMailboxAttachmentForEmail,
 	readMailboxAttachmentPage,
 } from "../lib/mailbox-attachments.ts";
-import { readMailboxChanges } from "../lib/mailbox-change-feed.ts";
+import { readMailboxChanges, readMailboxCurrentSequence } from "../lib/mailbox-change-feed.ts";
 import {
 	validateNormalizedMailboxChangeQuery,
 	type NormalizedMailboxChangeQuery,
@@ -946,6 +951,30 @@ export class MailboxDO extends DurableObject<Env> {
 			reminders,
 			boundaries,
 		);
+	}
+
+	/** Mutation-free aggregate Today AI metadata. No mail body crosses this RPC. */
+	async getGlobalTodayBriefMetadata(
+		mailboxAddress: string,
+		reminders: FollowUpReminder[],
+		boundaries: { now: string; tomorrowStart: string },
+	) {
+		return readGlobalTodayBriefMetadata(
+			this.ctx.storage.sql,
+			mailboxAddress,
+			reminders,
+			boundaries,
+		);
+	}
+
+	/** Mutation-free evidence for only globally selected compound Conversations. */
+	async getGlobalTodayBriefEvidence(requests: GlobalTodayBriefEvidenceRequest[]) {
+		return readGlobalTodayBriefEvidence(this.ctx.storage.sql, requests);
+	}
+
+	/** Mutation-free sequence check for aggregate Today AI freshness gates. */
+	async getGlobalTodayBriefSequence() {
+		return readMailboxCurrentSequence(this.ctx.storage.sql);
 	}
 
 	/** Coordinate paid Today inference across every Worker isolate for this mailbox. */

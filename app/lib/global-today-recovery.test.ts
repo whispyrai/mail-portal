@@ -15,6 +15,7 @@ test("a real reminder 403 purges scoped caches, aggregate data, and selected UI 
 	queryClient.setQueryData(["emails", "revoked@example.com"], { secret: true });
 	queryClient.setQueryData(["emails", "kept@example.com"], { safe: true });
 	queryClient.setQueryData(["global-today", "UTC"], { aggregate: true });
+	queryClient.setQueryData(["global-today-brief", "UTC"], { sensitiveGuidance: true });
 	useUIStore.getState().selectEmail("message-1");
 
 	const feedback = recoverGlobalTodayReminderError(
@@ -26,6 +27,7 @@ test("a real reminder 403 purges scoped caches, aggregate data, and selected UI 
 	assert.equal(queryClient.getQueryData(["emails", "revoked@example.com"]), undefined);
 	assert.deepEqual(queryClient.getQueryData(["emails", "kept@example.com"]), { safe: true });
 	assert.equal(queryClient.getQueryData(["global-today", "UTC"]), undefined);
+	assert.equal(queryClient.getQueryData(["global-today-brief", "UTC"]), undefined);
 	assert.equal(useUIStore.getState().selectedEmailId, null);
 	assert.equal(feedback.offerRefresh, undefined);
 });
@@ -61,6 +63,7 @@ test("roster diff purges only disappeared Mailbox state while preserving the fre
 	const queryClient = new QueryClient();
 	queryClient.setQueryData(["emails", "revoked@example.com"], { secret: true });
 	queryClient.setQueryData(["global-today", "UTC"], { fresh: true });
+	queryClient.setQueryData(["global-today-brief", "UTC"], { sensitiveGuidance: true });
 	assert.deepEqual(
 		purgeRemovedGlobalTodayMailboxes(
 			queryClient,
@@ -71,6 +74,7 @@ test("roster diff purges only disappeared Mailbox state while preserving the fre
 	);
 	assert.equal(queryClient.getQueryData(["emails", "revoked@example.com"]), undefined);
 	assert.deepEqual(queryClient.getQueryData(["global-today", "UTC"]), { fresh: true });
+	assert.equal(queryClient.getQueryData(["global-today-brief", "UTC"]), undefined);
 });
 
 test("only aggregate authorization failures discard mounted sensitive content", () => {

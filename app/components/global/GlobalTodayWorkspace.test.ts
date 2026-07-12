@@ -9,6 +9,8 @@ const query = readFileSync(new URL("../../queries/global-today.ts", import.meta.
 const shell = readFileSync(new URL("./GlobalShell.tsx", import.meta.url), "utf8");
 const routes = readFileSync(new URL("../../routes.ts", import.meta.url), "utf8");
 const home = readFileSync(new URL("../../routes/home.tsx", import.meta.url), "utf8");
+const briefCard = readFileSync(new URL("./GlobalTodayBriefCard.tsx", import.meta.url), "utf8");
+const briefQuery = readFileSync(new URL("../../queries/global-today-brief.ts", import.meta.url), "utf8");
 
 test("global Today is a first-class destination and preserves Mailbox administration", () => {
 	assert.match(routes, /route\("today", "routes\/global-today\.tsx"\)/);
@@ -53,7 +55,19 @@ test("global Today keeps identities compound, reminder actions row-local, and ma
 	assert.match(route, /authorizationError \? undefined : today\.data/);
 	assert.match(workspace, /Read state is shared by the Mailbox/);
 	assert.doesNotMatch(workspace, /markRead|markUnread|archiveConversation|moveEmail|mutateLabels|toggleStar|replyEmail|sendEmail/);
-	assert.doesNotMatch(route, /today-brief|runModel|provider|useTodayBrief/i);
+	assert.doesNotMatch(route, /runModel|provider|useTodayBrief\(/i);
+});
+
+test("global AI guidance is complete-only, compound, explicitly refreshable, and subordinate to Today", () => {
+	assert.match(route, /useGlobalTodayBrief\(timeZone, deterministicTodayIsComplete\)/);
+	assert.match(route, /markGlobalTodayBriefStale/);
+	assert.match(briefQuery, /staleTime: Number\.POSITIVE_INFINITY/);
+	assert.match(briefQuery, /refresh: true/);
+	assert.match(briefCard, /Human review required/);
+	assert.match(briefCard, /Review before acting/);
+	assert.match(briefCard, /onOpenSource\(source\.mailboxId, source\.messageId\)/);
+	assert.match(briefCard, /Source \{sourceIndex \+ 1\} · \{item\.candidate\.mailboxAddress\}/);
+	assert.match(workspace, /<GlobalTodayBriefCard[\s\S]*<section aria-labelledby="attention-now-title">/);
 });
 
 test("global Today adapts to mobile without horizontal dependence and stays keyboard reachable", () => {

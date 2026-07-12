@@ -4,6 +4,7 @@ import {
 	type NormalizedTodayBriefInput,
 	type TodayBriefGeneratedResult,
 } from "../../shared/today-brief.ts";
+import type { NormalizedGlobalTodayBriefInput } from "../../shared/global-today-brief.ts";
 import { wrapUntrustedAiContext } from "../../shared/ai-untrusted-context.ts";
 import { buildAiCacheKey } from "./ai-cost-control.ts";
 
@@ -91,7 +92,9 @@ Select and rank exactly the requested number of unique server-issued candidate I
 Return JSON only with exactly this structure and no extra fields:
 {"items":[{"candidateId":string,"rank":integer,"whyNow":"overdue_reminder"|"due_today"|"unread_request"|"unread_question"|"time_sensitive"|"new_information"|"review_needed","suggestedNextStep":"review"|"prepare_reply"|"follow_up"|"schedule_review"|"no_action","messageIds":string[],"requiresHumanReview":true}]}`;
 
-function modelEvidence(input: NormalizedTodayBriefInput) {
+export type TodayBriefModelInput = NormalizedTodayBriefInput | NormalizedGlobalTodayBriefInput;
+
+function modelEvidence(input: TodayBriefModelInput) {
 	return {
 		candidates: input.candidates.map((candidate) => ({
 			candidateId: candidate.id,
@@ -123,7 +126,7 @@ function modelEvidence(input: NormalizedTodayBriefInput) {
 }
 
 export function buildTodayBriefModelMessages(
-	input: NormalizedTodayBriefInput,
+	input: TodayBriefModelInput,
 ): TodayBriefModelMessage[] {
 	if (input.candidates.length === 0) {
 		throw new Error("Today brief inference requires at least one candidate");
@@ -220,7 +223,8 @@ const NEXT_STEP_COPY = {
 
 export function parseTodayBriefOutput(
 	raw: string,
-	input: NormalizedTodayBriefInput,
+	input: TodayBriefModelInput,
+	options: { requireUnreadSourceCitation?: boolean } = {},
 ): TodayBriefGeneratedResult {
 	if (byteLength(raw) > TODAY_BRIEF_LIMITS.modelOutputBytes) {
 		throw new TodayBriefValidationError("Today brief model output is oversized");
@@ -304,7 +308,8 @@ export function parseTodayBriefOutput(
 			);
 			if (
 				!candidate.reasons.includes("unread_in_mailbox") ||
-				!citedInboxMessage
+				!citedInboxMessage ||
+				(options.requireUnreadSourceCitation === true && !item.messageIds.includes(candidate.sourceEmailId))
 			) {
 				throw new TodayBriefValidationError(
 					"Today brief model output contradicted authoritative unread state",

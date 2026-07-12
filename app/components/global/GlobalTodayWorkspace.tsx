@@ -9,7 +9,9 @@ import {
 } from "@phosphor-icons/react";
 import { Link } from "react-router";
 import { ReminderRow, type TodayReminderAction } from "~/components/TodayWorkspace";
+import GlobalTodayBriefCard from "~/components/global/GlobalTodayBriefCard";
 import { globalTodayReminderOrder, type GlobalTodayReadyResponse, type GlobalTodayResponse } from "../../../shared/global-today.ts";
+import type { GlobalTodayBriefResponse } from "../../../shared/global-today-brief.ts";
 
 function dayLabel(localDate: string) {
 	return new Intl.DateTimeFormat(undefined, { weekday: "long", month: "long", day: "numeric" }).format(new Date(`${localDate}T12:00:00`));
@@ -89,6 +91,11 @@ export default function GlobalTodayWorkspace({
 	onOpenConversation,
 	onAction,
 	onRetry,
+	aiBrief,
+	aiBriefIsLoading,
+	aiBriefIsRefreshing,
+	aiBriefError,
+	onRefreshAiBrief,
 }: {
 	response?: GlobalTodayResponse;
 	isLoading: boolean;
@@ -100,6 +107,11 @@ export default function GlobalTodayWorkspace({
 	onOpenConversation(mailboxId: string, messageId: string): void;
 	onAction(action: TodayReminderAction): void;
 	onRetry(): void;
+	aiBrief?: GlobalTodayBriefResponse;
+	aiBriefIsLoading: boolean;
+	aiBriefIsRefreshing: boolean;
+	aiBriefError: Error | null;
+	onRefreshAiBrief(): void;
 }) {
 	if (isLoading && !response) return <LoadingState />;
 	if (error && !response) return (
@@ -155,6 +167,17 @@ export default function GlobalTodayWorkspace({
 
 				{hasNoMailboxes ? <section className="grid min-h-72 place-items-center py-10 text-center"><div className="max-w-md"><LockSimpleIcon size={38} weight="thin" className="mx-auto text-kumo-subtle" /><h2 className="mt-4 text-lg font-semibold text-kumo-default">No Mailboxes are available yet</h2><p className="mt-2 text-sm leading-6 text-kumo-subtle">Today will gather your work here after you receive access to a Mailbox.</p><Link to="/mailboxes" className="mt-5 inline-flex min-h-11 items-center rounded-md border border-kumo-line bg-kumo-base px-4 text-sm font-medium text-kumo-default no-underline hover:bg-kumo-tint">Open Mailboxes</Link></div></section> : allFailed ? <section className="grid min-h-72 place-items-center py-10 text-center" role="alert"><div className="max-w-md"><WarningCircleIcon size={38} className="mx-auto text-kumo-danger" /><h2 className="mt-4 text-lg font-semibold text-kumo-default">No Mailbox snapshot is current</h2><p className="mt-2 text-sm leading-6 text-kumo-subtle">Your Mailboxes are still available individually. Retry this overview when the connection recovers.</p><Button variant="secondary" icon={<ArrowClockwiseIcon size={16} />} onClick={onRetry} disabled={!isOnline} className="mt-5 min-h-11">Retry overview</Button></div></section> : (
 					<div className="py-8 sm:py-10">
+						<GlobalTodayBriefCard
+							brief={aiBrief}
+							mailboxCount={response.currentMailboxCount}
+							isLoading={aiBriefIsLoading}
+							isRefreshing={aiBriefIsRefreshing}
+							error={aiBriefError}
+							isOnline={isOnline}
+							onRefresh={onRefreshAiBrief}
+							onRefreshOverview={onRetry}
+							onOpenSource={onOpenConversation}
+						/>
 						<section aria-labelledby="attention-now-title">
 							<div className="flex items-end justify-between gap-4 pb-3"><div><h2 id="attention-now-title" className="text-lg font-semibold text-kumo-default">Attention now</h2><p className="mt-1 text-sm text-kumo-subtle">Your private reminders that are overdue or due today.</p></div><span className="text-sm tabular-nums text-kumo-subtle">{attention.length}</span></div>
 							{attention.length === 0 ? <div className="flex min-h-36 items-center gap-4 border-y border-kumo-line py-6"><EnvelopeOpenIcon size={34} weight="thin" className="shrink-0 text-kumo-subtle" /><div><p className="font-medium text-kumo-default">{isClear ? "Nothing needs attention right now" : "Nothing needs personal follow-up right now"}</p><p className="mt-1 text-sm text-kumo-subtle">{isClear ? "Every accessible Mailbox is shown below with a zero count." : "Unread Mailbox conversations still appear below."}</p></div></div> : <ul className="border-y border-kumo-line" aria-label="Private reminders needing attention">{attention.map((reminder) => { const mailbox = mailboxById.get(reminder.mailboxAddress)!; const key = `${reminder.mailboxAddress}:${reminder.id}`; return <ReminderRow key={key} reminder={reminder} group={Date.parse(reminder.remindAt) < now ? "overdue" : "today"} mailboxContext={{ address: mailbox.address, type: mailbox.type }} mutationsDisabled={pendingReminderKeys.has(key)} isPendingOrigin={pendingReminderKeys.has(key)} onOpenConversation={() => onOpenConversation(reminder.mailboxAddress, reminder.baselineMessageId)} onAction={onAction} />; })}</ul>}

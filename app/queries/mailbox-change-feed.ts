@@ -199,6 +199,7 @@ export function evictRevokedMailbox(
 	if (!options.preserveGlobalToday) {
 		queryClient.removeQueries({ queryKey: ["global-today"] });
 	}
+	queryClient.removeQueries({ queryKey: ["global-today-brief"] });
 	const ui = useUIStore.getState();
 	ui.closeCompose(false);
 	ui.closePanel();
