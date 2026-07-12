@@ -345,8 +345,9 @@ export default function EmailListRoute() {
 		mailboxId: string;
 		folder: string;
 	}>();
-	const { selectedEmailId, selectEmail, closePanel, startCompose } =
+	const { selectedEmailId, selectEmail, closePanel, startCompose, mailDensity } =
 		useUIStore();
+	const isCompact = mailDensity === "compact";
 	const [page, setPage] = useState(1);
 	const [keyboardTargetId, setKeyboardTargetId] = useState<string | null>(null);
 	const [batchSelection, setBatchSelection] = useState<Set<string>>(
@@ -1136,8 +1137,10 @@ export default function EmailListRoute() {
 									key={email.id}
 									data-email-id={email.id}
 									role="listitem"
-									className={`group flex min-w-0 items-center gap-1.5 sm:gap-2 w-full text-left transition-colors border-b border-kumo-line border-s-2 px-2 py-1.5 sm:px-3 md:px-4 md:py-2 ${
-										isPanelOpen ? "md:px-4 md:py-2.5" : ""
+									className={`group flex min-w-0 items-center gap-1.5 sm:gap-2 w-full text-left transition-colors border-b border-kumo-line border-s-2 px-2 sm:px-3 md:px-4 ${
+										isCompact ? "py-0" : "py-1.5 md:py-2"
+									} ${
+										isPanelOpen && !isCompact ? "md:px-4 md:py-2.5" : ""
 									} ${isSelected || isBatchSelected ? "bg-kumo-fill border-s-kumo-brand" : "border-s-transparent hover:bg-kumo-tint"} ${isKeyboardTarget ? "ring-2 ring-inset ring-kumo-brand/50" : ""}`}
 								>
 									{allowedBatchActions.size > 0 && (
@@ -1242,7 +1245,7 @@ export default function EmailListRoute() {
 											{(email.labels ?? []).slice(0, 2).map((label) => (
 												<LabelChip key={label.id} label={label} />
 											))}
-											{snippet && (
+											{!isCompact && snippet && (
 												<span className="text-kumo-subtle font-normal">
 													{" "}
 													&mdash; {snippet}

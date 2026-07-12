@@ -61,7 +61,8 @@ export default function SearchResultsRoute() {
 	const navigate = useNavigate();
 	const location = useLocation();
 	const queryClient = useQueryClient();
-	const { selectedEmailId, selectEmail, closePanel } = useUIStore();
+	const { selectedEmailId, selectEmail, closePanel, mailDensity } = useUIStore();
+	const isCompact = mailDensity === "compact";
 	const updateEmail = useUpdateEmail();
 	const urlQuery = searchParams.get("q") || "";
 	const draftIntent =
@@ -336,7 +337,7 @@ export default function SearchResultsRoute() {
 												handleRowClick(email);
 											}
 										}}
-										className={`group flex items-center gap-3 w-full text-left cursor-pointer transition-colors border-b border-kumo-line px-4 py-2.5 md:px-5 md:py-3 ${isPanelOpen ? "md:px-4 md:py-2.5" : ""} ${isSelected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}
+										className={`group flex min-h-11 items-center gap-3 w-full text-left cursor-pointer transition-colors border-b border-kumo-line px-4 md:px-5 ${isCompact ? "py-1" : "py-2.5 md:py-3"} ${isPanelOpen && !isCompact ? "md:px-4 md:py-2.5" : ""} ${isSelected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}
 									>
 										<div className="w-2.5 shrink-0 flex justify-center">
 											{!email.read && (
@@ -369,7 +370,7 @@ export default function SearchResultsRoute() {
 													<LabelChip key={label.id} label={label} />
 												))}
 											</div>
-											{snippet && (
+											{!isCompact && snippet && (
 												<div className="truncate text-xs text-kumo-subtle mt-0.5">
 													{highlightTerms(snippet, urlQuery)}
 												</div>

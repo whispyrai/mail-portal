@@ -2,14 +2,15 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { CommandIcon, ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, SparkleIcon, XIcon } from "@phosphor-icons/react";
+import { Button, DropdownMenu, Input, Tooltip } from "@cloudflare/kumo";
+import { CommandIcon, DotsThreeIcon, ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, SparkleIcon, XIcon } from "@phosphor-icons/react";
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useUIStore } from "~/hooks/useUIStore";
 import { useBrand } from "~/hooks/useBrand";
 import { MAIL_FOCUS_SEARCH_EVENT } from "~/components/MailKeyboardController";
 import { MAIL_COMMAND_PALETTE_OPEN_EVENT } from "~/components/MailCommandPalette";
+import WorkspaceViewControl from "~/components/WorkspaceViewControl";
 
 export default function Header() {
 	const [searchQuery, setSearchQuery] = useState("");
@@ -114,7 +115,7 @@ export default function Header() {
 				icon={<ListIcon size={20} />}
 				onClick={toggleSidebar}
 				aria-label="Toggle sidebar"
-				className="md:hidden shrink-0"
+				className={`${isSearchExpanded ? "hidden" : "shrink-0"} md:hidden`}
 			/>
 
 			{/* Search - full on desktop, collapsible on mobile */}
@@ -186,13 +187,16 @@ export default function Header() {
 					icon={<CommandIcon size={20} />}
 					onClick={() => window.dispatchEvent(new Event(MAIL_COMMAND_PALETTE_OPEN_EVENT))}
 					aria-label="Open command palette"
-					className="min-h-11 shrink-0 px-2"
+					className="hidden min-h-11 shrink-0 px-2 xl:inline-flex"
 				>
 					<span className="hidden lg:inline">Commands</span>
 				</Button>
 			</Tooltip>
+			<div className={`shrink-0 ${isSearchExpanded ? "hidden md:block" : ""}`}>
+				<WorkspaceViewControl />
+			</div>
 
-			<div className="flex items-center gap-1 ml-auto shrink-0">
+			<div className="ml-auto hidden shrink-0 items-center gap-1 xl:flex">
 				<Tooltip content={isAgentPanelOpen ? "Hide agent panel" : "Show agent panel"} side="bottom" asChild>
 					<Button
 						variant={isAgentPanelOpen ? "secondary" : "ghost"}
@@ -269,6 +273,84 @@ export default function Header() {
 						aria-label="Sign out"
 					/>
 				</Tooltip>
+			</div>
+
+			<div className={`${isSearchExpanded ? "hidden md:block" : "ml-auto shrink-0"} xl:hidden`}>
+				<DropdownMenu>
+					<DropdownMenu.Trigger
+						render={
+							<Button
+								variant="ghost"
+								shape="square"
+								className="min-h-11 min-w-11"
+								icon={<DotsThreeIcon size={20} weight="bold" />}
+								aria-label="More mail actions"
+							/>
+						}
+					/>
+					<DropdownMenu.Content align="end">
+						<DropdownMenu.Label>Mail actions</DropdownMenu.Label>
+						<DropdownMenu.Item
+							icon={RobotIcon}
+							className="min-h-11"
+							onSelect={toggleAgentPanel}
+						>
+							{isAgentPanelOpen ? "Hide agent panel" : "Show agent panel"}
+						</DropdownMenu.Item>
+						<DropdownMenu.Item
+							icon={GearSixIcon}
+							className="min-h-11"
+							onSelect={() =>
+								navigate(
+									isSettingsActive
+										? `/mailbox/${mailboxId}/emails/inbox`
+										: `/mailbox/${mailboxId}/settings`,
+								)
+							}
+						>
+							{isSettingsActive ? "Back to inbox" : "Settings"}
+						</DropdownMenu.Item>
+						{quizEnabled && (
+							<DropdownMenu.Item
+								icon={ExamIcon}
+								className="min-h-11"
+								onSelect={() => {
+									window.location.href = me?.role === "ADMIN" ? "/admin/quizzes" : "/quizzes";
+								}}
+							>
+								Quizzes
+							</DropdownMenu.Item>
+						)}
+						<DropdownMenu.Item
+							icon={PaperPlaneTiltIcon}
+							className="min-h-11"
+							onSelect={() => {
+								window.location.href = "/bulk";
+							}}
+						>
+							Bulk send
+						</DropdownMenu.Item>
+						{me?.role === "ADMIN" && (
+							<DropdownMenu.Item
+								icon={ShieldCheckIcon}
+								className="min-h-11"
+								onSelect={() => {
+									window.location.href = "/admin/users";
+								}}
+							>
+								Admin
+							</DropdownMenu.Item>
+						)}
+						<DropdownMenu.Separator />
+						<DropdownMenu.Item
+							icon={SignOutIcon}
+							className="min-h-11"
+							onSelect={signOut}
+						>
+							Sign out
+						</DropdownMenu.Item>
+					</DropdownMenu.Content>
+				</DropdownMenu>
 			</div>
 		</header>
 	);

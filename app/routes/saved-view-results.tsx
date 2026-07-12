@@ -17,7 +17,8 @@ export default function SavedViewResultsRoute() {
     viewId: string;
   }>();
   const [page, setPage] = useState(1);
-  const { selectedEmailId, selectEmail, closePanel } = useUIStore();
+  const { selectedEmailId, selectEmail, closePanel, mailDensity } = useUIStore();
+  const isCompact = mailDensity === "compact";
   const applied = useSavedView(mailboxId, viewId);
   const results = useSavedViewEmails({
     mailboxId,
@@ -116,7 +117,7 @@ export default function SavedViewResultsRoute() {
                     key={email.id}
                     type="button"
                     onClick={() => openEmail(email)}
-                    className={`flex min-h-16 w-full items-center gap-3 border-b border-kumo-line px-4 py-2.5 text-left transition-colors md:px-5 ${selected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}
+                    className={`flex w-full items-center gap-3 border-b border-kumo-line px-4 text-left transition-colors md:px-5 ${isCompact ? "min-h-11 py-1" : "min-h-16 py-2.5"} ${selected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}
                   >
                     <span className="flex w-2.5 shrink-0 justify-center">
                       {!email.read && (
@@ -137,7 +138,7 @@ export default function SavedViewResultsRoute() {
                       <span className="mt-0.5 block truncate text-sm text-kumo-default">
                         {email.subject || "(No subject)"}
                       </span>
-                      {snippet && (
+                      {!isCompact && snippet && (
                         <span className="mt-0.5 block truncate text-xs text-kumo-subtle">
                           {snippet}
                         </span>

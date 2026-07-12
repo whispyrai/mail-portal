@@ -535,21 +535,6 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			</div>
 
 			<div ref={conversationScrollRef} className="flex-1 overflow-y-auto">
-				{!isIntelligenceUnsupported && mailboxId && (
-					<ConversationIntelligenceCard
-						mailboxId={mailboxId}
-						emailId={email.id}
-						onFocusMessage={focusMessage}
-					/>
-				)}
-				{mailboxId && hasAuthoritativeActivityMailbox && (
-					<ConversationActivity
-						key={`${mailboxId}:${email.id}`}
-						mailboxId={mailboxId}
-						emailId={email.id}
-						isSharedMailbox={activityMailboxType === "SHARED"}
-					/>
-				)}
 				{hasThread ? (
 					allMessages.map((msg, idx) => {
 						const isDraft = draftMessageIds.has(msg.id);
@@ -588,6 +573,21 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 							}
 						/>
 					</div>
+				)}
+				{!isIntelligenceUnsupported && mailboxId && (
+					<ConversationIntelligenceCard
+						mailboxId={mailboxId}
+						emailId={email.id}
+						onFocusMessage={focusMessage}
+					/>
+				)}
+				{mailboxId && hasAuthoritativeActivityMailbox && (
+					<ConversationActivity
+						key={`${mailboxId}:${email.id}`}
+						mailboxId={mailboxId}
+						emailId={email.id}
+						isSharedMailbox={activityMailboxType === "SHARED"}
+					/>
 				)}
 			</div>
 

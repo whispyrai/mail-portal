@@ -5,6 +5,14 @@
 import { create } from "zustand";
 import type { Email } from "~/types";
 import { clearComposeRecovery } from "../lib/compose-recovery.ts";
+import {
+	DEFAULT_WORKSPACE_PREFERENCES,
+	WORKSPACE_PREFERENCES_VERSION,
+	normalizeListPaneWidth,
+	readWorkspacePreferences,
+	writeWorkspacePreferences,
+	type MailDensity,
+} from "../lib/workspace-preferences.ts";
 
 export type ComposeMode = "new" | "reply" | "reply-all" | "forward";
 
@@ -41,6 +49,15 @@ interface UIState {
 	toggleAgentPanel: () => void;
 	setAgentPanelOpen: (open: boolean) => void;
 	hydrateAgentPanel: () => void;
+
+	// Mail workspace preferences (SSR-safe defaults; hydrated client-side).
+	mailDensity: MailDensity;
+	listPaneWidth: number;
+	conversationIntelligenceExpanded: boolean;
+	setMailDensity: (density: MailDensity) => void;
+	setListPaneWidth: (width: number) => void;
+	setConversationIntelligenceExpanded: (expanded: boolean) => void;
+	hydrateWorkspacePreferences: () => void;
 }
 
 /** Persist the agent-panel open/closed choice so it survives reloads. */
@@ -53,6 +70,23 @@ function persistAgentPanel(open: boolean) {
 	}
 }
 
+function persistWorkspacePreferences(
+	state: Pick<
+		UIState,
+		| "mailDensity"
+		| "listPaneWidth"
+		| "conversationIntelligenceExpanded"
+	>,
+) {
+	writeWorkspacePreferences({
+		version: WORKSPACE_PREFERENCES_VERSION,
+		mailDensity: state.mailDensity,
+		listPaneWidth: state.listPaneWidth,
+		conversationIntelligenceExpanded:
+			state.conversationIntelligenceExpanded,
+	});
+}
+
 export const useUIStore = create<UIState>((set, get) => ({
 	selectedEmailId: null,
 	isComposing: false,
@@ -63,6 +97,10 @@ export const useUIStore = create<UIState>((set, get) => ({
 	// preference is loaded client-side via hydrateAgentPanel() to avoid an SSR
 	// hydration mismatch.
 	isAgentPanelOpen: false,
+	mailDensity: DEFAULT_WORKSPACE_PREFERENCES.mailDensity,
+	listPaneWidth: DEFAULT_WORKSPACE_PREFERENCES.listPaneWidth,
+	conversationIntelligenceExpanded:
+		DEFAULT_WORKSPACE_PREFERENCES.conversationIntelligenceExpanded,
 
 	selectEmail: (id) =>
 		set((state) => ({
@@ -135,5 +173,39 @@ export const useUIStore = create<UIState>((set, get) => ({
 		} catch {
 			// ignore
 		}
+	},
+
+	setMailDensity: (mailDensity) =>
+		set((state) => {
+			const next = { ...state, mailDensity };
+			persistWorkspacePreferences(next);
+			return { mailDensity };
+		}),
+
+	setListPaneWidth: (width) =>
+		set((state) => {
+			const listPaneWidth = normalizeListPaneWidth(width);
+			const next = { ...state, listPaneWidth };
+			persistWorkspacePreferences(next);
+			return { listPaneWidth };
+		}),
+
+	setConversationIntelligenceExpanded: (
+		conversationIntelligenceExpanded,
+	) =>
+		set((state) => {
+			const next = { ...state, conversationIntelligenceExpanded };
+			persistWorkspacePreferences(next);
+			return { conversationIntelligenceExpanded };
+		}),
+
+	hydrateWorkspacePreferences: () => {
+		const preferences = readWorkspacePreferences();
+		set({
+			mailDensity: preferences.mailDensity,
+			listPaneWidth: preferences.listPaneWidth,
+			conversationIntelligenceExpanded:
+				preferences.conversationIntelligenceExpanded,
+		});
 	},
 }));

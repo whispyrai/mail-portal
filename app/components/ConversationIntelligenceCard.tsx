@@ -5,8 +5,8 @@ import {
   SparkleIcon,
   ArrowsClockwiseIcon,
 } from "@phosphor-icons/react";
-import { useState } from "react";
 import ConversationQuestion from "~/components/ConversationQuestion";
+import { useUIStore } from "~/hooks/useUIStore";
 import { useConversationIntelligence } from "~/queries/conversation-intelligence";
 import type {
   ConversationIntelligenceResult,
@@ -224,7 +224,10 @@ export default function ConversationIntelligenceCard({
   emailId: string;
   onFocusMessage: (messageId: string) => void;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  const {
+    conversationIntelligenceExpanded: expanded,
+    setConversationIntelligenceExpanded,
+  } = useUIStore();
   const intelligence = useConversationIntelligence(
     mailboxId,
     emailId,
@@ -240,7 +243,7 @@ export default function ConversationIntelligenceCard({
         <button
           type="button"
           className="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
-          onClick={() => setExpanded((value) => !value)}
+          onClick={() => setConversationIntelligenceExpanded(!expanded)}
           aria-expanded={expanded}
           aria-controls="conversation-intelligence-content"
         >
@@ -267,26 +270,28 @@ export default function ConversationIntelligenceCard({
             <CaretDownIcon size={15} className="ms-auto shrink-0" />
           )}
         </button>
-        <Button
-          type="button"
-          variant="ghost"
-          shape="square"
-          size="sm"
-          className="min-h-11 min-w-11"
-          icon={
-            <ArrowsClockwiseIcon
-              size={17}
-              className={
-                intelligence.isRefreshing
-                  ? "animate-spin motion-reduce:animate-none"
-                  : ""
-              }
-            />
-          }
-          onClick={() => intelligence.refresh()}
-          disabled={intelligence.isLoading || intelligence.isRefreshing}
-          aria-label="Refresh intelligence"
-        />
+        {expanded && (
+          <Button
+            type="button"
+            variant="ghost"
+            shape="square"
+            size="sm"
+            className="min-h-11 min-w-11"
+            icon={
+              <ArrowsClockwiseIcon
+                size={17}
+                className={
+                  intelligence.isRefreshing
+                    ? "animate-spin motion-reduce:animate-none"
+                    : ""
+                }
+              />
+            }
+            onClick={() => intelligence.refresh()}
+            disabled={intelligence.isLoading || intelligence.isRefreshing}
+            aria-label="Refresh intelligence"
+          />
+        )}
       </div>
       {expanded && (
         <div id="conversation-intelligence-content">

@@ -126,6 +126,7 @@ export default function MailboxRoute() {
 		isAgentPanelOpen,
 		toggleAgentPanel,
 		hydrateAgentPanel,
+		hydrateWorkspacePreferences,
 		closePanel,
 	} = useUIStore();
 	const hasValuableComposeSeed = Boolean(
@@ -140,7 +141,8 @@ export default function MailboxRoute() {
 	// Load the persisted agent-panel preference once on the client.
 	useEffect(() => {
 		hydrateAgentPanel();
-	}, [hydrateAgentPanel]);
+		hydrateWorkspacePreferences();
+	}, [hydrateAgentPanel, hydrateWorkspacePreferences]);
 
 	useEffect(() => {
 		if (
