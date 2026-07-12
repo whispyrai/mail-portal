@@ -230,9 +230,13 @@ test("authorized reminder pages merge one bounded mailbox preview projection", a
 		},
 	} as unknown as Env;
 	const service = followUpReminderService(env);
-	await service.create("user-1", MAILBOX, createInput);
-	await service.create("user-1", MAILBOX, {
+	const futureCreateInput = {
 		...createInput,
+		remindAt: new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString(),
+	};
+	await service.create("user-1", MAILBOX, futureCreateInput);
+	await service.create("user-1", MAILBOX, {
+		...futureCreateInput,
 		emailId: "message-missing",
 		idempotencyKey: "create-reminder-2",
 	});
