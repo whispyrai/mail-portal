@@ -2714,8 +2714,18 @@ export class MailboxDO extends DurableObject<Env> {
 		const folderId = folderRow.id;
 		const isSent = folderId === Folders.SENT;
 		let pushTargetCount: number | null = null;
-		let automationRunPending = false;
 		let automationCaptureError: unknown = null;
+		if (email.automation_trigger !== undefined) {
+			if (
+				email.automation_trigger !== "live_inbound" ||
+				folderId !== Folders.INBOX ||
+				email.recipient_memory_origin !== RecipientMemoryOrigins.LIVE_INBOUND
+			) throw new Error("Automation trigger is not eligible for this Message");
+			// Register the alarm before accepting the Message. The Durable Object input
+			// gate keeps it from running until this event completes; a later transaction
+			// failure leaves only a harmless alarm with no due work.
+			await this.#scheduleAlarmAt(Date.now() + 100);
+		}
 
 		// Sent emails are always read — the sender obviously knows what they wrote.
 		// This prevents sent replies from inflating thread_unread_count.
@@ -2748,13 +2758,7 @@ export class MailboxDO extends DurableObject<Env> {
 				this.db.insert(schema.attachments).values(attachments).run();
 			}
 			if (email.automation_trigger !== undefined) {
-				if (
-					email.automation_trigger !== "live_inbound" ||
-					folderId !== Folders.INBOX ||
-					email.recipient_memory_origin !== RecipientMemoryOrigins.LIVE_INBOUND
-				) throw new Error("Automation trigger is not eligible for this Message");
 				const captured = this.#automationRules().captureLiveInbound(email.id, email.date);
-				automationRunPending = captured.state === "pending";
 				if (captured.captureFailed) automationCaptureError = captured.error;
 			}
 			if (
@@ -2834,14 +2838,6 @@ export class MailboxDO extends DurableObject<Env> {
 					? automationCaptureError.message
 					: String(automationCaptureError),
 			});
-		}
-		if (automationRunPending) {
-			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
-				console.error("[automation-rules] failed to schedule durable execution", {
-					emailId: email.id,
-					error: error instanceof Error ? error.message : String(error),
-				}),
-			);
 		}
 		if (pushTargetCount !== null) {
 			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
@@ -4300,6 +4296,7 @@ export class MailboxDO extends DurableObject<Env> {
 			console.error("[automation-rules] alarm pass failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+			throw error;
 		}
 		const pushVapid = vapidConfig(this.env);
 		const nextPushAt = await processPushOutbox({

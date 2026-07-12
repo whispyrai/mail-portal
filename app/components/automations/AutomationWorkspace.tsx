@@ -31,18 +31,22 @@ import {
 } from "~/lib/automation-rules-view";
 import {
 	useArchiveAutomationRule,
+	useAutomationRuleTests,
+	useAutomationRuleVersions,
 	useAutomationRules,
 	useAutomationRun,
 	useAutomationRuns,
 	useCreateAutomationRule,
 	useDryRunAutomationRule,
 	useReorderAutomationRules,
+	useRestoreAutomationRuleVersion,
 	useSetAutomationRuleEnabled,
 	useUpdateAutomationRule,
 } from "~/queries/automation-rules";
 import type {
 	AutomationRule,
 	AutomationRuleTest,
+	AutomationRuleVersion,
 	AutomationRun,
 } from "~/services/automation-rules";
 
@@ -121,6 +125,69 @@ function actionDefaults(kind: AutomationRuleAction["kind"]): AutomationRuleActio
 	}
 }
 
+function AutomationRuleHistory({
+	versions,
+	tests,
+	labels,
+	folders,
+	onRestore,
+	restoringVersion,
+}: {
+	versions: AutomationRuleVersion[];
+	tests: AutomationRuleTest[];
+	labels: Label[];
+	folders: Folder[];
+	onRestore(version: AutomationRuleVersion): void;
+	restoringVersion: number | null;
+}) {
+	const labelNames = Object.fromEntries(labels.map((label) => [label.id, label.name]));
+	const folderNames = Object.fromEntries(folders.map((folder) => [folder.id, folder.name]));
+	return (
+		<div className="mt-3 space-y-5">
+			<section aria-labelledby="version-history-title">
+				<h4 id="version-history-title" className="text-xs font-semibold uppercase tracking-wide text-kumo-subtle">Versions</h4>
+				{versions.length === 0 ? <p className="mt-2 text-xs text-kumo-subtle">No saved versions yet.</p> : (
+					<ol className="mt-2 max-h-80 space-y-2 overflow-y-auto pr-1">
+						{versions.map((version) => (
+							<li key={version.version} className="rounded-md border border-kumo-line bg-kumo-base p-3">
+								<div className="flex items-start justify-between gap-3">
+									<div className="min-w-0">
+										<div className="flex flex-wrap items-center gap-2 text-xs">
+											<span className="font-medium text-kumo-default">Version {version.version}</span>
+											{version.isActive && <span className="rounded-full bg-kumo-success-tint px-2 py-0.5 text-kumo-default">Active</span>}
+											{version.isDraft && <span className="rounded-full bg-kumo-tint px-2 py-0.5 text-kumo-default">Current draft</span>}
+										</div>
+										<p className="mt-1.5 text-xs leading-5 text-kumo-subtle">{describeAutomationDefinition(version.definition, { labels: labelNames, folders: { archive: "Archive", ...folderNames } })}</p>
+										<p className="mt-1 text-xs text-kumo-subtle">Saved {relativeAutomationTime(version.createdAt)} · fingerprint {version.definitionFingerprint.slice(0, 8)}</p>
+									</div>
+									{!version.isDraft && <Button variant="ghost" onClick={() => onRestore(version)} loading={restoringVersion === version.version} disabled={restoringVersion !== null} className="min-h-11 shrink-0">Restore as draft</Button>}
+								</div>
+							</li>
+						))}
+					</ol>
+				)}
+			</section>
+			<section aria-labelledby="test-history-title">
+				<h4 id="test-history-title" className="text-xs font-semibold uppercase tracking-wide text-kumo-subtle">Recent tests</h4>
+				{tests.length === 0 ? <p className="mt-2 text-xs text-kumo-subtle">No tests have been recorded for this rule.</p> : (
+					<ol className="mt-2 max-h-80 space-y-2 overflow-y-auto pr-1">
+						{tests.map((record) => (
+							<li key={record.id} className="rounded-md border border-kumo-line bg-kumo-base p-3 text-xs">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<span className="font-medium text-kumo-default">Version {record.ruleVersion ?? "unsaved"}</span>
+									<time className="text-kumo-subtle" dateTime={record.createdAt}>{relativeAutomationTime(record.createdAt)}</time>
+								</div>
+								<p className="mt-1.5 text-kumo-subtle">{record.matchedCount} of {record.evaluatedCount} matched · {record.actionCounts.wouldChange} would change · {record.actionCounts.conflicts} conflicts</p>
+								{record.acknowledgedZero && <p className="mt-1 font-medium text-kumo-default">Zero-result acknowledgment stored</p>}
+							</li>
+						))}
+					</ol>
+				)}
+			</section>
+		</div>
+	);
+}
+
 function AutomationRuleEditor({
 	mailboxId,
 	orderRevision,
@@ -146,7 +213,11 @@ function AutomationRuleEditor({
 	const create = useCreateAutomationRule(mailboxId, onAccessRevoked);
 	const update = useUpdateAutomationRule(mailboxId, onAccessRevoked);
 	const dryRun = useDryRunAutomationRule(mailboxId, onAccessRevoked);
-	const pending = create.isPending || update.isPending || dryRun.isPending;
+	const versionsQuery = useAutomationRuleVersions(mailboxId, rule?.id ?? null, onAccessRevoked);
+	const testsQuery = useAutomationRuleTests(mailboxId, rule?.id ?? null, onAccessRevoked);
+	const restore = useRestoreAutomationRuleVersion(mailboxId, onAccessRevoked);
+	const [restoringVersion, setRestoringVersion] = useState<number | null>(null);
+	const pending = create.isPending || update.isPending || dryRun.isPending || restore.isPending;
 	const savedDraftCanonical = useMemo(() => rule?.draftDefinition
 		? canonicalAutomationRuleDefinition(rule.draftDefinition)
 		: null, [rule?.draftDefinition]);
@@ -236,6 +307,24 @@ function AutomationRuleEditor({
 		}
 	};
 
+	const restoreVersion = async (version: AutomationRuleVersion) => {
+		if (!rule || !window.confirm(`Restore version ${version.version} of “${rule.name}” as a new draft?`)) return;
+		setError(null);
+		setRestoringVersion(version.version);
+		try {
+			await restore.mutateAsync({
+				ruleId: rule.id,
+				version: version.version,
+				expectedRevision: rule.revision,
+			});
+			onClose();
+		} catch (caught) {
+			setError(caught instanceof Error ? caught.message : "Version could not be restored.");
+		} finally {
+			setRestoringVersion(null);
+		}
+	};
+
 	return (
 		<aside className="flex h-full min-h-0 w-full flex-col border-l border-kumo-line bg-kumo-base lg:w-[560px]" aria-label={rule ? `Edit ${rule.name}` : "Create rule"}>
 			<header className="flex items-start justify-between gap-3 border-b border-kumo-line px-5 py-4">
@@ -294,6 +383,11 @@ function AutomationRuleEditor({
 						{!testReady && <p className="mt-2 text-xs font-medium text-kumo-subtle">Save draft before testing.</p>}
 						{test && <div className="mt-3 rounded-md bg-kumo-tint p-3" role="status"><div className="flex items-center gap-2 text-sm font-medium text-kumo-default"><CheckCircleIcon size={18} /> {test.matchedCount} of {test.evaluatedCount} messages matched</div><p className="mt-2 text-xs text-kumo-subtle">{test.actionCounts.wouldChange} would change · {test.actionCounts.alreadySatisfied} already satisfied · {test.actionCounts.conflicts} conflicts</p>{(test.evaluatedCount === 0 || test.matchedCount === 0) && (test.acknowledgedZero ? <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-kumo-default"><CheckCircleIcon size={15} aria-hidden="true" /> Zero-result acknowledgment stored. This draft may now be enabled.</p> : <label className="mt-3 flex items-start gap-2 text-xs text-kumo-default"><input type="checkbox" checked={acknowledgedZero} disabled={dryRun.isPending} onChange={(event) => { const checked = event.target.checked; setAcknowledgedZero(checked); if (checked) void runTest(true); }} /> I understand this test had {test.evaluatedCount === 0 ? "no eligible messages" : "no matches"}. Selecting this runs a confirming test and stores my acknowledgment before activation.</label>)}</div>}
 					</section>
+					{rule && <details className="rounded-md border border-kumo-line bg-kumo-tint px-3 py-3">
+						<summary className="cursor-pointer text-sm font-medium text-kumo-default">Version and test history</summary>
+						<p className="mt-2 text-xs leading-5 text-kumo-subtle">Inspect saved definitions and dry-run evidence. Restoring creates a new draft and never changes the active rule immediately.</p>
+						{versionsQuery.isLoading || testsQuery.isLoading ? <div className="mt-3 flex items-center gap-2 text-xs text-kumo-subtle"><Loader size="sm" /> Loading history…</div> : versionsQuery.isError || testsQuery.isError ? <div className="mt-3 rounded-md bg-kumo-danger-tint p-3" role="alert"><p className="text-xs text-kumo-danger">History could not be loaded. Your rule was not changed.</p><Button variant="secondary" icon={<ArrowsClockwiseIcon size={16} />} onClick={() => { void versionsQuery.refetch(); void testsQuery.refetch(); }} className="mt-3 min-h-11">Retry history</Button></div> : <AutomationRuleHistory versions={versionsQuery.data?.versions ?? []} tests={testsQuery.data?.tests ?? []} labels={labels} folders={folders} onRestore={(version) => void restoreVersion(version)} restoringVersion={restoringVersion} />}
+					</details>}
 					{error && <p className="rounded-md bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger" role="alert">{error}</p>}
 				</div>
 			</div>

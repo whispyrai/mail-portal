@@ -42,6 +42,16 @@ test("create uses order concurrency and zero-result acknowledgment is stored by 
 	assert.match(source, /ruleVersion: rule\.draftVersion/);
 });
 
+test("rule lifecycle history is visible and restore remains draft-only", () => {
+	assert.match(source, /useAutomationRuleVersions\(mailboxId, rule\?\.id \?\? null/);
+	assert.match(source, /useAutomationRuleTests\(mailboxId, rule\?\.id \?\? null/);
+	assert.match(source, /Version and test history/);
+	assert.match(source, /Restore as draft/);
+	assert.match(source, /Restoring creates a new draft and never changes the active rule immediately/);
+	assert.match(source, /expectedRevision: rule\.revision/);
+	assert.match(source, /Zero-result acknowledgment stored/);
+});
+
 test("supporting resource revocation exits before the workspace mounts", () => {
 	assert.match(route, /failureReason/);
 	assert.match(route, /error instanceof ApiError && error\.status === 403/);

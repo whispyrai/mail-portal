@@ -19,6 +19,10 @@ test("only live receive supplies the explicit Automation trigger through shared 
 
 test("Message acceptance reserves durable provenance before isolating captured-version failure", () => {
 	assert.match(durableObject, /captureLiveInbound\(email\.id, email\.date\)/u);
+	const createEmail = durableObject.indexOf("async createEmail(");
+	const scheduled = durableObject.indexOf("await this.#scheduleAlarmAt(Date.now() + 100)", createEmail);
+	const accepted = durableObject.indexOf("this.ctx.storage.transactionSync", createEmail);
+	assert.ok(createEmail >= 0 && scheduled > createEmail && accepted > scheduled);
 	const reservation = automationModule.indexOf("INSERT INTO automation_runs");
 	const validation = automationModule.indexOf("parseAutomationRuleDefinition(JSON.parse", reservation);
 	const snapshotWrite = automationModule.indexOf("INSERT INTO automation_run_rules", validation);
@@ -37,6 +41,10 @@ test("the shared alarm executes bounded Automation work before push and recovers
 	assert.match(
 		durableObject,
 		/SELECT next_attempt_at AS due_at FROM automation_runs[\s\S]*?SELECT lease_expires_at AS due_at FROM automation_runs/u,
+	);
+	assert.match(
+		durableObject.slice(alarmStart, pushPass),
+		/\[automation-rules\] alarm pass failed[\s\S]*?throw error/u,
 	);
 });
 

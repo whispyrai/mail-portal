@@ -161,7 +161,7 @@ export function useAutomationRuleTests(
 			() => fetchAutomationRuleTests(mailboxId, ruleId ?? undefined, signal),
 			onAccessRevoked,
 		),
-		enabled: Boolean(mailboxId),
+		enabled: Boolean(mailboxId && ruleId),
 		retry: (count, error) => !isAutomationAccessRevoked(error) && count < 2,
 	});
 }
