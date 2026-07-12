@@ -2,24 +2,42 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const compose = readFileSync(new URL("./ComposeEmail.tsx", import.meta.url), "utf8");
-const form = readFileSync(new URL("../hooks/useComposeForm.ts", import.meta.url), "utf8");
-const delivery = readFileSync(new URL("../lib/compose-delivery.ts", import.meta.url), "utf8");
+const compose = readFileSync(
+	new URL("./ComposeEmail.tsx", import.meta.url),
+	"utf8",
+);
+const assistant = readFileSync(
+	new URL("./ComposeAiAssistant.tsx", import.meta.url),
+	"utf8",
+);
+const form = readFileSync(
+	new URL("../hooks/useComposeForm.ts", import.meta.url),
+	"utf8",
+);
+const delivery = readFileSync(
+	new URL("../lib/compose-delivery.ts", import.meta.url),
+	"utf8",
+);
 
 test("compose shortcuts submit the form or call the existing save action without bypassing dialogs", () => {
 	assert.match(compose, /planComposeShortcut/);
 	assert.match(compose, /composeFormRef\.current\?\.requestSubmit\(\)/);
 	assert.match(compose, /data-compose-shortcut-surface="primary"/);
-	assert.match(compose, /data-compose-shortcut-surface="ai-panel"/);
+	assert.match(assistant, /data-compose-shortcut-surface="ai-panel"/);
+	assert.match(compose, /onActivityLabelChange=\{setAiActivityLabel\}/);
+	assert.match(assistant, /onActivityLabelChange\([\s\S]*?"Refining draft"/);
 	assert.match(compose, /event\.defaultPrevented/);
 	assert.match(compose, /composeFormRef\.current\?\.contains\(target\)/);
-	assert.match(compose, /closest\('\[data-compose-shortcut-surface="ai-panel"\]'/);
+	assert.match(
+		compose,
+		/closest\('\[data-compose-shortcut-surface="ai-panel"\]'/,
+	);
 	assert.match(compose, /action === "save"[\s\S]*?handleSaveDraft/);
 	assert.match(
 		compose,
 		/hasBlockingState:[\s\S]*?closePrompt[\s\S]*?showCustomSchedule[\s\S]*?isMissingAttachmentWarningOpen/,
 	);
-	assert.match(compose, /origin: "ai-prompt"[\s\S]*?"ai-generate"/);
+	assert.match(assistant, /origin: "ai-prompt"[\s\S]*?"ai-generate"/);
 	assert.match(compose, /aria-keyshortcuts="Meta\+Enter Control\+Enter"/);
 	assert.match(compose, /aria-keyshortcuts="Meta\+S Control\+S"/);
 	assert.match(compose, /title="Send \(⌘\/Ctrl\+Enter\)"/);

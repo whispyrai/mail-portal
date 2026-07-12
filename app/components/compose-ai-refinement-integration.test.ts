@@ -7,6 +7,7 @@ const read = (relativePath: string) =>
 
 test("new-mail AI supports iterative authored-content refinement", () => {
 	const compose = read("./ComposeEmail.tsx");
+	const assistant = read("./ComposeAiAssistant.tsx");
 	const queries = read("../queries/emails.ts");
 	const api = read("../services/api.ts");
 
@@ -14,27 +15,40 @@ test("new-mail AI supports iterative authored-content refinement", () => {
 		compose,
 		/composeOptions\.mode === "new" && !composeOptions\.draftEmail/,
 	);
-	assert.match(compose, /extractAiAuthoredContent\(body\)/);
+	assert.match(compose, /lazy\(\(\) => import\("\.\/ComposeAiAssistant"\)\)/);
+	assert.match(compose, /applyAiBody=\{applyAiBody\}/);
+	assert.doesNotMatch(compose, /useAiDraftCompose/);
+	assert.match(assistant, /extractAiAuthoredContent\(body\)/);
+	assert.match(assistant, /validateAiComposeDraftRequest\(request\)/);
+	assert.doesNotMatch(assistant, /authoredBody\.slice/);
+	assert.match(assistant, /preserveSignature: hasComposeSignature\(body\)/);
+	assert.match(assistant, /\/<img\\b\/i\.test\(authoredBody\)/);
 	assert.match(
-		compose,
-		/validateAiComposeDraftRequest\(request\)/,
+		assistant,
+		/editableSnapshotRef\.current\.subject !== requestedSnapshot\.subject/,
 	);
-	assert.doesNotMatch(compose, /aiAuthoredBody\.slice/);
-	assert.match(compose, /preserveSignature: hasComposeSignature\(body\)/);
-	assert.match(compose, /\/<img\\b\/i\.test\(aiAuthoredBody\)/);
-	assert.match(compose, /aiEditableSnapshotRef\.current\.subject !== requestedSnapshot\.subject/);
-	assert.match(compose, /Nothing was replaced/);
-	assert.match(compose, /hasAiDraftContext \? "Refine" : "Generate"/);
-	assert.match(compose, /\["Polish",/);
-	assert.match(compose, /\["Shorter",/);
-	assert.match(compose, /\["More formal",/);
-	assert.match(compose, /\["Friendlier",/);
-	assert.match(compose, /if \(!originMailboxId \|\| !prompt \|\| aiRequestPendingRef\.current\) return/);
-	assert.match(compose, /aiRequestPendingRef\.current = true/);
-	assert.match(compose, /finally \{\s*aiRequestPendingRef\.current = false/);
-	assert.match(compose, /disabled=\{aiComposeMut\.isPending\}/);
-	assert.match(compose, /if \(typeof draft\.body === "string"\) applyAiBody\(draft\.body\)/);
-	assert.doesNotMatch(compose, /setShowAiPrompt\(false\);\s*setAiPrompt\(""\);\s*\} catch/);
+	assert.match(assistant, /Nothing was replaced/);
+	assert.match(assistant, /hasDraftContext \? "Refine" : "Generate"/);
+	assert.match(assistant, /\["Polish",/);
+	assert.match(assistant, /\["Shorter",/);
+	assert.match(assistant, /\["More formal",/);
+	assert.match(assistant, /\["Friendlier",/);
+	assert.match(
+		assistant,
+		/if \(!originMailboxId \|\| !nextPrompt \|\| requestPendingRef\.current\) return/,
+	);
+	assert.match(assistant, /requestPendingRef\.current = true/);
+	assert.match(assistant, /finally \{\s*requestPendingRef\.current = false/);
+	assert.match(
+		assistant,
+		/if \(requestPendingRef\.current \|\| aiCompose\.isPending\) return/,
+	);
+	assert.match(assistant, /disabled=\{aiCompose\.isPending\}/);
+	assert.match(
+		assistant,
+		/if \(typeof draft\.body === "string"\) applyAiBody\(draft\.body\)/,
+	);
+	assert.doesNotMatch(assistant, /onClose\(\);\s*\} catch/);
 
 	assert.match(queries, /AiComposeDraftRequest/);
 	assert.match(api, /AiComposeDraftRequest/);

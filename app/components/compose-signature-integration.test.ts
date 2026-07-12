@@ -19,7 +19,10 @@ test("cached mailbox signatures initialize once at the pinned origin while Draft
 	)?.[1];
 	assert.ok(draftBranch);
 	assert.match(draftBranch, /body: draft\.body \|\| ""/);
-	assert.doesNotMatch(draftBranch, /insertComposeSignature|withInitialSignature/);
+	assert.doesNotMatch(
+		draftBranch,
+		/insertComposeSignature|withInitialSignature/,
+	);
 });
 
 test("late signatures distinguish pristine programmatic insertion from dirty manual insertion", () => {
@@ -46,6 +49,7 @@ test("late signatures distinguish pristine programmatic insertion from dirty man
 test("AI replacement, recovery, and route changes preserve the compose-session signature snapshot", () => {
 	const form = read("../hooks/useComposeForm.ts");
 	const compose = read("./ComposeEmail.tsx");
+	const assistant = read("./ComposeAiAssistant.tsx");
 	assert.match(form, /replaceAiAuthoredContent/);
 	assert.match(form, /const applyAiBody = useCallback/);
 	assert.match(
@@ -54,10 +58,11 @@ test("AI replacement, recovery, and route changes preserve the compose-session s
 	);
 	assert.match(form, /bodyUserDirtyRef\.current = true/);
 	assert.match(
-		compose,
+		assistant,
 		/if \(typeof draft\.body === "string"\) applyAiBody\(draft\.body\)/,
 	);
-	assert.doesNotMatch(compose, /if \(draft\.body\) setBody\(draft\.body\)/);
+	assert.match(compose, /applyAiBody=\{applyAiBody\}/);
+	assert.doesNotMatch(assistant, /if \(draft\.body\) setBody\(draft\.body\)/);
 
 	// The origin mailbox is pinned for the lifetime of the compose session, and
 	// only the first resolved settings response is accepted.

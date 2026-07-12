@@ -9,7 +9,10 @@ test("composer autosave is serialized, debounced, version-aware, and flushed bef
 	const form = read("../hooks/useComposeForm.ts");
 
 	assert.match(form, /savePromiseRef/);
-	assert.match(form, /window\.setTimeout\([\s\S]*?saveCurrentDraft[\s\S]*?1_200/);
+	assert.match(
+		form,
+		/window\.setTimeout\([\s\S]*?saveCurrentDraft[\s\S]*?1_200/,
+	);
 	assert.match(form, /draft_id: identity\?\.id/);
 	assert.match(form, /draft_version: identity\?\.version/);
 	assert.match(
@@ -30,7 +33,10 @@ test("close and discard remain explicit authoritative operations", () => {
 	assert.match(compose, />\s*Save and close\s*</);
 	assert.match(compose, /"Discard draft"/);
 	assert.match(compose, /"Discard changes"/);
-	assert.doesNotMatch(compose, /onClick=\{\(\) => !isSending && closeCompose\(\)\}/);
+	assert.doesNotMatch(
+		compose,
+		/onClick=\{\(\) => !isSending && closeCompose\(\)\}/,
+	);
 });
 
 test("saving state is visible and mailbox navigation keeps the original draft scope", () => {
@@ -65,13 +71,18 @@ test("SPA navigation and browser Back cannot unmount unconfirmed or saving work"
 test("AI seeds flush before send and AI generation remains pinned to the origin mailbox", () => {
 	const form = read("../hooks/useComposeForm.ts");
 	const compose = read("./ComposeEmail.tsx");
+	const assistant = read("./ComposeAiAssistant.tsx");
 
 	assert.match(
 		form,
 		/hasUnpersistedInitialDraft && !draftIdentityRef\.current/,
 	);
-	assert.match(form, /draft_create_key: identity \? undefined : draftCreateKeyRef\.current/);
-	assert.match(compose, /mailboxId: originMailboxId/);
+	assert.match(
+		form,
+		/draft_create_key: identity \? undefined : draftCreateKeyRef\.current/,
+	);
+	assert.match(compose, /originMailboxId=\{originMailboxId\}/);
+	assert.match(assistant, /mailboxId: originMailboxId/);
 });
 
 test("revoked mailbox access offers an explicit local-only close without claiming server deletion", () => {
@@ -89,11 +100,20 @@ test("runtime recovery restores dirty lifecycle and pins the snapshot origin mai
 	const recovery = read("../lib/compose-recovery.ts");
 
 	assert.match(form, /recoveryAtMountRef\.current\?\.mailboxId \?\? mailboxId/);
-	assert.match(form, /restoredComposeLifecycle\(recoveryAtMountRef\.current\.lifecycle\)/);
+	assert.match(
+		form,
+		/restoredComposeLifecycle\(recoveryAtMountRef\.current\.lifecycle\)/,
+	);
 	assert.match(form, /lifecycle: lifecycleForRecovery/);
-	assert.match(form, /lifecycle\.phase === "failed" && recoveryAutosaveNeededRef\.current/);
+	assert.match(
+		form,
+		/lifecycle\.phase === "failed" && recoveryAutosaveNeededRef\.current/,
+	);
 	assert.match(recovery, /localRevision: Math\.max/);
-	assert.match(recovery, /phase: lifecycle\.phase === "failed" \? "failed" : "pending"/);
+	assert.match(
+		recovery,
+		/phase: lifecycle\.phase === "failed" \? "failed" : "pending"/,
+	);
 });
 
 test("terminal delivery replay never closes as a fresh queue and safe resend renews the draft revision", () => {
@@ -104,6 +124,9 @@ test("terminal delivery replay never closes as a fresh queue and safe resend ren
 		form,
 		/enqueuePlan\.action === "renew_revision_and_resend"[\s\S]*?saveCurrentDraft\(true\)[\s\S]*?enqueueConfirmedDraft/,
 	);
-	assert.match(form, /enqueuePlan\.action !== "finish"[\s\S]*?setError\(message\)[\s\S]*?return/);
+	assert.match(
+		form,
+		/enqueuePlan\.action !== "finish"[\s\S]*?setError\(message\)[\s\S]*?return/,
+	);
 	assert.match(form, /Submitting email/);
 });

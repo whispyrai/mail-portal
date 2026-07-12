@@ -13,15 +13,46 @@ test("the rich composer is loaded only when compose is open", () => {
 		/useMemo\([\s\S]*?lazy\(\(\) => import\("~\/components\/ComposeEmail"\)\)[\s\S]*?\[composeRetryKey\]/,
 	);
 	assert.doesNotMatch(mailbox, /import ComposeEmail from/);
-	assert.match(mailbox, /isComposing \? \([\s\S]*?<Suspense[\s\S]*?<ComposeEmail \/>/);
+	assert.match(
+		mailbox,
+		/isComposing \? \([\s\S]*?<Suspense[\s\S]*?<ComposeEmail \/>/,
+	);
 	assert.match(mailbox, /role="status"/);
-	assert.match(mailbox, /ComposeLoadingFallback[\s\S]*?onCancel=\{closeCompose\}/);
+	assert.match(
+		mailbox,
+		/ComposeLoadingFallback[\s\S]*?onCancel=\{closeCompose\}/,
+	);
 	assert.match(mailbox, /ComposeLoadError[\s\S]*?onClose=\{closeCompose\}/);
 	assert.match(mailbox, /event\.key === "Escape"/);
 	assert.match(mailbox, /confirmDiscardPendingCompose/);
 	assert.match(mailbox, /Retry composer/);
 	assert.match(mailbox, /composeRetryKey/);
 	assert.match(mailbox, /onRetry=\{\(\) => setComposeRetryKey/);
+});
+
+test("the optional writing assistant is deferred behind a retryable local boundary", () => {
+	const compose = read("./ComposeEmail.tsx");
+	const assistant = read("./ComposeAiAssistant.tsx");
+
+	assert.match(
+		compose,
+		/useMemo\([\s\S]*?lazy\(\(\) => import\("\.\/ComposeAiAssistant"\)\)[\s\S]*?\[aiPanelRetryKey\]/,
+	);
+	assert.doesNotMatch(compose, /import ComposeAiAssistant from/);
+	assert.doesNotMatch(compose, /useAiDraftCompose/);
+	assert.match(
+		compose,
+		/<LazyLoadBoundary[\s\S]*?<Suspense[\s\S]*?<ComposeAiAssistant/,
+	);
+	assert.match(compose, /Opening writing assistant…/);
+	assert.match(
+		compose,
+		/Writing assistant could not open\. Your draft is[\s\S]*?unchanged\./,
+	);
+	assert.match(compose, /setAiPanelRetryKey\(\(key\) => key \+ 1\)/);
+	assert.match(assistant, /useAiDraftCompose\(\)/);
+	assert.match(assistant, /validateAiComposeDraftRequest/);
+	assert.match(assistant, /hasComposeSignature/);
 });
 
 test("conversation detail is loaded only after a message is selected", () => {

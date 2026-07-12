@@ -15,16 +15,17 @@ import {
 import {
   type ClipboardEvent as ReactClipboardEvent,
   type DragEvent as ReactDragEvent,
+  lazy,
+  Suspense,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { useBlocker, useParams } from "react-router";
 import { useComposeForm } from "~/hooks/useComposeForm";
 import { useUIStore } from "~/hooks/useUIStore";
-import { useBrand } from "~/hooks/useBrand";
-import { useAiDraftCompose } from "~/queries/emails";
-import { assistantCopyFor } from "~/utils/assistant-copy";
+import LazyLoadBoundary from "~/components/LazyLoadBoundary";
 import {
   earliestScheduleTime,
   formatDateTimeLocalValue,
@@ -41,18 +42,9 @@ import {
   consumeComposeFileTransfer,
   transferContainsFiles,
 } from "~/lib/compose-file-transfer";
-import {
-  extractAiAuthoredContent,
-  hasAiAuthoredContent,
-  hasComposeSignature,
-} from "~/lib/compose-signature";
 import RichTextEditor from "./RichTextEditor";
 import ComposeAttachments from "./ComposeAttachments";
 import RecipientCombobox from "./RecipientCombobox";
-import {
-  AI_DRAFTING_LIMITS,
-  validateAiComposeDraftRequest,
-} from "../../shared/ai-drafting";
 
 /**
  * The composer. A single roomy centered modal used for new mail, replies,
@@ -67,12 +59,13 @@ export default function ComposeEmail() {
   }>();
 
   const { isComposing, composeOptions } = useUIStore();
-  const { brand, name } = useBrand();
-  const assistantCopy = assistantCopyFor(brand, name);
-  const aiComposeMut = useAiDraftCompose();
   const [showAiPrompt, setShowAiPrompt] = useState(false);
-  const [aiPrompt, setAiPrompt] = useState("");
-  const [aiPanelError, setAiPanelError] = useState<string | null>(null);
+  const [aiActivityLabel, setAiActivityLabel] = useState("");
+  const [aiPanelRetryKey, setAiPanelRetryKey] = useState(0);
+  const ComposeAiAssistant = useMemo(
+    () => lazy(() => import("./ComposeAiAssistant")),
+    [aiPanelRetryKey],
+  );
   const [scheduledFor, setScheduledFor] = useState<string | null>(null);
   const [showCustomSchedule, setShowCustomSchedule] = useState(false);
   const [customScheduleValue, setCustomScheduleValue] = useState("");
@@ -129,8 +122,8 @@ export default function ComposeEmail() {
     originMailboxId,
     attachments,
     addFiles,
-		addInlineImages,
-		inlineImagePreviews,
+    addInlineImages,
+    inlineImagePreviews,
     removeAttachment,
     retryAttachment,
     isUploading,
@@ -141,9 +134,6 @@ export default function ComposeEmail() {
   const handledBlockedNavigationRef = useRef(false);
   const composeFormRef = useRef<HTMLFormElement>(null);
   const fileDragDepthRef = useRef(0);
-  const aiRequestPendingRef = useRef(false);
-  const aiEditableSnapshotRef = useRef({ subject, body });
-  aiEditableSnapshotRef.current = { subject, body };
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const sendButtonLabel = isSending
     ? scheduledFor
@@ -156,10 +146,6 @@ export default function ComposeEmail() {
         : scheduledFor
           ? "Schedule"
           : "Send";
-  const aiAuthoredBody = extractAiAuthoredContent(body);
-  const hasAiDraftContext =
-    subject.trim().length > 0 || hasAiAuthoredContent(body);
-  const aiActionLabel = hasAiDraftContext ? "Refine" : "Generate";
 
   useEffect(() => {
     if (!isComposing) return;
@@ -214,7 +200,7 @@ export default function ComposeEmail() {
           closePrompt ||
           showCustomSchedule ||
           isMissingAttachmentWarningOpen ||
-          isResolvingClose
+          isResolvingClose,
         ),
       });
       if (action === "ignore" || action === "ai-generate") return;
@@ -270,57 +256,6 @@ export default function ComposeEmail() {
     setScheduledFor(result.iso);
     setCustomScheduleError(null);
     setShowCustomSchedule(false);
-  };
-
-  const handleAiGenerate = async (instruction = aiPrompt) => {
-    const prompt = instruction.trim();
-    if (!originMailboxId || !prompt || aiRequestPendingRef.current) return;
-    if (/<img\b/i.test(aiAuthoredBody)) {
-      setAiPanelError(
-        "Remove inline images before refining this draft so their placement cannot be lost.",
-      );
-      return;
-    }
-    const request = {
-      prompt,
-      currentSubject: subject.trim().length > 0 ? subject : undefined,
-      currentBody: hasAiAuthoredContent(body) ? aiAuthoredBody : undefined,
-      preserveSignature: hasComposeSignature(body) || undefined,
-    };
-    const validation = validateAiComposeDraftRequest(request);
-    if (!validation.ok) {
-      setAiPanelError(
-        validation.code === "invalid_fields"
-          ? "This instruction or draft is too long to refine safely."
-          : "This draft is too large to refine safely. Shorten it before trying again.",
-      );
-      return;
-    }
-    const requestedSnapshot = { subject, body };
-    setAiPanelError(null);
-    aiRequestPendingRef.current = true;
-    try {
-      const draft = await aiComposeMut.mutateAsync({
-        mailboxId: originMailboxId,
-        ...request,
-      });
-      if (
-        aiEditableSnapshotRef.current.subject !== requestedSnapshot.subject ||
-        aiEditableSnapshotRef.current.body !== requestedSnapshot.body
-      ) {
-        setAiPanelError(
-          "Your draft changed while the writing assistant was working. Nothing was replaced. Run it again when you are ready.",
-        );
-        return;
-      }
-      if (typeof draft.subject === "string") setSubject(draft.subject);
-      if (typeof draft.body === "string") applyAiBody(draft.body);
-      setAiPrompt("");
-    } catch {
-      // error surfaced via mutation.error
-    } finally {
-      aiRequestPendingRef.current = false;
-    }
   };
 
   const acceptTransferredFiles = (files: File[]) => {
@@ -429,11 +364,7 @@ export default function ComposeEmail() {
                     ? "Uploading attachments"
                     : hasAttachmentIssue
                       ? "Attachments need attention"
-                    : aiComposeMut.isPending
-                      ? hasAiDraftContext
-                        ? "Refining draft"
-                        : "Generating draft"
-                      : ""}
+                      : aiActivityLabel}
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-4 sm:px-6 sm:py-5">
               {error && (
@@ -516,153 +447,82 @@ export default function ComposeEmail() {
                   {!showAiPrompt ? (
                     <button
                       type="button"
-                      onClick={() => {
-                        aiComposeMut.reset();
-                        setAiPanelError(null);
-                        setShowAiPrompt(true);
-                      }}
+                      onClick={() => setShowAiPrompt(true)}
                       className="flex min-h-11 items-center gap-1.5 rounded px-1 text-sm text-kumo-link hover:text-kumo-link-hover font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
                     >
                       <SparkleIcon size={15} weight="fill" />
                       Write with AI
                     </button>
                   ) : (
-                    <div
-                      data-compose-shortcut-surface="ai-panel"
-                      aria-busy={aiComposeMut.isPending}
-                      className="space-y-3 rounded-lg border border-kumo-line bg-kumo-recessed p-3"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-medium text-kumo-default">
-                            Writing assistant
-                          </div>
-                          <label
-                            htmlFor="ai-compose-prompt"
-                            className="mt-0.5 block text-xs text-kumo-subtle"
-                          >
-                            {hasAiDraftContext
-                              ? "Tell it what to improve in your current draft."
-                              : "Describe the email you want to write."}
-                          </label>
-                        </div>
-                        <button
-                          type="button"
-                          aria-label="Close writing assistant"
-                          disabled={aiComposeMut.isPending}
-                          onClick={() => {
-                            aiComposeMut.reset();
-                            setAiPanelError(null);
-                            setShowAiPrompt(false);
-                            setAiPrompt("");
-                          }}
-                          className="flex min-h-9 min-w-9 items-center justify-center rounded text-kumo-subtle hover:bg-white hover:text-kumo-default focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand disabled:opacity-50"
-                        >
-                          <XIcon size={15} />
-                        </button>
-                      </div>
-                      {hasAiDraftContext && (
+                    <LazyLoadBoundary
+                      resetKey={`${showAiPrompt}:${aiPanelRetryKey}`}
+                      fallback={
                         <div
-                          className="flex flex-wrap gap-1.5"
-                          aria-label="Quick refinements"
+                          data-compose-shortcut-surface="ai-panel"
+                          role="alert"
+                          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-kumo-line bg-kumo-recessed p-3 text-sm text-kumo-default"
                         >
-                          {[
-                            ["Polish", "Polish this draft while preserving its meaning."],
-                            ["Shorter", "Make this draft shorter and more concise."],
-                            ["More formal", "Make this draft more formal."],
-                            ["Friendlier", "Make this draft friendlier and warmer."],
-                          ].map(([label, instruction]) => (
+                          <span>
+                            Writing assistant could not open. Your draft is
+                            unchanged.
+                          </span>
+                          <div className="flex items-center gap-2">
                             <Button
-                              key={label}
                               type="button"
                               variant="secondary"
                               size="sm"
-                              disabled={aiComposeMut.isPending}
-                              onClick={() => void handleAiGenerate(instruction)}
+                              className="min-h-11"
+                              onClick={() =>
+                                setAiPanelRetryKey((key) => key + 1)
+                              }
                             >
-                              {label}
+                              Retry
                             </Button>
-                          ))}
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="min-h-11"
+                              onClick={() => setShowAiPrompt(false)}
+                            >
+                              Close
+                            </Button>
+                          </div>
                         </div>
-                      )}
-                      <textarea
-                        id="ai-compose-prompt"
-                        autoFocus
-                        value={aiPrompt}
-                        disabled={aiComposeMut.isPending}
-                        maxLength={AI_DRAFTING_LIMITS.promptChars}
-                        onChange={(e) => setAiPrompt(e.target.value)}
-                        onKeyDown={(e) => {
-                          const action = planComposeShortcut({
-                            key: e.key,
-                            metaKey: e.metaKey,
-                            ctrlKey: e.ctrlKey,
-                            altKey: e.altKey,
-                            shiftKey: e.shiftKey,
-                            repeat: e.repeat,
-                            isImeComposing: e.nativeEvent.isComposing,
-                            composeActive: isComposing,
-                            hasBlockingState: false,
-                            defaultPrevented: e.defaultPrevented,
-                            origin: "ai-prompt",
-                          });
-                          if (action === "ai-generate") {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            void handleAiGenerate();
-                          }
-                          if (e.key === "Escape" && !aiComposeMut.isPending) {
-                            aiComposeMut.reset();
-                            setAiPanelError(null);
-                            setShowAiPrompt(false);
-                            setAiPrompt("");
-                          }
-                        }}
-                        placeholder={
-                          hasAiDraftContext
-                            ? "For example: emphasize the next steps and keep it concise"
-                            : assistantCopy.composePlaceholder
-                        }
-                        rows={2}
-                        className="w-full resize-y rounded border border-kumo-line bg-white px-3 py-2 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:outline-none focus:ring-2 focus:ring-kumo-focus"
-                      />
-                      <div className="flex items-center gap-2">
-                        <Button
-                          type="button"
-                          variant="primary"
-                          size="sm"
-                          className="min-h-11"
-                          loading={aiComposeMut.isPending}
-                          disabled={!aiPrompt.trim() || aiComposeMut.isPending}
-                          icon={<SparkleIcon size={14} weight="fill" />}
-                          onClick={() => void handleAiGenerate()}
-                        >
-                          {aiComposeMut.isPending
-                            ? `${aiActionLabel}…`
-                            : aiActionLabel}
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="min-h-11"
-                          disabled={aiComposeMut.isPending}
-                          onClick={() => setAiPrompt("")}
-                        >
-                          Clear
-                        </Button>
-                        {(aiPanelError || aiComposeMut.isError) && (
-                          <span
-                            role="alert"
-                            className="min-w-0 break-words text-xs text-kumo-danger sm:ml-1"
+                      }
+                    >
+                      <Suspense
+                        fallback={
+                          <div
+                            data-compose-shortcut-surface="ai-panel"
+                            role="status"
+                            aria-live="polite"
+                            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-kumo-line bg-kumo-recessed p-3 text-sm text-kumo-subtle"
                           >
-                            {aiPanelError ||
-                              (aiComposeMut.error as Error)?.message ||
-                              "The writing assistant could not update this draft. Your content is unchanged."}
-                          </span>
-                        )}
-                      </div>
-                    </div>
+                            <span>Opening writing assistant…</span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="min-h-11"
+                              onClick={() => setShowAiPrompt(false)}
+                            >
+                              Close
+                            </Button>
+                          </div>
+                        }
+                      >
+                        <ComposeAiAssistant
+                          originMailboxId={originMailboxId}
+                          subject={subject}
+                          body={body}
+                          setSubject={setSubject}
+                          applyAiBody={applyAiBody}
+                          onActivityLabelChange={setAiActivityLabel}
+                          onClose={() => setShowAiPrompt(false)}
+                        />
+                      </Suspense>
+                    </LazyLoadBoundary>
                   )}
                 </div>
               )}
@@ -687,8 +547,8 @@ export default function ComposeEmail() {
                   value={body}
                   onChange={handleBodyChange}
                   onFiles={acceptTransferredFiles}
-					onInlineImages={addInlineImages}
-					inlineImagePreviews={inlineImagePreviews}
+                  onInlineImages={addInlineImages}
+                  inlineImagePreviews={inlineImagePreviews}
                 />
               </div>
 
@@ -850,7 +710,8 @@ export default function ComposeEmail() {
               Send without an attachment?
             </Dialog.Title>
             <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
-              Your message says an attachment is included, but no ready file is attached.
+              Your message says an attachment is included, but no ready file is
+              attached.
             </Dialog.Description>
           </div>
           <div className="flex flex-wrap justify-end gap-2 px-4 py-4 sm:px-5">
@@ -890,11 +751,11 @@ export default function ComposeEmail() {
                 ? "Draft is not safely saved"
                 : closePrompt?.reason === "access-revoked"
                   ? "Mailbox access was removed"
-                : closePrompt?.reason === "discard"
-                  ? hasPersistedDraft
-                    ? "Discard this draft?"
-                    : "Discard these changes?"
-                  : "Save before closing?"}
+                  : closePrompt?.reason === "discard"
+                    ? hasPersistedDraft
+                      ? "Discard this draft?"
+                      : "Discard these changes?"
+                    : "Save before closing?"}
             </Dialog.Title>
             <Dialog.Description className="mt-1 text-sm text-kumo-subtle">
               {closePrompt?.message ||

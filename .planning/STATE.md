@@ -58,17 +58,17 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Current verification
 
-- `npm test`: 775/775 passing after proactive cited Today intelligence, distributed inference coordination, and exact citation navigation.
+- `npm test`: 776/776 passing after proactive cited Today intelligence and the deferred AI writing-assistant boundary.
 - `npx tsc -b`: passing.
 - `git diff --check`: passing.
 - `npm run build:wiser`: production client and SSR artifacts built; Wrangler emitted the expected non-fatal sandbox log-file and missing-local-secrets warnings.
-- Initial mailbox JavaScript remains deferred at 77.60 kB raw and 21.70 kB gzip. Today is 28.76 kB raw and 8.52 kB gzip; EmailPanel is deferred at 59.82 kB raw and 18.19 kB gzip. ComposeEmail remains deferred at 501.96 kB raw and 156.78 kB gzip, just above the build advisory and still needs a targeted follow-up split.
+- Initial mailbox JavaScript remains deferred at 77.60 kB raw and 21.70 kB gzip. Today is 28.76 kB raw and 8.52 kB gzip; EmailPanel is deferred at 59.82 kB raw and 18.19 kB gzip. ComposeEmail is deferred at 498.06 kB raw and 155.41 kB gzip, below the build advisory, while the optional ComposeAiAssistant loads separately at 7.64 kB raw and 3.38 kB gzip.
 - Local D1 migrations 0001 through 0003 applied successfully to the local Wiser database.
 - Local migration 0004 application is pending because the approved Wrangler escalation was rejected after the Codex usage limit was reached. Migration SQL tests pass.
 - Fresh foundation, delivery, conversation-intelligence, Snooze, follow-up reminder, Search v2, attachment-integrity, deferred-loading, draft-lifecycle, recipient-intelligence, signature, composer-input, and inline-image reviews found no P0 issues. Every reported P1 finding was fixed and covered by targeted regressions.
 - Adversarial Outbox review found eight P1 issues; all eight were fixed and regression coverage was added.
-- Integrated correctness, security, data-integrity, AI-cost, and UX reviews produced further P1 remediation rounds; all reported findings are fixed and covered by targeted regression tests. Independent final compose-refinement and Today-brief re-reviews are clean at P0/P1.
+- Integrated correctness, security, data-integrity, AI-cost, and UX reviews produced further P1 remediation rounds; all reported findings are fixed and covered by targeted regression tests. Independent final compose-refinement, Today-brief, and AI lazy-boundary re-reviews are clean at P0/P1.
 
 ## Next gate
 
-Checkpoint proactive Today intelligence, then perform the targeted ComposeEmail chunk split before the next research-backed AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
+Checkpoint the completed ComposeEmail AI boundary, then continue with the next research-backed AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
