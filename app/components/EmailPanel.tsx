@@ -44,8 +44,9 @@ function EmailPanelSkeleton() {
 export default function EmailPanel({ emailId }: { emailId: string }) {
 	const { mailboxId, folder } = useParams<{ mailboxId: string; folder: string }>();
 	const { data: email } = useEmail(mailboxId, emailId) as { data?: Email };
-	const { data: threadRepliesRaw } = useThreadReplies(mailboxId, email?.thread_id) as {
+	const { data: threadRepliesRaw, isFetched: threadRepliesFetched } = useThreadReplies(mailboxId, email?.thread_id) as {
 		data?: Email[];
+		isFetched: boolean;
 	};
 	const updateEmail = useUpdateEmail();
 	const deleteEmailMut = useDeleteEmail();
@@ -72,6 +73,8 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const draftSendIdentityRef = useRef(new LogicalSendIdentity());
 	const [sourceViewEmail, setSourceViewEmail] = useState<Email | null>(null);
 	const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
+	const conversationScrollRef = useRef<HTMLDivElement>(null);
+	const pendingMessageFocusRef = useRef<string | null>(null);
 	const [previewImage, setPreviewImage] = useState<{ url: string; filename: string } | null>(null);
 	const [isSnoozeOpen, setIsSnoozeOpen] = useState(false);
 	const isDraftFolder = folder === Folders.DRAFT;
@@ -99,10 +102,30 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		return [email, ...threadReplies].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 	}, [email, threadReplies]);
 
-	// Reset expanded state only when the selected email changes, not on every refetch.
-	// Using allMessages as a dependency would reset user expand/collapse state on background refetches.
 	const currentEmailId = email?.id;
-	useEffect(() => { if (allMessages.length > 1) setExpandedMessages(new Set([allMessages[0].id])); }, [currentEmailId]); // eslint-disable-line react-hooks/exhaustive-deps
+	useEffect(() => {
+		if (!currentEmailId) return;
+		pendingMessageFocusRef.current = currentEmailId;
+		setExpandedMessages(new Set([currentEmailId]));
+	}, [currentEmailId]);
+	useEffect(() => {
+		const pendingId = pendingMessageFocusRef.current;
+		const container = conversationScrollRef.current;
+		if (!pendingId || !container) return;
+		if (email?.thread_id && !threadRepliesFetched) return;
+		const target = Array.from(
+			container.querySelectorAll<HTMLElement>("[data-intelligence-message-id]"),
+		).find((element) => element.dataset.intelligenceMessageId === pendingId);
+		if (!target) return;
+		target.scrollIntoView({ block: "start" });
+		target.focus({ preventScroll: true });
+		pendingMessageFocusRef.current = null;
+	}, [currentEmailId, allMessages.length, expandedMessages, email?.thread_id, threadRepliesFetched]);
+
+	const focusMessage = (messageId: string) => {
+		pendingMessageFocusRef.current = messageId;
+		setExpandedMessages((current) => new Set(current).add(messageId));
+	};
 
 	const toggleExpand = (msgId: string) => { setExpandedMessages((prev) => { const next = new Set(prev); if (next.has(msgId)) next.delete(msgId); else next.add(msgId); return next; }); };
 
@@ -501,14 +524,12 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				</div>
 			</div>
 
-			<div className="flex-1 overflow-y-auto">
+			<div ref={conversationScrollRef} className="flex-1 overflow-y-auto">
 				{!isIntelligenceUnsupported && mailboxId && (
 					<ConversationIntelligenceCard
 						mailboxId={mailboxId}
 						emailId={email.id}
-						onFocusMessage={(messageId) =>
-							setExpandedMessages((current) => new Set(current).add(messageId))
-						}
+						onFocusMessage={focusMessage}
 					/>
 				)}
 				{hasThread ? (
@@ -536,13 +557,19 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 						);
 					})
 				) : (
-					<SingleMessageView
-						email={email}
-						mailboxId={mailboxId}
-						onPreviewImage={(url, filename) =>
-							setPreviewImage({ url, filename })
-						}
-					/>
+					<div
+						data-intelligence-message-id={email.id}
+						tabIndex={-1}
+						aria-label={`Message from ${email.sender}`}
+					>
+						<SingleMessageView
+							email={email}
+							mailboxId={mailboxId}
+							onPreviewImage={(url, filename) =>
+								setPreviewImage({ url, filename })
+							}
+						/>
+					</div>
 				)}
 			</div>
 

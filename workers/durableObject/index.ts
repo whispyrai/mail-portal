@@ -115,6 +115,8 @@ import {
 	type RecipientMemoryOrigin,
 } from "../../shared/recipient-suggestions.ts";
 import { classifyDraftCreateReplay } from "../lib/draft-create-replay.ts";
+import { readTodayBriefCandidates } from "../lib/today-brief-candidates.ts";
+import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -791,6 +793,117 @@ export class MailboxDO extends DurableObject<Env> {
 			mailboxAddress,
 			baselineMessageIds,
 		);
+	}
+
+	/** Project bounded authoritative mail evidence for one actor's Today brief. */
+	async getTodayBriefCandidates(
+		mailboxAddress: string,
+		reminders: FollowUpReminder[],
+		boundaries: { now: string; tomorrowStart: string },
+	) {
+		await this.#selfHealSnoozes();
+		return readTodayBriefCandidates(
+			this.ctx.storage.sql,
+			mailboxAddress,
+			reminders,
+			boundaries,
+		);
+	}
+
+	/** Coordinate paid Today inference across every Worker isolate for this mailbox. */
+	async claimTodayBriefGeneration(
+		cacheKey: string,
+		ownerUserId: string,
+		claimToken: string,
+		expiresAt: number,
+	) {
+		const now = Date.now();
+		if (
+			cacheKey.length < 20 ||
+			cacheKey.length > 300 ||
+			ownerUserId.length < 1 ||
+			ownerUserId.length > 200 ||
+			claimToken.length < 16 ||
+			claimToken.length > 200 ||
+			!Number.isSafeInteger(expiresAt) ||
+			expiresAt <= now ||
+			expiresAt > now + 5 * 60 * 1_000
+		) {
+			throw new Error("Today brief generation claim is invalid");
+		}
+		const current = [
+			...this.ctx.storage.sql.exec<{
+				owner_user_id: string;
+				claim_token: string;
+				expires_at: number;
+			}>(
+				`SELECT owner_user_id, claim_token, expires_at
+				 FROM today_brief_generation_claims
+				 WHERE cache_key = ?1 LIMIT 1`,
+				cacheKey,
+			),
+		][0];
+		if (current && current.expires_at > now) {
+			const sameOwner = current.owner_user_id === ownerUserId &&
+				current.claim_token === claimToken;
+			if (sameOwner && expiresAt > current.expires_at) {
+				this.ctx.storage.sql.exec(
+					`UPDATE today_brief_generation_claims SET expires_at = ?2
+					 WHERE cache_key = ?1 AND owner_user_id = ?3 AND claim_token = ?4`,
+					cacheKey,
+					expiresAt,
+					ownerUserId,
+					claimToken,
+				);
+			}
+			return sameOwner;
+		}
+		this.ctx.storage.sql.exec(
+			`INSERT OR REPLACE INTO today_brief_generation_claims
+			 (cache_key, owner_user_id, claim_token, expires_at, created_at)
+			 VALUES (?1, ?2, ?3, ?4, ?5)`,
+			cacheKey,
+			ownerUserId,
+			claimToken,
+			expiresAt,
+			now,
+		);
+		return true;
+	}
+
+	async releaseTodayBriefGeneration(
+		cacheKey: string,
+		ownerUserId: string,
+		claimToken: string,
+	) {
+		if (
+			cacheKey.length < 20 ||
+			cacheKey.length > 300 ||
+			ownerUserId.length < 1 ||
+			ownerUserId.length > 200 ||
+			claimToken.length < 16 ||
+			claimToken.length > 200
+		) {
+			return false;
+		}
+		const before = [
+			...this.ctx.storage.sql.exec<{ total: number }>(
+				`SELECT COUNT(*) AS total FROM today_brief_generation_claims
+				 WHERE cache_key = ?1 AND owner_user_id = ?2 AND claim_token = ?3`,
+				cacheKey,
+				ownerUserId,
+				claimToken,
+			),
+		][0]?.total ?? 0;
+		if (before === 0) return false;
+		this.ctx.storage.sql.exec(
+			`DELETE FROM today_brief_generation_claims
+			 WHERE cache_key = ?1 AND owner_user_id = ?2 AND claim_token = ?3`,
+			cacheKey,
+			ownerUserId,
+			claimToken,
+		);
+		return true;
 	}
 
 	async updateEmail(

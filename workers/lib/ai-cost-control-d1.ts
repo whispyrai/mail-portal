@@ -350,12 +350,17 @@ export function createAiCostController(
 
 export async function getCachedAiResponse<T>(
 	env: Env,
-	input: { cacheKey: string; mailboxId?: string; now?: number },
+	input: {
+		cacheKey: string;
+		mailboxId?: string;
+		cacheScope?: string;
+		now?: number;
+	},
 ): Promise<T | null> {
 	const config = resolveAiCostControlConfig(
 		env as unknown as AiCostEnvironment,
 	);
-	const mailboxScope = input.mailboxId?.toLowerCase() ?? "";
+	const mailboxScope = cacheScope(input);
 	const row = await env.DB.prepare(
 		`SELECT value_json
 		 FROM ai_response_cache
@@ -382,6 +387,7 @@ export async function putCachedAiResponse(
 	input: {
 		cacheKey: string;
 		mailboxId?: string;
+		cacheScope?: string;
 		feature: string;
 		value: unknown;
 		ttlMs?: number;
@@ -392,7 +398,7 @@ export async function putCachedAiResponse(
 		env as unknown as AiCostEnvironment,
 	);
 	const now = input.now ?? Date.now();
-	const mailboxScope = input.mailboxId?.toLowerCase() ?? "";
+	const mailboxScope = cacheScope(input);
 	await env.DB.prepare(
 		`INSERT INTO ai_response_cache (
 		   cache_key, environment, mailbox_id, mailbox_scope, feature,
@@ -415,6 +421,17 @@ export async function putCachedAiResponse(
 			now + (input.ttlMs ?? 30 * 24 * 60 * 60 * 1000),
 		)
 		.run();
+}
+
+function cacheScope(input: { mailboxId?: string; cacheScope?: string }): string {
+	if (input.cacheScope !== undefined) {
+		const scope = input.cacheScope.trim().toLowerCase();
+		if (!scope || scope.length > 1_000) {
+			throw new Error("AI cache scope is invalid");
+		}
+		return scope;
+	}
+	return input.mailboxId?.toLowerCase() ?? "";
 }
 
 function mapMonth(row: MonthRow): AiMonthLedger {

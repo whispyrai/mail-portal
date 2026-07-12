@@ -11,6 +11,8 @@ import {
 	XIcon,
 } from "@phosphor-icons/react";
 import { useMemo } from "react";
+import TodayBriefCard from "~/components/TodayBriefCard";
+import type { TodayBriefResponse } from "~/services/today-brief";
 import {
 	groupFollowUpReminders,
 	type FollowUpReminderView,
@@ -37,6 +39,9 @@ export interface TodayMutationFeedback {
 }
 
 interface TodayWorkspaceProps {
+	brief: TodayBriefResponse | undefined;
+	briefIsLoading: boolean;
+	briefError: Error | null;
 	reminders: readonly FollowUpReminderView[];
 	isLoading: boolean;
 	error: Error | null;
@@ -45,8 +50,10 @@ interface TodayWorkspaceProps {
 	mutationFeedback?: TodayMutationFeedback | null;
 	now?: Date;
 	onOpenConversation(reminder: FollowUpReminderView): void;
+	onOpenBriefSource(messageId: string): void;
 	onAction(action: TodayReminderAction): void;
 	onRetry(): void;
+	onRetryBrief(): void;
 	onDismissFeedback(): void;
 }
 
@@ -259,6 +266,9 @@ function ReminderSection({
 }
 
 export default function TodayWorkspace({
+	brief,
+	briefIsLoading,
+	briefError,
 	reminders,
 	isLoading,
 	error,
@@ -267,8 +277,10 @@ export default function TodayWorkspace({
 	mutationFeedback,
 	now = new Date(),
 	onOpenConversation,
+	onOpenBriefSource,
 	onAction,
 	onRetry,
+	onRetryBrief,
 	onDismissFeedback,
 }: TodayWorkspaceProps) {
 	const groups = useMemo(
@@ -297,7 +309,7 @@ export default function TodayWorkspace({
 						<p className="mt-3 max-w-2xl text-base leading-7 text-kumo-strong">
 							{dueCount > 0
 								? `${dueCount} follow-up${dueCount === 1 ? "" : "s"} need your attention.`
-								: "Nothing needs your attention right now."}
+								: "No personal follow-ups are due right now."}
 						</p>
 					</div>
 					<div className="flex items-start gap-3 rounded-lg bg-kumo-recessed px-4 py-3.5">
@@ -342,6 +354,15 @@ export default function TodayWorkspace({
 							)}
 						</div>
 					)}
+					{!isLoading && !error && (
+						<TodayBriefCard
+							brief={brief}
+							isLoading={briefIsLoading}
+							error={briefError}
+							onRetry={onRetryBrief}
+							onOpenSource={onOpenBriefSource}
+						/>
+					)}
 					{isLoading ? (
 						<div role="status" className="flex min-h-72 flex-col items-center justify-center gap-3 text-center">
 							<Loader size="lg" />
@@ -361,7 +382,7 @@ export default function TodayWorkspace({
 					) : activeCount === 0 ? (
 						<div className="mx-auto flex min-h-72 max-w-lg flex-col items-center justify-center text-center">
 							<SunHorizonIcon size={48} weight="thin" className="text-kumo-subtle" aria-hidden="true" />
-							<h2 className="mt-5 text-xl font-semibold text-kumo-default">Your desk is clear</h2>
+							<h2 className="mt-5 text-xl font-semibold text-kumo-default">No personal follow-ups</h2>
 							<p className="mt-2 max-w-md text-sm leading-6 text-kumo-subtle">
 								Follow-ups you create from conversations will appear here. Use them for the mail you want to return to, without creating team tasks or changing the mailbox.
 							</p>

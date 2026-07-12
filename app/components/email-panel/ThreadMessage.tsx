@@ -78,6 +78,7 @@ export default function ThreadMessage({
 				className={containerClassName}
 				data-intelligence-message-id={email.id}
 				tabIndex={-1}
+				aria-label={`Message from ${senderLabel}, ${formatDetailDate(email.date)}`}
 			>
 				<button
 					type="button"
@@ -109,6 +110,7 @@ export default function ThreadMessage({
 			className={`group/thread-msg ${containerClassName}`}
 			data-intelligence-message-id={email.id}
 			tabIndex={-1}
+			aria-label={`Message from ${senderLabel}, ${formatDetailDate(email.date)}`}
 		>
 			<div className="px-4 py-4 md:px-6">
 				<div className="flex items-center justify-between gap-3 mb-3">

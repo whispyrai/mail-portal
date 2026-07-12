@@ -525,4 +525,18 @@ export const mailboxMigrations: Migration[] = [
 				WHERE draft_create_key IS NOT NULL;
 		`),
 	},
+	{
+		name: "20_add_today_brief_generation_claims",
+		sql: txn(`
+			CREATE TABLE today_brief_generation_claims (
+				cache_key TEXT PRIMARY KEY,
+				owner_user_id TEXT NOT NULL,
+				claim_token TEXT NOT NULL,
+				expires_at INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE INDEX idx_today_brief_generation_claim_expiry
+				ON today_brief_generation_claims(expires_at, cache_key);
+		`),
+	},
 ];

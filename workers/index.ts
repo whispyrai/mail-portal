@@ -37,6 +37,7 @@ import { searchRoutes } from "./routes/search";
 import { recipientSuggestionRoutes } from "./routes/recipient-suggestions";
 import { mailboxSignatureSettingsRoutes } from "./routes/mailbox-signature-settings";
 import { aiDraftRoutes } from "./routes/ai-drafts";
+import { todayBriefRoutes } from "./routes/today-brief";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -208,6 +209,7 @@ app.route("/", searchRoutes);
 app.route("/", recipientSuggestionRoutes);
 app.route("/", mailboxSignatureSettingsRoutes);
 app.route("/", aiDraftRoutes);
+app.route("/", todayBriefRoutes);
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");

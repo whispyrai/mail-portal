@@ -32,7 +32,7 @@ test("Today is a private daily workspace with complete reminder controls", () =>
 test("Today has accessible loading, failure, empty, and responsive states", () => {
 	assert.match(workspace, /role="status"/);
 	assert.match(workspace, /role="alert"/);
-	assert.match(workspace, /Your desk is clear/);
+	assert.match(workspace, /No personal follow-ups/);
 	assert.match(workspace, /aria-live="polite"/);
 	assert.match(workspace, /mutationFeedback\.kind === "error" \? "alert" : "status"/);
 	assert.match(workspace, /mutationsDisabled=\{isMutating\}/);

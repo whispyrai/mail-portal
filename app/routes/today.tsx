@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router";
 import MailboxSplitView from "~/components/MailboxSplitView";
 import TodayWorkspace, {
@@ -13,6 +14,10 @@ import {
 	useFollowUpReminderOperation,
 	useFollowUpReminders,
 } from "~/queries/follow-up-reminders";
+import {
+	invalidateTodayBrief,
+	useTodayBrief,
+} from "~/queries/today-brief";
 import { useUIStore } from "~/hooks/useUIStore";
 
 function originLabel(value: string): string {
@@ -34,7 +39,10 @@ function rescheduledLabel(value: string): string {
 
 export default function TodayRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
+	const queryClient = useQueryClient();
 	const reminders = useFollowUpReminders(mailboxId);
+	const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+	const todayBrief = useTodayBrief(mailboxId, timeZone, reminders.isSuccess);
 	const operation = useFollowUpReminderOperation();
 	const { selectedEmailId, selectEmail, closePanel } = useUIStore();
 	const [now, setNow] = useState(() => new Date());
@@ -96,6 +104,7 @@ export default function TodayRoute() {
 			void operation.mutateAsync(variables)
 				.then(() => {
 					operationIds.current.delete(identity);
+					void invalidateTodayBrief(queryClient, mailboxId);
 					const message = input.action === "complete"
 						? `Follow-up from ${origin} marked complete.`
 						: input.action === "dismiss"
@@ -132,15 +141,19 @@ export default function TodayRoute() {
 					}
 				});
 		},
-		[mailboxId, operation],
+		[mailboxId, operation, queryClient],
 	);
 	const pendingReminderId = mailboxId
 		? pendingByMailbox.current.get(mailboxId) ?? null
 		: null;
+	const briefIsRefreshing = todayBrief.isFetching && todayBrief.isStale;
 
 	return (
 		<MailboxSplitView selectedEmailId={selectedEmailId}>
 			<TodayWorkspace
+				brief={briefIsRefreshing ? undefined : todayBrief.data}
+				briefIsLoading={todayBrief.isLoading || briefIsRefreshing}
+				briefError={todayBrief.error}
 				reminders={reminders.data ?? []}
 				isLoading={reminders.isLoading}
 				error={reminders.error}
@@ -151,8 +164,10 @@ export default function TodayRoute() {
 				onOpenConversation={(reminder) =>
 					selectEmail(reminder.baselineMessageId)
 				}
+				onOpenBriefSource={(messageId) => selectEmail(messageId)}
 				onAction={handleAction}
 				onRetry={() => reminders.refetch()}
+				onRetryBrief={() => todayBrief.refetch()}
 				onDismissFeedback={() => {
 					if (mailboxId) feedbackByMailbox.current.delete(mailboxId);
 					setMutationFeedback(null);
