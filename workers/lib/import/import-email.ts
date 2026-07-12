@@ -141,6 +141,7 @@ export async function importParsedEmail(
 			threadId,
 			recipientMemoryOrigin: RecipientMemoryOrigins.ADMIN_IMPORT,
 			attachmentIdNamespace,
+			mailboxAddress: mailboxId,
 		});
 
 		return { status: "imported" as const, id, folder };

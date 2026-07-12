@@ -124,6 +124,7 @@ test("importParsedEmail preserves metadata, attachments, threads, and idempotenc
 	assert.equal(createdEmails[0]?.email.date, "2026-04-15T15:42:00.000Z");
 	assert.equal(createdEmails[0]?.email.read, true);
 	assert.equal(createdEmails[0]?.email.recipient_memory_origin, "admin_import");
+	assert.equal(createdEmails[0]?.email.sender_name, "Sender");
 	assert.equal(createdEmails[0]?.email.thread_id, expectedThreadId);
 	assert.equal(createdEmails[0]?.attachments[0]?.filename, "contract_.pdf");
 	assert.equal(createdEmails[0]?.attachments[0]?.email_id, imported.id);

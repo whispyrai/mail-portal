@@ -79,6 +79,7 @@ export function buildInitialComposeFields(input: {
 	if (!original) {
 		return {
 			...EMPTY_FIELDS,
+			to: mode === "new" ? composeOptions.initialTo ?? "" : "",
 			body: withSignature(signature?.enabled ? "<p><br></p>" : "", "new", signature),
 		};
 	}

@@ -132,6 +132,7 @@ export default function MailboxRoute() {
 		closePanel,
 	} = useUIStore();
 	const hasValuableComposeSeed = Boolean(
+		composeOptions.initialTo ||
 		composeOptions.draftEmail &&
 			(!composeOptions.draftEmail.id ||
 				composeOptions.draftEmail.subject ||

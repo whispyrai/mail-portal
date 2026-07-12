@@ -7,6 +7,7 @@ import { extractThreadTokens } from "./thread-token.ts";
 import { sanitizeFilename, type StoredAttachment } from "./attachments.ts";
 import type { RecipientMemoryOrigin } from "../../shared/recipient-suggestions.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
+import { normalizeObservedSenderName } from "./people/index.ts";
 
 export const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
@@ -14,6 +15,7 @@ type StoredEmail = {
 	id: string;
 	subject: string;
 	sender: string;
+	sender_name: string | null;
 	recipient: string;
 	cc: string | null;
 	bcc: string | null;
@@ -163,6 +165,7 @@ export async function storeParsedEmail(
 				id: messageId,
 				subject: parsed.subject ?? "",
 				sender: parsed.from?.address?.toLowerCase() ?? "",
+				sender_name: normalizeObservedSenderName(parsed.from?.name),
 				recipient: addresses(parsed.to).join(", "),
 				cc: addresses(parsed.cc).join(", ") || null,
 				bcc: addresses(parsed.bcc).join(", ") || null,

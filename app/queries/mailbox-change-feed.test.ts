@@ -10,6 +10,7 @@ import {
 	MAILBOX_CHANGE_HIDDEN_MAX_BACKOFF_MS,
 	MAILBOX_CHANGE_VISIBLE_MAX_BACKOFF_MS,
 	createMailboxChangeFeedController,
+	exitRevokedMailbox,
 	invalidateMailboxChangeQueries,
 	mailboxChangeCursorStorageKey,
 	resolveMailboxChangeFeedStorage,
@@ -87,6 +88,9 @@ test("each feed resource invalidates only its deterministic non-AI mailbox proje
 		attachments: ["attachments", mailboxId, "list", { q: "", kind: "", folder: "" }],
 		attachmentDetail: ["attachments", mailboxId, "detail", "attachment-1"],
 		attachmentBytes: ["attachments", mailboxId, "bytes", "message-1", "attachment-1"],
+		peopleList: ["people", mailboxId, "list", { q: "", sort: "recent" }],
+		peopleDetail: ["people", mailboxId, "detail", "person-1"],
+		peopleTimeline: ["people", mailboxId, "timeline", "person-1"],
 		labels: ["labels", mailboxId],
 		outbound: ["outbound", mailboxId, "message-1"],
 		ai: ["conversation-intelligence", mailboxId, "message-1"],
@@ -145,6 +149,9 @@ test("each feed resource invalidates only its deterministic non-AI mailbox proje
 		keys.activity,
 		keys.attachments,
 		keys.attachmentDetail,
+		keys.peopleList,
+		keys.peopleDetail,
+		keys.peopleTimeline,
 		keys.labels,
 		keys.outbound,
 	]) {
@@ -213,6 +220,21 @@ test("message and folder changes refresh Files metadata while attachment changes
 			scenario.resource,
 		);
 	}
+});
+
+test("attachment changes refresh People evidence without refetching the People list", async () => {
+	const mailboxId = "team@example.com";
+	const queryClient = new QueryClient();
+	const list = ["people", mailboxId, "list", { q: "", sort: "recent" }] as const;
+	const detail = ["people", mailboxId, "detail", "person-1"] as const;
+	const timeline = ["people", mailboxId, "timeline", "person-1"] as const;
+	for (const key of [list, detail, timeline]) queryClient.setQueryData(key, { ready: true });
+
+	await invalidateMailboxChangeQueries(queryClient, mailboxId, [change("attachment")]);
+
+	assert.equal(queryClient.getQueryState(list)?.isInvalidated, false);
+	assert.equal(queryClient.getQueryState(detail)?.isInvalidated, true);
+	assert.equal(queryClient.getQueryState(timeline)?.isInvalidated, true);
 });
 
 test("the feed resumes from and stores one versioned mailbox cursor without mail content", async () => {
@@ -482,6 +504,31 @@ test("revoked mailbox exit never waits for a stalled accessible-mailbox refresh"
 	assert.equal(refreshStarted, true);
 	assert.deepEqual(losses, ["revoked@example.com"]);
 	controller.stop();
+});
+
+test("a direct feature 403 reuses the revoked-mailbox exit without waiting for refresh", () => {
+	const mailboxId = "revoked@example.com";
+	const queryClient = new QueryClient();
+	queryClient.setQueryData(["people", mailboxId, "list", {}], { secret: true });
+	let refreshStarted = false;
+	let exited = false;
+	queryClient.invalidateQueries = (() => {
+		refreshStarted = true;
+		return new Promise(() => undefined);
+	}) as typeof queryClient.invalidateQueries;
+
+	exitRevokedMailbox({
+		queryClient,
+		mailboxId,
+		storage: memoryStorage().storage,
+		onExit: () => {
+			exited = true;
+		},
+	});
+
+	assert.equal(queryClient.getQueryData(["people", mailboxId, "list", {}]), undefined);
+	assert.equal(refreshStarted, true);
+	assert.equal(exited, true);
 });
 
 test("unavailable browser storage falls back safely and read/write failures never stop live invalidation", async () => {

@@ -667,4 +667,56 @@ export const mailboxMigrations: Migration[] = [
 			END;
 		`),
 	},
+	{
+		name: "24_add_mail_people_projection",
+		sql: txn(`
+			ALTER TABLE emails ADD COLUMN sender_name TEXT;
+			CREATE INDEX idx_emails_people_backfill
+				ON emails(date DESC, id ASC);
+
+			CREATE TABLE mail_people (
+				id TEXT PRIMARY KEY,
+				address TEXT NOT NULL COLLATE NOCASE UNIQUE,
+				domain TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			);
+
+			CREATE TABLE mail_message_participants (
+				source_email_id TEXT NOT NULL,
+				person_id TEXT NOT NULL,
+				role TEXT NOT NULL CHECK(role IN ('from', 'to', 'cc', 'bcc')),
+				direction TEXT NOT NULL CHECK(direction IN ('sent', 'received')),
+				occurred_at TEXT NOT NULL,
+				conversation_id TEXT NOT NULL,
+				origin TEXT NOT NULL CHECK(origin IN (
+					'live_inbound', 'accepted_outbound', 'admin_import'
+				)),
+				observed_name TEXT,
+				PRIMARY KEY(source_email_id, person_id, role),
+				FOREIGN KEY(source_email_id) REFERENCES emails(id) ON DELETE CASCADE,
+				FOREIGN KEY(person_id) REFERENCES mail_people(id) ON DELETE CASCADE
+			);
+
+			CREATE INDEX idx_mail_participants_person_time
+				ON mail_message_participants(person_id, occurred_at DESC, source_email_id);
+			CREATE INDEX idx_mail_participants_conversation_person
+				ON mail_message_participants(conversation_id, person_id, occurred_at DESC);
+			CREATE INDEX idx_mail_people_domain_address
+				ON mail_people(domain, address);
+
+			CREATE TABLE people_projection_state (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+				status TEXT NOT NULL CHECK(status IN ('building', 'ready', 'failed')),
+				baseline_change_sequence INTEGER NOT NULL,
+				applied_change_sequence INTEGER NOT NULL,
+				backfill_date TEXT,
+				backfill_message_id TEXT,
+				processed_messages INTEGER NOT NULL,
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				last_error TEXT
+			);
+		`),
+	},
 ];

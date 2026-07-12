@@ -143,6 +143,17 @@ import {
 	validateNormalizedMailboxChangeQuery,
 	type NormalizedMailboxChangeQuery,
 } from "../../shared/mailbox-change-feed.ts";
+import { createMailPeopleProjector } from "../lib/people/index.ts";
+import type {
+	NormalizedMailPeopleListQuery,
+	NormalizedMailPersonTimelineQuery,
+} from "../../shared/mail-people.ts";
+import {
+	validateMailPersonId,
+	validateNormalizedMailPeopleListQuery,
+	validateNormalizedMailPersonTimelineQuery,
+} from "../../shared/mail-people.ts";
+import { normalizeMailAddress } from "../lib/mail-address.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -199,6 +210,7 @@ interface EmailData {
 	id: string;
 	subject: string;
 	sender: string;
+	sender_name?: string | null;
 	recipient: string;
 	cc?: string | null;
 	bcc?: string | null;
@@ -2664,6 +2676,7 @@ export class MailboxDO extends DurableObject<Env> {
 					folder_id: folderId,
 					subject: email.subject,
 					sender: email.sender,
+					sender_name: email.sender_name ?? null,
 					recipient: email.recipient,
 					cc: email.cc ?? null,
 					bcc: email.bcc ?? null,
@@ -2696,6 +2709,12 @@ export class MailboxDO extends DurableObject<Env> {
 					mailboxAddress,
 					addresses: interaction.addresses,
 				});
+			}
+			if (mailboxAddress && email.recipient_memory_origin) {
+				createMailPeopleProjector({
+					store: this.ctx.storage,
+					mailboxAddress,
+				}).projectMessage(email.id);
 			}
 			if (folderId === Folders.INBOX && email.snooze_wake_thread_id) {
 				this.ctx.storage.sql.exec(
@@ -3501,6 +3520,10 @@ export class MailboxDO extends DurableObject<Env> {
 					mailboxAddress: snapshot.mailboxId,
 					addresses: [...snapshot.to, ...snapshot.cc, ...snapshot.bcc],
 				});
+				createMailPeopleProjector({
+					store: this.ctx.storage,
+					mailboxAddress: snapshot.mailboxId,
+				}).projectMessage(emailId);
 			}
 			this.#recordActivity(
 				actor,
@@ -3526,6 +3549,50 @@ export class MailboxDO extends DurableObject<Env> {
 			mailboxAddress,
 			query,
 			limit,
+		);
+	}
+
+	async listMailPeople(
+		mailboxAddress: string,
+		query: NormalizedMailPeopleListQuery,
+	) {
+		const normalizedMailbox = normalizeMailAddress(mailboxAddress);
+		if (!normalizedMailbox || normalizedMailbox !== mailboxAddress) {
+			throw new Error("Mailbox address is invalid");
+		}
+		return createMailPeopleProjector({
+			store: this.ctx.storage,
+			mailboxAddress: normalizedMailbox,
+		}).listPeople(validateNormalizedMailPeopleListQuery(query));
+	}
+
+	async getMailPerson(mailboxAddress: string, personId: string) {
+		const normalizedMailbox = normalizeMailAddress(mailboxAddress);
+		if (!normalizedMailbox || normalizedMailbox !== mailboxAddress) {
+			throw new Error("Mailbox address is invalid");
+		}
+		return createMailPeopleProjector({
+			store: this.ctx.storage,
+			mailboxAddress: normalizedMailbox,
+		}).getPerson(validateMailPersonId(personId));
+	}
+
+	async listMailPersonTimeline(
+		mailboxAddress: string,
+		personId: string,
+		query: NormalizedMailPersonTimelineQuery,
+	) {
+		const normalizedMailbox = normalizeMailAddress(mailboxAddress);
+		if (!normalizedMailbox || normalizedMailbox !== mailboxAddress) {
+			throw new Error("Mailbox address is invalid");
+		}
+		const id = validateMailPersonId(personId);
+		return createMailPeopleProjector({
+			store: this.ctx.storage,
+			mailboxAddress: normalizedMailbox,
+		}).listPersonTimeline(
+			id,
+			validateNormalizedMailPersonTimelineQuery(query, id),
 		);
 	}
 

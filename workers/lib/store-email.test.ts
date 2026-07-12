@@ -53,6 +53,28 @@ test("heuristic same-subject threading never gains Snooze wake authority", async
 	assert.equal(state.created[0]!.snooze_wake_thread_id, null);
 });
 
+test("storeParsedEmail persists only normalized control-safe structured sender names", async () => {
+	const valid = dependencies();
+	await storeParsedEmail(valid.value, parsed({
+		from: { address: "person@example.com", name: "  Person   Name  " },
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "valid-name",
+	});
+	assert.equal(valid.created[0]?.sender_name, "Person Name");
+
+	const unsafe = dependencies();
+	await storeParsedEmail(unsafe.value, parsed({
+		from: { address: "person@example.com", name: "Deceptive\u202EName" },
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "unsafe-name",
+	});
+	assert.equal(unsafe.created[0]?.sender_name, null);
+});
+
 test("live RFC reply identity may wake its exact stored thread", async () => {
 	const state = dependencies();
 	await storeParsedEmail(state.value, parsed({

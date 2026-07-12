@@ -45,6 +45,39 @@ test("draft content remains authoritative over signatures and mode defaults", ()
 	});
 });
 
+test("a People compose action seeds only the observed address", () => {
+	const fields = buildInitialComposeFields({
+		composeOptions: {
+			mode: "new",
+			initialTo: "contact@example.com",
+		},
+		signature: { enabled: true, text: "Team" },
+	});
+
+	assert.equal(fields.to, "contact@example.com");
+	assert.equal(fields.subject, "");
+	assert.match(fields.body, /data-mail-signature="v1"/);
+});
+
+test("draft and reply modes never accept a People recipient seed", () => {
+	const draft = buildInitialComposeFields({
+		composeOptions: {
+			mode: "new",
+			initialTo: "people@example.com",
+			draftEmail: { ...original, recipient: "draft@example.com" },
+		},
+	});
+	const incompleteReply = buildInitialComposeFields({
+		composeOptions: {
+			mode: "reply",
+			initialTo: "people@example.com",
+		},
+	});
+
+	assert.equal(draft.to, "draft@example.com");
+	assert.equal(incompleteReply.to, "");
+});
+
 test("reply-all excludes the mailbox and inserts one marked signature", () => {
 	const fields = buildInitialComposeFields({
 		composeOptions: { mode: "reply-all", originalEmail: original },

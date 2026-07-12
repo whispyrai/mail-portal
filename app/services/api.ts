@@ -35,6 +35,17 @@ import {
 	validateMailboxChangePage,
 	type MailboxChangePage,
 } from "../../shared/mailbox-change-feed.ts";
+import {
+	normalizeMailPeopleListQuery,
+	normalizeMailPersonTimelineQuery,
+	validateMailPeopleListResponse,
+	validateMailPersonDetailResponse,
+	validateMailPersonTimelineResponse,
+	type MailPeopleListResponse,
+	type MailPeopleSort,
+	type MailPersonDetailResponse,
+	type MailPersonTimelineResponse,
+} from "../../shared/mail-people.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -135,6 +146,18 @@ export interface MailboxAttachmentListRequest {
 	cursor?: string | null;
 }
 
+export type MailPeopleListRequest = {
+	limit?: number;
+	q?: string;
+	sort?: MailPeopleSort;
+	cursor?: string | null;
+};
+
+export type MailPersonTimelineRequest = {
+	limit?: number;
+	cursor?: string | null;
+};
+
 function encodedPathPart(value: string): string {
 	return encodeURIComponent(value);
 }
@@ -206,6 +229,46 @@ const api = {
 				signal: opts?.signal,
 			},
 		).then((value) => validateMailboxChangePage(value, after));
+	},
+	listMailPeople: (
+		mailboxId: string,
+		input: MailPeopleListRequest,
+		opts?: { signal?: AbortSignal },
+	): Promise<MailPeopleListResponse> => {
+		const params = new URLSearchParams();
+		if (input.limit !== undefined) params.set("limit", String(input.limit));
+		if (input.q) params.set("q", input.q);
+		if (input.sort) params.set("sort", input.sort);
+		if (input.cursor) params.set("cursor", input.cursor);
+		const normalized = normalizeMailPeopleListQuery(params);
+		return get<unknown>(
+			`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/people`,
+			{ params: Object.fromEntries(params), signal: opts?.signal },
+		).then((value) => validateMailPeopleListResponse(value, normalized));
+	},
+	getMailPerson: (
+		mailboxId: string,
+		personId: string,
+		opts?: { signal?: AbortSignal },
+	): Promise<MailPersonDetailResponse> => get<unknown>(
+		`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/people/${encodedPathPart(personId)}`,
+		{ signal: opts?.signal },
+	).then((value) => validateMailPersonDetailResponse(value, personId)),
+	listMailPersonTimeline: (
+		mailboxId: string,
+		personId: string,
+		input: MailPersonTimelineRequest,
+		opts?: { signal?: AbortSignal },
+	): Promise<MailPersonTimelineResponse> => {
+		const params = new URLSearchParams();
+		if (input.limit !== undefined) params.set("limit", String(input.limit));
+		if (input.cursor) params.set("cursor", input.cursor);
+		const normalized = normalizeMailPersonTimelineQuery(params, personId);
+		return get<unknown>(
+			`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/people/${encodedPathPart(personId)}/timeline`,
+			{ params: Object.fromEntries(params), signal: opts?.signal },
+		).then((value) =>
+			validateMailPersonTimelineResponse(value, personId, normalized));
 	},
 
 	// Emails

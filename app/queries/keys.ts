@@ -26,6 +26,16 @@ export const queryKeys = {
 		bytes: (mailboxId: string, emailId: string, attachmentId: string) =>
 			["attachments", mailboxId, "bytes", emailId, attachmentId] as const,
 	},
+	people: {
+		list: (
+			mailboxId: string,
+			filters: { q: string; sort: string },
+		) => ["people", mailboxId, "list", filters] as const,
+		detail: (mailboxId: string, personId: string) =>
+			["people", mailboxId, "detail", personId] as const,
+		timeline: (mailboxId: string, personId: string) =>
+			["people", mailboxId, "timeline", personId] as const,
+	},
 	folders: {
 		list: (mailboxId: string) => ["folders", mailboxId] as const,
 	},

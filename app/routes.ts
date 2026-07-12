@@ -9,6 +9,7 @@ export default [
 	route("mailbox/:mailboxId", "routes/mailbox.tsx", [
 		index("routes/mailbox-index.tsx"),
 		route("today", "routes/today.tsx"),
+		route("people", "routes/people.tsx"),
 		route("attachments", "routes/attachments.tsx"),
 		route("emails/:folder", "routes/email-list.tsx"),
 		route("settings", "routes/settings.tsx"),

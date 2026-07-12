@@ -89,6 +89,7 @@ type InvalidatedQueryRoot =
 	| "folders"
 	| "labels"
 	| "outbound"
+	| "people"
 	| "recipient-suggestions"
 	| "saved-view-results"
 	| "search";
@@ -99,6 +100,7 @@ const INVALIDATED_ROOTS_BY_RESOURCE: Record<MailboxChange["resource"], readonly 
 		"conversation-activity",
 		"emails",
 		"folders",
+		"people",
 		"recipient-suggestions",
 		"saved-view-results",
 		"search",
@@ -107,6 +109,7 @@ const INVALIDATED_ROOTS_BY_RESOURCE: Record<MailboxChange["resource"], readonly 
 		"attachments",
 		"conversation-activity",
 		"emails",
+		"people",
 		"saved-view-results",
 		"search",
 	],
@@ -123,13 +126,21 @@ export function invalidateMailboxChangeQueries(
 	changes: readonly MailboxChange[],
 ): Promise<void> {
 	const roots = new Set<InvalidatedQueryRoot>();
+	let messagePeopleChanged = false;
+	let attachmentPeopleChanged = false;
 	for (const change of changes) {
+		if (change.resource === "message") messagePeopleChanged = true;
+		if (change.resource === "attachment") attachmentPeopleChanged = true;
 		for (const root of INVALIDATED_ROOTS_BY_RESOURCE[change.resource]) roots.add(root);
 	}
 	if (roots.size === 0) return Promise.resolve();
 	return queryClient.invalidateQueries({
 		predicate: (query) => {
 			const [root, scopedMailboxId, projection] = query.queryKey;
+			if (root === "people" && scopedMailboxId === mailboxId) {
+				return messagePeopleChanged ||
+					(attachmentPeopleChanged && (projection === "detail" || projection === "timeline"));
+			}
 			return (
 				typeof root === "string" &&
 				roots.has(root as InvalidatedQueryRoot) &&
@@ -186,6 +197,17 @@ function evictRevokedMailbox(
 		queryKey: ["mailboxes"],
 		exact: true,
 	});
+}
+
+export function exitRevokedMailbox(input: {
+	queryClient: QueryClient;
+	mailboxId: string;
+	storage: MailboxChangeFeedStorage;
+	onExit?: (mailboxId: string) => void;
+}): void {
+	removeCursor(input.storage, input.mailboxId);
+	evictRevokedMailbox(input.queryClient, input.mailboxId);
+	input.onExit?.(input.mailboxId);
 }
 
 export function createMailboxChangeFeedController(input: {
@@ -250,11 +272,16 @@ export function createMailboxChangeFeedController(input: {
 				active = false;
 				clearTimer();
 				detachListeners();
-				removeCursor(input.storage, input.mailboxId);
-				evictRevokedMailbox(input.queryClient, input.mailboxId);
-				if (controller === requestController) {
-					input.onAccessLost?.(input.mailboxId);
-				}
+				exitRevokedMailbox({
+					queryClient: input.queryClient,
+					mailboxId: input.mailboxId,
+					storage: input.storage,
+					onExit: controller === requestController
+						? input.onAccessLost
+						: undefined,
+				});
+				// Navigation intentionally does not wait for the accessible-mailbox
+				// refresh started by exitRevokedMailbox.
 			} else if (active && !requestController.signal.aborted) {
 				consecutiveFailures += 1;
 			}

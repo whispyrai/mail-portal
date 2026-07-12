@@ -36,6 +36,7 @@ export const emails = sqliteTable("emails", {
 	thread_id: text("thread_id"),
 	message_id: text("message_id"),
 	raw_headers: text("raw_headers"),
+	sender_name: text("sender_name"),
 	recipient_memory_origin: text("recipient_memory_origin", {
 		enum: ["live_inbound", "accepted_outbound", "admin_import"],
 	}),
@@ -162,6 +163,64 @@ export const mailboxChanges = sqliteTable("mailbox_changes", {
 	operation: text("operation", {
 		enum: ["created", "updated", "deleted"],
 	}).notNull(),
+});
+
+export const mailPeople = sqliteTable(
+	"mail_people",
+	{
+		id: text("id").primaryKey(),
+		address: text("address").notNull().unique(),
+		domain: text("domain").notNull(),
+		created_at: text("created_at").notNull(),
+	},
+	(table) => [index("idx_mail_people_domain_address").on(table.domain, table.address)],
+);
+
+export const mailMessageParticipants = sqliteTable(
+	"mail_message_participants",
+	{
+		source_email_id: text("source_email_id")
+			.notNull()
+			.references(() => emails.id, { onDelete: "cascade" }),
+		person_id: text("person_id")
+			.notNull()
+			.references(() => mailPeople.id, { onDelete: "cascade" }),
+		role: text("role", { enum: ["from", "to", "cc", "bcc"] }).notNull(),
+		direction: text("direction", { enum: ["sent", "received"] }).notNull(),
+		occurred_at: text("occurred_at").notNull(),
+		conversation_id: text("conversation_id").notNull(),
+		origin: text("origin", {
+			enum: ["live_inbound", "accepted_outbound", "admin_import"],
+		}).notNull(),
+		observed_name: text("observed_name"),
+	},
+	(table) => [
+		primaryKey({ columns: [table.source_email_id, table.person_id, table.role] }),
+		index("idx_mail_participants_person_time").on(
+			table.person_id,
+			table.occurred_at,
+			table.source_email_id,
+		),
+		index("idx_mail_participants_conversation_person").on(
+			table.conversation_id,
+			table.person_id,
+			table.occurred_at,
+		),
+	],
+);
+
+export const peopleProjectionState = sqliteTable("people_projection_state", {
+	id: integer("id").primaryKey(),
+	schema_version: integer("schema_version").notNull(),
+	status: text("status", { enum: ["building", "ready", "failed"] }).notNull(),
+	baseline_change_sequence: integer("baseline_change_sequence").notNull(),
+	applied_change_sequence: integer("applied_change_sequence").notNull(),
+	backfill_date: text("backfill_date"),
+	backfill_message_id: text("backfill_message_id"),
+	processed_messages: integer("processed_messages").notNull(),
+	started_at: text("started_at").notNull(),
+	completed_at: text("completed_at"),
+	last_error: text("last_error"),
 });
 
 export const labels = sqliteTable(

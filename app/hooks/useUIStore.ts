@@ -18,6 +18,8 @@ export type ComposeMode = "new" | "reply" | "reply-all" | "forward";
 
 export interface ComposeOptions {
 	mode: ComposeMode;
+	/** Optional truthful recipient seed for a new message. */
+	initialTo?: string;
 	originalEmail?: Email | null;
 	/** When editing a draft, this holds the draft email to pre-fill the composer */
 	draftEmail?: Email | null;
