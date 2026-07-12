@@ -35,6 +35,7 @@ import { conversationIntelligenceApp } from "./routes/conversation-intelligence"
 import { conversationAnswerRoutes } from "./routes/conversation-answer";
 import { replyRefinementRoutes } from "./routes/reply-refinement";
 import { inboxTriageSuggestionRoutes } from "./routes/inbox-triage-suggestions";
+import { conversationActivityRoutes } from "./routes/conversation-activity";
 import { followUpReminderRoutes } from "./routes/follow-up-reminders";
 import { searchRoutes } from "./routes/search";
 import { recipientSuggestionRoutes } from "./routes/recipient-suggestions";
@@ -210,6 +211,7 @@ app.route("/", conversationIntelligenceApp);
 app.route("/", conversationAnswerRoutes);
 app.route("/", replyRefinementRoutes);
 app.route("/", inboxTriageSuggestionRoutes);
+app.route("/", conversationActivityRoutes);
 app.route("/", followUpReminderRoutes);
 app.route("/", searchRoutes);
 app.route("/", recipientSuggestionRoutes);

@@ -15,6 +15,7 @@ import LabelChip from "~/components/labels/LabelChip";
 import LabelPicker from "~/components/labels/LabelPicker";
 import OutboundDeliveryActions from "~/components/OutboundDeliveryActions";
 import ConversationIntelligenceCard from "~/components/ConversationIntelligenceCard";
+import ConversationActivity from "~/components/ConversationActivity";
 import SnoozeDialog from "~/components/SnoozeDialog";
 import { FollowUpReminderControl } from "~/components/FollowUpReminderDialog";
 import { splitEmailList, toEmailListValue } from "~/lib/utils";
@@ -23,7 +24,7 @@ import { planComposeEnqueueResult } from "~/lib/outbound-enqueue-outcome";
 import api from "~/services/api";
 import { useAiDraftReply, useCancelOutboundDelivery, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSaveDraft, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
-import { useMailbox } from "~/queries/mailboxes";
+import { useMailbox, useMailboxes } from "~/queries/mailboxes";
 import { useLabels, useMutateLabels } from "~/queries/labels";
 import { useUnsnooze } from "~/queries/snooze";
 import { useFollowUpReminders } from "~/queries/follow-up-reminders";
@@ -66,6 +67,15 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	const { data: currentMailbox } = useMailbox(mailboxId) as {
 		data?: Mailbox;
 	};
+	const { data: mailboxes = [] } = useMailboxes();
+	const activityMailboxType = mailboxId
+		? mailboxes.find((mailbox) =>
+			mailbox.id.toLowerCase() === mailboxId.toLowerCase() ||
+			mailbox.email.toLowerCase() === mailboxId.toLowerCase()
+		)?.type
+		: undefined;
+	const hasAuthoritativeActivityMailbox =
+		activityMailboxType === "PERSONAL" || activityMailboxType === "SHARED";
 	const { closePanel, startCompose } = useUIStore();
 	const toastManager = useKumoToastManager();
 	const [isSending, setIsSending] = useState(false);
@@ -530,6 +540,14 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 						mailboxId={mailboxId}
 						emailId={email.id}
 						onFocusMessage={focusMessage}
+					/>
+				)}
+				{mailboxId && hasAuthoritativeActivityMailbox && (
+					<ConversationActivity
+						key={`${mailboxId}:${email.id}`}
+						mailboxId={mailboxId}
+						emailId={email.id}
+						isSharedMailbox={activityMailboxType === "SHARED"}
 					/>
 				)}
 				{hasThread ? (

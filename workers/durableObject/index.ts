@@ -96,6 +96,7 @@ import { finalizeCommittedSnooze } from "../lib/snooze-liveness.ts";
 import { resolveUnambiguousThreadReference } from "../lib/thread-reference.ts";
 import { readConversationIntelligenceEvidenceProjection } from "../lib/conversation-intelligence-evidence.ts";
 import { projectInboxTriageCandidates } from "../lib/inbox-triage-candidates.ts";
+import { readConversationActivityProjection } from "../lib/conversation-activity.ts";
 import {
 	validateNormalizedInboxTriageSuggestionRequest,
 	type NormalizedInboxTriageSuggestionRequest,
@@ -779,6 +780,19 @@ export class MailboxDO extends DurableObject<Env> {
 			this.ctx.storage.sql,
 			emailId,
 		);
+	}
+
+	/** Read a bounded, redacted history projection without recording another event. */
+	async getConversationActivity(
+		emailId: string,
+		limit: number,
+		cursor: string | null,
+	) {
+		return readConversationActivityProjection(this.ctx.storage.sql, {
+			emailId,
+			limit,
+			cursor,
+		});
 	}
 
 	/** Project the exact visible Inbox page and bounded evidence for manual AI review. */
