@@ -45,6 +45,7 @@ import { aiDraftRoutes } from "./routes/ai-drafts";
 import { todayBriefRoutes } from "./routes/today-brief";
 import { mailboxAttachmentRoutes } from "./routes/mailbox-attachments";
 import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
+import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -224,6 +225,7 @@ app.route("/", aiDraftRoutes);
 app.route("/", todayBriefRoutes);
 app.route("/", mailboxAttachmentRoutes);
 app.route("/", mailboxAttachmentByteRoutes);
+app.route("/", mailboxChangeFeedRoutes);
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");

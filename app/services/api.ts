@@ -30,6 +30,11 @@ import {
 	parseMailboxAttachmentItem,
 	parseMailboxAttachmentPage,
 } from "./mailbox-attachment-response.ts";
+import {
+	decodeMailboxChangeCursor,
+	validateMailboxChangePage,
+	type MailboxChangePage,
+} from "../../shared/mailbox-change-feed.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -188,6 +193,20 @@ const api = {
 		put<Mailbox>(`/api/v1/mailboxes/${mailboxId}`, { settings }),
 	deleteMailbox: (mailboxId: string) =>
 		del<void>(`/api/v1/mailboxes/${mailboxId}`),
+	listMailboxChanges: (
+		mailboxId: string,
+		cursor: string | null,
+		opts?: { signal?: AbortSignal },
+	): Promise<MailboxChangePage> => {
+		const after = cursor === null ? null : decodeMailboxChangeCursor(cursor);
+		return get<unknown>(
+			`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/changes`,
+			{
+				params: cursor === null ? undefined : { after: cursor },
+				signal: opts?.signal,
+			},
+		).then((value) => validateMailboxChangePage(value, after));
+	},
 
 	// Emails
 	listEmails: (mailboxId: string, params: Record<string, string>, opts?: { signal?: AbortSignal }) =>

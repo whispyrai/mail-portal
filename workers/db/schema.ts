@@ -142,6 +142,28 @@ export const activityEvents = sqliteTable("activity_events", {
 	occurred_at: text("occurred_at").notNull(),
 });
 
+export const mailboxChanges = sqliteTable("mailbox_changes", {
+	sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+	schema_version: integer("schema_version").notNull(),
+	committed_at: text("committed_at").notNull(),
+	resource: text("resource", {
+		enum: [
+			"message",
+			"attachment",
+			"folder",
+			"label",
+			"message_label",
+			"delivery",
+			"delivery_attempt",
+		],
+	}).notNull(),
+	entity_id: text("entity_id").notNull(),
+	parent_id: text("parent_id"),
+	operation: text("operation", {
+		enum: ["created", "updated", "deleted"],
+	}).notNull(),
+});
+
 export const labels = sqliteTable(
 	"labels",
 	{

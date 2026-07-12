@@ -14,6 +14,7 @@ import MailCommandPalette from "~/components/MailCommandPalette";
 import Sidebar from "~/components/Sidebar";
 import { useMailNotifications } from "~/hooks/useMailNotifications";
 import { useRebindExistingPushSubscription } from "~/hooks/pwa/usePushSubscription";
+import { useMailboxChangeFeed } from "~/queries/mailbox-change-feed";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
 import { hasComposeRecovery } from "~/lib/compose-recovery";
@@ -111,6 +112,7 @@ export default function MailboxRoute() {
 	// New-mail toasts + unread tab-title counter, scoped to this mailbox.
 	useMailNotifications(mailboxId);
 	useRebindExistingPushSubscription(mailboxId);
+	useMailboxChangeFeed(mailboxId);
 	const prevMailboxIdRef = useRef<string | undefined>(undefined);
 	const [composeRetryKey, setComposeRetryKey] = useState(0);
 	const ComposeEmail = useMemo(

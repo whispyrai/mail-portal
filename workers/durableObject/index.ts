@@ -138,6 +138,11 @@ import {
 	readMailboxAttachmentForEmail,
 	readMailboxAttachmentPage,
 } from "../lib/mailbox-attachments.ts";
+import { readMailboxChanges } from "../lib/mailbox-change-feed.ts";
+import {
+	validateNormalizedMailboxChangeQuery,
+	type NormalizedMailboxChangeQuery,
+} from "../../shared/mailbox-change-feed.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -2075,6 +2080,13 @@ export class MailboxDO extends DurableObject<Env> {
 			this.ctx.storage.sql,
 			emailId,
 			attachmentId,
+		);
+	}
+
+	async listMailboxChanges(options: NormalizedMailboxChangeQuery) {
+		return readMailboxChanges(
+			this.ctx.storage.sql,
+			validateNormalizedMailboxChangeQuery(options),
 		);
 	}
 

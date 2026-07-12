@@ -559,4 +559,112 @@ export const mailboxMigrations: Migration[] = [
 				ON import_generation_claims(expires_at, message_id);
 		`,
 	},
+	{
+		name: "23_add_mailbox_change_feed",
+		sql: txn(`
+			CREATE TABLE mailbox_changes (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+				committed_at TEXT NOT NULL,
+				resource TEXT NOT NULL CHECK(resource IN (
+					'message', 'attachment', 'folder', 'label', 'message_label',
+					'delivery', 'delivery_attempt'
+				)),
+				entity_id TEXT NOT NULL,
+				parent_id TEXT,
+				operation TEXT NOT NULL CHECK(operation IN ('created', 'updated', 'deleted'))
+			);
+
+			CREATE TRIGGER mailbox_changes_emails_insert AFTER INSERT ON emails BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_emails_update AFTER UPDATE ON emails BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_emails_delete AFTER DELETE ON emails BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', OLD.id, NULL, 'deleted');
+			END;
+
+			CREATE TRIGGER mailbox_changes_attachments_insert AFTER INSERT ON attachments BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'attachment', NEW.id, NEW.email_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_attachments_update AFTER UPDATE ON attachments BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'attachment', NEW.id, NEW.email_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_attachments_delete AFTER DELETE ON attachments BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'attachment', OLD.id, OLD.email_id, 'deleted');
+			END;
+
+			CREATE TRIGGER mailbox_changes_folders_insert AFTER INSERT ON folders BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'folder', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_folders_update AFTER UPDATE ON folders BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'folder', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_folders_delete AFTER DELETE ON folders BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'folder', OLD.id, NULL, 'deleted');
+			END;
+
+			CREATE TRIGGER mailbox_changes_labels_insert AFTER INSERT ON labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'label', NEW.id, NULL, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_labels_update AFTER UPDATE ON labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'label', NEW.id, NULL, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_labels_delete AFTER DELETE ON labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'label', OLD.id, NULL, 'deleted');
+			END;
+
+			CREATE TRIGGER mailbox_changes_email_labels_insert AFTER INSERT ON email_labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message_label', NEW.email_id || ':' || NEW.label_id, NEW.email_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_email_labels_update AFTER UPDATE ON email_labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message_label', NEW.email_id || ':' || NEW.label_id, NEW.email_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_email_labels_delete AFTER DELETE ON email_labels BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message_label', OLD.email_id || ':' || OLD.label_id, OLD.email_id, 'deleted');
+			END;
+
+			CREATE TRIGGER mailbox_changes_deliveries_insert AFTER INSERT ON outbound_deliveries BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery', NEW.id, NEW.email_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_deliveries_update AFTER UPDATE ON outbound_deliveries BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery', NEW.id, NEW.email_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_deliveries_delete AFTER DELETE ON outbound_deliveries BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery', OLD.id, OLD.email_id, 'deleted');
+			END;
+
+			CREATE TRIGGER mailbox_changes_delivery_attempts_insert AFTER INSERT ON outbound_delivery_attempts BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', NEW.id, NEW.delivery_id, 'created');
+			END;
+			CREATE TRIGGER mailbox_changes_delivery_attempts_update AFTER UPDATE ON outbound_delivery_attempts BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', NEW.id, NEW.delivery_id, 'updated');
+			END;
+			CREATE TRIGGER mailbox_changes_delivery_attempts_delete AFTER DELETE ON outbound_delivery_attempts BEGIN
+				INSERT INTO mailbox_changes(schema_version, committed_at, resource, entity_id, parent_id, operation)
+				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', OLD.id, OLD.delivery_id, 'deleted');
+			END;
+		`),
+	},
 ];
