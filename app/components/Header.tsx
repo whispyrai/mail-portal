@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { CommandIcon, ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, XIcon } from "@phosphor-icons/react";
+import { CommandIcon, ExamIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, PaperPlaneTiltIcon, RobotIcon, ShieldCheckIcon, SignOutIcon, SparkleIcon, XIcon } from "@phosphor-icons/react";
 import { type KeyboardEvent, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import { useUIStore } from "~/hooks/useUIStore";
@@ -56,11 +56,15 @@ export default function Header() {
 
 	// Sync search input with URL query param so it stays populated
 	const urlQuery = searchParams.get("q") || "";
+	const navigationDraft =
+		typeof (location.state as { aiSearchDraft?: unknown } | null)?.aiSearchDraft === "string"
+			? (location.state as { aiSearchDraft: string }).aiSearchDraft
+			: "";
 	useEffect(() => {
-		if (location.pathname.includes("/search") && urlQuery) {
-			setSearchQuery(urlQuery);
-		}
-	}, [urlQuery, location.pathname]);
+		setSearchQuery(
+			location.pathname.includes("/search") ? urlQuery || navigationDraft : "",
+		);
+	}, [mailboxId, urlQuery, navigationDraft, location.pathname]);
 
 	const performSearch = () => {
 		if (mailboxId && searchQuery.trim()) {
@@ -68,6 +72,14 @@ export default function Header() {
 			navigate(`/mailbox/${mailboxId}/search?q=${encodeURIComponent(q)}`);
 			setIsSearchExpanded(false);
 		}
+	};
+
+	const openAiSearch = () => {
+		if (!mailboxId) return;
+		navigate(`/mailbox/${mailboxId}/search`, {
+			state: { aiSearchDraft: searchQuery.trim() },
+		});
+		setIsSearchExpanded(false);
 	};
 
 	const clearSearch = () => {
@@ -107,7 +119,7 @@ export default function Header() {
 
 			{/* Search - full on desktop, collapsible on mobile */}
 			<div
-				className={`flex-1 max-w-lg transition-all flex items-center gap-1 ${
+				className={`flex-1 max-w-2xl transition-all flex items-center gap-1 ${
 					isSearchExpanded ? "flex" : "hidden md:flex"
 				}`}
 			>
@@ -139,6 +151,18 @@ export default function Header() {
 						onClick={performSearch}
 						aria-label="Search"
 					/>
+				</Tooltip>
+				<Tooltip content="Translate an ordinary-language request into mail filters" side="bottom" asChild>
+					<Button
+						variant="secondary"
+						size="sm"
+						icon={<SparkleIcon size={18} />}
+						onClick={openAiSearch}
+						aria-label="AI search"
+						className="min-h-11 shrink-0 px-2"
+					>
+						<span className="hidden xl:inline">AI search</span>
+					</Button>
 				</Tooltip>
 			</div>
 

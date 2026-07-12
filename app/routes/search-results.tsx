@@ -10,8 +10,9 @@ import {
 } from "@phosphor-icons/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import MailboxSplitView from "~/components/MailboxSplitView";
+import AiSearchWorkspace from "~/components/AiSearchWorkspace";
 import LabelChip from "~/components/labels/LabelChip";
 import SaveCurrentViewButton from "~/components/SaveCurrentViewButton";
 import { formatListDate, getSnippetText } from "~/lib/utils";
@@ -58,14 +59,24 @@ export default function SearchResultsRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
 	const [searchParams, setSearchParams] = useSearchParams();
 	const navigate = useNavigate();
+	const location = useLocation();
 	const queryClient = useQueryClient();
 	const { selectedEmailId, selectEmail, closePanel } = useUIStore();
 	const updateEmail = useUpdateEmail();
 	const urlQuery = searchParams.get("q") || "";
+	const draftIntent =
+		typeof (location.state as { aiSearchDraft?: unknown } | null)?.aiSearchDraft === "string"
+			? (location.state as { aiSearchDraft: string }).aiSearchDraft
+			: "";
 	const labelId = searchParams.get("label_id") || "";
 	const sortColumn = searchParams.get("sortColumn") || "";
 	const sortDirection = searchParams.get("sortDirection") || "";
-	const { data: labels = [] } = useLabels(mailboxId);
+	const {
+		data: labels = [],
+		isSuccess: labelsReady,
+		isError: labelsError,
+		refetch: refetchLabels,
+	} = useLabels(mailboxId);
 	const selectedLabel = labels.find((label) => label.id === labelId);
 	const currentViewDefinition = useMemo(
 		() => definitionFromSearchView({ query: urlQuery, searchParams }),
@@ -77,6 +88,7 @@ export default function SearchResultsRoute() {
 		[mailboxId, urlQuery, labelId, sortColumn, sortDirection],
 	);
 	const prevSearchKeyRef = useRef(searchKey);
+	const resultsHeadingRef = useRef<HTMLHeadingElement>(null);
 	const searchChanged = prevSearchKeyRef.current !== searchKey;
 	const currentPage = searchChanged ? 1 : page;
 
@@ -108,6 +120,19 @@ export default function SearchResultsRoute() {
 	const results = searchData?.results ?? [];
 	const totalCount = searchData?.totalCount ?? 0;
 	const isPanelOpen = selectedEmailId !== null;
+	const hasCommittedSearch = Boolean(urlQuery || labelId);
+	const hadCommittedSearchRef = useRef(hasCommittedSearch);
+
+	useEffect(() => {
+		if (!hadCommittedSearchRef.current && hasCommittedSearch) {
+			requestAnimationFrame(() => resultsHeadingRef.current?.focus());
+		}
+		hadCommittedSearchRef.current = hasCommittedSearch;
+	}, [hasCommittedSearch]);
+
+	useEffect(() => {
+		closePanel();
+	}, [closePanel, mailboxId]);
 
 	useEffect(() => {
 		const onMailCommand = (event: Event) => {
@@ -124,6 +149,14 @@ export default function SearchResultsRoute() {
 		selectEmail(email.id);
 		if (!email.read && mailboxId)
 			updateEmail.mutate({ mailboxId, id: email.id, data: { read: true } });
+	};
+	const runReviewedSearch = (query: string, nextLabelId: string | null) => {
+		const next = new URLSearchParams();
+		if (query) next.set("q", query);
+		if (nextLabelId) next.set("label_id", nextLabelId);
+		setPage(1);
+		closePanel();
+		setSearchParams(next);
 	};
 	const folderDisplayName = (name: string | null | undefined): string => {
 		if (!name) return "";
@@ -154,20 +187,24 @@ export default function SearchResultsRoute() {
 						/>
 					</Tooltip>
 					<div className="min-w-0 flex-1">
-						<h1 className="text-lg font-semibold text-kumo-default truncate">
-							Search Results
+						<h1
+							ref={resultsHeadingRef}
+							tabIndex={-1}
+							className="text-lg font-semibold text-kumo-default truncate outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring"
+						>
+							{hasCommittedSearch ? "Search Results" : "Search"}
 						</h1>
-						{!isLoading && !isError && (
+						{hasCommittedSearch && !isLoading && !isError && (
 							<span className="text-sm text-kumo-subtle">
 								{totalCount} result{totalCount !== 1 ? "s" : ""}
 								{urlQuery ? ` for "${urlQuery}"` : ""}
 							</span>
 						)}
 					</div>
-					<label className="flex items-center gap-2 text-sm text-kumo-subtle">
+					{hasCommittedSearch && <label className="flex items-center gap-2 text-sm text-kumo-subtle">
 						<span className="sr-only">Filter search by label</span>
 						<select
-							className="h-10 rounded-md border border-kumo-line bg-kumo-base px-3 text-sm text-kumo-strong"
+							className="min-h-11 rounded-md border border-kumo-line bg-kumo-base px-3 text-sm text-kumo-strong"
 							value={labelId}
 							onChange={(event) =>
 								setSearchParams((current) => {
@@ -186,7 +223,7 @@ export default function SearchResultsRoute() {
 								</option>
 							))}
 						</select>
-					</label>
+					</label>}
 					{selectedLabel && <LabelChip label={selectedLabel} />}
 					{mailboxId && (urlQuery || labelId) && (
 						<SaveCurrentViewButton
@@ -200,7 +237,19 @@ export default function SearchResultsRoute() {
 					)}
 				</div>
 				<div className="flex-1 overflow-y-auto">
-					{isLoading ? (
+					{mailboxId && !hasCommittedSearch && (
+						<AiSearchWorkspace
+							mailboxId={mailboxId}
+							initialIntent={draftIntent}
+							labels={labels}
+							labelCatalogState={
+								labelsError ? "error" : labelsReady ? "ready" : "loading"
+							}
+							onRetryLabels={() => void refetchLabels()}
+							onRun={runReviewedSearch}
+						/>
+					)}
+					{!hasCommittedSearch ? null : isLoading ? (
 						<div className="flex justify-center py-16">
 							<Loader size="lg" />
 						</div>
@@ -338,7 +387,7 @@ export default function SearchResultsRoute() {
 						</div>
 					)}
 				</div>
-				{!isError && totalCount > SEARCH_PAGE_SIZE && (
+				{hasCommittedSearch && !isError && totalCount > SEARCH_PAGE_SIZE && (
 					<div className="flex justify-center py-3 border-t border-kumo-line shrink-0">
 						<Pagination
 							page={currentPage}

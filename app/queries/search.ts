@@ -31,7 +31,7 @@ export function useSearchEmails(
 		queryKey: mailboxId && (query || labelId)
 			? [...queryKeys.search.results(mailboxId, query, page, labelId), sortColumn, sortDirection]
 			: ["search", "_disabled"],
-		queryFn: async () => {
+		queryFn: async ({ signal }) => {
 			const params = searchRequestParams({
 				query,
 				page,
@@ -39,7 +39,7 @@ export function useSearchEmails(
 				sortColumn,
 				sortDirection,
 			});
-			const data = await api.searchEmails(mailboxId!, params) as
+			const data = await api.searchEmails(mailboxId!, params, { signal }) as
 				| SearchResponse
 				| Email[];
 			if (data && typeof data === "object" && "emails" in data) {

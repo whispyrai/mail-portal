@@ -97,6 +97,7 @@ import { resolveUnambiguousThreadReference } from "../lib/thread-reference.ts";
 import { readConversationIntelligenceEvidenceProjection } from "../lib/conversation-intelligence-evidence.ts";
 import { projectInboxTriageCandidates } from "../lib/inbox-triage-candidates.ts";
 import { readConversationActivityProjection } from "../lib/conversation-activity.ts";
+import { readAiSearchInterpreterCatalog } from "../lib/ai-search-interpreter-catalog.ts";
 import {
 	validateNormalizedInboxTriageSuggestionRequest,
 	type NormalizedInboxTriageSuggestionRequest,
@@ -793,6 +794,11 @@ export class MailboxDO extends DurableObject<Env> {
 			limit,
 			cursor,
 		});
+	}
+
+	/** Read folder and label identity only, without healing or changing mail. */
+	async getAiSearchInterpreterCatalog() {
+		return readAiSearchInterpreterCatalog(this.ctx.storage.sql);
 	}
 
 	/** Project the exact visible Inbox page and bounded evidence for manual AI review. */
