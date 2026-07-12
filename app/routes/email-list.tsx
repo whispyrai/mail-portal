@@ -4,6 +4,7 @@
 
 import {
 	Button,
+	Dialog,
 	Pagination,
 	Tooltip,
 	useKumoToastManager,
@@ -20,17 +21,19 @@ import {
 	PaperPlaneTiltIcon,
 	PencilSimpleIcon,
 	StarIcon,
+	SparkleIcon,
 	TrashIcon,
 	TrayIcon,
 	XIcon,
 } from "@phosphor-icons/react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router";
 import { Folders } from "shared/folders";
 import { formatListDate } from "shared/dates";
 import MailboxSplitView from "~/components/MailboxSplitView";
 import BatchTriageToolbar from "~/components/BatchTriageToolbar";
+import LazyLoadBoundary from "~/components/LazyLoadBoundary";
 import LabelChip from "~/components/labels/LabelChip";
 import LabelPicker from "~/components/labels/LabelPicker";
 import { MAIL_COMMAND_EVENT } from "~/components/MailKeyboardController";
@@ -44,6 +47,7 @@ import {
 	type MailCommand,
 } from "~/lib/mail-keyboard";
 import { planKeyboardConversationAction } from "~/lib/conversation-actions";
+import { createInboxTriageVisibleSnapshot } from "~/lib/inbox-triage-review";
 import { indexDeliveryHighlights } from "~/lib/delivery-highlights";
 import {
 	batchSelectionsEqual,
@@ -187,6 +191,60 @@ function EmailListSkeleton() {
 	);
 }
 
+function InboxTriageReviewLoadingFallback({ onClose }: { onClose: () => void }) {
+	return (
+		<Dialog.Root open onOpenChange={(open) => !open && onClose()}>
+			<Dialog size="lg" className="w-[calc(100vw-1rem)] max-w-[700px]">
+				<Dialog.Title className="font-semibold text-kumo-default">
+					Opening Inbox suggestion review
+				</Dialog.Title>
+				<Dialog.Description
+					className="mt-2 text-sm text-kumo-subtle"
+					role="status"
+					aria-live="polite"
+				>
+					Loading the review surface. No mail is changing.
+				</Dialog.Description>
+				<Button className="mt-4 min-h-11" variant="secondary" onClick={onClose}>
+					Close
+				</Button>
+			</Dialog>
+		</Dialog.Root>
+	);
+}
+
+function InboxTriageReviewLoadError({
+	onClose,
+	onRetry,
+}: {
+	onClose: () => void;
+	onRetry: () => void;
+}) {
+	return (
+		<Dialog.Root open onOpenChange={(open) => !open && onClose()}>
+			<Dialog size="lg" className="w-[calc(100vw-1rem)] max-w-[700px]">
+				<Dialog.Title className="font-semibold text-kumo-default">
+					Suggestion review could not open
+				</Dialog.Title>
+				<Dialog.Description
+					className="mt-2 text-sm leading-6 text-kumo-subtle"
+					role="alert"
+				>
+					Inbox and every manual action remain available.
+				</Dialog.Description>
+				<div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+					<Button className="min-h-11" variant="secondary" onClick={onClose}>
+						Close
+					</Button>
+					<Button className="min-h-11" onClick={onRetry}>
+						Try again
+					</Button>
+				</div>
+			</Dialog>
+		</Dialog.Root>
+	);
+}
+
 function FolderEmptyState({
 	folder,
 	onCompose,
@@ -296,6 +354,13 @@ export default function EmailListRoute() {
 	);
 	const [snoozeTarget, setSnoozeTarget] =
 		useState<SnoozeDialogTarget | null>(null);
+	const [triageReviewLoaded, setTriageReviewLoaded] = useState(false);
+	const [triageReviewOpen, setTriageReviewOpen] = useState(false);
+	const [triageReviewRetryKey, setTriageReviewRetryKey] = useState(0);
+	const InboxTriageReview = useMemo(
+		() => lazy(() => import("~/components/InboxTriageReview")),
+		[triageReviewRetryKey],
+	);
 	const [searchParams, setSearchParams] = useSearchParams();
 	const labelId = searchParams.get("label_id") ?? "";
 	const toastManager = useKumoToastManager();
@@ -380,6 +445,17 @@ export default function EmailListRoute() {
 	const visibleEmailIds = useMemo(
 		() => emails.map((email) => email.id),
 		[emails],
+	);
+	const inboxTriageSnapshot = useMemo(
+		() =>
+			createInboxTriageVisibleSnapshot({
+				mailboxId: mailboxId ?? "",
+				folderId: folder ?? Folders.INBOX,
+				page,
+				labelId: labelId || null,
+				emails,
+			}),
+		[emails, folder, labelId, mailboxId, page],
 	);
 	const clearSnooze = (email: Email) => {
 		if (!mailboxId || unsnooze.isPending) return;
@@ -504,6 +580,8 @@ export default function EmailListRoute() {
 		if (previousSelectionContext.current !== selectionContext) {
 			previousSelectionContext.current = selectionContext;
 			setBatchSelection(new Set());
+			setTriageReviewOpen(false);
+			setTriageReviewLoaded(false);
 			return;
 		}
 		setBatchSelection((current) => {
@@ -1011,6 +1089,23 @@ export default function EmailListRoute() {
 					}
 					onClear={() => setBatchSelection(new Set())}
 					onAction={handleBatchAction}
+					idleControl={
+						folder === Folders.INBOX && mailboxId ? (
+							<Button
+								variant="ghost"
+								size="sm"
+								className="min-h-11"
+								icon={<SparkleIcon size={16} />}
+								disabled={isRefreshing}
+								onClick={() => {
+									setTriageReviewLoaded(true);
+									setTriageReviewOpen(true);
+								}}
+							>
+								Review suggestions
+							</Button>
+						) : undefined
+					}
 					labelControl={
 						<LabelPicker
 							labels={labels}
@@ -1310,6 +1405,51 @@ export default function EmailListRoute() {
 						if (!open) setSnoozeTarget(null);
 					}}
 				/>
+			)}
+
+			{triageReviewLoaded && mailboxId && (
+				<LazyLoadBoundary
+					fallback={
+						<InboxTriageReviewLoadError
+							onClose={() => {
+								setTriageReviewOpen(false);
+								setTriageReviewLoaded(false);
+								setTriageReviewRetryKey((key) => key + 1);
+							}}
+							onRetry={() => {
+								setTriageReviewRetryKey((key) => key + 1);
+								setTriageReviewOpen(true);
+							}}
+						/>
+					}
+					resetKey={`${selectionContext}:${triageReviewRetryKey}`}
+				>
+					<Suspense
+						fallback={
+							triageReviewOpen ? (
+								<InboxTriageReviewLoadingFallback
+									onClose={() => {
+										setTriageReviewOpen(false);
+										setTriageReviewLoaded(false);
+										setTriageReviewRetryKey((key) => key + 1);
+									}}
+								/>
+							) : null
+						}
+					>
+						<InboxTriageReview
+							open={triageReviewOpen}
+							onOpenChange={setTriageReviewOpen}
+							mailboxId={mailboxId}
+							snapshot={inboxTriageSnapshot}
+							onOpenEvidence={(messageId) => {
+								setTriageReviewOpen(false);
+								setKeyboardTargetId(messageId);
+								selectEmail(messageId);
+							}}
+						/>
+					</Suspense>
+				</LazyLoadBoundary>
 			)}
 		</MailboxSplitView>
 	);

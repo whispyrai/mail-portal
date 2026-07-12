@@ -95,6 +95,11 @@ import {
 import { finalizeCommittedSnooze } from "../lib/snooze-liveness.ts";
 import { resolveUnambiguousThreadReference } from "../lib/thread-reference.ts";
 import { readConversationIntelligenceEvidenceProjection } from "../lib/conversation-intelligence-evidence.ts";
+import { projectInboxTriageCandidates } from "../lib/inbox-triage-candidates.ts";
+import {
+	validateNormalizedInboxTriageSuggestionRequest,
+	type NormalizedInboxTriageSuggestionRequest,
+} from "../../shared/inbox-triage-suggestions.ts";
 import { readStoredReminderAnchor } from "../lib/follow-up-reminder-anchor.ts";
 import { readFollowUpReminderPreviews } from "../lib/follow-up-reminder-previews.ts";
 import { followUpReminderD1Store } from "../lib/follow-up-reminders-d1.ts";
@@ -572,7 +577,7 @@ export class MailboxDO extends DurableObject<Env> {
 				SELECT
 					conversation_id,
 					folder_id,
-					ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY date DESC) as rn
+					ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY date DESC, id DESC) as rn
 				FROM all_emails_with_conversation
 			),
 			latest_in_folder AS (
@@ -605,7 +610,7 @@ export class MailboxDO extends DurableObject<Env> {
 			LEFT JOIN latest_message_per_conversation lmc
 				ON lmc.conversation_id = lif.conversation_id AND lmc.rn = 1
 			WHERE lif.rn = 1
-			ORDER BY lif.date DESC
+			ORDER BY lif.date DESC, lif.conversation_id ASC, lif.id ASC
 			LIMIT ?2 OFFSET ?3`,
 			visibleFolderId,
 			limit,
@@ -773,6 +778,26 @@ export class MailboxDO extends DurableObject<Env> {
 		return readConversationIntelligenceEvidenceProjection(
 			this.ctx.storage.sql,
 			emailId,
+		);
+	}
+
+	/** Project the exact visible Inbox page and bounded evidence for manual AI review. */
+	async getInboxTriageCandidates(
+		request: NormalizedInboxTriageSuggestionRequest,
+		mailboxAddress: string,
+	) {
+		const normalized = validateNormalizedInboxTriageSuggestionRequest(request);
+		const rows = await this.getThreadedEmails({
+			folder: Folders.INBOX,
+			page: normalized.page,
+			limit: 25,
+			label_id: normalized.labelId ?? undefined,
+		});
+		return projectInboxTriageCandidates(
+			this.ctx.storage.sql,
+			rows,
+			normalized,
+			mailboxAddress,
 		);
 	}
 

@@ -18,6 +18,7 @@ export default function BatchTriageToolbar({
 	onClear,
 	onAction,
 	labelControl,
+	idleControl,
 }: {
 	visibleCount: number;
 	selectedCount: number;
@@ -27,6 +28,7 @@ export default function BatchTriageToolbar({
 	onClear: () => void;
 	onAction: (action: BatchTriageAction) => void;
 	labelControl?: ReactNode;
+	idleControl?: ReactNode;
 }) {
 	const selectAllRef = useRef<HTMLInputElement>(null);
 	const allSelected = visibleCount > 0 && selectedCount === visibleCount;
@@ -130,6 +132,9 @@ export default function BatchTriageToolbar({
 						/>
 					</Tooltip>
 				</>
+			)}
+			{selectedCount === 0 && idleControl && (
+				<div className="ms-auto min-w-0">{idleControl}</div>
 			)}
 		</div>
 	);

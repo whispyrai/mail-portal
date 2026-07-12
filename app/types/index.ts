@@ -20,6 +20,7 @@ export interface Mailbox {
 	id: string;
 	email: string;
 	name: string;
+	type?: "PERSONAL" | "SHARED";
 	settings?: MailboxSettings;
 }
 

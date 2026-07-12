@@ -14,6 +14,7 @@ test("batch toolbar exposes touch-sized, labeled selection and action controls",
 	assert.match(toolbar, /Mark selected conversations unread/);
 	assert.match(toolbar, /Archive selected conversations/);
 	assert.match(toolbar, /Move selected conversations to Trash/);
+	assert.match(toolbar, /selectedCount === 0 && idleControl/);
 });
 
 test("list row checkboxes are siblings of the dedicated open control and batch once", () => {
