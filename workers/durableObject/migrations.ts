@@ -719,4 +719,58 @@ export const mailboxMigrations: Migration[] = [
 			);
 		`),
 	},
+	{
+		name: "25_add_durable_push_outbox",
+		sql: txn(`
+			ALTER TABLE push_subscriptions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;
+			ALTER TABLE push_subscriptions ADD COLUMN last_push_attempt_at TEXT;
+			ALTER TABLE push_subscriptions ADD COLUMN last_push_accepted_at TEXT;
+			ALTER TABLE push_subscriptions ADD COLUMN last_push_failure_at TEXT;
+			ALTER TABLE push_subscriptions ADD COLUMN last_push_failure_reason TEXT;
+			ALTER TABLE push_subscriptions ADD COLUMN consecutive_push_failures INTEGER NOT NULL DEFAULT 0;
+
+			CREATE TABLE push_notifications (
+				id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL UNIQUE,
+				mailbox_id TEXT NOT NULL,
+				payload_json TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'no_targets', 'expired')),
+				target_count INTEGER NOT NULL CHECK(target_count >= 0),
+				created_at TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				completed_at TEXT,
+				FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+
+			CREATE INDEX idx_push_notifications_state_expiry
+				ON push_notifications(state, expires_at);
+			CREATE INDEX idx_push_notifications_retention
+				ON push_notifications(state, completed_at, created_at);
+
+			CREATE TABLE push_notification_deliveries (
+				notification_id TEXT NOT NULL,
+				subscription_id TEXT NOT NULL,
+				target_user_id TEXT NOT NULL,
+				status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'retrying', 'accepted', 'terminal')),
+				attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+				next_attempt_at TEXT NOT NULL,
+				lease_token TEXT,
+				lease_expires_at TEXT,
+				attempted_subscription_generation INTEGER,
+				last_reason TEXT,
+				last_http_status INTEGER,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				accepted_at TEXT,
+				terminal_at TEXT,
+				PRIMARY KEY(notification_id, subscription_id),
+				FOREIGN KEY(notification_id) REFERENCES push_notifications(id) ON DELETE CASCADE
+			);
+
+			CREATE INDEX idx_push_deliveries_due
+				ON push_notification_deliveries(status, next_attempt_at, notification_id, subscription_id);
+			CREATE INDEX idx_push_deliveries_actor_health
+				ON push_notification_deliveries(target_user_id, updated_at DESC, notification_id);
+		`),
+	},
 ];

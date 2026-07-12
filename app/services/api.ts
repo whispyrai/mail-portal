@@ -170,6 +170,8 @@ const api = {
 		get<{ domains: string[]; emailAddresses: string[]; vapidPublicKey: string | null }>(
 			"/api/v1/config",
 		),
+	getCurrentActor: () =>
+		get<{ email: string; role: string; mailbox: string }>("/api/v1/me"),
 
 	listLabels: (mailboxId: string) =>
 		get<{ labels: Label[] }>(`/api/v1/mailboxes/${mailboxId}/labels`),
@@ -185,16 +187,6 @@ const api = {
 	) => post<LabelMutationResult>(`/api/v1/mailboxes/${mailboxId}/label-mutations`, input),
 
 	// Push subscriptions (WISER-240)
-	listPushSubscriptions: (mailboxId: string) =>
-		get<{
-			subscriptions: Array<{
-				id: string;
-				deviceLabel: string | null;
-				userAgent: string | null;
-				createdAt: string;
-				lastSeenAt: string;
-			}>;
-		}>(`/api/v1/mailboxes/${mailboxId}/push-subscriptions`),
 	registerPushSubscription: (
 		mailboxId: string,
 		sub: { endpoint: string; keys: { p256dh: string; auth: string } },

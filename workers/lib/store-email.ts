@@ -8,6 +8,7 @@ import { sanitizeFilename, type StoredAttachment } from "./attachments.ts";
 import type { RecipientMemoryOrigin } from "../../shared/recipient-suggestions.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
 import { normalizeObservedSenderName } from "./people/index.ts";
+import type { PushPayload } from "./push/types.ts";
 
 export const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
@@ -31,6 +32,7 @@ type StoredEmail = {
 	/** Exact live RFC/token thread identity allowed to wake Snoozed mail. */
 	snooze_wake_thread_id: string | null;
 	follow_up_reply_mailbox_address: string | null;
+	push_notification?: PushPayload;
 };
 
 type AttachmentBucket = {
@@ -71,6 +73,7 @@ type StoreParsedEmailOptions = {
 	followUpMailboxAddress?: string;
 	mailboxAddress?: string;
 	recipientMemoryOrigin: RecipientMemoryOrigin;
+	pushNotification?: PushPayload;
 	/** Optional write-generation fence for import-only attachment identities. */
 	attachmentIdNamespace?: string;
 };
@@ -179,8 +182,9 @@ export async function storeParsedEmail(
 				raw_headers: JSON.stringify(parsed.headers),
 				recipient_memory_origin: options.recipientMemoryOrigin,
 				snooze_wake_thread_id: snoozeWakeThreadId,
-				follow_up_reply_mailbox_address:
-					options.followUpMailboxAddress?.toLowerCase() ?? null,
+					follow_up_reply_mailbox_address:
+						options.followUpMailboxAddress?.toLowerCase() ?? null,
+					push_notification: options.pushNotification,
 			},
 			attachmentData,
 			undefined,

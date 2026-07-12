@@ -5,7 +5,7 @@
 export type PushSetupState =
 	| "loading"
 	| "error"
-	| "hidden"
+	| "not_configured"
 	| "install"
 	| "blocked"
 	| "unsupported"
@@ -24,7 +24,7 @@ type PushSetupInput = {
 export function derivePushSetupState(input: PushSetupInput): PushSetupState {
 	if (!input.mounted || input.configLoading) return "loading";
 	if (input.hasQueryError) return "error";
-	if (!input.hasVapidKey) return "hidden";
+	if (!input.hasVapidKey) return "not_configured";
 	if (!input.installed) return "install";
 	if (input.permission === "denied") return "blocked";
 	if (!input.pushSupported) return "unsupported";

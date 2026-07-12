@@ -4,8 +4,9 @@
 
 import { Button, Tooltip } from "@cloudflare/kumo";
 import { RobotIcon } from "@phosphor-icons/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { Outlet, useParams } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Outlet, useNavigate, useParams } from "react-router";
 import AgentSidebar from "~/components/AgentSidebar";
 import Header from "~/components/Header";
 import LazyLoadBoundary from "~/components/LazyLoadBoundary";
@@ -14,7 +15,11 @@ import MailCommandPalette from "~/components/MailCommandPalette";
 import Sidebar from "~/components/Sidebar";
 import { useMailNotifications } from "~/hooks/useMailNotifications";
 import { useRebindExistingPushSubscription } from "~/hooks/pwa/usePushSubscription";
-import { useMailboxChangeFeed } from "~/queries/mailbox-change-feed";
+import {
+	exitRevokedMailbox,
+	resolveMailboxChangeFeedStorage,
+	useMailboxChangeFeed,
+} from "~/queries/mailbox-change-feed";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
 import { hasComposeRecovery } from "~/lib/compose-recovery";
@@ -107,11 +112,39 @@ function ComposeLoadError({
 
 export default function MailboxRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
+	const navigate = useNavigate();
+	const queryClient = useQueryClient();
+	const [revokedByFeature, setRevokedByFeature] = useState(false);
+	const revokedExitStartedRef = useRef(false);
+	const exitForRevokedAccess = useCallback((revokedMailboxId: string) => {
+		if (!mailboxId || revokedMailboxId !== mailboxId) {
+			exitRevokedMailbox({
+				queryClient,
+				mailboxId: revokedMailboxId,
+				storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
+			});
+			return;
+		}
+		setRevokedByFeature(true);
+		if (revokedExitStartedRef.current) return;
+		revokedExitStartedRef.current = true;
+		exitRevokedMailbox({
+			queryClient,
+			mailboxId,
+			storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
+			onExit: () => navigate("/", { replace: true }),
+		});
+	}, [mailboxId, navigate, queryClient]);
+
+	useEffect(() => {
+		revokedExitStartedRef.current = false;
+		setRevokedByFeature(false);
+	}, [mailboxId]);
 	// Prefetch mailbox data for child components
 	useMailbox(mailboxId);
 	// New-mail toasts + unread tab-title counter, scoped to this mailbox.
 	useMailNotifications(mailboxId);
-	useRebindExistingPushSubscription(mailboxId);
+	useRebindExistingPushSubscription(mailboxId, exitForRevokedAccess);
 	useMailboxChangeFeed(mailboxId);
 	const prevMailboxIdRef = useRef<string | undefined>(undefined);
 	const [composeRetryKey, setComposeRetryKey] = useState(0);
@@ -159,6 +192,18 @@ export default function MailboxRoute() {
 
 		prevMailboxIdRef.current = mailboxId;
 	}, [mailboxId, closePanel, closeSidebar]);
+
+	if (revokedByFeature) {
+		return (
+			<div
+				className="grid h-full place-items-center px-4 text-center text-sm text-kumo-subtle"
+				role="status"
+				aria-live="assertive"
+			>
+				Mailbox access changed. Returning to your mailboxes…
+			</div>
+		);
+	}
 
 	return (
 		<div className="flex h-screen overflow-hidden">

@@ -26,6 +26,55 @@ export type PushPayload = {
 	data: { emailId: string; mailboxId: string };
 };
 
+const PUSH_PAYLOAD_KEYS = ["title", "body", "icon", "badge", "clickUrl", "data"];
+const UNSAFE_PUSH_TEXT = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u;
+
+function safeText(value: unknown, minimum: number, maximum: number): value is string {
+	return typeof value === "string" && value.length >= minimum && value.length <= maximum &&
+		value.trim() === value && value.normalize("NFC") === value && !UNSAFE_PUSH_TEXT.test(value);
+}
+
+function safeAssetPath(value: unknown): value is string {
+	return safeText(value, 2, 200) && /^\/(?!\/)[A-Za-z0-9._/-]+$/.test(value) &&
+		!value.includes("\\") && !value.split("/").includes("..");
+}
+
+export function validateStoredPushPayload(
+	value: unknown,
+	input: { emailId: string; mailboxId: string },
+): PushPayload {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Push payload is invalid");
+	}
+	const payload = value as Record<string, unknown>;
+	if (Object.keys(payload).sort().join(",") !== [...PUSH_PAYLOAD_KEYS].sort().join(",")) {
+		throw new Error("Push payload is invalid");
+	}
+	if (!payload.data || typeof payload.data !== "object" || Array.isArray(payload.data)) {
+		throw new Error("Push payload is invalid");
+	}
+	const data = payload.data as Record<string, unknown>;
+	if (Object.keys(data).sort().join(",") !== "emailId,mailboxId") {
+		throw new Error("Push payload is invalid");
+	}
+	const mailboxId = input.mailboxId.trim().toLowerCase();
+	const expectedClick = `/mailbox/${encodeURIComponent(mailboxId)}/emails/inbox?email=${encodeURIComponent(input.emailId)}`;
+	if (
+		data.emailId !== input.emailId ||
+		data.mailboxId !== mailboxId ||
+		!safeText(payload.title, 1, 120) ||
+		!safeText(payload.body, 1, 400) ||
+		!safeAssetPath(payload.icon) ||
+		!safeAssetPath(payload.badge) ||
+		payload.clickUrl !== expectedClick
+	) throw new Error("Push payload is invalid");
+	const encoded = JSON.stringify(payload);
+	if (new TextEncoder().encode(encoded).byteLength > 3_993) {
+		throw new Error("Push payload is invalid");
+	}
+	return payload as PushPayload;
+}
+
 /**
  * Why a single-endpoint send failed. Mirrors the CRM's
  * `PushNotificationFailureReason` so the classification table ports verbatim.

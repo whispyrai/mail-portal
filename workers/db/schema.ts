@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import {
+	check,
 	index,
 	integer,
 	primaryKey,
@@ -10,6 +11,7 @@ import {
 	text,
 	uniqueIndex,
 } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 
 export const folders = sqliteTable("folders", {
 	id: text("id").primaryKey(),
@@ -131,6 +133,24 @@ export const importGenerationClaims = sqliteTable(
 	},
 	(table) => [index("idx_import_generation_claims_expiry").on(table.expires_at, table.message_id)],
 );
+
+export const pushSubscriptions = sqliteTable("push_subscriptions", {
+	id: text("id").primaryKey(),
+	user_id: text("user_id"),
+	endpoint: text("endpoint").notNull().unique(),
+	p256dh: text("p256dh").notNull(),
+	auth: text("auth").notNull(),
+	user_agent: text("user_agent"),
+	device_label: text("device_label"),
+	created_at: text("created_at").notNull().default(sql`(datetime('now'))`),
+	last_seen_at: text("last_seen_at").notNull().default(sql`(datetime('now'))`),
+	generation: integer("generation").notNull().default(1),
+	last_push_attempt_at: text("last_push_attempt_at"),
+	last_push_accepted_at: text("last_push_accepted_at"),
+	last_push_failure_at: text("last_push_failure_at"),
+	last_push_failure_reason: text("last_push_failure_reason"),
+	consecutive_push_failures: integer("consecutive_push_failures").notNull().default(0),
+}, (table) => [index("idx_push_subscriptions_user_id").on(table.user_id)]);
 
 export const activityEvents = sqliteTable("activity_events", {
 	id: text("id").primaryKey(),
@@ -343,6 +363,67 @@ export const outboundDeliveryAttempts = sqliteTable(
 		index("idx_outbound_attempts_delivery").on(
 			table.delivery_id,
 			table.attempt_number,
+		),
+	],
+);
+
+export const pushNotifications = sqliteTable(
+	"push_notifications",
+	{
+		id: text("id").primaryKey(),
+		email_id: text("email_id").notNull().unique()
+			.references(() => emails.id, { onDelete: "cascade" }),
+		mailbox_id: text("mailbox_id").notNull(),
+		payload_json: text("payload_json").notNull(),
+		state: text("state", { enum: ["pending", "completed", "no_targets", "expired"] }).notNull(),
+		target_count: integer("target_count").notNull(),
+		created_at: text("created_at").notNull(),
+		expires_at: text("expires_at").notNull(),
+		completed_at: text("completed_at"),
+	},
+	(table) => [
+		check(
+			"push_notifications_state_closed",
+			sql`${table.state} IN ('pending', 'completed', 'no_targets', 'expired')`,
+		),
+		check("push_notifications_target_count_nonnegative", sql`${table.target_count} >= 0`),
+		index("idx_push_notifications_state_expiry").on(table.state, table.expires_at),
+		index("idx_push_notifications_retention").on(table.state, table.completed_at, table.created_at),
+	],
+);
+
+export const pushNotificationDeliveries = sqliteTable(
+	"push_notification_deliveries",
+	{
+		notification_id: text("notification_id").notNull()
+			.references(() => pushNotifications.id, { onDelete: "cascade" }),
+		subscription_id: text("subscription_id").notNull(),
+		target_user_id: text("target_user_id").notNull(),
+		status: text("status", { enum: ["pending", "sending", "retrying", "accepted", "terminal"] }).notNull(),
+		attempt_count: integer("attempt_count").notNull().default(0),
+		next_attempt_at: text("next_attempt_at").notNull(),
+		lease_token: text("lease_token"),
+		lease_expires_at: text("lease_expires_at"),
+		attempted_subscription_generation: integer("attempted_subscription_generation"),
+		last_reason: text("last_reason"),
+		last_http_status: integer("last_http_status"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+		accepted_at: text("accepted_at"),
+		terminal_at: text("terminal_at"),
+	},
+	(table) => [
+		primaryKey({ columns: [table.notification_id, table.subscription_id] }),
+		check(
+			"push_notification_deliveries_status_closed",
+			sql`${table.status} IN ('pending', 'sending', 'retrying', 'accepted', 'terminal')`,
+		),
+		check("push_notification_deliveries_attempt_count_nonnegative", sql`${table.attempt_count} >= 0`),
+		index("idx_push_deliveries_due").on(table.status, table.next_attempt_at, table.notification_id, table.subscription_id),
+		index("idx_push_deliveries_actor_health").on(
+			table.target_user_id,
+			sql`${table.updated_at} DESC`,
+			table.notification_id,
 		),
 	],
 );

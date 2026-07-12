@@ -12,6 +12,11 @@ const serviceWorkerSource = readFileSync(
 	"utf8",
 );
 
+test("push display uses the exact Message identity as its stable notification tag", () => {
+	assert.match(serviceWorkerSource, /tag:\s*notificationTag/);
+	assert.match(serviceWorkerSource, /typeof data\.emailId === "string"/);
+});
+
 type WindowClientDouble = {
 	url: string;
 	focus: () => Promise<void>;

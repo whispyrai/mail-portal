@@ -4,11 +4,16 @@
 
 import { Badge, Button, Input, Loader, useKumoToastManager } from "@cloudflare/kumo";
 import { RobotIcon, ArrowCounterClockwiseIcon } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
-import { useParams } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router";
 import { useMailbox, useUpdateMailbox } from "~/queries/mailboxes";
 import { PushNotificationsSection } from "~/components/settings/push-notifications/PushNotificationsSection";
 import { SignatureSettingsCard } from "~/components/settings/SignatureSettingsCard";
+import {
+	exitRevokedMailbox,
+	resolveMailboxChangeFeedStorage,
+} from "~/queries/mailbox-change-feed";
 
 // Placeholder shown in the textarea when no custom prompt is set.
 // The authoritative default prompt lives in workers/agent/index.ts (DEFAULT_SYSTEM_PROMPT).
@@ -16,6 +21,8 @@ const PROMPT_PLACEHOLDER = `You are an email assistant that helps manage this in
 
 export default function SettingsRoute() {
 	const { mailboxId } = useParams<{ mailboxId: string }>();
+	const navigate = useNavigate();
+	const queryClient = useQueryClient();
 	const toastManager = useKumoToastManager();
 	const { data: mailbox } = useMailbox(mailboxId);
 	const updateMailboxMutation = useUpdateMailbox();
@@ -23,6 +30,33 @@ export default function SettingsRoute() {
 	const [displayName, setDisplayName] = useState("");
 	const [agentPrompt, setAgentPrompt] = useState("");
 	const [isSaving, setIsSaving] = useState(false);
+	const [revokedByFeature, setRevokedByFeature] = useState(false);
+	const revokedExitStartedRef = useRef(false);
+
+	const exitForRevokedAccess = useCallback((revokedMailboxId: string) => {
+		if (!mailboxId || revokedMailboxId !== mailboxId) {
+			exitRevokedMailbox({
+				queryClient,
+				mailboxId: revokedMailboxId,
+				storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
+			});
+			return;
+		}
+		setRevokedByFeature(true);
+		if (revokedExitStartedRef.current) return;
+		revokedExitStartedRef.current = true;
+		exitRevokedMailbox({
+			queryClient,
+			mailboxId,
+			storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
+			onExit: () => navigate("/", { replace: true }),
+		});
+	}, [mailboxId, navigate, queryClient]);
+
+	useEffect(() => {
+		revokedExitStartedRef.current = false;
+		setRevokedByFeature(false);
+	}, [mailboxId]);
 
 	useEffect(() => {
 		if (mailbox) {
@@ -54,6 +88,19 @@ export default function SettingsRoute() {
 	const handleResetPrompt = () => {
 		setAgentPrompt("");
 	};
+
+	if (revokedByFeature) {
+		return (
+			<div
+				className="flex h-full items-center justify-center gap-2 px-4 text-sm text-kumo-subtle"
+				role="status"
+				aria-live="assertive"
+			>
+				<Loader size="sm" />
+				<span>Mailbox access changed. Returning to Mailboxes…</span>
+			</div>
+		);
+	}
 
 	if (!mailbox) {
 		return (
@@ -89,7 +136,10 @@ export default function SettingsRoute() {
 				<SignatureSettingsCard mailboxId={mailboxId ?? mailbox.id} />
 
 				{/* Push notifications (WISER-240) — self-managed, independent of Save. */}
-				<PushNotificationsSection mailboxId={mailboxId} />
+				<PushNotificationsSection
+					mailboxId={mailboxId}
+					onAccessRevoked={exitForRevokedAccess}
+				/>
 
 				{/* Agent System Prompt */}
 				<div className="rounded-lg border border-kumo-line bg-kumo-base p-5">

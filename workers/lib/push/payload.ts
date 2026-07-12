@@ -23,6 +23,7 @@ type BuildPushPayloadInput = {
 
 const MAX_TITLE_LENGTH = 120;
 const MAX_SUBJECT_LENGTH = 240;
+const UNSAFE_NOTIFICATION_TEXT = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/gu;
 
 const ENTITIES: [RegExp, string][] = [
 	[/&nbsp;/g, " "],
@@ -48,8 +49,9 @@ export function htmlToSnippet(raw: string | null | undefined, maxLength = 120): 
 }
 
 function truncateText(value: string, maxLength: number): string {
-	const codePoints = Array.from(value);
-	if (codePoints.length <= maxLength) return value;
+	const safe = value.replace(UNSAFE_NOTIFICATION_TEXT, " ").replace(/\s+/g, " ").trim().normalize("NFC");
+	const codePoints = Array.from(safe);
+	if (codePoints.length <= maxLength) return safe;
 	return `${codePoints.slice(0, maxLength - 1).join("").trimEnd()}…`;
 }
 
@@ -59,8 +61,8 @@ export function buildPushPayload(input: BuildPushPayloadInput): PushPayload {
 	const title = truncateText(
 		fromName?.trim() || fromAddress.split("@")[0] || "New email",
 		MAX_TITLE_LENGTH,
-	);
-	const subjectText = truncateText(subject?.trim() || "(no subject)", MAX_SUBJECT_LENGTH);
+	) || truncateText(fromAddress.split("@")[0] || "New email", MAX_TITLE_LENGTH) || "New email";
+	const subjectText = truncateText(subject?.trim() || "(no subject)", MAX_SUBJECT_LENGTH) || "(no subject)";
 	const snippet = htmlToSnippet(body);
 
 	return {

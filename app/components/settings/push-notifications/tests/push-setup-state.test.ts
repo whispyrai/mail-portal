@@ -20,7 +20,10 @@ test("push setup waits for hydration and deploy configuration", () => {
 	assert.equal(derivePushSetupState({ ...ready, mounted: false }), "loading");
 	assert.equal(derivePushSetupState({ ...ready, configLoading: true }), "loading");
 	assert.equal(derivePushSetupState({ ...ready, hasQueryError: true }), "error");
-	assert.equal(derivePushSetupState({ ...ready, hasVapidKey: false }), "hidden");
+	assert.equal(
+		derivePushSetupState({ ...ready, hasVapidKey: false }),
+		"not_configured",
+	);
 });
 
 test("push setup requires installation before it offers notification permission", () => {

@@ -15,8 +15,6 @@ import {
 	isBlockedAttachment,
 	attachmentExtension,
 } from "../shared/attachments";
-import { PushSubscriptionSchema } from "./lib/schemas";
-import { buildDeviceLabel } from "./lib/push/deviceLabel";
 import { vapidConfig } from "./lib/push/transport";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { handleSendEmail } from "./routes/send-email";
@@ -48,6 +46,8 @@ import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
 import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
 import { mailPeopleRoutes } from "./routes/mail-people";
 import { relationshipBriefRoutes } from "./routes/relationship-brief";
+import { pushHealthRoutes } from "./routes/push-health";
+import { pushSubscriptionRoutes } from "./routes/push-subscriptions";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -158,6 +158,8 @@ app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 app.use("/api/v1/mailboxes/:mailboxId", requireMailbox);
 app.route("/", mailPeopleRoutes);
 app.route("/", relationshipBriefRoutes);
+app.route("/", pushHealthRoutes);
+app.route("/", pushSubscriptionRoutes);
 
 // -- Config ---------------------------------------------------------
 
@@ -580,68 +582,6 @@ app.put("/api/v1/mailboxes/:mailboxId/folders/:id", async (c: AppContext) => {
 });
 
 app.delete("/api/v1/mailboxes/:mailboxId/folders/:id", handleDeleteFolder);
-
-// -- Push subscriptions (WISER-240) ---------------------------------
-// Per-device Web Push subscriptions, scoped to both the authorized mailbox and
-// the signed-in user. The list never exposes endpoint or keys.
-
-app.post(
-	"/api/v1/mailboxes/:mailboxId/push-subscriptions",
-	async (c: AppContext) => {
-		const session = c.get("session");
-		if (!session) return c.json({ error: "Unauthorized" }, 401);
-		const parsed = PushSubscriptionSchema.safeParse(
-			await c.req.json().catch(() => null),
-		);
-		if (!parsed.success) {
-			return c.json(
-				{ error: `Invalid subscription: ${parsed.error.message}` },
-				400,
-			);
-		}
-		const body = parsed.data;
-		// Derive the device label server-side from the request UA, never from the body.
-		const userAgent = c.req.header("user-agent") ?? null;
-		const result = await c.var.mailboxStub.upsertPushSubscription({
-			userId: session.sub,
-			endpoint: body.endpoint,
-			p256dh: body.keys.p256dh,
-			auth: body.keys.auth,
-			userAgent,
-			deviceLabel: buildDeviceLabel(userAgent),
-		});
-		return c.json(result, 201);
-	},
-);
-
-app.get(
-	"/api/v1/mailboxes/:mailboxId/push-subscriptions",
-	async (c: AppContext) => {
-		const session = c.get("session");
-		if (!session) return c.json({ error: "Unauthorized" }, 401);
-		return c.json({
-			subscriptions: await c.var.mailboxStub.listPushSubscriptionDevices(
-				session.sub,
-			),
-		});
-	},
-);
-
-app.delete(
-	"/api/v1/mailboxes/:mailboxId/push-subscriptions/:id",
-	async (c: AppContext) => {
-		const session = c.get("session");
-		if (!session) return c.json({ error: "Unauthorized" }, 401);
-		const subscriptionId = c.req.param("id");
-		if (!subscriptionId)
-			return c.json({ error: "Subscription id is required" }, 400);
-		const ok = await c.var.mailboxStub.deletePushSubscription(
-			subscriptionId,
-			session.sub,
-		);
-		return ok ? c.body(null, 204) : c.json({ error: "Not found" }, 404);
-	},
-);
 
 // -- Attachments ----------------------------------------------------
 

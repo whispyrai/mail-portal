@@ -2,6 +2,8 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+import { pushHealthKey } from "../lib/push-health-cache.ts";
+
 /** Centralised query key factories for cache invalidation. */
 export const queryKeys = {
 	mailboxes: {
@@ -47,11 +49,12 @@ export const queryKeys = {
 			["search", mailboxId, query, page, labelId] as const,
 	},
 	push: {
-		devices: (mailboxId: string | undefined) => ["push", "devices", mailboxId] as const,
+		health: pushHealthKey,
 	},
 	outbound: {
 		list: (mailboxId: string, emailIdsKey = "") =>
 			["outbound", mailboxId, emailIdsKey] as const,
 	},
 	config: ["config"] as const,
+	currentActor: ["me"] as const,
 };

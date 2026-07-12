@@ -62,7 +62,7 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
 		async getEmail() {
 			return null;
 		},
-		async firePush() {},
+		async ensurePushAlarm() {},
 	};
 	const env = {
 		BRAND: "wiser",
@@ -226,13 +226,13 @@ test("inbound push payload uses the active brand's notification assets", async (
 		async resolveCanonicalThreadId() {
 			return null;
 		},
-		async createEmail() {},
+		async createEmail(_folder: string, email: Record<string, unknown>) {
+			pushPayload = email.push_notification as Record<string, unknown>;
+		},
 		async getEmail() {
 			return null;
 		},
-		async firePush(payload: Record<string, unknown>) {
-			pushPayload = payload;
-		},
+		async ensurePushAlarm() {},
 	};
 	const env = {
 		BRAND: "wiser",

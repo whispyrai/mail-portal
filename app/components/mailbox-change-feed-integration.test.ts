@@ -7,7 +7,7 @@ test("MailboxRoute owns exactly one mailbox change feed for its active mailbox",
 		new URL("../routes/mailbox.tsx", import.meta.url),
 		"utf8",
 	);
-	assert.match(source, /import \{ useMailboxChangeFeed \} from "~\/queries\/mailbox-change-feed"/);
+	assert.match(source, /useMailboxChangeFeed,[\s\S]*?from "~\/queries\/mailbox-change-feed"/);
 	assert.equal(source.match(/useMailboxChangeFeed\(mailboxId\)/g)?.length, 1);
 
 	const feed = readFileSync(

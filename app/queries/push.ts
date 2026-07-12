@@ -2,9 +2,22 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	useMutation,
+	useQuery,
+	useQueryClient,
+	type QueryClient,
+} from "@tanstack/react-query";
 import { queryKeys } from "~/queries/keys";
 import api from "~/services/api";
+import {
+	isPushHealthAccessRevoked,
+	pushHealthKey,
+} from "~/lib/push-health-cache.ts";
+import {
+	fetchPushHealth,
+	type PushHealthResponse,
+} from "~/services/push-health.ts";
 
 /** App config (domains, addresses, VAPID public key). Static per deploy. */
 export function useAppConfig() {
@@ -15,39 +28,126 @@ export function useAppConfig() {
 	});
 }
 
-export function usePushDevices(mailboxId: string | undefined, pushConfigured = true) {
+/**
+ * The actor email is already visible account identity. Including it in the
+ * in-memory health key prevents a browser identity transition from reusing
+ * another actor's device response. Push-health queries are never persisted.
+ */
+export function useCurrentPushActor() {
 	return useQuery({
-		queryKey: queryKeys.push.devices(mailboxId),
-		queryFn: () => {
-			if (!mailboxId) throw new Error("A mailbox is required to list push devices");
-			return api.listPushSubscriptions(mailboxId).then((response) => response.subscriptions);
-		},
-		enabled: !!mailboxId && pushConfigured,
+		queryKey: queryKeys.currentActor,
+		queryFn: () => api.getCurrentActor(),
+		staleTime: Number.POSITIVE_INFINITY,
 	});
 }
 
-export function useRegisterPushDevice(mailboxId: string | undefined) {
-	const qc = useQueryClient();
+export { pushHealthKey } from "~/lib/push-health-cache.ts";
+
+type PushHealthRequest = (
+	mailboxId: string,
+	signal?: AbortSignal,
+) => Promise<PushHealthResponse>;
+
+function requestPushHealth(mailboxId: string, signal?: AbortSignal) {
+	return fetchPushHealth(mailboxId, fetch, signal);
+}
+
+export function buildPushHealthQueryOptions(
+	mailboxId: string,
+	actorScope: string,
+	request: PushHealthRequest = requestPushHealth,
+	onAccessRevoked?: (mailboxId: string) => void,
+) {
+	return {
+		queryKey: pushHealthKey(mailboxId, actorScope),
+		queryFn: async ({ signal }: { signal: AbortSignal }) => {
+			try {
+				return await request(mailboxId, signal);
+			} catch (error) {
+				if (isPushHealthAccessRevoked(error)) {
+					onAccessRevoked?.(mailboxId);
+				}
+				throw error;
+			}
+		},
+		staleTime: 0,
+		refetchOnWindowFocus: true,
+		refetchOnReconnect: true,
+		retry: (failureCount: number, error: unknown) =>
+			!isPushHealthAccessRevoked(error) && failureCount < 2,
+	};
+}
+
+export function usePushHealth(
+	mailboxId: string | undefined,
+	actorScope: string | undefined,
+	onAccessRevoked?: (mailboxId: string) => void,
+) {
+	const enabled = Boolean(mailboxId && actorScope);
+	return useQuery({
+		...(enabled
+			? buildPushHealthQueryOptions(
+					mailboxId!,
+					actorScope!,
+					requestPushHealth,
+					onAccessRevoked,
+				)
+			: {
+					queryKey: ["push", mailboxId ?? "", "health", actorScope ?? ""] as const,
+					queryFn: async (): Promise<PushHealthResponse> => {
+						throw new Error("A Mailbox and actor are required for push health");
+					},
+				}),
+		enabled,
+	});
+}
+
+function invalidatePushHealth(
+	queryClient: QueryClient,
+	mailboxId: string,
+	actorScope: string,
+) {
+	return queryClient.invalidateQueries({
+		queryKey: pushHealthKey(mailboxId, actorScope),
+		exact: true,
+	});
+}
+
+export function useRegisterPushDevice(
+	mailboxId: string | undefined,
+	actorScope: string | undefined,
+) {
+	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: (sub: { endpoint: string; keys: { p256dh: string; auth: string } }) => {
-			if (!mailboxId) throw new Error("A mailbox is required to register a push device");
-			return api.registerPushSubscription(mailboxId, sub);
+		mutationFn: (subscription: {
+			endpoint: string;
+			keys: { p256dh: string; auth: string };
+		}) => {
+			if (!mailboxId) throw new Error("A Mailbox is required to register a push device");
+			return api.registerPushSubscription(mailboxId, subscription);
 		},
 		onSuccess: () => {
-			if (mailboxId) qc.invalidateQueries({ queryKey: queryKeys.push.devices(mailboxId) });
+			if (mailboxId && actorScope) {
+				void invalidatePushHealth(queryClient, mailboxId, actorScope);
+			}
 		},
 	});
 }
 
-export function useDeletePushDevice(mailboxId: string | undefined) {
-	const qc = useQueryClient();
+export function useDeletePushDevice(
+	mailboxId: string | undefined,
+	actorScope: string | undefined,
+) {
+	const queryClient = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => {
-			if (!mailboxId) throw new Error("A mailbox is required to remove a push device");
+			if (!mailboxId) throw new Error("A Mailbox is required to remove a push device");
 			return api.deletePushSubscription(mailboxId, id);
 		},
 		onSuccess: () => {
-			if (mailboxId) qc.invalidateQueries({ queryKey: queryKeys.push.devices(mailboxId) });
+			if (mailboxId && actorScope) {
+				void invalidatePushHealth(queryClient, mailboxId, actorScope);
+			}
 		},
 	});
 }

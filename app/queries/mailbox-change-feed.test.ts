@@ -460,7 +460,7 @@ test("a forbidden feed purges every revoked-mailbox cache, clears its cursor, re
 		["attachments", mailboxId, "bytes", "message-1", "attachment-1"],
 		["mailbox-signature-settings", mailboxId],
 		["follow-up-reminders", mailboxId],
-		["push", "devices", mailboxId],
+		["push", mailboxId, "health", "actor@example.com"],
 	] as const;
 	const otherKey = ["emails", otherMailboxId, { folder: "inbox" }] as const;
 	const adversarialOtherKey = ["search", otherMailboxId, mailboxId, 1, ""] as const;

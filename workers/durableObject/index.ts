@@ -29,8 +29,12 @@ import {
 import { validateAttachmentSet } from "../../shared/attachments";
 import { vapidConfig } from "../lib/push/transport";
 import { sendWebPush } from "../lib/push/send";
-import { fanOutPush } from "../lib/push/fanout";
 import type { PushPayload } from "../lib/push/types";
+import {
+	enqueuePushNotification,
+	processPushOutbox,
+	readPushHealth,
+} from "../lib/push/outbox.ts";
 import type { ActivityActor } from "../lib/activity";
 import {
 	buildMailSearchPlan,
@@ -227,6 +231,7 @@ interface EmailData {
 	recipient_memory_origin?: RecipientMemoryOrigin | null;
 	snooze_wake_thread_id?: string | null;
 	follow_up_reply_mailbox_address?: string | null;
+	push_notification?: PushPayload;
 }
 
 interface AttachmentData {
@@ -2666,6 +2671,7 @@ export class MailboxDO extends DurableObject<Env> {
 
 		const folderId = folderRow.id;
 		const isSent = folderId === Folders.SENT;
+		let pushTargetCount: number | null = null;
 
 		// Sent emails are always read — the sender obviously knows what they wrote.
 		// This prevents sent replies from inflating thread_unread_count.
@@ -2753,7 +2759,28 @@ export class MailboxDO extends DurableObject<Env> {
 					email.date,
 				);
 			}
+			if (email.push_notification !== undefined) {
+				if (
+					folderId !== Folders.INBOX ||
+					email.recipient_memory_origin !== RecipientMemoryOrigins.LIVE_INBOUND ||
+					!mailboxAddress
+				) throw new Error("Push notification is not eligible for this Message");
+				pushTargetCount = enqueuePushNotification(this.ctx.storage.sql, {
+					emailId: email.id,
+					mailboxId: mailboxAddress,
+					payload: email.push_notification,
+					now: email.date,
+				}).targetCount;
+			}
 		});
+		if (pushTargetCount !== null) {
+			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
+				console.error("[push-outbox] failed to schedule durable delivery", {
+					emailId: email.id,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		}
 		if (folderId === Folders.INBOX && email.snooze_wake_thread_id) {
 			const queued = this.db
 				.select({ threadId: schema.snoozeReplyWakeQueue.thread_id })
@@ -4114,6 +4141,29 @@ export class MailboxDO extends DurableObject<Env> {
 	/** Enqueue the next recipient of the head job, persist progress, reschedule. */
 	async alarm(): Promise<void> {
 		const alarmNow = Date.now();
+		const pushVapid = vapidConfig(this.env);
+		const nextPushAt = await processPushOutbox({
+			storage: this.ctx.storage,
+			vapidConfigured: pushVapid !== null,
+			canAccess: (userId, mailboxId) =>
+				mailboxAccess(this.env).canAccessMailbox(userId, mailboxId),
+			send: (subscription, payload, options) => {
+				if (!pushVapid) {
+					return Promise.resolve({
+						ok: false as const,
+						reason: "CONFIG_ERROR" as const,
+						shouldDelete: false,
+						statusCode: null,
+					});
+				}
+				return sendWebPush(subscription, payload, pushVapid, {
+					signal: options.signal,
+					timeoutMs: Math.max(1, options.deadlineMs - Date.now()),
+				});
+			},
+			scheduleAlarmAt: (timestamp) => this.#scheduleAlarmAt(timestamp),
+		});
+		if (nextPushAt !== null) await this.#scheduleAlarmAt(nextPushAt);
 		const replyWakePending = this.#processReplyWakeBatch();
 		const nextSnoozeAt = this.#processDueSnoozeBatch(alarmNow);
 		const nextFollowUpAt = await this.#processFollowUpReplyCompletionQueue(alarmNow);
@@ -4312,10 +4362,9 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	// ── Push subscriptions (WISER-240) ─────────────────────────────
-	// Per-device rows for this mailbox. `firePush` fans a payload out to every
-	// enabled device best-effort and prunes the ones the push service reports
-	// gone. Storage + send + prune are co-located here because the subscriptions
-	// are local to the DO (the CRM keys by user; the portal keys by mailbox).
+	// Per-device capabilities for this mailbox. Live inbound writes snapshot their
+	// opaque IDs into the durable outbox; alarm dispatch rechecks actor access and
+	// the current capability generation before using any endpoint or key material.
 
 	async upsertPushSubscription(input: {
 		userId: string;
@@ -4324,19 +4373,46 @@ export class MailboxDO extends DurableObject<Env> {
 		auth: string;
 		userAgent: string | null;
 		deviceLabel: string;
-	}): Promise<{ id: string; deviceLabel: string }> {
-		// Re-subscribing the same device yields the same endpoint → refresh its
-		// keys + last_seen without minting a new row. device_label / user_agent
-		// stay create-only (the first registration's values stick).
+	}): Promise<{ id: string; deviceLabel: string; generation: number }> {
+		// Re-subscribing the same device yields the same endpoint, but every
+		// accepted rebind advances its capability generation so an older in-flight
+		// provider response can never act on the rebound record. Health is retained
+		// only when the actor and key material are unchanged.
 		const id = crypto.randomUUID();
 		this.ctx.storage.sql.exec(
 			`INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, user_agent, device_label)
 			 VALUES (?, ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(endpoint) DO UPDATE SET
-			   user_id = excluded.user_id,
-			   p256dh = excluded.p256dh,
-			   auth = excluded.auth,
-			   last_seen_at = datetime('now')`,
+				 ON CONFLICT(endpoint) DO UPDATE SET
+				   user_id = excluded.user_id,
+				   p256dh = excluded.p256dh,
+				   auth = excluded.auth,
+				   generation = push_subscriptions.generation + 1,
+				   last_push_attempt_at = CASE WHEN
+				     push_subscriptions.user_id IS NOT excluded.user_id OR
+				     push_subscriptions.p256dh <> excluded.p256dh OR
+				     push_subscriptions.auth <> excluded.auth
+				   THEN NULL ELSE push_subscriptions.last_push_attempt_at END,
+				   last_push_accepted_at = CASE WHEN
+				     push_subscriptions.user_id IS NOT excluded.user_id OR
+				     push_subscriptions.p256dh <> excluded.p256dh OR
+				     push_subscriptions.auth <> excluded.auth
+				   THEN NULL ELSE push_subscriptions.last_push_accepted_at END,
+				   last_push_failure_at = CASE WHEN
+				     push_subscriptions.user_id IS NOT excluded.user_id OR
+				     push_subscriptions.p256dh <> excluded.p256dh OR
+				     push_subscriptions.auth <> excluded.auth
+				   THEN NULL ELSE push_subscriptions.last_push_failure_at END,
+				   last_push_failure_reason = CASE WHEN
+				     push_subscriptions.user_id IS NOT excluded.user_id OR
+				     push_subscriptions.p256dh <> excluded.p256dh OR
+				     push_subscriptions.auth <> excluded.auth
+				   THEN NULL ELSE push_subscriptions.last_push_failure_reason END,
+				   consecutive_push_failures = CASE WHEN
+				     push_subscriptions.user_id IS NOT excluded.user_id OR
+				     push_subscriptions.p256dh <> excluded.p256dh OR
+				     push_subscriptions.auth <> excluded.auth
+				   THEN 0 ELSE push_subscriptions.consecutive_push_failures END,
+				   last_seen_at = datetime('now')`,
 			id,
 			input.userId,
 			input.endpoint,
@@ -4348,62 +4424,39 @@ export class MailboxDO extends DurableObject<Env> {
 		const [row] = this.ctx.storage.sql.exec<{
 			id: string;
 			device_label: string;
+			generation: number;
 		}>(
-			`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`,
+			`SELECT id, device_label, generation FROM push_subscriptions WHERE endpoint = ?`,
 			input.endpoint,
 		);
 		if (!row) throw new Error("Push subscription was not stored");
-		return { id: row.id, deviceLabel: row.device_label };
+		await this.ensurePushAlarm();
+		return {
+			id: row.id,
+			deviceLabel: row.device_label,
+			generation: row.generation,
+		};
 	}
 
-	async listPushSubscriptionDevices(userId: string): Promise<
-		Array<{
-			id: string;
-			deviceLabel: string | null;
-			userAgent: string | null;
-			createdAt: string;
-			lastSeenAt: string;
-		}>
-	> {
-		// Never returns endpoint / keys — the device list is UX metadata only.
-		return [
-			...this.ctx.storage.sql.exec<{
-				id: string;
-				device_label: string | null;
-				user_agent: string | null;
-				created_at: string;
-				last_seen_at: string;
-			}>(
-				`SELECT id, device_label, user_agent, created_at, last_seen_at
-				 FROM push_subscriptions
-				 WHERE user_id = ?
-				 ORDER BY last_seen_at DESC`,
-				userId,
-			),
-		].map((row) => {
-			return {
-				id: row.id,
-				deviceLabel: row.device_label,
-				userAgent: row.user_agent,
-				createdAt: row.created_at,
-				lastSeenAt: row.last_seen_at,
-			};
-		});
-	}
-
-	async deletePushSubscription(id: string, userId: string): Promise<boolean> {
+	async deletePushSubscription(
+		id: string,
+		userId: string,
+		expectedGeneration?: number,
+	): Promise<boolean> {
+		const generationClause = expectedGeneration === undefined ? "" : " AND generation = ?";
+		const bindings = expectedGeneration === undefined
+			? [id, userId]
+			: [id, userId, expectedGeneration];
 		const existing = [
 			...this.ctx.storage.sql.exec(
-				`SELECT id FROM push_subscriptions WHERE id = ? AND user_id = ?`,
-				id,
-				userId,
+				`SELECT id FROM push_subscriptions WHERE id = ? AND user_id = ?${generationClause}`,
+				...bindings,
 			),
 		];
 		if (existing.length === 0) return false;
 		this.ctx.storage.sql.exec(
-			`DELETE FROM push_subscriptions WHERE id = ? AND user_id = ?`,
-			id,
-			userId,
+			`DELETE FROM push_subscriptions WHERE id = ? AND user_id = ?${generationClause}`,
+			...bindings,
 		);
 		return true;
 	}
@@ -4415,91 +4468,29 @@ export class MailboxDO extends DurableObject<Env> {
 		);
 	}
 
-	/**
-	 * Fan a push out to every device on this mailbox, prune dead endpoints, and
-	 * touch the delivered ones. Best-effort and never throws — a push failure or
-	 * missing VAPID config must never break mail receipt (the caller fires this
-	 * from `receiveEmail` after the mail is already stored).
-	 */
-	async firePush(payload: PushPayload): Promise<void> {
-		try {
-			const vapid = vapidConfig(this.env);
-			if (!vapid) return; // push not configured for this env — no-op
+	async ensurePushAlarm(): Promise<void> {
+		const row = [...this.ctx.storage.sql.exec<{ due_at: string | null }>(
+			`SELECT MIN(due_at) AS due_at FROM (
+			 SELECT next_attempt_at AS due_at FROM push_notification_deliveries
+			 WHERE status IN ('pending', 'retrying')
+			 UNION ALL
+			 SELECT lease_expires_at AS due_at FROM push_notification_deliveries
+			 WHERE status = 'sending' AND lease_expires_at IS NOT NULL
+			 UNION ALL
+			 SELECT strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(completed_at, created_at), '+7 days') AS due_at
+			 FROM push_notifications
+			 WHERE state IN ('completed', 'no_targets', 'expired')
+			)`,
+		)][0];
+		if (row?.due_at) await this.#scheduleAlarmAt(Date.parse(row.due_at));
+	}
 
-			const candidateRows = [
-				...this.ctx.storage.sql.exec<{
-					user_id: string;
-					endpoint: string;
-					p256dh: string;
-					auth: string;
-				}>(
-					`SELECT user_id, endpoint, p256dh, auth
-					 FROM push_subscriptions
-					 WHERE user_id IS NOT NULL`,
-				),
-			];
-			const authorized = await Promise.all(
-				candidateRows.map((row) =>
-					mailboxAccess(this.env).canAccessMailbox(
-						row.user_id,
-						payload.data.mailboxId,
-					),
-				),
-			);
-			const rows = candidateRows
-				.filter((_row, index) => authorized[index])
-				.map(({ endpoint, p256dh, auth }) => ({ endpoint, p256dh, auth }));
-			const revokedEndpoints = candidateRows
-				.filter((_row, index) => !authorized[index])
-				.map((row) => row.endpoint);
-			if (revokedEndpoints.length > 0) {
-				const placeholders = revokedEndpoints.map(() => "?").join(", ");
-				this.ctx.storage.sql.exec(
-					`DELETE FROM push_subscriptions WHERE endpoint IN (${placeholders})`,
-					...revokedEndpoints,
-				);
-			}
-			if (rows.length === 0) return;
-
-			const result = await fanOutPush(
-				rows,
-				JSON.stringify(payload),
-				(sub, body) => sendWebPush(sub, body, vapid),
-			);
-			if (result.delivered < result.attempted) {
-				console.warn("[push] delivery incomplete", {
-					mailboxId: payload.data.mailboxId,
-					attempted: result.attempted,
-					delivered: result.delivered,
-					pruned: result.deadEndpoints.length,
-					failureCounts: result.failureCounts,
-				});
-			}
-
-			for (const endpoint of result.deadEndpoints) {
-				const attemptedSubscription = rows.find(
-					(row) => row.endpoint === endpoint,
-				);
-				if (!attemptedSubscription) continue;
-				this.ctx.storage.sql.exec(
-					`DELETE FROM push_subscriptions
-					 WHERE endpoint = ? AND p256dh = ? AND auth = ?`,
-					attemptedSubscription.endpoint,
-					attemptedSubscription.p256dh,
-					attemptedSubscription.auth,
-				);
-			}
-			for (const endpoint of result.deliveredEndpoints) {
-				this.ctx.storage.sql.exec(
-					`UPDATE push_subscriptions SET last_seen_at = datetime('now') WHERE endpoint = ?`,
-					endpoint,
-				);
-			}
-		} catch (error) {
-			console.error("[push] dispatch failed", {
-				mailboxId: payload.data.mailboxId,
-				error,
-			});
-		}
+	async getPushHealth(userId: string) {
+		await this.ensurePushAlarm();
+		return readPushHealth(this.ctx.storage.sql, {
+			userId,
+			configured: vapidConfig(this.env) !== null,
+			now: new Date().toISOString(),
+		});
 	}
 }

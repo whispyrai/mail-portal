@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildPushPayload, htmlToSnippet } from "./payload.ts";
+import { validateStoredPushPayload } from "./types.ts";
 
 test("htmlToSnippet strips tags, decodes entities, collapses whitespace", () => {
 	assert.equal(
@@ -90,4 +91,35 @@ test("sender-controlled notification text stays inside the Web Push plaintext li
 	const encodedLength = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
 
 	assert.ok(encodedLength <= 3_993, `payload is ${encodedLength} bytes`);
+});
+
+test("hostile control and bidi-only text falls back without making inbound payload invalid", () => {
+	const payload = buildPushPayload({
+		...base,
+		fromName: "\u202e\u0000\u200b",
+		fromAddress: "safe.sender@example.com",
+		subject: "\u202e\u0000",
+		body: "\u200b",
+	});
+	assert.equal(payload.title, "safe.sender");
+	assert.equal(payload.body, "(no subject)");
+	assert.deepEqual(
+		validateStoredPushPayload(payload, { emailId: base.emailId, mailboxId: base.mailboxId }),
+		payload,
+	);
+});
+
+test("stored payload rejects protocol-relative or traversing assets and forged identities", () => {
+	const payload = buildPushPayload(base);
+	for (const invalid of [
+		{ ...payload, icon: "//evil.example/icon.png" },
+		{ ...payload, badge: "/../secret" },
+		{ ...payload, title: "Unsafe\u202etitle" },
+		{ ...payload, data: { ...payload.data, emailId: "other" } },
+	]) {
+		assert.throws(() => validateStoredPushPayload(invalid, {
+			emailId: base.emailId,
+			mailboxId: base.mailboxId,
+		}));
+	}
 });

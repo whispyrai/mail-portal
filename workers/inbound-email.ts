@@ -80,6 +80,16 @@ export async function receiveEmail(
 	const messageId = crypto.randomUUID();
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 	const brand = resolveBrand(env.BRAND);
+	const pushNotification = buildPushPayload({
+		emailId: messageId,
+		mailboxId,
+		fromName: parsedEmail.from?.name || null,
+		fromAddress: parsedEmail.from?.address || "",
+		subject: parsedEmail.subject || "",
+		body: parsedEmail.text || parsedEmail.html || "",
+		icon: brand.pwaIcon192,
+		badge: brand.notificationBadge,
+	});
 
 	await storeParsedEmail({ bucket: env.BUCKET, mailbox: stub }, parsedEmail, {
 		folder: Folders.INBOX,
@@ -90,25 +100,14 @@ export async function receiveEmail(
 		followUpMailboxAddress: mailboxId,
 		mailboxAddress: mailboxId,
 		recipientMemoryOrigin: RecipientMemoryOrigins.LIVE_INBOUND,
+		pushNotification,
 	});
 
 	ctx.waitUntil(
-		stub
-			.firePush(
-				buildPushPayload({
-					emailId: messageId,
-					mailboxId,
-					fromName: parsedEmail.from?.name || null,
-					fromAddress: parsedEmail.from?.address || "",
-					subject: parsedEmail.subject || "",
-					body: parsedEmail.text || parsedEmail.html || "",
-					icon: brand.pwaIcon192,
-					badge: brand.notificationBadge,
-				}),
-			)
+		stub.ensurePushAlarm()
 			.catch((error) =>
 				console.error(
-					"Push dispatch failed:",
+					"Push alarm recovery failed:",
 					error instanceof Error ? error.message : String(error),
 				),
 			),

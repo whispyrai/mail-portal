@@ -4,7 +4,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { decodeBase64Url } from "../../../shared/base64url";
-import { useAppConfig, useRegisterPushDevice } from "~/queries/push";
+import {
+	useAppConfig,
+	useCurrentPushActor,
+	useRegisterPushDevice,
+} from "~/queries/push";
+import { ApiError } from "~/services/api";
 import { rebindExistingPushSubscription } from "./push-rebind";
 
 const SW_READY_TIMEOUT_MS = 10_000;
@@ -23,9 +28,15 @@ async function waitForServiceWorkerReady(): Promise<ServiceWorkerRegistration | 
  * requests permission (must be called from a user gesture), waits for the SW,
  * subscribes with the env's VAPID key, and stores the subscription.
  */
-export function usePushSubscription(mailboxId: string | undefined) {
+export type PushSubscriptionActionResult = "enabled" | "failed" | "revoked";
+
+export function usePushSubscription(
+	mailboxId: string | undefined,
+	actorScope: string | undefined,
+	onAccessRevoked?: (mailboxId: string) => void,
+) {
 	const { data: config } = useAppConfig();
-	const register = useRegisterPushDevice(mailboxId);
+	const register = useRegisterPushDevice(mailboxId, actorScope);
 	const [isSubscribing, setIsSubscribing] = useState(false);
 
 	const pushSupported =
@@ -37,17 +48,17 @@ export function usePushSubscription(mailboxId: string | undefined) {
 	const vapidKey = config?.vapidPublicKey ?? null;
 	const canSubscribe = pushSupported && !!vapidKey && !!mailboxId;
 
-	async function enable(): Promise<boolean> {
-		if (!canSubscribe || !vapidKey) return false;
+	async function enable(): Promise<PushSubscriptionActionResult> {
+		if (!canSubscribe || !vapidKey) return "failed";
 		const applicationServerKey = decodeBase64Url(vapidKey);
-		if (!applicationServerKey) return false;
+		if (!applicationServerKey) return "failed";
 		setIsSubscribing(true);
 		try {
 			const permission = await Notification.requestPermission();
-			if (permission !== "granted") return false;
+			if (permission !== "granted") return "failed";
 
 			const registration = await waitForServiceWorkerReady();
-			if (!registration) return false;
+			if (!registration) return "failed";
 
 			const subscription = await registration.pushManager.subscribe({
 				userVisibleOnly: true,
@@ -58,16 +69,26 @@ export function usePushSubscription(mailboxId: string | undefined) {
 				endpoint: json.endpoint ?? "",
 				keys: { p256dh: json.keys?.p256dh ?? "", auth: json.keys?.auth ?? "" },
 			});
-			return true;
+			return "enabled";
 		} catch (err) {
+			if (err instanceof ApiError && err.status === 403 && mailboxId) {
+				onAccessRevoked?.(mailboxId);
+				return "revoked";
+			}
 			console.error("[pwa] push subscribe failed", err);
-			return false;
+			return "failed";
 		} finally {
 			setIsSubscribing(false);
 		}
 	}
 
-	return { enable, canSubscribe, isSubscribing, pushSupported, hasVapidKey: !!vapidKey };
+	return {
+		enable,
+		canSubscribe,
+		isSubscribing,
+		pushSupported,
+		hasVapidKey: !!vapidKey,
+	};
 }
 
 /**
@@ -76,9 +97,11 @@ export function usePushSubscription(mailboxId: string | undefined) {
  */
 export function useRebindExistingPushSubscription(
 	mailboxId: string | undefined,
+	onAccessRevoked?: (mailboxId: string) => void,
 ) {
 	const { data: config } = useAppConfig();
-	const register = useRegisterPushDevice(mailboxId);
+	const actorQuery = useCurrentPushActor();
+	const register = useRegisterPushDevice(mailboxId, actorQuery.data?.email);
 	const registerRef = useRef(register.mutateAsync);
 	registerRef.current = register.mutateAsync;
 	const vapidKey = config?.vapidPublicKey ?? null;
@@ -86,6 +109,7 @@ export function useRebindExistingPushSubscription(
 	useEffect(() => {
 		if (
 			!mailboxId ||
+			!actorQuery.data?.email ||
 			!vapidKey ||
 			typeof window === "undefined" ||
 			!("serviceWorker" in navigator) ||
@@ -105,10 +129,15 @@ export function useRebindExistingPushSubscription(
 				);
 			})
 			.catch((error) => {
-				if (!cancelled) console.error("[pwa] push rebind failed", error);
+				if (cancelled) return;
+				if (error instanceof ApiError && error.status === 403 && mailboxId) {
+					onAccessRevoked?.(mailboxId);
+					return;
+				}
+				console.error("[pwa] push rebind failed", error);
 			});
 		return () => {
 			cancelled = true;
 		};
-	}, [mailboxId, vapidKey]);
+	}, [actorQuery.data?.email, mailboxId, onAccessRevoked, vapidKey]);
 }

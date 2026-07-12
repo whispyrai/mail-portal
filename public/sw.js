@@ -42,6 +42,10 @@ self.addEventListener("push", (event) => {
 	}
 
 	const { title, body, icon, badge, clickUrl, data } = payload;
+	const notificationTag =
+		data && typeof data.emailId === "string" && data.emailId
+			? data.emailId
+			: undefined;
 
 	// showNotification requires a non-empty title; fall back so a malformed
 	// payload never renders "undefined" or throws.
@@ -50,6 +54,7 @@ self.addEventListener("push", (event) => {
 			body: body || "",
 			icon,
 			badge,
+			tag: notificationTag,
 			data: { clickUrl, swVersion: SW_VERSION, ...data },
 		}),
 	);

@@ -185,13 +185,7 @@ function evictRevokedMailbox(
 	mailboxId: string,
 ): void {
 	queryClient.removeQueries({
-		predicate: (query) =>
-			query.queryKey[1] === mailboxId ||
-			(
-				query.queryKey[0] === "push" &&
-				query.queryKey[1] === "devices" &&
-				query.queryKey[2] === mailboxId
-			),
+		predicate: (query) => query.queryKey[1] === mailboxId,
 	});
 	void queryClient.invalidateQueries({
 		queryKey: ["mailboxes"],
