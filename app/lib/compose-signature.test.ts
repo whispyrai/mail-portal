@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	extractAiAuthoredContent,
 	extractComposeSignature,
+	hasAiAuthoredContent,
 	hasComposeSignature,
 	insertComposeSignature,
 	insertComposeSignatureManually,
@@ -12,6 +14,22 @@ import {
 	replaceAiAuthoredContent,
 	renderComposeSignature,
 } from "./compose-signature.ts";
+
+test("AI context contains only authored content, never signatures or forwarded mail", () => {
+	const signature = '<div data-mail-signature="v1">Hesham<br>Wiser</div>';
+	const forwarded =
+		'<div data-mail-forwarded-message="v1"><p>Original message</p></div>';
+	assert.equal(
+		extractAiAuthoredContent(
+			`<p>Please refine this</p>${signature}${signature}${forwarded}`,
+		),
+		"<p>Please refine this</p>",
+	);
+	assert.equal(hasAiAuthoredContent(`<p><br></p>${signature}`), false);
+	assert.equal(hasAiAuthoredContent(`<p>&nbsp;</p>${forwarded}`), false);
+	assert.equal(hasAiAuthoredContent(`<p>One thought</p>${signature}`), true);
+	assert.equal(hasAiAuthoredContent(`<p><img src="cid:chart"></p>`), true);
+});
 
 test("plain-text signatures normalize newlines and escape hostile markup", () => {
 	assert.equal(MAIL_SIGNATURE_MARKER, 'data-mail-signature="v1"');

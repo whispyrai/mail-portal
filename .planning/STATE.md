@@ -30,6 +30,7 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 - Inline images are live end to end. Paste, drop, and toolbar insertion create managed canonical CID nodes with trusted local or authenticated previews, while strict server-side body-to-attachment validation runs after authoritative resolution and before every Draft or Outbox mutation.
 - Compose initialization and delivery planning now live in independently tested deep modules. Draft authority, Reply-All self exclusion, signature placement, fail-closed attachments, missing-attachment confirmation, schedule validation, and delivery identity remain unchanged while the central hook is smaller.
 - One-shot AI drafting routes now authenticate before consuming request bodies, stream-enforce strict 2 KiB and 12 KiB limits, reject unknown input, preserve safe budget explanations, redact arbitrary provider failures, and attribute work to the signed-in actor. Reply mail is isolated as bounded untrusted evidence, and the prompt/cache version was advanced.
+- Contextual AI compose refinement is live for new mail with explicit Generate, Refine, Polish, Shorter, More formal, and Friendlier actions. It may replace only authored subject/body content, rejects stale responses and unsafe inline-image drafts, preserves signatures and forwarded tails, shares exact client/server byte and model-envelope validation, and never changes recipients, attachments, schedule, mailbox identity, or delivery state.
 - Rich composer and conversation-detail code are deferred from initial mailbox load. Local error boundaries, cancel/back/reload paths, pending Escape, and SSR-safe defaults keep slow or failed chunks recoverable.
 - The first adversarial Outbox review and all integrated foundation, intelligence, Snooze, reminders, Search v2, attachment-integrity, bundle-splitting, draft-lifecycle, recipient-intelligence, and signature review rounds are complete. Every reported P1 finding has a regression fix.
 
@@ -56,17 +57,17 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Current verification
 
-- `npm test`: 720/720 passing after compose deep-module extraction and AI drafting boundary hardening.
+- `npm test`: 732/732 passing after contextual AI compose refinement and its adversarial safety remediations.
 - `npx tsc -b`: passing.
 - `git diff --check`: passing.
 - `npm run build:wiser`: production client and SSR artifacts built; Wrangler emitted the expected non-fatal sandbox log-file and missing-local-secrets warnings.
-- Initial mailbox JavaScript fell from about 527 kB raw to 76.99 kB raw and 21.43 kB gzip. ComposeEmail is deferred at 451.37 kB raw and 140.08 kB gzip; EmailPanel is deferred at 58.47 kB raw and 17.69 kB gzip.
+- Initial mailbox JavaScript remains deferred at 77.56 kB raw and 21.68 kB gzip. ComposeEmail is deferred at 501.93 kB raw and 156.76 kB gzip; EmailPanel remains deferred. The compose chunk now crosses the 500 kB advisory and needs a targeted follow-up split.
 - Local D1 migrations 0001 through 0003 applied successfully to the local Wiser database.
 - Local migration 0004 application is pending because the approved Wrangler escalation was rejected after the Codex usage limit was reached. Migration SQL tests pass.
 - Fresh foundation, delivery, conversation-intelligence, Snooze, follow-up reminder, Search v2, attachment-integrity, deferred-loading, draft-lifecycle, recipient-intelligence, signature, composer-input, and inline-image reviews found no P0 issues. Every reported P1 finding was fixed and covered by targeted regressions.
 - Adversarial Outbox review found eight P1 issues; all eight were fixed and regression coverage was added.
-- Integrated correctness, security, and AI-cost reviews produced two further P1 remediation rounds; all reported findings are fixed and covered by targeted regression tests.
+- Integrated correctness, security, data-integrity, and AI-cost reviews produced further P1 remediation rounds; all reported findings are fixed and covered by targeted regression tests. Two independent final compose-refinement re-reviews are clean at P0/P1.
 
 ## Next gate
 
-Checkpoint compose architecture and AI drafting safety, then implement the next research-backed AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
+Implement the next research-backed AI-native workflow slice, with proactive Today intelligence as the leading candidate, while preserving deterministic authority and the locked cost controls. Follow with a targeted ComposeEmail chunk split. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.

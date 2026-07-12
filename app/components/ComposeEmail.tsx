@@ -41,9 +41,18 @@ import {
   consumeComposeFileTransfer,
   transferContainsFiles,
 } from "~/lib/compose-file-transfer";
+import {
+  extractAiAuthoredContent,
+  hasAiAuthoredContent,
+  hasComposeSignature,
+} from "~/lib/compose-signature";
 import RichTextEditor from "./RichTextEditor";
 import ComposeAttachments from "./ComposeAttachments";
 import RecipientCombobox from "./RecipientCombobox";
+import {
+  AI_DRAFTING_LIMITS,
+  validateAiComposeDraftRequest,
+} from "../../shared/ai-drafting";
 
 /**
  * The composer. A single roomy centered modal used for new mail, replies,
@@ -63,6 +72,7 @@ export default function ComposeEmail() {
   const aiComposeMut = useAiDraftCompose();
   const [showAiPrompt, setShowAiPrompt] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
+  const [aiPanelError, setAiPanelError] = useState<string | null>(null);
   const [scheduledFor, setScheduledFor] = useState<string | null>(null);
   const [showCustomSchedule, setShowCustomSchedule] = useState(false);
   const [customScheduleValue, setCustomScheduleValue] = useState("");
@@ -131,6 +141,9 @@ export default function ComposeEmail() {
   const handledBlockedNavigationRef = useRef(false);
   const composeFormRef = useRef<HTMLFormElement>(null);
   const fileDragDepthRef = useRef(0);
+  const aiRequestPendingRef = useRef(false);
+  const aiEditableSnapshotRef = useRef({ subject, body });
+  aiEditableSnapshotRef.current = { subject, body };
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const sendButtonLabel = isSending
     ? scheduledFor
@@ -143,6 +156,10 @@ export default function ComposeEmail() {
         : scheduledFor
           ? "Schedule"
           : "Send";
+  const aiAuthoredBody = extractAiAuthoredContent(body);
+  const hasAiDraftContext =
+    subject.trim().length > 0 || hasAiAuthoredContent(body);
+  const aiActionLabel = hasAiDraftContext ? "Refine" : "Generate";
 
   useEffect(() => {
     if (!isComposing) return;
@@ -255,19 +272,54 @@ export default function ComposeEmail() {
     setShowCustomSchedule(false);
   };
 
-  const handleAiGenerate = async () => {
-    if (!originMailboxId || !aiPrompt.trim()) return;
+  const handleAiGenerate = async (instruction = aiPrompt) => {
+    const prompt = instruction.trim();
+    if (!originMailboxId || !prompt || aiRequestPendingRef.current) return;
+    if (/<img\b/i.test(aiAuthoredBody)) {
+      setAiPanelError(
+        "Remove inline images before refining this draft so their placement cannot be lost.",
+      );
+      return;
+    }
+    const request = {
+      prompt,
+      currentSubject: subject.trim().length > 0 ? subject : undefined,
+      currentBody: hasAiAuthoredContent(body) ? aiAuthoredBody : undefined,
+      preserveSignature: hasComposeSignature(body) || undefined,
+    };
+    const validation = validateAiComposeDraftRequest(request);
+    if (!validation.ok) {
+      setAiPanelError(
+        validation.code === "invalid_fields"
+          ? "This instruction or draft is too long to refine safely."
+          : "This draft is too large to refine safely. Shorten it before trying again.",
+      );
+      return;
+    }
+    const requestedSnapshot = { subject, body };
+    setAiPanelError(null);
+    aiRequestPendingRef.current = true;
     try {
       const draft = await aiComposeMut.mutateAsync({
         mailboxId: originMailboxId,
-        prompt: aiPrompt.trim(),
+        ...request,
       });
-      if (draft.subject) setSubject(draft.subject);
-      if (draft.body) applyAiBody(draft.body);
-      setShowAiPrompt(false);
+      if (
+        aiEditableSnapshotRef.current.subject !== requestedSnapshot.subject ||
+        aiEditableSnapshotRef.current.body !== requestedSnapshot.body
+      ) {
+        setAiPanelError(
+          "Your draft changed while the writing assistant was working. Nothing was replaced. Run it again when you are ready.",
+        );
+        return;
+      }
+      if (typeof draft.subject === "string") setSubject(draft.subject);
+      if (typeof draft.body === "string") applyAiBody(draft.body);
       setAiPrompt("");
     } catch {
       // error surfaced via mutation.error
+    } finally {
+      aiRequestPendingRef.current = false;
     }
   };
 
@@ -378,7 +430,9 @@ export default function ComposeEmail() {
                     : hasAttachmentIssue
                       ? "Attachments need attention"
                     : aiComposeMut.isPending
-                      ? "Generating draft"
+                      ? hasAiDraftContext
+                        ? "Refining draft"
+                        : "Generating draft"
                       : ""}
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-4 sm:px-6 sm:py-5">
@@ -462,27 +516,81 @@ export default function ComposeEmail() {
                   {!showAiPrompt ? (
                     <button
                       type="button"
-                      onClick={() => setShowAiPrompt(true)}
+                      onClick={() => {
+                        aiComposeMut.reset();
+                        setAiPanelError(null);
+                        setShowAiPrompt(true);
+                      }}
                       className="flex min-h-11 items-center gap-1.5 rounded px-1 text-sm text-kumo-link hover:text-kumo-link-hover font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
                     >
                       <SparkleIcon size={15} weight="fill" />
-                      Generate with AI
+                      Write with AI
                     </button>
                   ) : (
                     <div
                       data-compose-shortcut-surface="ai-panel"
-                      className="rounded-lg border border-kumo-line bg-kumo-recessed p-3 space-y-2"
+                      aria-busy={aiComposeMut.isPending}
+                      className="space-y-3 rounded-lg border border-kumo-line bg-kumo-recessed p-3"
                     >
-                      <label
-                        htmlFor="ai-compose-prompt"
-                        className="text-xs font-medium text-kumo-subtle"
-                      >
-                        What should this email be about?
-                      </label>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium text-kumo-default">
+                            Writing assistant
+                          </div>
+                          <label
+                            htmlFor="ai-compose-prompt"
+                            className="mt-0.5 block text-xs text-kumo-subtle"
+                          >
+                            {hasAiDraftContext
+                              ? "Tell it what to improve in your current draft."
+                              : "Describe the email you want to write."}
+                          </label>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="Close writing assistant"
+                          disabled={aiComposeMut.isPending}
+                          onClick={() => {
+                            aiComposeMut.reset();
+                            setAiPanelError(null);
+                            setShowAiPrompt(false);
+                            setAiPrompt("");
+                          }}
+                          className="flex min-h-9 min-w-9 items-center justify-center rounded text-kumo-subtle hover:bg-white hover:text-kumo-default focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand disabled:opacity-50"
+                        >
+                          <XIcon size={15} />
+                        </button>
+                      </div>
+                      {hasAiDraftContext && (
+                        <div
+                          className="flex flex-wrap gap-1.5"
+                          aria-label="Quick refinements"
+                        >
+                          {[
+                            ["Polish", "Polish this draft while preserving its meaning."],
+                            ["Shorter", "Make this draft shorter and more concise."],
+                            ["More formal", "Make this draft more formal."],
+                            ["Friendlier", "Make this draft friendlier and warmer."],
+                          ].map(([label, instruction]) => (
+                            <Button
+                              key={label}
+                              type="button"
+                              variant="secondary"
+                              size="sm"
+                              disabled={aiComposeMut.isPending}
+                              onClick={() => void handleAiGenerate(instruction)}
+                            >
+                              {label}
+                            </Button>
+                          ))}
+                        </div>
+                      )}
                       <textarea
                         id="ai-compose-prompt"
                         autoFocus
                         value={aiPrompt}
+                        disabled={aiComposeMut.isPending}
+                        maxLength={AI_DRAFTING_LIMITS.promptChars}
                         onChange={(e) => setAiPrompt(e.target.value)}
                         onKeyDown={(e) => {
                           const action = planComposeShortcut({
@@ -503,9 +611,18 @@ export default function ComposeEmail() {
                             e.stopPropagation();
                             void handleAiGenerate();
                           }
-                          if (e.key === "Escape") setShowAiPrompt(false);
+                          if (e.key === "Escape" && !aiComposeMut.isPending) {
+                            aiComposeMut.reset();
+                            setAiPanelError(null);
+                            setShowAiPrompt(false);
+                            setAiPrompt("");
+                          }
                         }}
-                        placeholder={assistantCopy.composePlaceholder}
+                        placeholder={
+                          hasAiDraftContext
+                            ? "For example: emphasize the next steps and keep it concise"
+                            : assistantCopy.composePlaceholder
+                        }
                         rows={2}
                         className="w-full resize-y rounded border border-kumo-line bg-white px-3 py-2 text-sm text-kumo-default placeholder:text-kumo-placeholder focus:outline-none focus:ring-2 focus:ring-kumo-focus"
                       />
@@ -518,9 +635,11 @@ export default function ComposeEmail() {
                           loading={aiComposeMut.isPending}
                           disabled={!aiPrompt.trim() || aiComposeMut.isPending}
                           icon={<SparkleIcon size={14} weight="fill" />}
-                          onClick={handleAiGenerate}
+                          onClick={() => void handleAiGenerate()}
                         >
-                          {aiComposeMut.isPending ? "Generating…" : "Generate"}
+                          {aiComposeMut.isPending
+                            ? `${aiActionLabel}…`
+                            : aiActionLabel}
                         </Button>
                         <Button
                           type="button"
@@ -528,20 +647,18 @@ export default function ComposeEmail() {
                           size="sm"
                           className="min-h-11"
                           disabled={aiComposeMut.isPending}
-                          onClick={() => {
-                            setShowAiPrompt(false);
-                            setAiPrompt("");
-                          }}
+                          onClick={() => setAiPrompt("")}
                         >
-                          Cancel
+                          Clear
                         </Button>
-                        {aiComposeMut.isError && (
+                        {(aiPanelError || aiComposeMut.isError) && (
                           <span
                             role="alert"
                             className="min-w-0 break-words text-xs text-kumo-danger sm:ml-1"
                           >
-                            {(aiComposeMut.error as Error)?.message ||
-                              "Generation failed"}
+                            {aiPanelError ||
+                              (aiComposeMut.error as Error)?.message ||
+                              "The writing assistant could not update this draft. Your content is unchanged."}
                           </span>
                         )}
                       </div>

@@ -3,13 +3,18 @@ import { z } from "zod";
 import {
 	draftNewEmail,
 	draftReplyForEmail,
+	type ComposeDraftRequest,
 } from "../lib/agent-context.ts";
 import type { MailboxContext } from "../lib/mailbox.ts";
 import type { Env } from "../types.ts";
+import {
+	AI_DRAFTING_LIMITS,
+	validateAiComposeDraftRequest,
+} from "../../shared/ai-drafting.ts";
 
 export const AI_DRAFT_REQUEST_LIMITS = {
-	replyBytes: 2_048,
-	composeBytes: 12 * 1_024,
+	replyBytes: AI_DRAFTING_LIMITS.replyRequestBytes,
+	composeBytes: AI_DRAFTING_LIMITS.composeRequestBytes,
 } as const;
 
 const ReplyDraftRequestSchema = z.object({
@@ -17,7 +22,10 @@ const ReplyDraftRequestSchema = z.object({
 }).strict();
 
 const ComposeDraftRequestSchema = z.object({
-	prompt: z.string().trim().min(1).max(8_000),
+	prompt: z.string().trim().min(1).max(AI_DRAFTING_LIMITS.promptChars),
+	currentSubject: z.string().max(AI_DRAFTING_LIMITS.currentSubjectChars).optional(),
+	currentBody: z.string().max(AI_DRAFTING_LIMITS.currentBodyChars).optional(),
+	preserveSignature: z.boolean().optional(),
 }).strict();
 
 const SAFE_AI_UNAVAILABLE_MESSAGES = new Set([
@@ -93,9 +101,9 @@ export interface AiDraftRouteOperations {
 	draftCompose(
 		env: Env,
 		mailboxId: string,
-		prompt: string,
+		request: ComposeDraftRequest,
 		actorUserId: string,
-	): Promise<{ subject: string; body: string }>;
+	): Promise<{ subject?: string; body: string }>;
 }
 
 export type AiDraftRouteContext = MailboxContext;
@@ -216,6 +224,18 @@ export function createAiDraftRoutes(
 			if (!parsed.success) {
 				return c.json({ error: invalidComposeMessage(body) }, 400);
 			}
+			const validation = validateAiComposeDraftRequest(parsed.data);
+			if (!validation.ok) {
+				return c.json(
+					{
+						error:
+							validation.code === "draft_context_too_large"
+								? "The current draft is too large to refine safely"
+								: "AI compose request is invalid",
+					},
+					400,
+				);
+			}
 			input = parsed.data;
 		} catch (error) {
 			if (error instanceof AiDraftRequestTooLargeError) {
@@ -231,7 +251,7 @@ export function createAiDraftRoutes(
 				await operations.draftCompose(
 					c.env,
 					mailboxId,
-					input.prompt,
+					input,
 					session.sub,
 				),
 			);

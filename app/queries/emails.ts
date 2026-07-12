@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import api from "~/services/api";
 import type { Email, AttachmentRef, OutboundDelivery } from "~/types";
 import type { BatchTriageCommand } from "../../shared/batch-triage";
+import type { AiComposeDraftRequest } from "../../shared/ai-drafting";
 import { queryKeys } from "./keys";
 
 // ---------- Types ----------
@@ -429,13 +430,21 @@ export function useAiDraftReply() {
 	});
 }
 
-/** One-shot AI compose draft for a new email. Returns { subject, body } to seed the composer. */
+/** Generate or refine a new email while keeping the request pinned to its origin mailbox. */
 export function useAiDraftCompose() {
 	return useMutation({
 		mutationFn: ({
 			mailboxId,
 			prompt,
-		}: { mailboxId: string; prompt: string }) =>
-			api.aiDraftCompose(mailboxId, prompt),
+			currentSubject,
+			currentBody,
+			preserveSignature,
+		}: AiComposeDraftRequest & { mailboxId: string }) =>
+			api.aiDraftCompose(mailboxId, {
+				prompt,
+				currentSubject,
+				currentBody,
+				preserveSignature,
+			}),
 	});
 }

@@ -76,6 +76,26 @@ export function removeComposeSignatures(bodyHtml: string): string {
 	return bodyHtml.replace(signatureBlockPattern(true), "");
 }
 
+/**
+ * Returns only the content authored for the current message. Stable signature
+ * and forwarded-message blocks are deliberately excluded from AI context.
+ */
+export function extractAiAuthoredContent(bodyHtml: string): string {
+	return removeComposeSignatures(authoredContent(bodyHtml));
+}
+
+export function hasAiAuthoredContent(bodyHtml: string): boolean {
+	const authored = extractAiAuthoredContent(bodyHtml);
+	if (/<(?:img|hr|table|iframe|video|audio|svg)\b/i.test(authored)) {
+		return true;
+	}
+	return authored
+		.replace(/<br\s*\/?>/gi, " ")
+		.replace(/<[^>]*>/g, "")
+		.replace(/&nbsp;|&#160;|&#x0*a0;/gi, " ")
+		.trim().length > 0;
+}
+
 export function insertComposeSignature(
 	bodyHtml: string,
 	signatureText: string,
@@ -149,6 +169,6 @@ export function replaceAiAuthoredContent(
 ): string {
 	const signature = extractComposeSignature(authoredContent(currentBodyHtml));
 	const forwarded = extractForwardedMessageTail(currentBodyHtml);
-	const replacement = removeComposeSignatures(authoredContent(aiAuthoredHtml));
+	const replacement = extractAiAuthoredContent(aiAuthoredHtml);
 	return `${replacement}${signature ?? ""}${forwarded ?? ""}`;
 }

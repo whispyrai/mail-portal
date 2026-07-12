@@ -80,7 +80,37 @@ test("AI draft routes preserve successful responses and attribute the signed-in 
 	assert.deepEqual(await compose.json(), { subject: "Hello", body: "<p>Draft</p>" });
 	assert.deepEqual(calls.map((call) => call.slice(1)), [
 		["team@example.com", "mail-1", "user-1"],
-		["team@example.com", "Write a hello", "user-1"],
+		["team@example.com", { prompt: "Write a hello" }, "user-1"],
+	]);
+});
+
+test("AI compose forwards optional authored subject and body without trimming draft data", async () => {
+	let forwarded: unknown[] | undefined;
+	const app = testApp(operations({
+		async draftCompose(...args) {
+			forwarded = args;
+			return { subject: "Refined", body: "<p>Refined body</p>" };
+		},
+	}));
+	const response = await request(
+		app,
+		"/ai-compose",
+		JSON.stringify({
+			prompt: "  Make this clearer  ",
+			currentSubject: "  Existing subject  ",
+			currentBody: "<p> Existing body </p>",
+		}),
+	);
+
+	assert.equal(response.status, 200);
+	assert.deepEqual(forwarded?.slice(1), [
+		"team@example.com",
+		{
+			prompt: "Make this clearer",
+			currentSubject: "  Existing subject  ",
+			currentBody: "<p> Existing body </p>",
+		},
+		"user-1",
 	]);
 });
 
@@ -91,15 +121,21 @@ test("AI draft routes require auth before parsing request bodies", async () => {
 			called = true;
 			return { to: "", subject: "", body: "" };
 		},
+		async draftCompose() {
+			called = true;
+			return { subject: "", body: "" };
+		},
 	}), null);
-	const response = await request(
-		app,
-		"/ai-draft",
-		JSON.stringify({ emailId: "mail-1" }),
-		{ "Content-Length": String(AI_DRAFT_REQUEST_LIMITS.replyBytes + 1) },
-	);
-	assert.equal(response.status, 401);
-	assert.deepEqual(await response.json(), { error: "Unauthorized" });
+	for (const [path, body, limit] of [
+		["/ai-draft", { emailId: "mail-1" }, AI_DRAFT_REQUEST_LIMITS.replyBytes],
+		["/ai-compose", { prompt: "Write it" }, AI_DRAFT_REQUEST_LIMITS.composeBytes],
+	] as const) {
+		const response = await request(app, path, JSON.stringify(body), {
+			"Content-Length": String(limit + 1),
+		});
+		assert.equal(response.status, 401);
+		assert.deepEqual(await response.json(), { error: "Unauthorized" });
+	}
 	assert.equal(called, false);
 });
 
@@ -142,6 +178,83 @@ test("AI draft routes reject malformed, empty, extra, and oversized input before
 		{ "Content-Length": String(AI_DRAFT_REQUEST_LIMITS.composeBytes + 1) },
 	);
 	assert.equal(declaredOversize.status, 413);
+	assert.equal(calls, 0);
+});
+
+test("AI compose enforces field limits and the combined safe model envelope", async () => {
+	let calls = 0;
+	const app = testApp(operations({
+		async draftCompose() {
+			calls++;
+			return { subject: "ok", body: "<p>ok</p>" };
+		},
+	}));
+	for (const body of [
+		{ prompt: "p".repeat(8_000) },
+		{
+			prompt: "valid",
+			currentSubject: "s".repeat(500),
+			currentBody: "b".repeat(17_000),
+			preserveSignature: true,
+		},
+	]) {
+		const exact = await request(app, "/ai-compose", JSON.stringify(body));
+		assert.equal(exact.status, 200);
+	}
+	assert.equal(calls, 2);
+
+	const unsafeCombination = await request(
+		app,
+		"/ai-compose",
+		JSON.stringify({
+			prompt: "p".repeat(8_000),
+			currentSubject: "s".repeat(500),
+			currentBody: "b".repeat(20_000),
+		}),
+	);
+	assert.equal(unsafeCombination.status, 400);
+	assert.deepEqual(await unsafeCombination.json(), {
+		error: "The current draft is too large to refine safely",
+	});
+
+	for (const body of [
+		{ prompt: "p".repeat(8_001) },
+		{ prompt: "valid", currentSubject: "s".repeat(501) },
+		{ prompt: "valid", currentBody: "b".repeat(20_001) },
+		{ prompt: "valid", currentSubject: 42 },
+		{ prompt: "valid", currentBody: null },
+	]) {
+		const response = await request(app, "/ai-compose", JSON.stringify(body));
+		assert.equal(response.status, 400);
+		assert.deepEqual(await response.json(), {
+			error: "AI compose request is invalid",
+		});
+	}
+	assert.equal(calls, 2);
+});
+
+test("AI compose enforces the streamed body cap at exactly 32 KiB", async () => {
+	let calls = 0;
+	const app = testApp(operations({
+		async draftCompose() {
+			calls++;
+			return { subject: "", body: "" };
+		},
+	}));
+	const base = JSON.stringify({ prompt: "valid", unknown: "" });
+	const exactBody = JSON.stringify({
+		prompt: "valid",
+		unknown: "x".repeat(AI_DRAFT_REQUEST_LIMITS.composeBytes - base.length),
+	});
+	assert.equal(new TextEncoder().encode(exactBody).byteLength, 32 * 1_024);
+
+	const exact = await request(app, "/ai-compose", exactBody);
+	assert.equal(exact.status, 400);
+	assert.deepEqual(await exact.json(), { error: "AI compose request is invalid" });
+
+	const over = await request(app, "/ai-compose", `${exactBody} `);
+	assert.equal(over.status, 413);
+	assert.deepEqual(await over.json(), { error: "AI draft request is too large" });
 	assert.equal(calls, 0);
 });
 

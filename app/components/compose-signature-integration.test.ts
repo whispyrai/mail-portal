@@ -53,7 +53,10 @@ test("AI replacement, recovery, and route changes preserve the compose-session s
 		/replaceAiAuthoredContent\(snapshotRef\.current\.body, nextAiBody\)/,
 	);
 	assert.match(form, /bodyUserDirtyRef\.current = true/);
-	assert.match(compose, /if \(draft\.body\) applyAiBody\(draft\.body\)/);
+	assert.match(
+		compose,
+		/if \(typeof draft\.body === "string"\) applyAiBody\(draft\.body\)/,
+	);
 	assert.doesNotMatch(compose, /if \(draft\.body\) setBody\(draft\.body\)/);
 
 	// The origin mailbox is pinned for the lifetime of the compose session, and

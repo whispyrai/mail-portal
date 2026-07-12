@@ -22,6 +22,7 @@ import type {
 	SnoozeMutationResponse,
 	SnoozeScope,
 } from "../../shared/snooze";
+import type { AiComposeDraftRequest } from "../../shared/ai-drafting";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -321,10 +322,13 @@ const api = {
 			`/api/v1/mailboxes/${mailboxId}/ai-draft`,
 			{ emailId },
 		),
-	aiDraftCompose: (mailboxId: string, prompt: string) =>
-		post<{ subject: string; body: string }>(
+	aiDraftCompose: (
+		mailboxId: string,
+		input: AiComposeDraftRequest,
+	) =>
+		post<{ subject?: string; body: string }>(
 			`/api/v1/mailboxes/${mailboxId}/ai-compose`,
-			{ prompt },
+			input,
 		),
 
 	// Folders
