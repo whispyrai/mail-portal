@@ -77,6 +77,11 @@ export default function ComposeEmail() {
   );
   const isNewCompose =
     composeOptions.mode === "new" && !composeOptions.draftEmail;
+  const isReplyCompose =
+    !composeOptions.draftEmail &&
+    Boolean(composeOptions.originalEmail?.id) &&
+    (composeOptions.mode === "reply" || composeOptions.mode === "reply-all");
+  const isAiComposeEligible = isNewCompose || isReplyCompose;
   const sendLaterPresets = getSendLaterPresets();
   const scheduledLabel = scheduledFor
     ? formatScheduledTime(new Date(scheduledFor))
@@ -441,8 +446,8 @@ export default function ComposeEmail() {
                 required
               />
 
-              {/* AI compose, only for brand-new emails */}
-              {isNewCompose && (
+              {/* AI writing stays scoped to new mail and eligible stored replies. */}
+              {isAiComposeEligible && (
                 <div>
                   {!showAiPrompt ? (
                     <button
@@ -513,7 +518,10 @@ export default function ComposeEmail() {
                         }
                       >
                         <ComposeAiAssistant
+                          key={`${originMailboxId ?? ""}:${composeOptions.originalEmail?.id ?? "new"}:${composeOptions.mode}`}
                           originMailboxId={originMailboxId}
+                          composeMode={composeOptions.mode}
+                          sourceEmailId={composeOptions.originalEmail?.id}
                           subject={subject}
                           body={body}
                           setSubject={setSubject}
