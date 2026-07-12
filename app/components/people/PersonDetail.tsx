@@ -19,6 +19,7 @@ import {
 	useMailPerson,
 	useMailPersonTimeline,
 } from "~/queries/people";
+import PersonRelationshipBrief from "./PersonRelationshipBrief.tsx";
 
 function messageUrl(
 	mailboxId: string,
@@ -120,7 +121,7 @@ export default function PersonDetail({
 	showBack: boolean;
 	focusHeading: boolean;
 	onBack: () => void;
-	onAccessRevoked: () => void;
+	onAccessRevoked: (mailboxId?: string, active?: boolean) => void;
 }) {
 	const detail = useMailPerson(mailboxId, personId);
 	const person = detail.data?.status === "ready" ? detail.data.person : null;
@@ -274,6 +275,13 @@ export default function PersonDetail({
 						Imported history contributes {person.importedMessageCount} {person.importedMessageCount === 1 ? "message" : "messages"} to this relationship.
 					</p>
 				) : null}
+
+				<PersonRelationshipBrief
+					key={personId}
+					mailboxId={mailboxId}
+					personId={personId}
+					onAccessRevoked={onAccessRevoked}
+				/>
 
 				<section aria-labelledby="relationship-conversations-heading" className="border-b border-kumo-line py-5">
 					<h3 id="relationship-conversations-heading" className="px-4 text-sm font-semibold text-kumo-default sm:px-5">Recent conversations</h3>

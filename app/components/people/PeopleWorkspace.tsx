@@ -57,10 +57,23 @@ export default function PeopleWorkspace() {
 	const focusOriginRef = useRef<string | null>(null);
 	const previousSelectedRef = useRef<string | null>(urlState.selected);
 	const revokedExitStartedRef = useRef(false);
+	const [revokedByFeature, setRevokedByFeature] = useState(false);
 	const [containerWidth, setContainerWidth] = useState<number | null>(null);
-	const accessRevoked = peopleQuery.error instanceof ApiError &&
-		peopleQuery.error.status === 403;
-	const exitForRevokedAccess = useCallback(() => {
+	const accessRevoked = revokedByFeature ||
+		(peopleQuery.error instanceof ApiError && peopleQuery.error.status === 403);
+	const exitForRevokedAccess = useCallback((
+		revokedMailboxId = mailboxId,
+		active = true,
+	) => {
+		if (!active || revokedMailboxId !== mailboxId) {
+			exitRevokedMailbox({
+				queryClient,
+				mailboxId: revokedMailboxId,
+				storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
+			});
+			return;
+		}
+		setRevokedByFeature(true);
 		if (revokedExitStartedRef.current) return;
 		revokedExitStartedRef.current = true;
 		exitRevokedMailbox({
@@ -75,6 +88,7 @@ export default function PeopleWorkspace() {
 
 	useEffect(() => {
 		revokedExitStartedRef.current = false;
+		setRevokedByFeature(false);
 	}, [mailboxId]);
 
 	useEffect(() => {

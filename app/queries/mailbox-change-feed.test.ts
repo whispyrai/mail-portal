@@ -91,6 +91,7 @@ test("each feed resource invalidates only its deterministic non-AI mailbox proje
 		peopleList: ["people", mailboxId, "list", { q: "", sort: "recent" }],
 		peopleDetail: ["people", mailboxId, "detail", "person-1"],
 		peopleTimeline: ["people", mailboxId, "timeline", "person-1"],
+		relationshipBrief: ["relationship-brief", mailboxId, "person-1"],
 		labels: ["labels", mailboxId],
 		outbound: ["outbound", mailboxId, "message-1"],
 		ai: ["conversation-intelligence", mailboxId, "message-1"],
@@ -161,6 +162,7 @@ test("each feed resource invalidates only its deterministic non-AI mailbox proje
 		keys.attachmentBytes,
 		keys.ai,
 		keys.today,
+		keys.relationshipBrief,
 		keys.settings,
 		keys.reminders,
 		keys.otherMailbox,
@@ -235,6 +237,20 @@ test("attachment changes refresh People evidence without refetching the People l
 	assert.equal(queryClient.getQueryState(list)?.isInvalidated, false);
 	assert.equal(queryClient.getQueryState(detail)?.isInvalidated, true);
 	assert.equal(queryClient.getQueryState(timeline)?.isInvalidated, true);
+});
+
+test("deterministic Message and attachment changes never auto-invalidate a paid relationship brief", async () => {
+	const mailboxId = "team@example.com";
+	const queryClient = new QueryClient();
+	const brief = ["relationship-brief", mailboxId, "person-1"] as const;
+	queryClient.setQueryData(brief, { state: "cached" });
+
+	await invalidateMailboxChangeQueries(queryClient, mailboxId, [
+		change("message"),
+		change("attachment"),
+	]);
+
+	assert.equal(queryClient.getQueryState(brief)?.isInvalidated, false);
 });
 
 test("the feed resumes from and stores one versioned mailbox cursor without mail content", async () => {
@@ -510,6 +526,7 @@ test("a direct feature 403 reuses the revoked-mailbox exit without waiting for r
 	const mailboxId = "revoked@example.com";
 	const queryClient = new QueryClient();
 	queryClient.setQueryData(["people", mailboxId, "list", {}], { secret: true });
+	queryClient.setQueryData(["relationship-brief", mailboxId, "person-1"], { secret: true });
 	let refreshStarted = false;
 	let exited = false;
 	queryClient.invalidateQueries = (() => {
@@ -527,6 +544,7 @@ test("a direct feature 403 reuses the revoked-mailbox exit without waiting for r
 	});
 
 	assert.equal(queryClient.getQueryData(["people", mailboxId, "list", {}]), undefined);
+	assert.equal(queryClient.getQueryData(["relationship-brief", mailboxId, "person-1"]), undefined);
 	assert.equal(refreshStarted, true);
 	assert.equal(exited, true);
 });

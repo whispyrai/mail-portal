@@ -47,6 +47,7 @@ import { mailboxAttachmentRoutes } from "./routes/mailbox-attachments";
 import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
 import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
 import { mailPeopleRoutes } from "./routes/mail-people";
+import { relationshipBriefRoutes } from "./routes/relationship-brief";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -156,6 +157,7 @@ app.use(
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 app.use("/api/v1/mailboxes/:mailboxId", requireMailbox);
 app.route("/", mailPeopleRoutes);
+app.route("/", relationshipBriefRoutes);
 
 // -- Config ---------------------------------------------------------
 

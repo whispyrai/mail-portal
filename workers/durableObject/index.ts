@@ -154,6 +154,7 @@ import {
 	validateNormalizedMailPersonTimelineQuery,
 } from "../../shared/mail-people.ts";
 import { normalizeMailAddress } from "../lib/mail-address.ts";
+import { readRelationshipBriefEvidence } from "../lib/relationship-brief-evidence.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -3594,6 +3595,53 @@ export class MailboxDO extends DurableObject<Env> {
 			id,
 			validateNormalizedMailPersonTimelineQuery(query, id),
 		);
+	}
+
+	async getRelationshipBriefEvidence(
+		mailboxAddress: string,
+		personId: string,
+	) {
+		const normalizedMailbox = normalizeMailAddress(mailboxAddress);
+		if (!normalizedMailbox || normalizedMailbox !== mailboxAddress) {
+			throw new Error("Mailbox address is invalid");
+		}
+		const id = validateMailPersonId(personId);
+		const projector = createMailPeopleProjector({
+			store: this.ctx.storage,
+			mailboxAddress: normalizedMailbox,
+		});
+		const prepared = projector.getPerson(id);
+		if (prepared.status === "building") {
+			return {
+				state: "building" as const,
+				processedMessages: prepared.processedMessages,
+				retryAfterMs: prepared.retryAfterMs,
+			};
+		}
+		if (prepared.person === null) return { state: "not_found" as const };
+		return readRelationshipBriefEvidence(this.ctx.storage.sql, id);
+	}
+
+	async claimRelationshipBriefGeneration(
+		cacheKey: string,
+		ownerUserId: string,
+		claimToken: string,
+		expiresAt: number,
+	) {
+		return this.claimTodayBriefGeneration(
+			cacheKey,
+			ownerUserId,
+			claimToken,
+			expiresAt,
+		);
+	}
+
+	async releaseRelationshipBriefGeneration(
+		cacheKey: string,
+		ownerUserId: string,
+		claimToken: string,
+	) {
+		return this.releaseTodayBriefGeneration(cacheKey, ownerUserId, claimToken);
 	}
 
 	async #consumeAcceptedSourceDraft(

@@ -31,6 +31,10 @@ test("People adapts from list-detail to one-pane navigation with complete recove
 	assert.match(workspace, /Try again/);
 	assert.match(workspace, /min-h-11/);
 	assert.match(workspace, /invalidUrlState/);
+	assert.match(workspace, /const \[revokedByFeature, setRevokedByFeature\] = useState\(false\)/);
+	assert.match(workspace, /exitForRevokedAccess = useCallback\(\([\s\S]*?revokedMailboxId = mailboxId,[\s\S]*?active = true,[\s\S]*?setRevokedByFeature\(true\)/);
+	assert.match(workspace, /if \(!active \|\| revokedMailboxId !== mailboxId\) \{[\s\S]*?mailboxId: revokedMailboxId,[\s\S]*?return;/);
+	assert.match(workspace, /const accessRevoked = revokedByFeature \|\|/);
 	assert.match(
 		workspace,
 		/if \(accessRevoked\) \{[\s\S]*?return \([\s\S]*?Mailbox access changed[\s\S]*?\);[\s\S]*?\}[\s\S]*?return \([\s\S]*?<div ref=\{canvasRef\}/,
@@ -53,7 +57,7 @@ test("relationship actions use observed facts and exact non-mutating mail links"
 	assert.match(detail, /Mail history/);
 	assert.match(detail, /Back to people/);
 	assert.doesNotMatch(detail, /updateEmail|mark.*read|read:\s*true/i);
-	assert.doesNotMatch(detail, /avatar|company|sentiment|relationship strength|Generate relationship brief/i);
+	assert.doesNotMatch(detail, /avatar|company|sentiment|relationship strength/i);
 	assert.match(
 		compose,
 		/const initialFields = recovery[\s\S]*?to: recovery\.to[\s\S]*?: buildInitialComposeFields/,
