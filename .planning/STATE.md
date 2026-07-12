@@ -11,6 +11,7 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 - Truthful Outbox is live across compose, reply, forward, MCP, agent-compatible tools, and bulk sends. Immutable snapshots, idempotency, Send Later, Undo, provider ambiguity, retry budgets, draft retention, and delivery attempts are durable.
 - Outbox UI shows live delivery states, immediate Undo, retry, and explicit duplicate-risk confirmation for ambiguous outcomes.
 - Push subscriptions are user-scoped and safely rebound after migration. OAuth quiz operations use dedicated scopes and live identity checks.
+- Live inbound push delivery is now durable and bounded. Message acceptance atomically creates an exact target snapshot, the existing Mailbox alarm leases and retries provider handoffs with timeout, generation fencing, hard expiry, and seven-day retention, and Settings exposes only truthful actor-private device health. Background rebind and every direct push 403 immediately suppress and exit a revoked Mailbox.
 - Shared Mailbox administration UI is implemented.
 - AI cost controls now cover one-shot drafting and chat streaming, use token-aware reconciliation, reap stale reservations, bound model and tool context, cache by environment and mailbox, and expose an audited administrator review surface. Draft verification is deterministic and makes no model call.
 - Browser mutations enforce exact origin, login attempts are durably throttled, and password reset revokes browser, OAuth/MCP generation, and legacy MCP credentials.
@@ -68,11 +69,11 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Current verification
 
-- `npm test`: 1,170/1,170 passing after manual Relationship Brief evidence bounds, quote-tail attribution, exact citation proof, model-envelope and output bounds, actor-private caching, cost accounting, refresh isolation, distributed lease fencing, provider timeout, in-flight revocation, stale-cache eviction, explicit-only client actions, request ownership, and revoked-Mailbox purge regressions.
+- `npm test`: 1,221/1,221 passing after durable push atomicity, target snapshot, payload proof, lease recovery, retry classification, coordinator-owned transport timeout and exact wall-budget bounds, hard dispatch expiry, late-result suppression, generation-fenced handoff and revocation cleanup, seven-day retention, exact schema parity, actor-private health, owner/member/admin/nonmember authorization, service-worker deduplication, and revoked-Mailbox exit regressions.
 - `npx tsc -b`: passing.
 - `git diff --check`: passing.
-- `npm run build:wiser`: production client and SSR artifacts built with the expected non-fatal Wrangler sandbox log-file and missing development secret warnings.
-- People is a separate 49.68 kB raw and 12.30 kB gzip route chunk with the manual brief included. Files is 25.45 kB raw and 6.98 kB gzip. Initial mailbox JavaScript is 91.46 kB raw and 25.32 kB gzip. Today is 26.73 kB raw and 8.12 kB gzip; Search is 27.76 kB raw and 10.04 kB gzip; EmailPanel is deferred at 77.70 kB raw and 23.00 kB gzip. ComposeEmail is deferred at 497.18 kB raw and 155.41 kB gzip; ComposeAiAssistant remains separate at 14.33 kB raw and 5.65 kB gzip; InboxTriageReview remains separate at 17.34 kB raw and 6.14 kB gzip.
+- `npm run build`: production client and SSR artifacts built with the expected missing development secret warning when the sandboxed wrapper is used.
+- People is a separate 49.68 kB raw and 12.30 kB gzip route chunk with the manual brief included. Files is 25.45 kB raw and 6.98 kB gzip. Initial mailbox JavaScript is 92.08 kB raw and 25.51 kB gzip. Push subscription logic is separate at 9.59 kB raw and 3.77 kB gzip. Settings is 32.32 kB raw and 9.92 kB gzip. Today is 26.73 kB raw and 8.12 kB gzip; Search is 27.76 kB raw and 10.04 kB gzip; EmailPanel is deferred at 77.70 kB raw and 23.00 kB gzip. ComposeEmail is deferred at 497.18 kB raw and 155.41 kB gzip; ComposeAiAssistant remains separate at 14.33 kB raw and 5.65 kB gzip; InboxTriageReview remains separate at 17.34 kB raw and 6.13 kB gzip.
 - Local D1 migrations 0001 through 0003 applied successfully to the local Wiser database.
 - Local migration 0004 application is pending because the approved Wrangler escalation was rejected after the Codex usage limit was reached. Migration SQL tests pass.
 - Fresh foundation, delivery, conversation-intelligence, Snooze, follow-up reminder, Search v2, attachment-integrity, deferred-loading, draft-lifecycle, recipient-intelligence, signature, composer-input, and inline-image reviews found no P0 issues. Every reported P1 finding was fixed and covered by targeted regressions.
@@ -81,4 +82,4 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Next gate
 
-Audit the remaining roadmap and select the next bounded implementation slice. Semantic indexing, Automation Rules, hibernating WebSocket notifications, and persisted offline mail remain later candidates, subject to product value, cost, and architecture review. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
+Implement inbound-only deterministic Automation Rules v1 under a locked safety, audit, loop-prevention, and dry-run contract. Reviewable AI rule drafting remains a later layer over deterministic rule authority. Cross-Mailbox Today, semantic retrieval, offline mail, and operations hardening remain sequenced behind that slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
