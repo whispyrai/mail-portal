@@ -7,6 +7,7 @@ const read = (relativePath: string) =>
 
 test("draft save and send share the fail-closed attachment policy instead of filtering refs", () => {
 	const form = read("../hooks/useComposeForm.ts");
+	const delivery = read("../lib/compose-delivery.ts");
 
 	assert.match(form, /evaluateComposeAttachments\(attachments, body\)/);
 	assert.match(
@@ -14,9 +15,10 @@ test("draft save and send share the fail-closed attachment policy instead of fil
 		/const savedAttachmentPolicy = evaluateComposeAttachments[\s\S]*?if \(!savedAttachmentPolicy\.ok\)[\s\S]*?attachments: savedAttachmentPolicy\.refs/,
 	);
 	assert.match(
-		form,
-		/const requestSend[\s\S]*?if \(!latestAttachmentPolicy\.ok\)[\s\S]*?setError\(latestAttachmentPolicy\.error\)[\s\S]*?performSend\(scheduledFor, latestAttachmentPolicy\.refs\)/,
+		delivery,
+		/const attachmentPolicy = evaluateComposeAttachments[\s\S]*?if \(!attachmentPolicy\.ok\)[\s\S]*?message: attachmentPolicy\.error[\s\S]*?attachmentRefs: attachmentPolicy\.refs/,
 	);
+	assert.match(form, /const plan = planComposeSend/);
 	assert.doesNotMatch(form, /attachmentsToRefs/);
 });
 

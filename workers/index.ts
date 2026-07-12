@@ -36,6 +36,7 @@ import { followUpReminderRoutes } from "./routes/follow-up-reminders";
 import { searchRoutes } from "./routes/search";
 import { recipientSuggestionRoutes } from "./routes/recipient-suggestions";
 import { mailboxSignatureSettingsRoutes } from "./routes/mailbox-signature-settings";
+import { aiDraftRoutes } from "./routes/ai-drafts";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -55,7 +56,6 @@ import {
 	handleMutateLabels,
 	handleUpdateLabel,
 } from "./routes/labels";
-import { draftReplyForEmail, draftNewEmail } from "./lib/agent-context";
 import { systemPromptFor } from "./lib/prompts";
 import { pwaManifestFor, resolveBrand } from "./routes/brand";
 import { mailboxAccess, unregisterMailbox } from "./lib/mailbox-access";
@@ -207,6 +207,7 @@ app.route("/", followUpReminderRoutes);
 app.route("/", searchRoutes);
 app.route("/", recipientSuggestionRoutes);
 app.route("/", mailboxSignatureSettingsRoutes);
+app.route("/", aiDraftRoutes);
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");
@@ -471,42 +472,6 @@ app.post(
 	"/api/v1/mailboxes/:mailboxId/outbound-deliveries/:deliveryId/retry",
 	handleRetryOutboundDelivery,
 );
-
-// -- AI reply draft (one-shot, manually invoked from the thread view) -----
-app.post("/api/v1/mailboxes/:mailboxId/ai-draft", async (c: AppContext) => {
-	const mailboxId = c.req.param("mailboxId")!;
-	const { emailId } = (await c.req.json()) as { emailId?: string };
-	if (!emailId) return c.json({ error: "emailId is required" }, 400);
-	try {
-		const draft = await draftReplyForEmail(
-			c.env,
-			mailboxId,
-			emailId,
-			c.get("session")?.sub,
-		);
-		return c.json(draft);
-	} catch (e) {
-		return c.json({ error: (e as Error).message || "AI draft failed" }, 502);
-	}
-});
-
-// -- AI compose draft (one-shot, for brand-new outbound emails) -----------
-app.post("/api/v1/mailboxes/:mailboxId/ai-compose", async (c: AppContext) => {
-	const mailboxId = c.req.param("mailboxId")!;
-	const { prompt } = (await c.req.json()) as { prompt?: string };
-	if (!prompt?.trim()) return c.json({ error: "prompt is required" }, 400);
-	try {
-		const draft = await draftNewEmail(
-			c.env,
-			mailboxId,
-			prompt.trim(),
-			c.get("session")?.sub,
-		);
-		return c.json(draft);
-	} catch (e) {
-		return c.json({ error: (e as Error).message || "AI compose failed" }, 502);
-	}
-});
 
 // -- Bulk send (mail merge, F-06) -----------------------------------
 

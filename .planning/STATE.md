@@ -28,6 +28,8 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 - Composer keyboard flow now includes native form-owned Cmd/Ctrl+Enter send and Cmd/Ctrl+S save. A deterministic authored-content scanner warns about likely forgotten attachments without reading signatures, quoted replies, or forwarded content.
 - Composer file admission is same-tick safe and attempt-owned. Paste, drop, retry, removal, reset, hydration, recovery, and unmount abort stale work while preserving ordinary browser text and HTML paste behavior.
 - Inline images are live end to end. Paste, drop, and toolbar insertion create managed canonical CID nodes with trusted local or authenticated previews, while strict server-side body-to-attachment validation runs after authoritative resolution and before every Draft or Outbox mutation.
+- Compose initialization and delivery planning now live in independently tested deep modules. Draft authority, Reply-All self exclusion, signature placement, fail-closed attachments, missing-attachment confirmation, schedule validation, and delivery identity remain unchanged while the central hook is smaller.
+- One-shot AI drafting routes now authenticate before consuming request bodies, stream-enforce strict 2 KiB and 12 KiB limits, reject unknown input, preserve safe budget explanations, redact arbitrary provider failures, and attribute work to the signed-in actor. Reply mail is isolated as bounded untrusted evidence, and the prompt/cache version was advanced.
 - Rich composer and conversation-detail code are deferred from initial mailbox load. Local error boundaries, cancel/back/reload paths, pending Escape, and SSR-safe defaults keep slow or failed chunks recoverable.
 - The first adversarial Outbox review and all integrated foundation, intelligence, Snooze, reminders, Search v2, attachment-integrity, bundle-splitting, draft-lifecycle, recipient-intelligence, and signature review rounds are complete. Every reported P1 finding has a regression fix.
 
@@ -54,7 +56,7 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Current verification
 
-- `npm test`: 707/707 passing after the reviewed composer shortcut, attachment admission, Content-ID, and inline-image checkpoint.
+- `npm test`: 720/720 passing after compose deep-module extraction and AI drafting boundary hardening.
 - `npx tsc -b`: passing.
 - `git diff --check`: passing.
 - `npm run build:wiser`: production client and SSR artifacts built; Wrangler emitted the expected non-fatal sandbox log-file and missing-local-secrets warnings.
@@ -67,4 +69,4 @@ Phase 3: premium mail client, with Phase 4 cost-control foundation running in pa
 
 ## Next gate
 
-Checkpoint the completed composer and inline-image tranche, then reduce composer orchestration complexity without changing behavior and continue into the next AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.
+Checkpoint compose architecture and AI drafting safety, then implement the next research-backed AI-native workflow slice. Visual QA still requires explicit approval. The standards pass remains pending explicit scope confirmation.

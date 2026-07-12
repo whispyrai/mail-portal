@@ -12,11 +12,8 @@ import {
   useState,
 } from "react";
 import {
-  escapeHtml,
-  formatComposeDate,
   htmlToPlainText,
   splitEmailList,
-  stripHtml,
   toEmailListValue,
 } from "~/lib/utils";
 import {
@@ -33,16 +30,12 @@ import { useUIStore } from "~/hooks/useUIStore";
 import { useAttachments } from "~/hooks/useAttachments";
 import type { AttachmentRef, OutboundEnqueueResponse } from "~/types";
 import { LogicalSendIdentity } from "~/lib/compose-send-identity";
-import { replyAllRecipientFields } from "~/lib/recipient-input";
 import { planComposeEnqueueResult } from "~/lib/outbound-enqueue-outcome";
-import { validateScheduledDate } from "~/lib/send-later";
 import {
-  composeMissingAttachmentFingerprint,
-  shouldWarnMissingAttachment,
-} from "~/lib/compose-missing-attachment";
+	composeDeliveryPersistenceKey,
+	planComposeSend,
+} from "~/lib/compose-delivery";
 import {
-  FORWARDED_MESSAGE_MARKER,
-  insertComposeSignature,
   insertComposeSignatureManually,
   planDelayedComposeSignature,
   replaceAiAuthoredContent,
@@ -74,122 +67,7 @@ import {
   type ComposeDraftLifecycleEvent,
   type ComposeDraftSnapshot,
 } from "~/lib/compose-draft-lifecycle";
-
-interface ComposeFormFields {
-  to: string;
-  cc: string;
-  bcc: string;
-  showCcBcc: boolean;
-  subject: string;
-  body: string;
-}
-
-const EMPTY_FIELDS: ComposeFormFields = {
-  to: "",
-  cc: "",
-  bcc: "",
-  showCcBcc: false,
-  subject: "",
-  body: "",
-};
-
-function getPrefixedSubject(subject: string, prefix: "Re" | "Fwd") {
-  const expectedPrefix = `${prefix}: `;
-  return subject.startsWith(expectedPrefix)
-    ? subject
-    : `${expectedPrefix}${subject}`;
-}
-
-function buildForwardBody(
-  original: NonNullable<
-    ReturnType<typeof useUIStore.getState>["composeOptions"]["originalEmail"]
-  >,
-) {
-  const safeSender = escapeHtml(original.sender);
-  const safeSubject = escapeHtml(original.subject);
-  const safeBody = escapeHtml(stripHtml(original.body || "")).replace(
-    /\n/g,
-    "<br>",
-  );
-
-  return `<p><br></p><div ${FORWARDED_MESSAGE_MARKER} style="border: 1px solid #ddd; padding: 1em; background-color: #f9f9f9; margin: 1em 0;"><strong>Forwarded message:</strong><br><strong>From:</strong> ${safeSender}<br><strong>Date:</strong> ${formatComposeDate(original.date)}<br><strong>Subject:</strong> ${safeSubject}<br><br>${safeBody}</div>`;
-}
-
-function withInitialSignature(
-  bodyHtml: string,
-  mode: "new" | "reply" | "reply-all" | "forward",
-  signature: MailboxSignature | undefined,
-): string {
-  return signature?.enabled
-    ? insertComposeSignature(bodyHtml, signature.text, mode).bodyHtml
-    : bodyHtml;
-}
-
-function buildInitialComposeFields(
-  composeOptions: ReturnType<typeof useUIStore.getState>["composeOptions"],
-  mailboxEmail: string | undefined,
-  signature: MailboxSignature | undefined,
-): ComposeFormFields {
-  const { draftEmail: draft, originalEmail: original, mode } = composeOptions;
-
-  if (draft) {
-    return {
-      to: draft.recipient || "",
-      cc: draft.cc || "",
-      bcc: draft.bcc || "",
-      showCcBcc: Boolean(draft.cc || draft.bcc),
-      subject: draft.subject || "",
-      body: draft.body || "",
-    };
-  }
-
-  if (!original) {
-    return {
-      ...EMPTY_FIELDS,
-      body: withInitialSignature(signature?.enabled ? "<p><br></p>" : "", "new", signature),
-    };
-  }
-
-  // Replies open with a clean body (signature only). The original message stays
-  // visible in the thread view behind the composer; it is deliberately NOT
-  // quoted into the reply body.
-  if (mode === "reply") {
-    return {
-      ...EMPTY_FIELDS,
-      to: original.sender,
-      subject: getPrefixedSubject(original.subject, "Re"),
-      body: withInitialSignature(signature?.enabled ? "<p><br></p>" : "", "reply", signature),
-    };
-  }
-
-  if (mode === "reply-all") {
-    const recipients = replyAllRecipientFields({
-      sender: original.sender,
-      to: original.recipient,
-      cc: original.cc,
-      mailboxAddress: mailboxEmail ?? "",
-    });
-    return {
-      ...EMPTY_FIELDS,
-      ...recipients,
-      subject: getPrefixedSubject(original.subject, "Re"),
-      body: withInitialSignature(signature?.enabled ? "<p><br></p>" : "", "reply-all", signature),
-    };
-  }
-
-  if (mode === "forward") {
-    return {
-      ...EMPTY_FIELDS,
-      subject: getPrefixedSubject(original.subject, "Fwd"),
-      body: withInitialSignature(buildForwardBody(original), "forward", signature),
-    };
-  }
-
-  return {
-    ...EMPTY_FIELDS,
-    body: withInitialSignature(signature?.enabled ? "<p><br></p>" : "", "new", signature),
-  };
-}
+import { buildInitialComposeFields } from "~/lib/compose-initialization";
 
 interface DraftIdentity {
   id: string;
@@ -411,11 +289,11 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 					subject: recovery.subject,
 					body: recovery.body,
 				}
-			: buildInitialComposeFields(
+			: buildInitialComposeFields({
 					composeOptions,
-					composeMailboxId,
-					signatureSnapshotRef.current,
-				);
+					mailboxEmail: composeMailboxId,
+					signature: signatureSnapshotRef.current,
+				});
 	    const initialIdentity = recovery?.identity ?? (composeOptions.draftEmail?.id
 	      ? {
 	          id: composeOptions.draftEmail.id,
@@ -984,15 +862,14 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 					...(scheduledFor ? { scheduled_for: scheduledFor } : {}),
 				};
 				const sendPersistenceKey = draft.identity
-					? [
-							"mail-send",
-							composeMailboxId,
-							draft.identity.id,
-							draft.identity.version,
-							scheduledFor ?? "now",
+					? composeDeliveryPersistenceKey({
+							mailboxId: composeMailboxId,
+							draftId: draft.identity.id,
+							draftVersion: draft.identity.version,
+							scheduledFor,
 							mode,
-							composeOptions.originalEmail?.id ?? "none",
-						].join(":")
+							originalEmailId: composeOptions.originalEmail?.id,
+						})
 					: undefined;
 				const emailData = {
 					...sendPayload,
@@ -1089,55 +966,23 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
       setError("No mailbox selected.");
       return;
     }
-    const latestSnapshot = snapshotRef.current;
-    const toRecipients = splitEmailList(latestSnapshot.to);
-    if (toRecipients.length === 0) {
-      setPendingMissingAttachment(null);
-      setError("Add at least one recipient.");
-      return;
-    }
-    const latestAttachmentPolicy = evaluateComposeAttachments(
-      latestSnapshot.attachments,
-			latestSnapshot.body,
-    );
-    if (!latestAttachmentPolicy.ok) {
-      setPendingMissingAttachment(null);
-      setError(latestAttachmentPolicy.error);
-      return;
-    }
-    if (scheduledFor) {
-      const scheduleValidation = validateScheduledDate(new Date(scheduledFor));
-      if (!scheduleValidation.ok) {
-        setPendingMissingAttachment(null);
-        setError(scheduleValidation.error);
-        return;
-      }
-    }
+    const plan = planComposeSend({
+			snapshot: snapshotRef.current,
+			scheduledFor,
+			confirmedMissingAttachmentFingerprint,
+		});
+		if (plan.action === "error") {
+			setPendingMissingAttachment(null);
+			setError(plan.message);
+			return;
+		}
+		if (plan.action === "confirm-missing-attachment") {
+			setPendingMissingAttachment({ fingerprint: plan.fingerprint, scheduledFor });
+			return;
+		}
 
-    const fingerprint = composeMissingAttachmentFingerprint({
-      to: latestSnapshot.to,
-      cc: latestSnapshot.cc,
-      bcc: latestSnapshot.bcc,
-      subject: latestSnapshot.subject,
-      bodyHtml: latestSnapshot.body,
-      scheduledFor: scheduledFor ?? null,
-      attachments: latestSnapshot.attachments,
-    });
-    const missingAttachment = shouldWarnMissingAttachment({
-      subject: latestSnapshot.subject,
-      bodyHtml: latestSnapshot.body,
-      attachments: latestSnapshot.attachments,
-    });
-    if (
-      missingAttachment &&
-      confirmedMissingAttachmentFingerprint !== fingerprint
-    ) {
-      setPendingMissingAttachment({ fingerprint, scheduledFor });
-      return;
-    }
-
-    setPendingMissingAttachment(null);
-    await performSend(scheduledFor, latestAttachmentPolicy.refs);
+		setPendingMissingAttachment(null);
+		await performSend(scheduledFor, plan.attachmentRefs);
   };
 
   const handleSend = (e: FormEvent, scheduledFor?: string) => {

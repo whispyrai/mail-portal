@@ -4,6 +4,7 @@ import test from "node:test";
 
 const compose = readFileSync(new URL("./ComposeEmail.tsx", import.meta.url), "utf8");
 const form = readFileSync(new URL("../hooks/useComposeForm.ts", import.meta.url), "utf8");
+const delivery = readFileSync(new URL("../lib/compose-delivery.ts", import.meta.url), "utf8");
 
 test("compose shortcuts submit the form or call the existing save action without bypassing dialogs", () => {
 	assert.match(compose, /planComposeShortcut/);
@@ -26,11 +27,11 @@ test("compose shortcuts submit the form or call the existing save action without
 });
 
 test("missing attachment confirmation revalidates one fingerprint through the same perform-send path", () => {
-	assert.match(form, /shouldWarnMissingAttachment/);
-	assert.match(form, /composeMissingAttachmentFingerprint/);
+	assert.match(delivery, /shouldWarnMissingAttachment/);
+	assert.match(delivery, /composeMissingAttachmentFingerprint/);
 	assert.match(
-		form,
-		/splitEmailList\(latestSnapshot\.to\)[\s\S]*?evaluateComposeAttachments[\s\S]*?shouldWarnMissingAttachment/,
+		delivery,
+		/snapshot\.to\.split[\s\S]*?evaluateComposeAttachments[\s\S]*?shouldWarnMissingAttachment/,
 	);
 	assert.match(form, /pendingMissingAttachment/);
 	assert.match(
@@ -39,7 +40,7 @@ test("missing attachment confirmation revalidates one fingerprint through the sa
 	);
 	assert.match(
 		form,
-		/const performSend[\s\S]*?const requestSend[\s\S]*?await performSend/,
+		/const performSend[\s\S]*?const requestSend[\s\S]*?planComposeSend[\s\S]*?await performSend/,
 	);
 	assert.equal((form.match(/const enqueueConfirmedDraft/g) ?? []).length, 1);
 	assert.match(compose, />\s*Send anyway\s*</);

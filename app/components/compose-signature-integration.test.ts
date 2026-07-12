@@ -7,14 +7,15 @@ const read = (relativePath: string) =>
 
 test("cached mailbox signatures initialize once at the pinned origin while Draft bodies remain authoritative", () => {
 	const form = read("../hooks/useComposeForm.ts");
+	const initialization = read("../lib/compose-initialization.ts");
 	assert.match(form, /useMailboxSignatureSettings\(composeMailboxId\)/);
 	assert.match(form, /signatureSnapshotRef/);
-	assert.match(form, /insertComposeSignature/);
-	assert.match(form, /FORWARDED_MESSAGE_MARKER/);
+	assert.match(initialization, /insertComposeSignature/);
+	assert.match(initialization, /FORWARDED_MESSAGE_MARKER/);
 	assert.doesNotMatch(form, /getSignatureBlock/);
 	assert.doesNotMatch(form, /currentMailbox\?\.settings.*signature/);
-	const draftBranch = form.match(
-		/if \(draft\) \{([\s\S]*?)\n  \}\n\n  if \(!original\)/,
+	const draftBranch = initialization.match(
+		/if \(draft\) \{([\s\S]*?)\n\t\}\n\n\tif \(!original\)/,
 	)?.[1];
 	assert.ok(draftBranch);
 	assert.match(draftBranch, /body: draft\.body \|\| ""/);

@@ -77,10 +77,10 @@ test("compose recipient behavior preserves free-form input and isolates mailbox 
 test("Reply-All self exclusion uses the pinned origin before mailbox settings hydrate", () => {
 	assert.match(
 		composeForm,
-		/buildInitialComposeFields\(\s*composeOptions,\s*composeMailboxId,\s*signatureSnapshotRef\.current/,
+		/buildInitialComposeFields\(\{[\s\S]*?composeOptions,[\s\S]*?mailboxEmail: composeMailboxId,[\s\S]*?signature: signatureSnapshotRef\.current/,
 	);
 	assert.doesNotMatch(
 		composeForm,
-		/buildInitialComposeFields\(\s*composeOptions,\s*currentMailbox\?\.email/,
+		/mailboxEmail: currentMailbox\?\.email/,
 	);
 });

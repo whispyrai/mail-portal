@@ -11,6 +11,9 @@
 import DOMPurify from "dompurify";
 import { formatQuotedDate } from "shared/dates";
 import type { Attachment } from "~/types";
+import { escapeHtml, stripHtml } from "./html-text.ts";
+
+export { escapeHtml, stripHtml } from "./html-text.ts";
 
 export {
 	formatListDate,
@@ -71,13 +74,6 @@ export function htmlToPlainText(html: string): string {
 	return (div.textContent || div.innerText || "").trim();
 }
 
-/**
- * Strip all HTML tags from a string.
- */
-export function stripHtml(html: string): string {
-	return html.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-}
-
 function decodeHtmlEntities(text: string): string {
 	return text
 		.replace(/&#(\d+);/g, (_match: string, code: string) =>
@@ -113,20 +109,6 @@ export function getSnippetText(
 
 	if (!clean) return "";
 	return clean.length > maxLength ? `${clean.slice(0, maxLength)}...` : clean;
-}
-
-/**
- * Escape all five OWASP-recommended HTML special characters in plain text.
- * Safe for use in both text content and attribute contexts.
- */
-export function escapeHtml(text: string): string {
-	if (!text) return "";
-	return text
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/"/g, "&quot;")
-		.replace(/'/g, "&#39;");
 }
 
 /**
