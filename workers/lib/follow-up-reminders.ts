@@ -75,7 +75,7 @@ export interface ReminderStoreOperation {
 
 export type ReminderStoreMutationResult =
 	| { status: "applied" | "replayed"; reminder: FollowUpReminder }
-	| { status: "not_found" | "idempotency_conflict" }
+	| { status: "forbidden" | "not_found" | "idempotency_conflict" }
 	| { status: "state_conflict"; reminder: FollowUpReminder };
 
 export type FollowUpReminderStoreCursor = {
@@ -111,7 +111,7 @@ export interface FollowUpReminderStore {
 	}): Promise<
 		| { status: "created" | "replayed"; reminder: FollowUpReminder }
 		| { status: "active_conflict"; reminder: FollowUpReminder }
-		| { status: "idempotency_conflict" }
+		| { status: "forbidden" | "idempotency_conflict" }
 	>;
 	applyOperation(input: ReminderStoreOperation): Promise<ReminderStoreMutationResult>;
 	completeForInboundReply(input: {
@@ -211,6 +211,9 @@ export function createFollowUpReminderService(
 		if (result.status === "not_found") {
 			throw new FollowUpReminderError("NOT_FOUND", "Reminder was not found");
 		}
+		if (result.status === "forbidden") {
+			throw new FollowUpReminderError("FORBIDDEN", "Live mailbox access is required");
+		}
 		if (result.status === "idempotency_conflict") {
 			throw new FollowUpReminderError("IDEMPOTENCY_CONFLICT", "Operation ID was already used for different reminder data");
 		}
@@ -298,6 +301,9 @@ export function createFollowUpReminderService(
 			});
 			if (result.status === "created" || result.status === "replayed") {
 				return result.reminder;
+			}
+			if (result.status === "forbidden") {
+				throw new FollowUpReminderError("FORBIDDEN", "Live mailbox access is required");
 			}
 			if (result.status === "active_conflict") {
 				throw new FollowUpReminderError("ACTIVE_CONFLICT", "This conversation already has an active personal reminder");

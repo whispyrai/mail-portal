@@ -6,6 +6,7 @@ import type { Env } from "../types.ts";
 import { mailboxAccess } from "./mailbox-access.ts";
 import {
 	createFollowUpReminderService,
+	FollowUpReminderError,
 	type FollowUpReminderStore,
 	type ReminderStoreOperation,
 } from "./follow-up-reminders.ts";
@@ -34,6 +35,26 @@ interface OperationRow {
 const REMINDER_COLUMNS = `id, owner_user_id, mailbox_address, conversation_key,
 	baseline_message_id, baseline_message_date, remind_at, state,
 	resolution_reason, version, created_at, updated_at, resolved_at`;
+
+const LIVE_ACCESS_SQL = `EXISTS (
+	SELECT 1
+	FROM users AS owner
+	JOIN mailboxes AS mailbox ON mailbox.id = ?
+	WHERE owner.id = ?
+	  AND owner.is_active = 1
+	  AND mailbox.is_active = 1
+	  AND (
+	    (mailbox.type = 'PERSONAL' AND mailbox.owner_user_id = owner.id)
+	    OR (
+	      mailbox.type = 'SHARED'
+	      AND EXISTS (
+	        SELECT 1 FROM mailbox_memberships AS membership
+	        WHERE membership.mailbox_id = mailbox.id
+	          AND membership.user_id = owner.id
+	      )
+	    )
+	  )
+)`;
 
 function fromRow(row: ReminderRow): FollowUpReminder {
 	return {
@@ -111,6 +132,13 @@ export function followUpReminderD1Store(
 		return row ? fromRow(row) : undefined;
 	}
 
+	async function hasLiveAccess(ownerUserId: string, mailboxAddress: string) {
+		const row = await env.DB.prepare(`SELECT ${LIVE_ACCESS_SQL} AS allowed`)
+			.bind(mailboxAddress, ownerUserId)
+			.first<{ allowed: number }>();
+		return row?.allowed === 1;
+	}
+
 	return {
 		async list({ ownerUserId, mailboxAddress, limit, cursor }) {
 			const result = await env.DB.prepare(
@@ -171,13 +199,14 @@ export function followUpReminderD1Store(
 			}
 
 			try {
-				await env.DB.prepare(
+				const inserted = await env.DB.prepare(
 					`INSERT INTO follow_up_reminders
 					 (id, owner_user_id, mailbox_address, conversation_key,
 					  baseline_message_id, baseline_message_date, remind_at, state,
 					  resolution_reason, create_idempotency_key, create_fingerprint,
 					  create_result_json, version, created_at, updated_at, resolved_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?, ?, ?, ?, NULL)`,
+					 SELECT ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?, ?, ?, ?, NULL
+					 WHERE ${LIVE_ACCESS_SQL}`,
 				)
 					.bind(
 						row.id,
@@ -193,8 +222,13 @@ export function followUpReminderD1Store(
 						row.version,
 						row.createdAt,
 						row.updatedAt,
+						row.mailboxAddress,
+						row.ownerUserId,
 					)
 					.run();
+				if (!inserted.meta.changes) {
+					return { status: "forbidden" };
+				}
 				return { status: "created", reminder: row };
 			} catch (error) {
 				if (!isUniqueConstraint(error)) throw error;
@@ -251,11 +285,12 @@ export function followUpReminderD1Store(
 			try {
 				const results = await env.DB.batch([
 					env.DB.prepare(
-						`UPDATE follow_up_reminders
+						 `UPDATE follow_up_reminders
 						 SET remind_at = ?, state = ?, resolution_reason = ?,
 						     version = version + 1, updated_at = ?, resolved_at = ?
 						 WHERE id = ? AND owner_user_id = ? AND mailbox_address = ?
-						   AND state = 'active' AND version = ?`,
+						   AND state = 'active' AND version = ?
+						   AND ${LIVE_ACCESS_SQL}`,
 					)
 						.bind(
 							remindAt,
@@ -267,6 +302,8 @@ export function followUpReminderD1Store(
 							input.ownerUserId,
 							input.mailboxAddress,
 							input.expectedVersion,
+							input.mailboxAddress,
+							input.ownerUserId,
 						),
 					env.DB.prepare(
 						`INSERT INTO follow_up_reminder_operations
@@ -292,6 +329,9 @@ export function followUpReminderD1Store(
 				}
 			} catch (error) {
 				if (!isUniqueConstraint(error)) throw error;
+			}
+			if (!(await hasLiveAccess(input.ownerUserId, input.mailboxAddress))) {
+				return { status: "forbidden" };
 			}
 
 			const replay = await findOperation(input.ownerUserId, input.operationId);
@@ -353,10 +393,11 @@ export function followUpReminderD1Store(
 }
 
 export function followUpReminderService(env: Env) {
+	const access = mailboxAccess(env);
 	const service = createFollowUpReminderService({
 		store: followUpReminderD1Store(env),
 		canAccessMailbox: (userId, mailboxAddress) =>
-			mailboxAccess(env).canAccessMailbox(userId, mailboxAddress),
+			access.canAccessMailbox(userId, mailboxAddress),
 		resolveReminderAnchor: async (mailboxAddress, emailId) => {
 			const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxAddress));
 			return stub.getFollowUpReminderAnchor(emailId);
@@ -364,6 +405,20 @@ export function followUpReminderService(env: Env) {
 	});
 	return {
 		...service,
+		async create(userId: string, mailboxAddress: string, input: unknown) {
+			const reminder = await service.create(userId, mailboxAddress, input);
+			if (!(await access.canAccessMailbox(userId, mailboxAddress))) {
+				throw new FollowUpReminderError("FORBIDDEN", "Live mailbox access is required");
+			}
+			return reminder;
+		},
+		async apply(userId: string, mailboxAddress: string, reminderId: string, input: unknown) {
+			const reminder = await service.apply(userId, mailboxAddress, reminderId, input);
+			if (!(await access.canAccessMailbox(userId, mailboxAddress))) {
+				throw new FollowUpReminderError("FORBIDDEN", "Live mailbox access is required");
+			}
+			return reminder;
+		},
 		async list(
 			userId: string,
 			mailboxAddress: string,
@@ -379,6 +434,9 @@ export function followUpReminderService(env: Env) {
 				cursor,
 			);
 			if (page.reminders.length === 0) {
+				if (!(await access.canAccessMailbox(userId, mailboxAddress))) {
+					throw new FollowUpReminderError("FORBIDDEN", "Live mailbox access is required");
+				}
 				return { reminders: [], nextCursor: page.nextCursor };
 			}
 			const mailbox = mailboxAddress.toLowerCase();
@@ -390,7 +448,7 @@ export function followUpReminderService(env: Env) {
 			const previews = new Map(
 				projected.map((preview) => [preview.baselineMessageId, preview]),
 			);
-			return {
+			const response = {
 				reminders: page.reminders.map((reminder) => {
 					const projectedPreview = previews.get(reminder.baselineMessageId);
 					return {
@@ -405,6 +463,10 @@ export function followUpReminderService(env: Env) {
 				}),
 				nextCursor: page.nextCursor,
 			};
+			if (!(await access.canAccessMailbox(userId, mailboxAddress))) {
+				throw new FollowUpReminderError("FORBIDDEN", "Live mailbox access is required");
+			}
+			return response;
 		},
 	};
 }

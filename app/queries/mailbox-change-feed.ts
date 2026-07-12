@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
+import { useUIStore } from "../hooks/useUIStore.ts";
 import {
 	decodeMailboxChangeCursor,
 	type MailboxChange,
@@ -183,9 +184,10 @@ function removeCursor(storage: MailboxChangeFeedStorage, mailboxId: string): voi
 	}
 }
 
-function evictRevokedMailbox(
+export function evictRevokedMailbox(
 	queryClient: QueryClient,
 	mailboxId: string,
+	options: { preserveGlobalToday?: boolean } = {},
 ): void {
 	queryClient.removeQueries({
 		predicate: (query) => query.queryKey[1] === mailboxId,
@@ -194,6 +196,12 @@ function evictRevokedMailbox(
 		queryKey: ["mailboxes"],
 		exact: true,
 	});
+	if (!options.preserveGlobalToday) {
+		queryClient.removeQueries({ queryKey: ["global-today"] });
+	}
+	const ui = useUIStore.getState();
+	ui.closeCompose(false);
+	ui.closePanel();
 }
 
 export function exitRevokedMailbox(input: {

@@ -127,6 +127,7 @@ import {
 } from "../../shared/recipient-suggestions.ts";
 import { classifyDraftCreateReplay } from "../lib/draft-create-replay.ts";
 import { readTodayBriefCandidates } from "../lib/today-brief-candidates.ts";
+import { readGlobalTodayMailboxSnapshot } from "../lib/global-today-mailbox-snapshot.ts";
 import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
 import {
 	validateNormalizedMailboxAttachmentListOptions,
@@ -911,6 +912,21 @@ export class MailboxDO extends DurableObject<Env> {
 	) {
 		await this.#selfHealSnoozes();
 		return readFollowUpReminderPreviews(
+			this.ctx.storage.sql,
+			mailboxAddress,
+			baselineMessageIds,
+		);
+	}
+
+	/**
+	 * Read the global Today pulse without self-healing, queue work, alarms, or
+	 * activity. Merely viewing the cross-Mailbox hub must never mutate mail.
+	 */
+	async getGlobalTodaySnapshot(
+		mailboxAddress: string,
+		baselineMessageIds: string[],
+	) {
+		return readGlobalTodayMailboxSnapshot(
 			this.ctx.storage.sql,
 			mailboxAddress,
 			baselineMessageIds,

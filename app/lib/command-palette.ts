@@ -10,15 +10,36 @@ export type MailPaletteCommand = {
 	keywords: string[];
 	shortcut?: string;
 	action:
-		| { kind: "mail"; command: MailCommand }
-		| { kind: "folder"; folderId: string };
+			| { kind: "mail"; command: MailCommand }
+			| { kind: "folder"; folderId: string }
+			| { kind: "destination"; to: "/today" | "/mailboxes" };
 };
 
 export function buildMailPaletteCommands(context: {
+	hasMailboxContext?: boolean;
 	folderId?: string;
 	hasSelectedMessage: boolean;
 }): MailPaletteCommand[] {
 	const commands: MailPaletteCommand[] = [
+		{
+			id: "global-today",
+			title: "Today",
+			description: "See attention across every accessible Mailbox",
+			group: "Navigate",
+			keywords: ["global", "overview", "follow ups", "unread"],
+			action: { kind: "destination", to: "/today" },
+		},
+		{
+			id: "mailboxes",
+			title: "Mailboxes",
+			description: "Choose a Personal or Shared Mailbox",
+			group: "Navigate",
+			keywords: ["accounts", "shared", "personal"],
+			action: { kind: "destination", to: "/mailboxes" },
+		},
+	];
+	if (context.hasMailboxContext === false) return commands;
+	commands.push(
 		{
 			id: "compose",
 			title: "Compose",
@@ -70,7 +91,7 @@ export function buildMailPaletteCommands(context: {
 			shortcut: "?",
 			action: { kind: "mail", command: "show-shortcuts" },
 		},
-	];
+	);
 
 	const folderId = context.folderId;
 	if (!context.hasSelectedMessage || !folderId) return commands;

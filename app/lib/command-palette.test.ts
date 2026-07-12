@@ -9,7 +9,9 @@ import {
 test("palette includes core commands and context-valid triage", () => {
 	const inbox = buildMailPaletteCommands({ folderId: "inbox", hasSelectedMessage: true });
 	const ids = inbox.map((command) => command.id);
-	assert.deepEqual(ids.slice(0, 11), [
+	assert.deepEqual(ids.slice(0, 13), [
+		"global-today",
+		"mailboxes",
 		"compose",
 		"search",
 		"inbox",
@@ -29,6 +31,11 @@ test("palette includes core commands and context-valid triage", () => {
 	assert.ok(!outbox.some((command) => command.group === "Current conversation"));
 	const noSelection = buildMailPaletteCommands({ folderId: "inbox", hasSelectedMessage: false });
 	assert.ok(!noSelection.some((command) => command.group === "Current conversation"));
+});
+
+test("global palette exposes destinations without Mailbox-only actions", () => {
+	const commands = buildMailPaletteCommands({ hasMailboxContext: false, hasSelectedMessage: false });
+	assert.deepEqual(commands.map((command) => command.id), ["global-today", "mailboxes"]);
 });
 
 test("search ranks title matches and finds descriptions and aliases", () => {

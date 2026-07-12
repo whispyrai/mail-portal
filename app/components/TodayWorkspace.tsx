@@ -84,9 +84,10 @@ function formatBaseline(value: string) {
 	}).format(new Date(value));
 }
 
-function ReminderRow({
+export function ReminderRow({
 	reminder,
 	group,
+	mailboxContext,
 	mutationsDisabled,
 	isPendingOrigin,
 	onOpenConversation,
@@ -94,6 +95,7 @@ function ReminderRow({
 }: {
 	reminder: FollowUpReminderView;
 	group: "overdue" | "today" | "upcoming";
+	mailboxContext?: { address: string; type: "PERSONAL" | "SHARED" };
 	mutationsDisabled: boolean;
 	isPendingOrigin: boolean;
 	onOpenConversation(reminder: FollowUpReminderView): void;
@@ -108,7 +110,14 @@ function ReminderRow({
 	return (
 		<li className="group border-t border-kumo-line first:border-t-0">
 			<div className="grid gap-3 px-1 py-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-5">
-				<div className="min-w-0">
+					<div className="min-w-0">
+						{mailboxContext && (
+							<div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs text-kumo-subtle">
+								<span className="font-medium text-kumo-default">{mailboxContext.address}</span>
+								<span>{mailboxContext.type === "PERSONAL" ? "Personal" : "Shared"}</span>
+								<span className="inline-flex items-center gap-1"><LockSimpleIcon size={13} aria-hidden="true" /> Private to you</span>
+							</div>
+						)}
 					<div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
 						<h3 className="truncate font-medium text-kumo-default" title={subject}>
 							{subject}

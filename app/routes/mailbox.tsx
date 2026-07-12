@@ -132,7 +132,7 @@ export default function MailboxRoute() {
 			queryClient,
 			mailboxId,
 			storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
-			onExit: () => navigate("/", { replace: true }),
+				onExit: () => navigate("/mailboxes", { replace: true }),
 		});
 	}, [mailboxId, navigate, queryClient]);
 

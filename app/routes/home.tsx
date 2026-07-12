@@ -15,7 +15,7 @@ import {
 import { EnvelopeIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react";
 import { useQuery } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { Link as RouterLink, Navigate } from "react-router";
+import { Link as RouterLink } from "react-router";
 import api from "~/services/api";
 import {
 	useCreateMailbox,
@@ -139,23 +139,12 @@ export default function HomeRoute() {
 	};
 
 	const isConfigured = emailAddresses.length > 0;
-	const accounts = isConfigured
-		? emailAddresses.map((addr) => ({
-				id: addr,
-				email: addr,
-				name: addr.split("@")[0] || addr,
-			}))
-		: mailboxes;
+	const accounts = mailboxes;
 
 	const isLoading = !configData;
 
-	// Reps have exactly one mailbox — send them straight to their inbox.
-	if (me && !isAdmin && mailboxesFetched && accounts.length === 1) {
-		return <Navigate to={`/mailbox/${accounts[0].id}`} replace />;
-	}
-
 	return (
-		<div className="min-h-screen bg-kumo-recessed">
+		<div className="h-full overflow-y-auto bg-kumo-recessed">
 			<div className="mx-auto max-w-2xl px-4 py-8 md:px-6 md:py-16">
 				<div className="mb-8">
 					<div className="flex items-center justify-between">

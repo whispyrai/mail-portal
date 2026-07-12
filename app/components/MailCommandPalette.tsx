@@ -25,6 +25,7 @@ export default function MailCommandPalette() {
 	const listboxId = useId();
 	const commands = useMemo(
 		() => buildMailPaletteCommands({
+			hasMailboxContext: Boolean(mailboxId),
 			folderId: folder,
 			hasSelectedMessage: Boolean(selectedEmailId),
 		}),
@@ -79,13 +80,17 @@ export default function MailCommandPalette() {
 	const runCommand = (command: MailPaletteCommand) => {
 		changeOpen(false);
 		requestAnimationFrame(() => {
-			if (command.action.kind === "folder") {
+				if (command.action.kind === "folder") {
 				if (mailboxId) {
 					navigate(`/mailbox/${mailboxId}/emails/${command.action.folderId}`);
 				}
-				return;
-			}
-			window.dispatchEvent(
+					return;
+				}
+				if (command.action.kind === "destination") {
+					navigate(command.action.to);
+					return;
+				}
+				window.dispatchEvent(
 				new CustomEvent(MAIL_COMMAND_EVENT, { detail: command.action.command }),
 			);
 		});

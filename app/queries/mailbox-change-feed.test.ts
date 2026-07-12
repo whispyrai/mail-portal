@@ -483,10 +483,12 @@ test("a forbidden feed purges every revoked-mailbox cache, clears its cursor, re
 	] as const;
 	const otherKey = ["emails", otherMailboxId, { folder: "inbox" }] as const;
 	const adversarialOtherKey = ["search", otherMailboxId, mailboxId, 1, ""] as const;
+	const globalTodayKey = ["global-today", "Africa/Cairo"] as const;
 	queryClient.setQueryData(accessibleMailboxesKey, [mailboxId, otherMailboxId]);
 	for (const revokedKey of revokedKeys) queryClient.setQueryData(revokedKey, { private: true });
 	queryClient.setQueryData(otherKey, { private: false });
 	queryClient.setQueryData(adversarialOtherKey, { private: false });
+	queryClient.setQueryData(globalTodayKey, { mailboxes: [{ mailboxId, private: true }] });
 	const losses: string[] = [];
 	const controller = createMailboxChangeFeedController({
 		mailboxId,
@@ -508,6 +510,7 @@ test("a forbidden feed purges every revoked-mailbox cache, clears its cursor, re
 	}
 	assert.deepEqual(queryClient.getQueryData(otherKey), { private: false });
 	assert.deepEqual(queryClient.getQueryData(adversarialOtherKey), { private: false });
+	assert.equal(queryClient.getQueryState(globalTodayKey), undefined);
 	assert.equal(queryClient.getQueryState(accessibleMailboxesKey)?.isInvalidated, true);
 	assert.deepEqual(losses, [mailboxId]);
 	assert.equal(browser.timers.size, 0);

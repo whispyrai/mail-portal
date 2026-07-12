@@ -258,6 +258,104 @@ test("authorized reminder pages merge one bounded mailbox preview projection", a
 	db.close();
 });
 
+test("reminder listing discards projected content when access is revoked in flight", async () => {
+	const { db } = fixture();
+	const env = {
+		DB: d1(db),
+		MAILBOX: {
+			idFromName(name: string) {
+				return name;
+			},
+			get() {
+				return {
+					async getFollowUpReminderAnchor(emailId: string) {
+						return {
+							conversationKey: `thread-${emailId}`,
+							baselineMessageId: emailId,
+							baselineMessageDate: "2026-07-11T10:00:00.000Z",
+						};
+					},
+					async getFollowUpReminderPreviews() {
+						db.prepare(
+							"DELETE FROM mailbox_memberships WHERE mailbox_id = ? AND user_id = 'user-1'",
+						).run(MAILBOX);
+						return [{
+							baselineMessageId: "message-1",
+							subject: "Must not escape",
+							counterparty: "client@example.com",
+						}];
+					},
+				};
+			},
+		},
+	} as unknown as Env;
+	const service = followUpReminderService(env);
+	await service.create("user-1", MAILBOX, {
+		...createInput,
+		remindAt: new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString(),
+	});
+
+	await assert.rejects(
+		() => service.list("user-1", MAILBOX),
+		(error: unknown) => error instanceof FollowUpReminderError && error.code === "FORBIDDEN",
+	);
+	db.close();
+});
+
+test("D1 create rejects an access revocation in the same statement that would write", async () => {
+	const { db, store } = fixture();
+	const service = createFollowUpReminderService({
+		store,
+		canAccessMailbox: async () => {
+			db.prepare(
+				"DELETE FROM mailbox_memberships WHERE mailbox_id = ? AND user_id = 'user-1'",
+			).run(MAILBOX);
+			return true;
+		},
+		resolveReminderAnchor: async (_mailboxAddress, emailId) => ({
+			conversationKey: "thread-create-race",
+			baselineMessageId: emailId,
+			baselineMessageDate: "2026-07-11T10:00:00.000Z",
+		}),
+		now: () => NOW,
+		id: () => "revoked-create",
+	});
+	await assert.rejects(
+		() => service.create("user-1", MAILBOX, createInput),
+		(error: unknown) => error instanceof FollowUpReminderError && error.code === "FORBIDDEN",
+	);
+	assert.equal(Number(db.prepare("SELECT COUNT(*) AS total FROM follow_up_reminders").get()?.total), 0);
+	db.close();
+});
+
+test("D1 operation rejects an access revocation in the same statement that would mutate", async () => {
+	const { db, store, service: setup } = fixture();
+	await setup.create("user-1", MAILBOX, createInput);
+	const service = createFollowUpReminderService({
+		store,
+		canAccessMailbox: async () => {
+			db.prepare(
+				"DELETE FROM mailbox_memberships WHERE mailbox_id = ? AND user_id = 'user-1'",
+			).run(MAILBOX);
+			return true;
+		},
+		resolveReminderAnchor: async () => null,
+		now: () => NOW + 1,
+	});
+	await assert.rejects(
+		() => service.apply("user-1", MAILBOX, "reminder-1", {
+			action: "complete",
+			operationId: "complete-revoked-reminder",
+			expectedVersion: 1,
+		}),
+		(error: unknown) => error instanceof FollowUpReminderError && error.code === "FORBIDDEN",
+	);
+	const row = db.prepare("SELECT state, version FROM follow_up_reminders WHERE id = 'reminder-1'").get() as { state: string; version: number };
+	assert.equal(row.state, "active");
+	assert.equal(row.version, 1);
+	db.close();
+});
+
 test("D1 mutation ledger replays the immutable result after a later mutation", async () => {
 	const { db, service, advance } = fixture();
 	const created = await service.create("user-1", MAILBOX, createInput);
