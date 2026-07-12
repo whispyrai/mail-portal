@@ -11,6 +11,7 @@
  * access.
  */
 import { createMiddleware } from "hono/factory";
+import type { Context } from "hono";
 import type { MailboxDO } from "../durableObject";
 import type { Env } from "../types";
 import type { SessionClaims } from "./auth";
@@ -25,6 +26,22 @@ export type MailboxContext = {
 		session?: SessionClaims;
 	};
 };
+
+/** Re-check the live content grant after asynchronous mailbox work and before disclosure. */
+export async function hasLiveMailboxContentAccess(
+	c: Context<MailboxContext>,
+): Promise<boolean> {
+	const rawId = c.req.param("mailboxId");
+	const session = c.get("session");
+	if (!rawId || !session) return false;
+	let mailboxId: string;
+	try {
+		mailboxId = decodeURIComponent(rawId).toLowerCase();
+	} catch {
+		return false;
+	}
+	return mailboxAccess(c.env).canAccessMailbox(session.sub, mailboxId);
+}
 
 /** Settings-only routes authorize themselves and must never resolve a mailbox DO. */
 export function bypassMailboxContentAuthorization(method: string, pathname: string): boolean {
@@ -72,9 +89,7 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 		!(await access.canManageMailboxSettings(session.sub, mailboxId))
 	) {
 		return c.json({ error: "Forbidden" }, 403);
-	} else if (
-		!(await access.canAccessMailbox(session.sub, mailboxId.toLowerCase()))
-	) {
+	} else if (!(await hasLiveMailboxContentAccess(c))) {
 		return c.json({ error: "Forbidden" }, 403);
 	}
 

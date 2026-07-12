@@ -13,6 +13,7 @@ import type {
 	LabelColor,
 	LabelMutationResult,
 	LabelMutationTarget,
+	AttachmentKind,
 } from "~/types";
 import type {
 	BatchTriageCommand,
@@ -23,6 +24,12 @@ import type {
 	SnoozeScope,
 } from "../../shared/snooze";
 import type { AiComposeDraftRequest } from "../../shared/ai-drafting";
+import { decodeMailboxAttachmentCursor } from "../../shared/mailbox-attachments.ts";
+import {
+	MailboxAttachmentResponseError,
+	parseMailboxAttachmentItem,
+	parseMailboxAttachmentPage,
+} from "./mailbox-attachment-response.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -113,6 +120,18 @@ function del<T>(url: string, body?: unknown) {
 interface EmailListResponse {
 	emails: Email[];
 	totalCount: number;
+}
+
+export interface MailboxAttachmentListRequest {
+	limit?: number;
+	q?: string;
+	kind?: AttachmentKind | "";
+	folder?: string;
+	cursor?: string | null;
+}
+
+function encodedPathPart(value: string): string {
+	return encodeURIComponent(value);
 }
 
 // ---------- API client ----------
@@ -268,8 +287,55 @@ const api = {
 			`/api/v1/mailboxes/${mailboxId}/snooze/clear`,
 			{ scope },
 		),
-	getAttachment: (mailboxId: string, emailId: string, attachmentId: string) =>
-		get<Blob>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/attachments/${attachmentId}`, { responseType: "blob" }),
+	listMailboxAttachments: (
+		mailboxId: string,
+		input: MailboxAttachmentListRequest,
+		opts?: { signal?: AbortSignal },
+	) => {
+		const params: Record<string, string> = {};
+		if (input.limit !== undefined) params.limit = String(input.limit);
+		if (input.q) params.q = input.q;
+		if (input.kind) params.kind = input.kind;
+		if (input.folder) params.folder = input.folder;
+		if (input.cursor) params.cursor = input.cursor;
+		return get<unknown>(
+			`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/attachments`,
+			{ params, signal: opts?.signal },
+		).then((value) => {
+			const page = parseMailboxAttachmentPage(value, input.limit ?? 25);
+			if (page.nextCursor) {
+				try {
+					decodeMailboxAttachmentCursor(page.nextCursor, {
+						q: input.q?.trim().normalize("NFC") || null,
+						kind: input.kind || null,
+						folder: input.folder?.trim() || null,
+					});
+				} catch {
+					throw new MailboxAttachmentResponseError();
+				}
+			}
+			return page;
+		});
+	},
+	getMailboxAttachment: (
+		mailboxId: string,
+		attachmentId: string,
+		opts?: { signal?: AbortSignal },
+	) => get<unknown>(
+		`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/attachments/${encodedPathPart(attachmentId)}`,
+		{ signal: opts?.signal },
+	).then(parseMailboxAttachmentItem),
+	attachmentDownloadUrl: (mailboxId: string, emailId: string, attachmentId: string) =>
+		`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/emails/${encodedPathPart(emailId)}/attachments/${encodedPathPart(attachmentId)}`,
+	getAttachment: (
+		mailboxId: string,
+		emailId: string,
+		attachmentId: string,
+		opts?: { signal?: AbortSignal },
+	) => get<Blob>(
+		`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/emails/${encodedPathPart(emailId)}/attachments/${encodedPathPart(attachmentId)}`,
+		{ responseType: "blob", signal: opts?.signal },
+	),
 	// Upload a file to staging; returns a reference to carry into a send/reply/draft.
 	// Raw-body POST (not the JSON helper) with no artificial timeout, since large
 	// files on slow links can exceed the default request timeout.

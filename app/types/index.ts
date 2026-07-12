@@ -93,6 +93,12 @@ export interface Attachment {
 	disposition?: string;
 }
 
+export type {
+	AttachmentKind,
+	MailboxAttachmentItem,
+	MailboxAttachmentPage,
+} from "../../shared/mailbox-attachments.ts";
+
 /**
  * A reference to a file to attach, sent to the server instead of the bytes
  * (upload-first model): a freshly uploaded staging file, or a file already

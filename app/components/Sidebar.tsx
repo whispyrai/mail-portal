@@ -12,6 +12,7 @@ import {
 	FolderIcon,
 	HourglassMediumIcon,
 	PaperPlaneTiltIcon,
+	PaperclipIcon,
 	PencilSimpleIcon,
 	PlusIcon,
 	TagIcon,
@@ -185,6 +186,12 @@ export default function Sidebar() {
 					to={`/mailbox/${mailboxId}/today`}
 					icon={<CalendarCheckIcon size={18} weight="regular" />}
 					label="Today"
+					onClick={handleNavClick}
+				/>
+				<FolderLink
+					to={`/mailbox/${mailboxId}/attachments`}
+					icon={<PaperclipIcon size={18} weight="regular" />}
+					label="Files"
 					onClick={handleNavClick}
 				/>
 				<div className="my-2 border-t border-kumo-line" aria-hidden="true" />

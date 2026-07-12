@@ -64,17 +64,18 @@ function normalizeMessageId(raw: string | null | undefined): string | null {
 	return value.match(/<([^>]+)>/)?.[1] ?? value.split(/\s+/)[0] ?? null;
 }
 
-/**
- * Derive a deterministic internal id for an imported message so re-running the
- * import is idempotent: the endpoint skips any message whose id already exists,
- * and R2 attachment keys are built on this same id (re-runs overwrite in place
- * rather than duplicating). Keyed on the RFC `Message-ID` when present, else on
- * the sender, recipients, date, subject, and content. SHA-256 → first 32 hex
- * chars: stable and filesystem/URL-safe for R2 paths and deep links.
- */
-export async function deriveImportId(parts: ImportIdParts): Promise<string> {
+async function deriveImportHash(key: string): Promise<string> {
+	const bytes = new TextEncoder().encode(key);
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	const hex = Array.from(new Uint8Array(digest))
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+	return hex.slice(0, 32);
+}
+
+function importMessageKey(parts: ImportIdParts): string {
 	const mid = normalizeMessageId(parts.messageId);
-	const key = mid
+	return mid
 		? `msgid:${mid}`
 		: `fallback:${JSON.stringify([
 			parts.from ?? "",
@@ -83,12 +84,29 @@ export async function deriveImportId(parts: ImportIdParts): Promise<string> {
 			parts.subject ?? "",
 			parts.content ?? "",
 		])}`;
-	const bytes = new TextEncoder().encode(key);
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	const hex = Array.from(new Uint8Array(digest))
-		.map((b) => b.toString(16).padStart(2, "0"))
-		.join("");
-	return hex.slice(0, 32);
+}
+
+/** The pre-mailbox-scope identity, retained only as a read-compatibility bridge. */
+export function deriveLegacyImportId(parts: ImportIdParts): Promise<string> {
+	return deriveImportHash(importMessageKey(parts));
+}
+
+/**
+ * Derive a deterministic internal id for an imported message so re-running the
+ * import is idempotent: the endpoint skips any message whose id already exists.
+ * Attachments add a claim-generation fence beneath this mailbox-scoped message
+ * identity so a failed or expired writer cannot collide with its successor.
+ * The message identity is keyed on the RFC `Message-ID` when present, else on
+ * the sender, recipients, date, subject, and content. SHA-256 → first 32 hex
+ * chars: stable and filesystem/URL-safe for R2 paths and deep links.
+ */
+export async function deriveImportId(
+	parts: ImportIdParts,
+	mailboxId: string,
+): Promise<string> {
+	const mailbox = mailboxId.trim().toLowerCase();
+	if (!mailbox) throw new Error("Target mailbox identity is required for import");
+	return deriveImportHash(`mailbox:${mailbox}\n${importMessageKey(parts)}`);
 }
 
 /**
@@ -96,11 +114,24 @@ export async function deriveImportId(parts: ImportIdParts): Promise<string> {
  * thread id. RFC References lists the root first, so it wins over the direct
  * parent in In-Reply-To and makes grouping independent of import order.
  */
-export async function deriveImportThreadId(parts: ImportThreadParts): Promise<string> {
+export async function deriveImportThreadId(
+	parts: ImportThreadParts,
+	mailboxId: string,
+): Promise<string> {
 	const rootMessageId =
 		normalizeMessageId(parts.references) ??
 		normalizeMessageId(parts.inReplyTo) ??
 		normalizeMessageId(parts.messageId);
 
-	return deriveImportId({ ...parts, messageId: rootMessageId });
+	return deriveImportId({ ...parts, messageId: rootMessageId }, mailboxId);
+}
+
+export function deriveLegacyImportThreadId(
+	parts: ImportThreadParts,
+): Promise<string> {
+	const rootMessageId =
+		normalizeMessageId(parts.references) ??
+		normalizeMessageId(parts.inReplyTo) ??
+		normalizeMessageId(parts.messageId);
+	return deriveLegacyImportId({ ...parts, messageId: rootMessageId });
 }

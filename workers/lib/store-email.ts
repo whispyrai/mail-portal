@@ -36,7 +36,7 @@ type AttachmentBucket = {
 	delete(key: string): Promise<unknown>;
 };
 
-type MailboxEmailStore = {
+export type MailboxEmailStore = {
 	createEmail(
 		folder: string,
 		email: StoredEmail,
@@ -69,6 +69,8 @@ type StoreParsedEmailOptions = {
 	followUpMailboxAddress?: string;
 	mailboxAddress?: string;
 	recipientMemoryOrigin: RecipientMemoryOrigin;
+	/** Optional write-generation fence for import-only attachment identities. */
+	attachmentIdNamespace?: string;
 };
 
 function messageIds(value: string | undefined): string[] {
@@ -107,12 +109,18 @@ export async function storeParsedEmail(
 	options: StoreParsedEmailOptions,
 ): Promise<StoredEmailSignal> {
 	const { folder, date, messageId, read } = options;
+	if (
+		options.attachmentIdNamespace !== undefined &&
+		!/^[a-z0-9_-]{16,100}$/i.test(options.attachmentIdNamespace)
+	) throw new Error("Attachment identity namespace is invalid");
 	const attachmentData: StoredAttachment[] = [];
 	const attachmentKeys: string[] = [];
 
 	try {
 		for (const [attachmentIndex, attachment] of parsed.attachments.entries()) {
-			const attachmentId = `${messageId}-${attachmentIndex}`;
+			const attachmentId = options.attachmentIdNamespace
+				? `${messageId}-${options.attachmentIdNamespace}-${attachmentIndex}`
+				: `${messageId}-${attachmentIndex}`;
 			const filename = sanitizeFilename(attachment.filename ?? "untitled");
 			const key = `attachments/${messageId}/${attachmentId}/${filename}`;
 			attachmentKeys.push(key);

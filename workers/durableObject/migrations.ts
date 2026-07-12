@@ -539,4 +539,24 @@ export const mailboxMigrations: Migration[] = [
 				ON today_brief_generation_claims(expires_at, cache_key);
 		`),
 	},
+	{
+		name: "21_index_mailbox_attachments",
+		sql: `
+			CREATE INDEX IF NOT EXISTS idx_attachments_email_id_id
+				ON attachments(email_id, id);
+		`,
+	},
+	{
+		name: "22_add_import_generation_claims",
+		sql: `
+			CREATE TABLE import_generation_claims (
+				message_id TEXT PRIMARY KEY,
+				claim_token TEXT NOT NULL,
+				expires_at INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE INDEX idx_import_generation_claims_expiry
+				ON import_generation_claims(expires_at, message_id);
+		`,
+	},
 ];

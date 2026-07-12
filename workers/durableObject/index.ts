@@ -124,6 +124,20 @@ import {
 import { classifyDraftCreateReplay } from "../lib/draft-create-replay.ts";
 import { readTodayBriefCandidates } from "../lib/today-brief-candidates.ts";
 import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
+import {
+	validateNormalizedMailboxAttachmentListOptions,
+	type NormalizedMailboxAttachmentListOptions,
+} from "../../shared/mailbox-attachments.ts";
+import {
+	claimImportedEmail as claimImportedEmailRecord,
+	releaseImportedEmailClaim as releaseImportedEmailClaimRecord,
+	renewImportedEmailClaim as renewImportedEmailClaimRecord,
+} from "../lib/import-email-claims.ts";
+import {
+	readMailboxAttachmentDetail,
+	readMailboxAttachmentForEmail,
+	readMailboxAttachmentPage,
+} from "../lib/mailbox-attachments.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -2041,6 +2055,83 @@ export class MailboxDO extends DurableObject<Env> {
 				)
 				.get()?.attachment ?? null
 		);
+	}
+
+	async listMailboxAttachments(options: NormalizedMailboxAttachmentListOptions) {
+		return readMailboxAttachmentPage(
+			this.ctx.storage.sql,
+			validateNormalizedMailboxAttachmentListOptions(options),
+		);
+	}
+
+	async getMailboxAttachment(attachmentId: string) {
+		if (!attachmentId || attachmentId.length > 300) return null;
+		return readMailboxAttachmentDetail(this.ctx.storage.sql, attachmentId);
+	}
+
+	/** Exact byte authority: path email and attachment identities must match one visible row. */
+	async getAttachmentForEmail(emailId: string, attachmentId: string) {
+		return readMailboxAttachmentForEmail(
+			this.ctx.storage.sql,
+			emailId,
+			attachmentId,
+		);
+	}
+
+	async claimImportedEmail(emailId: string, legacyId: string, token: string) {
+		if (
+			!emailId || emailId.length > 300 ||
+			!legacyId || legacyId.length > 300 ||
+			token.length < 16 || token.length > 100
+		) throw new Error("Import claim identity is invalid");
+		const now = Date.now();
+		return this.ctx.storage.transactionSync(() =>
+			claimImportedEmailRecord(
+				this.ctx.storage.sql,
+				emailId,
+				legacyId,
+				token,
+				now,
+				now + 15 * 60_000,
+			)
+		);
+	}
+
+	async releaseImportedEmailClaim(emailId: string, token: string) {
+		if (
+			!emailId || emailId.length > 300 ||
+			token.length < 16 || token.length > 100
+		) return;
+		this.ctx.storage.transactionSync(() =>
+			releaseImportedEmailClaimRecord(this.ctx.storage.sql, emailId, token)
+		);
+	}
+
+	async renewImportedEmailClaim(emailId: string, token: string) {
+		if (
+			!emailId || emailId.length > 300 ||
+			token.length < 16 || token.length > 100
+		) return false;
+		const now = Date.now();
+		return this.ctx.storage.transactionSync(() =>
+			renewImportedEmailClaimRecord(
+				this.ctx.storage.sql,
+				emailId,
+				token,
+				now,
+				now + 15 * 60_000,
+			)
+		);
+	}
+
+	async hasEmailOrThreadIdentity(identity: string) {
+		if (!identity || identity.length > 300) return false;
+		const row = [...this.ctx.storage.sql.exec<{ found: number }>(
+			`SELECT 1 AS found FROM emails
+			 WHERE id = ?1 OR thread_id = ?1 LIMIT 1`,
+			identity,
+		)][0];
+		return row?.found === 1;
 	}
 
 	// ── Folders (Drizzle) ──────────────────────────────────────────

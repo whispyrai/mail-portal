@@ -452,10 +452,10 @@ adminApp.post("/import/:mailboxId", async (c) => {
     { bucket: c.env.BUCKET, mailbox: stub },
     parsed,
     folder,
+    mailboxId,
   );
-  return result.status === "imported"
-    ? c.json(result, 201)
-    : c.json(result, 200);
+  if (result.status === "imported") return c.json(result, 201);
+  return c.json(result, result.reason === "in_progress" ? 409 : 200);
 });
 
 export { adminApp };

@@ -104,17 +104,32 @@ export const recipientInteractionMeta = sqliteTable("recipient_interaction_meta"
 	value: text("value").notNull(),
 });
 
-export const attachments = sqliteTable("attachments", {
-	id: text("id").primaryKey(),
-	email_id: text("email_id")
-		.notNull()
-		.references(() => emails.id, { onDelete: "cascade" }),
-	filename: text("filename").notNull(),
-	mimetype: text("mimetype").notNull(),
-	size: integer("size").notNull(),
-	content_id: text("content_id"),
-	disposition: text("disposition"),
-});
+export const attachments = sqliteTable(
+	"attachments",
+	{
+		id: text("id").primaryKey(),
+		email_id: text("email_id")
+			.notNull()
+			.references(() => emails.id, { onDelete: "cascade" }),
+		filename: text("filename").notNull(),
+		mimetype: text("mimetype").notNull(),
+		size: integer("size").notNull(),
+		content_id: text("content_id"),
+		disposition: text("disposition"),
+	},
+	(table) => [index("idx_attachments_email_id_id").on(table.email_id, table.id)],
+);
+
+export const importGenerationClaims = sqliteTable(
+	"import_generation_claims",
+	{
+		message_id: text("message_id").primaryKey(),
+		claim_token: text("claim_token").notNull(),
+		expires_at: integer("expires_at").notNull(),
+		created_at: integer("created_at").notNull(),
+	},
+	(table) => [index("idx_import_generation_claims_expiry").on(table.expires_at, table.message_id)],
+);
 
 export const activityEvents = sqliteTable("activity_events", {
 	id: text("id").primaryKey(),

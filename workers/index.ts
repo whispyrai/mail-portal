@@ -43,6 +43,8 @@ import { recipientSuggestionRoutes } from "./routes/recipient-suggestions";
 import { mailboxSignatureSettingsRoutes } from "./routes/mailbox-signature-settings";
 import { aiDraftRoutes } from "./routes/ai-drafts";
 import { todayBriefRoutes } from "./routes/today-brief";
+import { mailboxAttachmentRoutes } from "./routes/mailbox-attachments";
+import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
 import {
 	handleCancelOutboundDelivery,
 	handleGetOutboundDelivery,
@@ -220,6 +222,8 @@ app.route("/", recipientSuggestionRoutes);
 app.route("/", mailboxSignatureSettingsRoutes);
 app.route("/", aiDraftRoutes);
 app.route("/", todayBriefRoutes);
+app.route("/", mailboxAttachmentRoutes);
+app.route("/", mailboxAttachmentByteRoutes);
 
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");
@@ -678,27 +682,5 @@ app.post("/api/v1/mailboxes/:mailboxId/attachments", async (c: AppContext) => {
 		201,
 	);
 });
-
-app.get(
-	"/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId",
-	async (c: AppContext) => {
-		const emailId = c.req.param("emailId")!;
-		const attachmentId = c.req.param("attachmentId")!;
-		const attachment = await c.var.mailboxStub.getAttachment(attachmentId);
-		if (!attachment) return c.json({ error: "Attachment not found" }, 404);
-		const obj = await c.env.BUCKET.get(
-			`attachments/${emailId}/${attachmentId}/${attachment.filename}`,
-		);
-		if (!obj) return c.json({ error: "Attachment file not found" }, 404);
-		const headers = new Headers();
-		headers.set("Content-Type", attachment.mimetype);
-		const sanitized = attachment.filename.replace(/[\x00-\x1f"\\]/g, "_");
-		headers.set(
-			"Content-Disposition",
-			`attachment; filename="${sanitized}"; filename*=UTF-8''${encodeURIComponent(attachment.filename)}`,
-		);
-		return new Response(obj.body, { headers });
-	},
-);
 
 export { app };
