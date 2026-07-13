@@ -11,7 +11,7 @@ import {
 	TooltipProvider,
 } from "@cloudflare/kumo";
 import { WarningIcon } from "@phosphor-icons/react";
-import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { forwardRef, useState } from "react";
 import {
 	isRouteErrorResponse,
@@ -22,9 +22,9 @@ import {
 	Scripts,
 	ScrollRestoration,
 } from "react-router";
-import { ApiError } from "~/services/api";
 import { useBrand } from "~/hooks/useBrand";
 import { ServiceWorkerRegistrar } from "~/components/pwa/ServiceWorkerRegistrar";
+import { createMailQueryClient } from "~/lib/mail-query-client";
 import { resolveBrand } from "../workers/routes/brand";
 import {
 	isQuizEnabled,
@@ -56,41 +56,16 @@ export async function loader({ context }: Route.LoaderArgs) {
 	};
 }
 
-function makeQueryClient() {
-	return new QueryClient({
-		defaultOptions: {
-			queries: {
-				staleTime: 30_000,
-				refetchOnWindowFocus: false,
-				retry: (failureCount, error) => {
-					// Don't retry 4xx errors (not found, unauthorized, etc.)
-					if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
-						return false;
-					}
-					return failureCount < 2;
-				},
-			},
-		},
-		mutationCache: new MutationCache({
-			onError: (error) => {
-				// Global fallback for mutations that don't handle errors themselves.
-				// Consumers using mutateAsync + try/catch handle their own errors.
-				console.error("Mutation failed:", error);
-			},
-		}),
-	});
-}
-
 // Lazy singleton for the browser — avoids module-scope instantiation that
 // leaks cache across SSR requests.
 let browserQueryClient: QueryClient | undefined;
 function getQueryClient() {
 	if (typeof window === "undefined") {
 		// SSR: always create a fresh client per request to prevent cross-user cache leaks
-		return makeQueryClient();
+		return createMailQueryClient();
 	}
 	// Browser: reuse the same client across navigations
-	if (!browserQueryClient) browserQueryClient = makeQueryClient();
+	if (!browserQueryClient) browserQueryClient = createMailQueryClient();
 	return browserQueryClient;
 }
 
