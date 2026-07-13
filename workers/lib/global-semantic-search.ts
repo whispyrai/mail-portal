@@ -138,24 +138,30 @@ async function mapWithUnsettledConcurrency<T, TResult>(
   const start = (index: number) => {
     const item = items[index]!;
     let expired = false;
+		let released = false;
+		let releaseSlot: () => void = () => undefined;
+		const slot = new Promise<void>((resolve) => {
+			releaseSlot = resolve;
+		});
+		const release = () => {
+			if (released) return;
+			released = true;
+			expired = true;
+			clearTimeout(timeout);
+			active.delete(slot);
+			releaseSlot();
+		};
     const timeout = setTimeout(
-      () => {
-        expired = true;
-      },
+			release,
       Math.max(0, Math.min(operationMs, deadline - Date.now())),
     );
-    let task: Promise<void>;
-    task = worker(item, () => expired || Date.now() >= deadline)
+		worker(item, () => expired || Date.now() >= deadline)
       .then((result) => {
         if (!expired && Date.now() < deadline) results[index] = result;
       })
       .catch(() => undefined)
-      .finally(() => {
-        expired = true;
-        clearTimeout(timeout);
-        active.delete(task);
-      });
-    active.add(task);
+			.finally(release);
+		active.add(slot);
   };
   while (
     (nextIndex < items.length || active.size > 0) &&
@@ -197,18 +203,30 @@ function evidenceResult(
   const recipient = candidate.recipient.trim();
   const counterparty =
     sender.toLowerCase() === mailbox.address.toLowerCase() ? recipient : sender;
-  return {
-    mailboxId: mailbox.address,
-    mailboxAddress: mailbox.address,
-    messageId: candidate.messageId,
+	const common = {
+		mailboxId: mailbox.address,
+		mailboxAddress: mailbox.address,
+		messageId: candidate.messageId,
     score: candidate.score,
     subject: candidate.subject,
     counterparty,
     date: candidate.date,
-    folderId: candidate.folderId,
-    excerpt: candidate.excerpt,
-    excerptKind: "authored_mail",
-  };
+		folderId: candidate.folderId,
+		excerpt: candidate.excerpt,
+	};
+	return candidate.source === "attachment"
+		? {
+			...common,
+			source: "attachment",
+			attachmentId: candidate.attachmentId,
+			attachmentFilename: candidate.attachmentFilename,
+			excerptKind: "extracted_attachment",
+		}
+		: {
+			...common,
+			source: "message",
+			excerptKind: "authored_mail",
+		};
 }
 
 async function runAttempt(

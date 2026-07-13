@@ -68,6 +68,7 @@ function setup(input?: {
 				readiness: readiness(input?.postReadiness?.[mailboxId] ?? "complete"),
 				candidates: candidates.map((candidate) => ({
 					...candidate,
+					source: "message" as const,
 					messageId: `message-${mailboxId}`,
 					subject: `Subject ${mailboxId}`,
 					sender: "sender@example.com",
@@ -163,6 +164,29 @@ test("semantic evidence bounds a stalled Mailbox and returns the remaining evide
 	]);
 });
 
+test("semantic evidence releases timed-out fan-out slots for later healthy Mailboxes", async () => {
+	const addresses = ["a", "b", "c", "d", "z"].map((prefix) => mailbox(`${prefix}@example.com`));
+	const state = setup({ rosters: [addresses] });
+	state.dependencies.queryIndex = async ({ mailboxId }) => {
+		if (mailboxId !== "z@example.com") return new Promise(() => undefined);
+		return [{ vectorId: "vector-z", score: 0.8 }];
+	};
+	const response = await searchSemanticEvidence(state.dependencies, {
+		actorUserId: "user-1",
+		query: "healthy evidence",
+	}, {
+		requestMs: 150,
+		rosterMs: 30,
+		readinessMs: 20,
+		embeddingMs: 20,
+		mailboxMs: 10,
+	});
+	assert.deepEqual(response.results.map((result) => result.mailboxId), ["z@example.com"]);
+	assert.equal(response.mailboxes.find(
+		(mailboxStatus) => mailboxStatus.mailboxId === "z@example.com",
+	)?.state, "complete");
+});
+
 test("semantic evidence makes complete zero-results and capacity limits explicit", async () => {
 	const state = setup();
 	state.dependencies.queryIndex = async () => [];
@@ -181,4 +205,41 @@ test("semantic evidence makes complete zero-results and capacity limits explicit
 		query: "anything",
 	}), SemanticSearchCapacityError);
 	assert.equal(overflow.embeddingCalls(), 0);
+});
+
+test("semantic evidence maps exact attachment citations without collapsing them into the parent Message", async () => {
+	const state = setup();
+	state.dependencies.resolveCandidates = async ({ candidates }) => ({
+		readiness: readiness("complete"),
+		candidates: candidates.map((candidate, index) => ({
+			...candidate,
+			source: "attachment" as const,
+			messageId: "message-1",
+			attachmentId: `attachment-${index + 1}`,
+			attachmentFilename: `contract-${index + 1}.md`,
+			subject: "Contract",
+			sender: "sender@example.com",
+			recipient: "one@example.com",
+			date: "2026-07-13T08:00:00.000Z",
+			folderId: "inbox",
+			excerpt: "Attachment-only evidence",
+		})),
+	});
+	state.dependencies.queryIndex = async () => [
+		{ vectorId: "sa1_one", score: 0.9 },
+		{ vectorId: "sa1_two", score: 0.8 },
+	];
+	const response = await searchSemanticEvidence(state.dependencies, {
+		actorUserId: "user-1",
+		query: "attachment decision",
+	});
+	assert.equal(response.results.length, 2);
+	assert.deepEqual(response.results.map((result) => ({
+		source: result.source,
+		attachmentId: result.source === "attachment" ? result.attachmentId : null,
+		excerptKind: result.excerptKind,
+	})), [
+		{ source: "attachment", attachmentId: "attachment-1", excerptKind: "extracted_attachment" },
+		{ source: "attachment", attachmentId: "attachment-2", excerptKind: "extracted_attachment" },
+	]);
 });

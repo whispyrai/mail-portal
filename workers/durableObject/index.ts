@@ -183,7 +183,7 @@ import {
 	createSemanticIndex,
 	type SemanticIndexReadiness,
 } from "../lib/semantic-index.ts";
-import { advanceSemanticIndex } from "../lib/semantic-index-runtime.ts";
+import { advanceSemanticMailboxIndex } from "../lib/semantic-index-runtime.ts";
 import { createSemanticIndexProvider } from "../lib/semantic-provider.ts";
 import { semanticMailboxNamespace } from "../lib/semantic-search.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
@@ -1110,12 +1110,81 @@ export class MailboxDO extends DurableObject<Env> {
 		);
 	}
 
+	async leaseSemanticAttachmentExtraction(
+		leaseToken: string,
+		nowMs: number,
+		leaseMs: number,
+	) {
+		return createSemanticIndex({ store: this.ctx.storage })
+			.leaseAttachmentExtraction(leaseToken, nowMs, leaseMs);
+	}
+
+	async completeSemanticAttachmentExtraction(
+		completion: Parameters<
+			ReturnType<typeof createSemanticIndex>["completeAttachmentExtraction"]
+		>[0],
+	) {
+		return createSemanticIndex({ store: this.ctx.storage })
+			.completeAttachmentExtraction(completion);
+	}
+
+	async rejectSemanticAttachmentExtraction(
+		input: Parameters<
+			ReturnType<typeof createSemanticIndex>["rejectAttachmentExtraction"]
+		>[0],
+	) {
+		return createSemanticIndex({ store: this.ctx.storage })
+			.rejectAttachmentExtraction(input);
+	}
+
+	async retrySemanticAttachmentExtraction(
+		input: Parameters<
+			ReturnType<typeof createSemanticIndex>["retryAttachmentExtraction"]
+		>[0],
+	) {
+		return createSemanticIndex({ store: this.ctx.storage })
+			.retryAttachmentExtraction(input);
+	}
+
 	async resolveSemanticCandidates(
 		candidates: ReadonlyArray<{ vectorId: string; score: number }>,
 	) {
 		const semanticIndex = createSemanticIndex({ store: this.ctx.storage });
+		const initiallyResolved = semanticIndex.resolveCandidates(candidates);
+		const attachmentAuthority = new Map<string, boolean>();
+		await Promise.all(initiallyResolved.map(async (candidate) => {
+			if (
+				candidate.source !== "attachment" ||
+				!candidate.attachmentId ||
+				!candidate.attachmentStorageFilename
+			) return;
+			const object = await this.env.BUCKET.head(attachmentKey(
+				candidate.messageId,
+				candidate.attachmentId,
+				candidate.attachmentStorageFilename,
+			));
+			const authoritative = Boolean(
+				object && object.version === candidate.r2Version &&
+				object.etag === candidate.r2Etag && object.size === candidate.actualSize,
+			);
+			if (!authoritative) {
+				semanticIndex.invalidateAttachmentAuthority({
+					vectorId: candidate.vectorId,
+					attachmentId: candidate.attachmentId,
+					sourceFingerprint: candidate.sourceFingerprint,
+					r2Version: candidate.r2Version,
+					r2Etag: candidate.r2Etag,
+					actualSize: candidate.actualSize,
+					errorCode: object ? "r2_authority_changed" : "r2_object_missing",
+				});
+			}
+			attachmentAuthority.set(candidate.vectorId, authoritative);
+		}));
+		const current = semanticIndex.resolveCandidates(candidates).filter((candidate) =>
+			candidate.source === "message" || attachmentAuthority.get(candidate.vectorId) === true,
+		);
 		return {
-			candidates: semanticIndex.resolveCandidates(candidates),
+			candidates: current,
 			readiness: semanticIndex.readiness(),
 		};
 	}
@@ -3571,8 +3640,17 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 
 		try {
-			await advanceSemanticIndex({
+			await advanceSemanticMailboxIndex({
 				mailbox: this,
+				bucket: {
+					head: (key) => this.env.BUCKET.head(key),
+					get: async (key, etag) => {
+						const object = await this.env.BUCKET.get(key, {
+							onlyIf: { etagMatches: etag },
+						});
+						return object && "body" in object ? object : null;
+					},
+				},
 				provider: createSemanticIndexProvider(this.env, mailboxId),
 				namespace: await semanticMailboxNamespace(brand.id, mailboxId),
 				onObservationError: (error) => {

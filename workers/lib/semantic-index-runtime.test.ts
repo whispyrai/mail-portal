@@ -34,6 +34,7 @@ function setup(input?: {
 	const upserts: Array<Array<{ id: string; values: number[]; namespace: string }>> = [];
 	const deletes: string[][] = [];
 	const leaseDurations: number[] = [];
+	const embeddingFeatures: string[] = [];
 	const mailbox: SemanticIndexRuntimeMailbox = {
 		async prepareSemanticIndex() {
 			return readiness(submittedJobs.length === 0 && (input?.jobs?.length ?? 0) === 0 ? "complete" : "building");
@@ -80,7 +81,8 @@ function setup(input?: {
 		},
 	};
 	const provider: SemanticIndexRuntimeProvider = {
-		async embed(texts) {
+		async embed(texts, feature) {
+			embeddingFeatures.push(feature);
 			if (input?.embedError) throw input.embedError;
 			return texts.map((_, index) => [index + 1, 0.5]);
 		},
@@ -105,18 +107,30 @@ function setup(input?: {
 		upserts,
 		deletes,
 		leaseDurations,
+		embeddingFeatures,
 	};
 }
 
-test("semantic runtime leases beyond two sequential provider timeout budgets", async () => {
-	const state = setup();
+test("semantic runtime leases beyond every mixed-turn provider timeout budget", async () => {
+	const state = setup({
+		jobs: [
+			{ vectorId: "sm1_message", operation: "upsert", content: "message", leaseToken: "lease", attemptCount: 1 },
+			{ vectorId: "sa1_attachment", operation: "upsert", content: "attachment", leaseToken: "lease", attemptCount: 1 },
+			{ vectorId: "delete", operation: "delete", content: null, leaseToken: "lease", attemptCount: 1 },
+		],
+	});
 	await advanceSemanticIndex({
 		mailbox: state.mailbox,
 		provider: state.provider,
 		namespace: "mb1_namespace",
 		createLeaseToken: () => "lease",
 	});
-	assert.deepEqual(state.leaseDurations, [60_000]);
+	assert.deepEqual(state.leaseDurations, [120_000]);
+	assert.deepEqual(state.embeddingFeatures, [
+		"semantic_message_index",
+		"semantic_attachment_index",
+	]);
+	assert.deepEqual(state.deletes, [["delete"]]);
 });
 
 test("semantic runtime confirms eventual visibility and sends content-free vector records", async () => {
@@ -127,7 +141,7 @@ test("semantic runtime confirms eventual visibility and sends content-free vecto
 		],
 		visible: ["old-upsert"],
 		jobs: [{
-			vectorId: "next-upsert",
+			vectorId: "sm1_next-upsert",
 			operation: "upsert",
 			content: "private evidence",
 			leaseToken: "lease",
@@ -144,10 +158,10 @@ test("semantic runtime confirms eventual visibility and sends content-free vecto
 	assert.deepEqual(state.confirmed, [["old-upsert"]]);
 	assert.deepEqual(state.submittedJobs, [
 		{ vectorId: "old-delete", operation: "delete", submittedAt: 1 },
-		{ vectorId: "next-upsert", operation: "upsert", submittedAt: 1_000 },
+		{ vectorId: "sm1_next-upsert", operation: "upsert", submittedAt: 1_000 },
 	]);
 	assert.deepEqual(state.upserts, [[{
-		id: "next-upsert",
+		id: "sm1_next-upsert",
 		values: [1, 0.5],
 		namespace: "mb1_namespace",
 	}]]);
@@ -168,7 +182,7 @@ test("semantic runtime batches deletes without embedding and retries provider fa
 	assert.equal(deleteState.upserts.length, 0);
 
 	const failed = setup({
-		jobs: [{ vectorId: "retry-me", operation: "upsert", content: "evidence", leaseToken: "lease", attemptCount: 1 }],
+		jobs: [{ vectorId: "sm1_retry-me", operation: "upsert", content: "evidence", leaseToken: "lease", attemptCount: 1 }],
 		embedError: new TypeError("provider unavailable"),
 	});
 	await advanceSemanticIndex({
@@ -178,13 +192,13 @@ test("semantic runtime batches deletes without embedding and retries provider fa
 		now: () => 5_000,
 		createLeaseToken: () => "lease",
 	});
-	assert.deepEqual(failed.retried, ["retry-me"]);
+	assert.deepEqual(failed.retried, ["sm1_retry-me"]);
 	assert.equal(failed.submittedJobs.length, 0);
 });
 
 test("semantic runtime rejects malformed embeddings before vector mutation", async () => {
 	const state = setup({
-		jobs: [{ vectorId: "bad-vector", operation: "upsert", content: "evidence", leaseToken: "lease", attemptCount: 1 }],
+		jobs: [{ vectorId: "sm1_bad-vector", operation: "upsert", content: "evidence", leaseToken: "lease", attemptCount: 1 }],
 	});
 	state.provider.embed = async () => [[Number.NaN]];
 	await advanceSemanticIndex({
@@ -193,6 +207,26 @@ test("semantic runtime rejects malformed embeddings before vector mutation", asy
 		namespace: "mb1_namespace",
 		createLeaseToken: () => "lease",
 	});
-	assert.deepEqual(state.retried, ["bad-vector"]);
+	assert.deepEqual(state.retried, ["sm1_bad-vector"]);
 	assert.equal(state.upserts.length, 0);
+});
+
+test("semantic runtime accounts attachment embeddings separately from Message embeddings", async () => {
+	const state = setup({
+		jobs: [
+			{ vectorId: "sm1_message", operation: "upsert", content: "message", leaseToken: "lease", attemptCount: 1 },
+			{ vectorId: "sa1_attachment", operation: "upsert", content: "attachment", leaseToken: "lease", attemptCount: 1 },
+		],
+	});
+	await advanceSemanticIndex({
+		mailbox: state.mailbox,
+		provider: state.provider,
+		namespace: "mb1_namespace",
+		createLeaseToken: () => "lease",
+	});
+	assert.deepEqual(state.embeddingFeatures, [
+		"semantic_message_index",
+		"semantic_attachment_index",
+	]);
+	assert.equal(state.upserts.length, 2);
 });

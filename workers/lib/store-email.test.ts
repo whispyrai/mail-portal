@@ -202,3 +202,24 @@ test("ingest preserves legitimate inline CID and erases ordinary CID", async () 
 	assert.equal(state.storedAttachments[0]?.[0]?.content_id, "diagram@example.com");
 	assert.equal(state.storedAttachments[0]?.[1]?.content_id, null);
 });
+
+test("ingest records UTF-8 byte size for string attachment content", async () => {
+	const state = dependencies();
+	const content = "عقد موقّع";
+	await storeParsedEmail(state.value, parsed({
+		attachments: [{
+			filename: "contract.txt",
+			mimeType: "text/plain",
+			content,
+			disposition: "attachment",
+		}],
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "unicode-attachment",
+	});
+	assert.equal(
+		state.storedAttachments[0]?.[0]?.size,
+		new TextEncoder().encode(content).byteLength,
+	);
+});

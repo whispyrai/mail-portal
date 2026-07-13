@@ -5,8 +5,28 @@ export const SEMANTIC_SEARCH_LIMITS = {
 	queryBytes: 1_000,
 	resultLimit: 20,
 	excerptChars: 600,
+	attachmentFilenameChars: 255,
 	mailboxes: 20,
 } as const;
+
+export function truncateSemanticSearchText(
+	value: string,
+	maxCodeUnits: number,
+): string {
+	if (!Number.isSafeInteger(maxCodeUnits) || maxCodeUnits < 1) {
+		throw new Error("Semantic text bound is invalid");
+	}
+	let result = "";
+	for (const character of value) {
+		const codePoint = character.codePointAt(0)!;
+		const scalar = codePoint >= 0xd800 && codePoint <= 0xdfff
+			? "\uFFFD"
+			: character;
+		if (result.length + scalar.length > maxCodeUnits) break;
+		result += scalar;
+	}
+	return result;
+}
 
 export const SEMANTIC_SEARCH_STATES = [
 	"complete",
@@ -21,7 +41,7 @@ export type SemanticSearchRequest = {
 	query: string;
 };
 
-export type SemanticSearchResult = {
+type SemanticSearchResultBase = {
 	mailboxId: string;
 	mailboxAddress: string;
 	messageId: string;
@@ -31,8 +51,20 @@ export type SemanticSearchResult = {
 	date: string;
 	folderId: string;
 	excerpt: string;
-	excerptKind: "authored_mail";
 };
+
+export type SemanticSearchResult = SemanticSearchResultBase & (
+	| {
+		source: "message";
+		excerptKind: "authored_mail";
+	}
+	| {
+		source: "attachment";
+		attachmentId: string;
+		attachmentFilename: string;
+		excerptKind: "extracted_attachment";
+	}
+);
 
 export type SemanticSearchMailboxStatus = {
 	mailboxId: string;
@@ -48,14 +80,17 @@ export type SemanticSearchResponse = {
 };
 
 const strictText = (maximum: number) => z.string().max(maximum);
-const identifier = z.string().min(1).max(300);
+const identifier = z.string().min(1).max(300).refine(
+	(value) => !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value),
+	"Semantic identifier contains an invalid Unicode scalar",
+);
 const mailboxAddress = z.string().min(3).max(320);
 
 const requestSchema = z.object({
 	query: z.string().trim().min(2).max(SEMANTIC_SEARCH_LIMITS.queryChars),
 }).strict();
 
-const resultSchema = z.object({
+const resultBaseShape = {
 	mailboxId: identifier,
 	mailboxAddress,
 	messageId: identifier,
@@ -65,8 +100,22 @@ const resultSchema = z.object({
 	date: strictText(64),
 	folderId: strictText(200),
 	excerpt: z.string().min(1).max(SEMANTIC_SEARCH_LIMITS.excerptChars),
-	excerptKind: z.literal("authored_mail"),
-}).strict();
+};
+
+const resultSchema = z.discriminatedUnion("source", [
+	z.object({
+		...resultBaseShape,
+		source: z.literal("message"),
+		excerptKind: z.literal("authored_mail"),
+	}).strict(),
+	z.object({
+		...resultBaseShape,
+		source: z.literal("attachment"),
+		attachmentId: identifier,
+		attachmentFilename: strictText(SEMANTIC_SEARCH_LIMITS.attachmentFilenameChars).min(1),
+		excerptKind: z.literal("extracted_attachment"),
+	}).strict(),
+]);
 
 const mailboxStatusSchema = z.object({
 	mailboxId: identifier,
@@ -82,11 +131,13 @@ const responseSchema = z.object({
 }).strict().superRefine((value, context) => {
 	const identities = new Set<string>();
 	for (const result of value.results) {
-		const identity = `${result.mailboxId}\u0000${result.messageId}`;
+		const identity = result.source === "message"
+			? `${result.mailboxId}\u0000message\u0000${result.messageId}`
+			: `${result.mailboxId}\u0000attachment\u0000${result.messageId}\u0000${result.attachmentId}`;
 		if (identities.has(identity)) {
 			context.addIssue({
 				code: z.ZodIssueCode.custom,
-				message: "Semantic results contain a duplicate Message identity",
+				message: "Semantic results contain a duplicate source identity",
 			});
 		}
 		identities.add(identity);

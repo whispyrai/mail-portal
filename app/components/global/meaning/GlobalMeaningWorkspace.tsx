@@ -86,7 +86,7 @@ export default function GlobalMeaningWorkspace({
 					</p>
 					<div className="mt-4 flex max-w-2xl items-start gap-3 text-sm leading-6 text-kumo-subtle">
 						<ShieldCheckIcon size={18} className="mt-0.5 shrink-0" aria-hidden="true" />
-						<p>This returns attributable Message evidence, not an AI-written answer. Opening evidence does not change its read state.</p>
+						<p>This returns attributable Message and attachment evidence, not an AI-written answer. Opening evidence does not change its read state.</p>
 					</div>
 					<MeaningSearchForm
 						query={draftQuery}
@@ -129,9 +129,9 @@ export default function GlobalMeaningWorkspace({
 							{response.results.length > 0 && <span className="text-sm tabular-nums text-kumo-subtle">{resultCountLabel}</span>}
 						</div>
 						{response.results.length > 0 ? (
-							<ol className="divide-y divide-kumo-line border-y border-kumo-line" aria-label="Ranked Message evidence">
+							<ol className="divide-y divide-kumo-line border-y border-kumo-line" aria-label="Ranked mail evidence">
 								{response.results.map((result) => {
-									const identity = semanticSearchResultIdentity(result.mailboxId, result.messageId);
+									const identity = semanticSearchResultIdentity(result);
 									return <MeaningResultRow key={identity} result={result} expanded={expandedResultIds.has(identity)} onExpandedChange={(expanded) => onExpandedChange(identity, expanded)} />;
 								})}
 							</ol>

@@ -12,6 +12,7 @@ const BGE_M3_MICROS_PER_MILLION_INPUT_TOKENS = 12_000;
 
 export type SemanticEmbeddingFeature =
 	| "semantic_message_index"
+	| "semantic_attachment_index"
 	| "semantic_query_embedding";
 
 type SemanticEmbeddingCost = {
@@ -157,12 +158,18 @@ export function createSemanticIndexProvider(
 ): SemanticIndexRuntimeProvider {
 	const index = env.SEMANTIC_INDEX;
 	if (!index) throw new Error("Semantic Vectorize binding is unavailable");
-	const embed = createSemanticEmbeddingRunner(env, {
+	const messageEmbed = createSemanticEmbeddingRunner(env, {
 		feature: "semantic_message_index",
 		mailboxId,
 	});
+	const attachmentEmbed = createSemanticEmbeddingRunner(env, {
+		feature: "semantic_attachment_index",
+		mailboxId,
+	});
 	return {
-		embed,
+		embed: (texts, feature) => feature === "semantic_attachment_index"
+			? attachmentEmbed(texts)
+			: messageEmbed(texts),
 		upsert: (vectors) => index.upsert(vectors),
 		deleteByIds: (ids) => index.deleteByIds(ids),
 		getByIds: async (ids) => (await index.getByIds(ids)).map((vector) => ({

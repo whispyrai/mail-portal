@@ -1,5 +1,6 @@
 import type { MailboxChange } from "../../shared/mailbox-change-feed.ts";
 import type { SemanticSearchResponse } from "../../shared/semantic-search.ts";
+import { truncateSemanticSearchText } from "../../shared/semantic-search.ts";
 
 export type SemanticSearchSessionSnapshot = {
   actorEmail: string;
@@ -53,11 +54,29 @@ function cloneSnapshot(
   };
 }
 
+type SemanticSearchResultIdentity =
+  | { mailboxId: string; messageId: string; source: "message" }
+  | {
+      mailboxId: string;
+      messageId: string;
+      source: "attachment";
+      attachmentId: string;
+    };
+
 export function semanticSearchResultIdentity(
-  mailboxId: string,
-  messageId: string,
+  result: SemanticSearchResultIdentity,
 ): string {
-  return `${mailboxId}\u0000${messageId}`;
+  return result.source === "attachment"
+    ? `${result.mailboxId}\u0000attachment\u0000${result.messageId}\u0000${result.attachmentId}`
+    : `${result.mailboxId}\u0000message\u0000${result.messageId}`;
+}
+
+export function semanticSearchExcerptPreview(excerpt: string): string {
+	if (excerpt.length <= 260) return excerpt;
+	const bounded = truncateSemanticSearchText(excerpt, 257)
+		.replace(/\s+\S*$/u, "")
+		.trimEnd();
+	return `${bounded}…`;
 }
 
 export function readSemanticSearchSession(): SemanticSearchSessionSnapshot | null {

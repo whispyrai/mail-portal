@@ -141,7 +141,7 @@ export async function storeParsedEmail(
 				mimetype: attachment.mimeType,
 				size:
 					typeof attachment.content === "string"
-						? attachment.content.length
+						? new TextEncoder().encode(attachment.content).byteLength
 						: attachment.content.byteLength,
 				content_id: contentIdForDisposition(disposition, attachment.contentId),
 				disposition,

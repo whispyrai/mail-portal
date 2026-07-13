@@ -1,9 +1,10 @@
 import { Button } from "@cloudflare/kumo";
-import { ArrowSquareOutIcon } from "@phosphor-icons/react";
+import { ArrowSquareOutIcon, PaperclipIcon } from "@phosphor-icons/react";
 import { Link } from "react-router";
 import { useId } from "react";
 import { getFolderDisplayName } from "../../../../shared/folders.ts";
 import type { SemanticSearchResult } from "../../../../shared/semantic-search.ts";
+import { semanticSearchExcerptPreview } from "../../../lib/semantic-search-session.ts";
 
 function formatResultDate(value: string): string {
 	const date = new Date(value);
@@ -27,10 +28,15 @@ export default function MeaningResultRow({
 	onExpandedChange(expanded: boolean): void;
 }) {
 	const excerptId = useId();
-	const collapsedExcerpt = result.excerpt.length > 260
-		? `${result.excerpt.slice(0, 257).replace(/\s+\S*$/u, "").trimEnd()}…`
-		: result.excerpt;
+	const collapsedExcerpt = semanticSearchExcerptPreview(result.excerpt);
 	const canExpand = collapsedExcerpt !== result.excerpt;
+	const attachment = result.source === "attachment" ? result : null;
+	const evidenceHref = attachment
+		? `/mailbox/${encodeURIComponent(result.mailboxId)}/attachments?selected=${encodeURIComponent(attachment.attachmentId)}`
+		: `/mailbox/${encodeURIComponent(result.mailboxId)}/open/${encodeURIComponent(result.messageId)}`;
+	const evidenceLabel = attachment
+		? `Open file ${attachment.attachmentFilename} in ${result.mailboxAddress}`
+		: `Open message ${result.subject || "without a subject"} in ${result.mailboxAddress}`;
 	return (
 		<li className="py-6 first:pt-5 last:pb-5">
 			<article>
@@ -45,6 +51,12 @@ export default function MeaningResultRow({
 					{result.subject || "(No subject)"}
 				</h3>
 				<p className="mt-1 break-words text-sm text-kumo-subtle">{result.counterparty || "Unknown correspondent"}</p>
+				{attachment && (
+					<p className="mt-3 flex min-w-0 items-center gap-2 text-xs font-medium text-kumo-subtle">
+						<PaperclipIcon size={15} className="shrink-0" aria-hidden="true" />
+						<span className="break-all">Extracted from {attachment.attachmentFilename}</span>
+					</p>
+				)}
 				<p id={excerptId} className="mt-4 whitespace-pre-wrap break-words text-sm leading-6 text-kumo-strong">
 					{expanded ? result.excerpt : collapsedExcerpt}
 				</p>
@@ -59,10 +71,11 @@ export default function MeaningResultRow({
 						{expanded ? "Show less" : "Show full excerpt"}
 					</Button>}
 					<Link
-						to={`/mailbox/${encodeURIComponent(result.mailboxId)}/open/${encodeURIComponent(result.messageId)}`}
+						to={evidenceHref}
+						aria-label={evidenceLabel}
 						className="inline-flex min-h-11 items-center gap-2 rounded-md border border-kumo-line bg-kumo-base px-3 text-sm font-medium text-kumo-default no-underline hover:bg-kumo-tint focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kumo-brand"
 					>
-						Open message <ArrowSquareOutIcon size={16} aria-hidden="true" />
+						{attachment ? "Open file" : "Open message"} <ArrowSquareOutIcon size={16} aria-hidden="true" />
 					</Link>
 				</div>
 			</article>

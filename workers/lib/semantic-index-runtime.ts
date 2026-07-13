@@ -3,10 +3,15 @@ import type {
   SemanticIndexReadiness,
   SemanticSubmittedJob,
 } from "./semantic-index.ts";
+import {
+	advanceSemanticAttachmentExtraction,
+	type SemanticAttachmentRuntimeBucket,
+	type SemanticAttachmentRuntimeMailbox,
+} from "./semantic-attachment-runtime.ts";
 
-// One upsert turn can spend the full provider budget on both embedding and
-// Vectorize. Keep the durable lease comfortably beyond those sequential calls.
-const LEASE_MS = 60_000;
+// A mixed turn can run two embed/upsert pairs and one delete. Keep the durable
+// lease beyond all five provider budgets with ample commit and scheduler margin.
+const LEASE_MS = 120_000;
 const JOB_LIMIT = 20;
 const RETRY_DELAY_MS = 30_000;
 const DEFER_DELAY_MS = 15 * 60 * 1_000;
@@ -87,11 +92,17 @@ export type SemanticIndexRuntimeMailbox = {
 };
 
 export type SemanticIndexRuntimeProvider = {
-  embed(texts: string[]): Promise<number[][]>;
+	embed(
+		texts: string[],
+		feature: "semantic_message_index" | "semantic_attachment_index",
+	): Promise<number[][]>;
   upsert(vectors: SemanticVector[]): Promise<unknown>;
   deleteByIds(ids: string[]): Promise<unknown>;
   getByIds(ids: string[]): Promise<Array<{ id: string }>>;
 };
+
+export type SemanticMailboxIndexRuntime = SemanticIndexRuntimeMailbox &
+	SemanticAttachmentRuntimeMailbox;
 
 function providerErrorCode(error: unknown): string {
   if (error instanceof Error && error.name) {
@@ -270,37 +281,62 @@ export async function advanceSemanticIndex(input: {
   );
   const deletes = jobs.filter((job) => job.operation === "delete");
 
-  if (upserts.length > 0) {
-    try {
-      const embeddings = validateEmbeddings(
-        await providerCall(
-          input.provider.embed(upserts.map((job) => job.content)),
-        ),
-        upserts.length,
-      );
-      const mutation = await providerCall(
-        input.provider.upsert(
-          upserts.map((job, index) => ({
+	const upsertGroups = [
+		{
+			feature: "semantic_message_index" as const,
+			jobs: upserts.filter((job) => job.vectorId.startsWith("sm1_")),
+		},
+		{
+			feature: "semantic_attachment_index" as const,
+			jobs: upserts.filter((job) => job.vectorId.startsWith("sa1_")),
+		},
+	];
+	for (const group of upsertGroups) {
+		if (group.jobs.length === 0) continue;
+		try {
+			const embeddings = validateEmbeddings(
+				await providerCall(
+					input.provider.embed(
+						group.jobs.map((job) => job.content),
+						group.feature,
+					),
+				),
+				group.jobs.length,
+			);
+			const mutation = await providerCall(
+				input.provider.upsert(
+					group.jobs.map((job, index) => ({
             id: job.vectorId,
             values: embeddings[index]!,
             namespace: input.namespace,
           })),
         ),
       );
-      await submitJobs(
-        input.mailbox,
-        upserts,
+			await submitJobs(
+				input.mailbox,
+				group.jobs,
         mutationReceipt(mutation, createReceiptToken),
         now(),
       );
-    } catch (error) {
-      if (error instanceof SemanticIndexDeferredError) {
-        await deferJobs(input.mailbox, upserts, nowMs);
-      } else {
-        await retryJobs(input.mailbox, upserts, nowMs, error);
-      }
-    }
-  }
+		} catch (error) {
+			if (error instanceof SemanticIndexDeferredError) {
+				await deferJobs(input.mailbox, group.jobs, nowMs);
+			} else {
+				await retryJobs(input.mailbox, group.jobs, nowMs, error);
+			}
+		}
+	}
+	const unknownUpserts = upserts.filter(
+		(job) => !job.vectorId.startsWith("sm1_") && !job.vectorId.startsWith("sa1_"),
+	);
+	if (unknownUpserts.length > 0) {
+		await retryJobs(
+			input.mailbox,
+			unknownUpserts,
+			nowMs,
+			new Error("Semantic vector source type is invalid"),
+		);
+	}
 
   if (deletes.length > 0) {
     try {
@@ -319,4 +355,36 @@ export async function advanceSemanticIndex(input: {
   }
 
   return input.mailbox.readSemanticIndexReadiness();
+}
+
+/**
+ * Advances the exact composed work owned by one Mailbox alarm turn. Attachment
+ * extraction runs first so a ready extraction can enter the same turn's
+ * authoritative projection and vector outbox.
+ */
+export async function advanceSemanticMailboxIndex(input: {
+	mailbox: SemanticMailboxIndexRuntime;
+	bucket: SemanticAttachmentRuntimeBucket;
+	provider: SemanticIndexRuntimeProvider;
+	namespace: string;
+	now?: () => number;
+	createLeaseToken?: () => string;
+	createReceiptToken?: () => string;
+	onObservationError?: (error: unknown) => void;
+}): Promise<SemanticIndexReadiness> {
+	await advanceSemanticAttachmentExtraction({
+		mailbox: input.mailbox,
+		bucket: input.bucket,
+		now: input.now,
+		createLeaseToken: input.createLeaseToken,
+	});
+	return advanceSemanticIndex({
+		mailbox: input.mailbox,
+		provider: input.provider,
+		namespace: input.namespace,
+		now: input.now,
+		createLeaseToken: input.createLeaseToken,
+		createReceiptToken: input.createReceiptToken,
+		onObservationError: input.onObservationError,
+	});
 }

@@ -7,6 +7,7 @@ import {
 	clearSemanticSearchSessionForMailboxChanges,
 	subscribeSemanticSearchSession,
 	readSemanticSearchSession,
+	semanticSearchExcerptPreview,
 	semanticSearchResultIdentity,
 	writeSemanticSearchSession,
 } from "./semantic-search-session.ts";
@@ -39,7 +40,11 @@ function store() {
 				state: "complete",
 			}],
 		},
-		expandedResultIds: [semanticSearchResultIdentity("mailbox-1", "message-1")],
+		expandedResultIds: [semanticSearchResultIdentity({
+			mailboxId: "mailbox-1",
+			messageId: "message-1",
+			source: "message",
+		})],
 		scrollTop: 240,
 	});
 }
@@ -53,6 +58,26 @@ test("semantic workspace snapshots remain module-memory-only and are cloned", ()
 	assert.equal(readSemanticSearchSession()?.expandedResultIds.length, 1);
 	clearSemanticSearchSession();
 	assert.equal(readSemanticSearchSession(), null);
+});
+
+test("semantic result identity distinguishes Message and attachment evidence", () => {
+	assert.notEqual(
+		semanticSearchResultIdentity({ mailboxId: "mailbox-1", messageId: "message-1", source: "message" }),
+		semanticSearchResultIdentity({ mailboxId: "mailbox-1", messageId: "message-1", source: "attachment", attachmentId: "attachment-1" }),
+	);
+	assert.notEqual(
+		semanticSearchResultIdentity({ mailboxId: "mailbox-1", messageId: "message-1", source: "attachment", attachmentId: "attachment-1" }),
+		semanticSearchResultIdentity({ mailboxId: "mailbox-1", messageId: "message-1", source: "attachment", attachmentId: "attachment-2" }),
+	);
+});
+
+test("collapsed semantic excerpts never split a Unicode scalar", () => {
+	const preview = semanticSearchExcerptPreview(`${"x".repeat(256)}😀tail`);
+	assert.equal(preview, `${"x".repeat(256)}…`);
+	assert.doesNotMatch(
+		preview,
+		/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+	);
 });
 
 test("semantic session subscribers are notified without receiving evidence payloads", () => {

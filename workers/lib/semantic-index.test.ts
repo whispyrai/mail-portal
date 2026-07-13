@@ -27,13 +27,15 @@ function setup() {
 			}
 		},
 	};
+	const createIndex = () => createSemanticIndex({
+		store,
+		now: () => "2026-07-13T12:00:00.000Z",
+		createId: () => (++nextId).toString(16).padStart(32, "0"),
+	});
 	return {
 		database,
-		index: createSemanticIndex({
-			store,
-			now: () => "2026-07-13T12:00:00.000Z",
-			createId: () => (++nextId).toString(16).padStart(32, "0"),
-		}),
+		index: createIndex(),
+		restartIndex: createIndex,
 	};
 }
 
@@ -263,5 +265,512 @@ test("semantic candidate hydration drops stale fingerprints and preserves curren
 	assert.match(resolved?.excerpt ?? "", /signed contract/);
 	state.database.prepare("UPDATE emails SET folder_id = 'spam' WHERE id = ?").run("message-1");
 	assert.deepEqual(state.index.resolveCandidates([{ vectorId, score: 1 }]), []);
+	state.database.close();
+});
+
+test("semantic attachment evidence is exact, independently deduplicated, fenced, and immediately invalidated", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent authored evidence");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES (?, ?, ?, ?, ?, 'attachment')
+	`).run("attachment-1", "message-1", "contract.md", "text/markdown", 36);
+	await state.index.prepare();
+	assert.equal(state.index.readiness().state, "building");
+	const lease = state.index.leaseAttachmentExtraction("attachment-lease", 1_000, 10_000);
+	assert.equal(lease?.attachmentId, "attachment-1");
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "wrong-lease",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 36,
+		text: "The signed contract arrives Tuesday.",
+	}), false);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "attachment-lease",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 36,
+		text: "The signed contract arrives Tuesday.",
+	}), true);
+	const rows = state.database.prepare(`
+		SELECT vector_id AS vectorId, source_type AS sourceType
+		FROM semantic_chunks ORDER BY source_type
+	`).all();
+	assert.equal(rows.length, 2);
+	const attachmentVector = String(rows.find((row) => row.sourceType === "attachment")?.vectorId);
+	assert.match(attachmentVector, /^sa1_[a-f0-9]{32}_[a-z0-9]{2}$/);
+	const resolved = state.index.resolveCandidates([
+		{ vectorId: attachmentVector, score: 0.95 },
+		{ vectorId: attachmentVector, score: 0.8 },
+	]);
+	assert.equal(resolved.length, 1);
+	assert.equal(resolved[0]?.source, "attachment");
+	assert.equal(resolved[0]?.attachmentId, "attachment-1");
+	assert.equal(resolved[0]?.attachmentFilename, "contract.md");
+	assert.match(resolved[0]?.excerpt ?? "", /signed contract/);
+	assert.equal(state.index.invalidateAttachmentAuthority({
+		vectorId: attachmentVector,
+		attachmentId: "attachment-1",
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 36,
+		errorCode: "r2_authority_changed",
+	}), true);
+	assert.deepEqual(state.index.resolveCandidates([{ vectorId: attachmentVector, score: 1 }]), []);
+	assert.equal(state.database.prepare(
+		"SELECT state FROM semantic_attachment_extractions WHERE attachment_id = 'attachment-1'",
+	).get()?.state, "pending");
+	assert.equal(state.index.readiness().state, "building");
+	state.database.prepare("UPDATE emails SET folder_id = 'trash' WHERE id = ?").run("message-1");
+	assert.deepEqual(state.index.resolveCandidates([{ vectorId: attachmentVector, score: 1 }]), []);
+	assert.equal(state.database.prepare(
+		"SELECT COUNT(*) AS total FROM semantic_attachment_extractions",
+	).get()?.total, 0);
+	assert.equal(state.database.prepare(
+		"SELECT operation FROM semantic_index_jobs WHERE vector_id = ?",
+	).get(attachmentVector)?.operation, "delete");
+	state.database.close();
+});
+
+test("semantic candidate bounds preserve complete Unicode scalars in every visible field", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	state.database.prepare(`
+		UPDATE emails SET subject = ?, sender = ?, recipient = ? WHERE id = 'message-1'
+	`).run(
+		`${"s".repeat(499)}😀tail`,
+		`${"f".repeat(319)}😀tail`,
+		`${"t".repeat(319)}😀tail`,
+	);
+	const filename = `${"a".repeat(254)}😀.txt`;
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', ?, 'text/plain', 620, 'attachment')
+	`).run(filename);
+	await state.index.prepare();
+	const lease = state.index.leaseAttachmentExtraction("lease", 1_000, 10_000);
+	assert.ok(lease);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "lease",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 620,
+		text: `${"x".repeat(599)}😀tail`,
+	}), true);
+	const vectorId = String(state.database.prepare(`
+		SELECT vector_id FROM semantic_chunks
+		WHERE source_type = 'attachment' AND attachment_id = 'attachment-1'
+	`).get()?.vector_id);
+	const candidate = state.index.resolveCandidates([{ vectorId, score: 1 }])[0];
+	assert.equal(candidate?.subject, "s".repeat(499));
+	assert.equal(candidate?.sender, "f".repeat(319));
+	assert.equal(candidate?.recipient, "t".repeat(319));
+	assert.equal(candidate?.excerpt, "x".repeat(599));
+	assert.equal(
+		candidate?.source === "attachment" ? candidate.attachmentFilename : null,
+		"a".repeat(254),
+	);
+	assert.doesNotMatch(
+		JSON.stringify(candidate),
+		/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+	);
+	state.database.close();
+});
+
+test("unsupported, inline, and CID attachments never block semantic readiness", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Message evidence");
+	for (const attachment of [
+		["html", "page.html", "text/html", null, "attachment"],
+		["inline", "notes.txt", "text/plain", null, "inline"],
+		["cid", "notes.txt", "text/plain", "cid-1", "attachment"],
+	] as const) {
+		state.database.prepare(`
+			INSERT INTO attachments(id, email_id, filename, mimetype, size, content_id, disposition)
+			VALUES (?, 'message-1', ?, ?, 10, ?, ?)
+		`).run(...attachment);
+	}
+	await state.index.prepare();
+	assert.equal(state.database.prepare(
+		"SELECT state FROM semantic_attachment_extractions WHERE attachment_id = 'html'",
+	).get()?.state, "unsupported");
+	assert.equal(state.database.prepare(
+		"SELECT COUNT(*) AS total FROM semantic_attachment_extractions",
+	).get()?.total, 1);
+	const jobs = state.database.prepare("SELECT vector_id FROM semantic_index_jobs").all();
+	for (const row of jobs) {
+		state.database.prepare("DELETE FROM semantic_index_jobs WHERE vector_id = ?").run(row.vector_id);
+	}
+	assert.equal(state.index.readiness().state, "complete");
+	state.database.close();
+});
+
+test("invalid legacy attachment sizes are classified without crashing projection preparation", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Message evidence");
+	for (const [id, size] of [["negative", -1], ["fractional", 1.5]] as const) {
+		state.database.prepare(`
+			INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+			VALUES (?, 'message-1', ?, 'text/plain', ?, 'attachment')
+		`).run(id, `${id}.txt`, size);
+	}
+	await state.index.prepare();
+	assert.deepEqual(state.database.prepare(`
+		SELECT attachment_id AS attachmentId, declared_size AS declaredSize,
+		 state, last_error_code AS errorCode
+		FROM semantic_attachment_extractions ORDER BY attachment_id
+	`).all().map((row) => ({ ...row })), [
+		{ attachmentId: "fractional", declaredSize: 0, state: "unsupported", errorCode: "invalid_size" },
+		{ attachmentId: "negative", declaredSize: 0, state: "unsupported", errorCode: "invalid_size" },
+	]);
+	state.database.prepare("DELETE FROM semantic_index_jobs").run();
+	assert.equal(state.index.readiness().state, "complete");
+	state.database.close();
+});
+
+test("attachment extraction, policy, or chunk version drift rebuilds only attachment evidence", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Stable Message evidence");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', 'contract.md', 'text/markdown', 36, 'attachment')
+	`).run();
+	await state.index.prepare();
+	const messageVector = String(state.database.prepare(
+		"SELECT vector_id FROM semantic_chunks WHERE source_type = 'message'",
+	).get()?.vector_id);
+	const lease = state.index.leaseAttachmentExtraction("lease", 1_000, 10_000);
+	assert.ok(lease);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "lease",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 36,
+		text: "The signed contract arrives Tuesday.",
+	}), true);
+	state.database.prepare(`
+		UPDATE semantic_projection_state SET attachment_extraction_version = 99,
+		 attachment_policy_version = 99, attachment_chunk_version = 99 WHERE id = 1
+	`).run();
+	await state.index.prepare();
+	assert.equal(state.database.prepare(
+		"SELECT vector_id FROM semantic_chunks WHERE source_type = 'message'",
+	).get()?.vector_id, messageVector);
+	assert.equal(state.database.prepare(
+		"SELECT COUNT(*) AS total FROM semantic_sources WHERE source_type = 'attachment'",
+	).get()?.total, 0);
+	assert.equal(state.database.prepare(
+		"SELECT state FROM semantic_attachment_extractions WHERE attachment_id = 'attachment-1'",
+	).get()?.state, "pending");
+	assert.equal(state.index.readiness().state, "building");
+	assert.deepEqual({ ...state.database.prepare(`
+		SELECT attachment_extraction_version AS extractionVersion,
+		 attachment_policy_version AS policyVersion,
+		 attachment_chunk_version AS chunkVersion
+		FROM semantic_projection_state WHERE id = 1
+	`).get()! }, { extractionVersion: 1, policyVersion: 1, chunkVersion: 1 });
+	state.database.close();
+});
+
+test("an expired attachment extraction lease is taken over durably after restart", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', 'notes.txt', 'text/plain', 12, 'attachment')
+	`).run();
+	await state.index.prepare();
+	const first = state.index.leaseAttachmentExtraction("lease-1", 1_000, 100);
+	assert.equal(first?.attemptCount, 1);
+	assert.equal(state.restartIndex().leaseAttachmentExtraction("too-early", 1_099, 100), null);
+	const second = state.restartIndex().leaseAttachmentExtraction("lease-2", 1_100, 100);
+	assert.equal(second?.attemptCount, 2);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "lease-1",
+		completedAt: 1_101,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 12,
+		text: "New evidence",
+	}), false);
+	assert.equal(state.restartIndex().completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "lease-2",
+		completedAt: 1_101,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 12,
+		text: "New evidence",
+	}), true);
+	state.database.close();
+});
+
+test("a reparented attachment rejects stale work and resumes under its new Message authority", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "First parent");
+	insertMessage(state.database, "message-2", "archive", "Second parent");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', 'notes.txt', 'text/plain', 12, 'attachment')
+	`).run();
+	await state.index.prepare();
+	const stale = state.index.leaseAttachmentExtraction("stale", 1_000, 10_000);
+	assert.equal(stale?.messageId, "message-1");
+	state.database.prepare(`
+		UPDATE attachments SET email_id = 'message-2', filename = 'renamed.txt'
+		WHERE id = 'attachment-1'
+	`).run();
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "stale",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 12,
+		text: "New evidence",
+	}), false);
+	await state.index.prepare();
+	const current = state.index.leaseAttachmentExtraction("current", 2_001, 10_000);
+	assert.deepEqual(current && {
+		messageId: current.messageId,
+		attachmentVersion: current.attachmentVersion,
+		filename: current.filename,
+	}, {
+		messageId: "message-2",
+		attachmentVersion: 2,
+		filename: "renamed.txt",
+	});
+	assert.equal(state.database.prepare(`
+		SELECT COUNT(*) AS total FROM semantic_sources
+		WHERE source_type = 'attachment' AND attachment_id = 'attachment-1'
+	`).get()?.total, 0);
+	state.database.close();
+});
+
+test("deleting an attachment removes local evidence immediately and preserves vector deletion work", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', 'notes.txt', 'text/plain', 12, 'attachment')
+	`).run();
+	await state.index.prepare();
+	const lease = state.index.leaseAttachmentExtraction("lease", 1_000, 10_000);
+	assert.ok(lease);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "lease",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 12,
+		text: "New evidence",
+	}), true);
+	const vectorId = String(state.database.prepare(`
+		SELECT vector_id FROM semantic_chunks
+		WHERE source_type = 'attachment' AND attachment_id = 'attachment-1'
+	`).get()?.vector_id);
+	state.database.prepare("DELETE FROM attachments WHERE id = 'attachment-1'").run();
+	assert.deepEqual(state.index.resolveCandidates([{ vectorId, score: 1 }]), []);
+	assert.equal(state.database.prepare(`
+		SELECT COUNT(*) AS total FROM semantic_sources
+		WHERE source_type = 'attachment' AND attachment_id = 'attachment-1'
+	`).get()?.total, 0);
+	assert.equal(state.database.prepare(`
+		SELECT COUNT(*) AS total FROM semantic_attachment_extractions
+		WHERE attachment_id = 'attachment-1'
+	`).get()?.total, 0);
+	assert.equal(state.database.prepare(`
+		SELECT operation FROM semantic_index_jobs WHERE vector_id = ?
+	`).get(vectorId)?.operation, "delete");
+	state.database.close();
+});
+
+test("a changed R2 object replaces the attachment source and its opaque vector identities", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', 'notes.txt', 'text/plain', 12, 'attachment')
+	`).run();
+	await state.index.prepare();
+	const firstLease = state.index.leaseAttachmentExtraction("first", 1_000, 10_000);
+	assert.ok(firstLease);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "first",
+		completedAt: 2_000,
+		byteSha256: "a".repeat(64),
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 12,
+		text: "Old evidence",
+	}), true);
+	const oldVectorId = String(state.database.prepare(`
+		SELECT vector_id FROM semantic_chunks
+		WHERE source_type = 'attachment' AND attachment_id = 'attachment-1'
+	`).get()?.vector_id);
+	assert.equal(state.index.invalidateAttachmentAuthority({
+		vectorId: oldVectorId,
+		attachmentId: "attachment-1",
+		sourceFingerprint: "b".repeat(64),
+		r2Version: "version-1",
+		r2Etag: "etag-1",
+		actualSize: 12,
+		errorCode: "r2_authority_changed",
+	}), true);
+	const secondLease = state.restartIndex().leaseAttachmentExtraction("second", 2_001, 10_000);
+	assert.equal(secondLease?.attemptCount, 1);
+	assert.equal(state.index.completeAttachmentExtraction({
+		attachmentId: "attachment-1",
+		messageId: "message-1",
+		attachmentVersion: 1,
+		leaseToken: "second",
+		completedAt: 3_000,
+		byteSha256: "c".repeat(64),
+		sourceFingerprint: "d".repeat(64),
+		r2Version: "version-2",
+		r2Etag: "etag-2",
+		actualSize: 12,
+		text: "New evidence",
+	}), true);
+	const newVectorId = String(state.database.prepare(`
+		SELECT vector_id FROM semantic_chunks
+		WHERE source_type = 'attachment' AND attachment_id = 'attachment-1'
+	`).get()?.vector_id);
+	assert.notEqual(newVectorId, oldVectorId);
+	assert.deepEqual(state.index.resolveCandidates([{ vectorId: oldVectorId, score: 1 }]), []);
+	assert.match(
+		state.index.resolveCandidates([{ vectorId: newVectorId, score: 1 }])[0]?.excerpt ?? "",
+		/New evidence/,
+	);
+	state.database.close();
+});
+
+test("attachment backfill is bounded and later attachment changes replay from the durable feed", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	const insertAttachment = state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES (?, 'message-1', ?, 'text/plain', 10, 'attachment')
+	`);
+	for (let index = 0; index < 25; index += 1) {
+		const id = `attachment-${index.toString().padStart(2, "0")}`;
+		insertAttachment.run(id, `${id}.txt`);
+	}
+	await state.index.prepare();
+	assert.deepEqual({ ...state.database.prepare(`
+		SELECT attachment_status AS status, processed_attachments AS processed
+		FROM semantic_projection_state WHERE id = 1
+	`).get()! }, { status: "building", processed: 20 });
+	assert.equal(state.database.prepare(
+		"SELECT COUNT(*) AS total FROM semantic_attachment_extractions",
+	).get()?.total, 20);
+	await state.index.prepare();
+	assert.deepEqual({ ...state.database.prepare(`
+		SELECT attachment_status AS status, processed_attachments AS processed
+		FROM semantic_projection_state WHERE id = 1
+	`).get()! }, { status: "ready", processed: 25 });
+
+	insertAttachment.run("attachment-25", "attachment-25.txt");
+	await state.restartIndex().prepare();
+	assert.equal(state.database.prepare(`
+		SELECT COUNT(*) AS total FROM semantic_attachment_extractions
+		WHERE attachment_id = 'attachment-25' AND state = 'pending'
+	`).get()?.total, 1);
+	const projection = state.database.prepare(`
+		SELECT applied_change_sequence AS applied FROM semantic_projection_state WHERE id = 1
+	`).get();
+	const current = state.database.prepare("SELECT MAX(sequence) AS current FROM mailbox_changes").get();
+	assert.equal(projection?.applied, current?.current);
+	state.database.close();
+});
+
+test("exhausted attachment extraction retries make readiness unavailable without another lease", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	state.database.prepare(`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('attachment-1', 'message-1', 'notes.txt', 'text/plain', 12, 'attachment')
+	`).run();
+	await state.index.prepare();
+	state.database.prepare("DELETE FROM semantic_index_jobs").run();
+	let currentTime = 1_000;
+	for (let attempt = 1; attempt <= 5; attempt += 1) {
+		const lease = state.restartIndex().leaseAttachmentExtraction(
+			`lease-${attempt}`,
+			currentTime,
+			1_000,
+		);
+		assert.equal(lease?.attemptCount, attempt);
+		assert.equal(state.index.retryAttachmentExtraction({
+			attachmentId: "attachment-1",
+			leaseToken: `lease-${attempt}`,
+			failedAt: currentTime + 1,
+			nextAttemptAt: currentTime + 2,
+			errorCode: "r2_timeout_error",
+		}), true);
+		currentTime += 3;
+	}
+	assert.equal(state.index.readiness().state, "unavailable");
+	assert.equal(
+		state.restartIndex().leaseAttachmentExtraction("never", currentTime, 1_000),
+		null,
+	);
+	assert.equal(state.index.nextAdvanceAt(currentTime), null);
+	assert.deepEqual({ ...state.database.prepare(`
+		SELECT state, attempt_count AS attempts, last_error_code AS errorCode
+		FROM semantic_attachment_extractions WHERE attachment_id = 'attachment-1'
+	`).get()! }, {
+		state: "failed",
+		attempts: 5,
+		errorCode: "r2_timeout_error",
+	});
 	state.database.close();
 });

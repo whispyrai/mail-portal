@@ -41,7 +41,8 @@ test("Meaning exposes every truthful readiness, recovery, and zero-evidence stat
 });
 
 test("Meaning evidence remains compound, attributable, read-only, and free of model internals", () => {
-	assert.match(workspace, /semanticSearchResultIdentity\(result\.mailboxId, result\.messageId\)/);
+	assert.match(workspace, /semanticSearchResultIdentity\(/);
+	assert.match(workspace, /semanticSearchResultIdentity\(result\)/);
 	assert.match(resultRow, /result\.mailboxAddress/);
 	assert.match(resultRow, /result\.folderId/);
 	assert.match(resultRow, /result\.counterparty/);
@@ -50,6 +51,11 @@ test("Meaning evidence remains compound, attributable, read-only, and free of mo
 	assert.match(resultRow, /aria-controls=\{excerptId\}/);
 	assert.doesNotMatch(resultRow, /line-clamp/);
 	assert.match(resultRow, /\/open\/\$\{encodeURIComponent\(result\.messageId\)\}/);
+	assert.match(resultRow, /Extracted from \{attachment\.attachmentFilename\}/);
+	assert.match(resultRow, /\/attachments\?selected=\$\{encodeURIComponent\(attachment\.attachmentId\)\}/);
+	assert.match(resultRow, /attachment \? "Open file" : "Open message"/);
+	assert.match(resultRow, /aria-label=\{evidenceLabel\}/);
+	assert.match(resultRow, /Open file \$\{attachment\.attachmentFilename\} in \$\{result\.mailboxAddress\}/);
 	assert.doesNotMatch(`${workspace}\n${resultRow}\n${route}`, /markRead|markUnread|toggleUnread|score\}|vectorId|modelName/);
 });
 

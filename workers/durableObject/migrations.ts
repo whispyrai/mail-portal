@@ -1261,4 +1261,355 @@ export const mailboxMigrations: Migration[] = [
 			END;
 		`),
 	},
+	{
+		name: "28_add_semantic_attachment_evidence",
+		sql: txn(`
+			DROP TRIGGER semantic_chunks_fts_insert;
+			DROP TRIGGER semantic_chunks_fts_delete;
+			DROP TRIGGER semantic_chunks_enqueue_upsert;
+			DROP TRIGGER semantic_chunks_enqueue_delete;
+			DROP TRIGGER semantic_sources_invalidate_on_message_content_change;
+			DROP TRIGGER semantic_sources_invalidate_on_excluded_folder;
+			DROP TRIGGER semantic_sources_track_eligible_folder;
+
+			ALTER TABLE semantic_projection_state RENAME TO semantic_projection_state_v1;
+			ALTER TABLE semantic_sources RENAME TO semantic_sources_v1;
+			ALTER TABLE semantic_chunks RENAME TO semantic_chunks_v1;
+			DROP TABLE semantic_chunks_fts;
+
+			CREATE TABLE semantic_projection_state (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 2),
+				policy_version INTEGER NOT NULL CHECK(policy_version = 1),
+				chunk_version INTEGER NOT NULL CHECK(chunk_version = 1),
+				status TEXT NOT NULL CHECK(status IN ('building', 'ready', 'failed')),
+				baseline_change_sequence INTEGER NOT NULL CHECK(baseline_change_sequence >= 0),
+				applied_change_sequence INTEGER NOT NULL CHECK(applied_change_sequence >= 0),
+				backfill_date TEXT,
+				backfill_message_id TEXT,
+				processed_messages INTEGER NOT NULL DEFAULT 0 CHECK(processed_messages >= 0),
+				attachment_status TEXT NOT NULL CHECK(attachment_status IN ('building', 'ready', 'failed')),
+				attachment_extraction_version INTEGER NOT NULL CHECK(attachment_extraction_version > 0),
+				attachment_policy_version INTEGER NOT NULL CHECK(attachment_policy_version > 0),
+				attachment_chunk_version INTEGER NOT NULL CHECK(attachment_chunk_version > 0),
+				attachment_backfill_date TEXT,
+				attachment_backfill_message_id TEXT,
+				attachment_backfill_id TEXT,
+				processed_attachments INTEGER NOT NULL DEFAULT 0 CHECK(processed_attachments >= 0),
+				attachment_last_error_code TEXT,
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				last_error_code TEXT
+			);
+			INSERT INTO semantic_projection_state(
+				id, schema_version, policy_version, chunk_version, status,
+				baseline_change_sequence, applied_change_sequence, backfill_date,
+				backfill_message_id, processed_messages, attachment_status,
+				attachment_extraction_version,
+				attachment_policy_version, attachment_chunk_version,
+				attachment_backfill_date, attachment_backfill_message_id,
+				attachment_backfill_id, processed_attachments,
+				attachment_last_error_code, started_at, completed_at,
+				last_error_code
+			)
+			SELECT 1, 2, policy_version, chunk_version, status,
+				baseline_change_sequence, applied_change_sequence,
+				backfill_date, backfill_message_id, processed_messages, 'building', 1, 1, 1,
+				NULL, NULL, NULL, 0, NULL, started_at, completed_at, last_error_code
+			FROM semantic_projection_state_v1 WHERE id = 1;
+
+			CREATE TABLE semantic_sources (
+				source_id TEXT PRIMARY KEY,
+				source_type TEXT NOT NULL CHECK(source_type IN ('message', 'attachment')),
+				message_id TEXT NOT NULL,
+				attachment_id TEXT,
+				attachment_filename TEXT,
+				extraction_version INTEGER NOT NULL DEFAULT 0 CHECK(extraction_version >= 0),
+				attachment_policy_version INTEGER NOT NULL DEFAULT 0 CHECK(attachment_policy_version >= 0),
+				attachment_chunk_version INTEGER NOT NULL DEFAULT 0 CHECK(attachment_chunk_version >= 0),
+				source_fingerprint TEXT NOT NULL,
+				source_sequence INTEGER NOT NULL CHECK(source_sequence >= 0),
+				folder_id TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				CHECK(
+					(source_type = 'message' AND attachment_id IS NULL AND attachment_filename IS NULL
+					 AND extraction_version = 0 AND attachment_policy_version = 0 AND attachment_chunk_version = 0)
+					OR
+					(source_type = 'attachment' AND attachment_id IS NOT NULL AND attachment_filename IS NOT NULL
+					 AND extraction_version > 0 AND attachment_policy_version > 0 AND attachment_chunk_version > 0)
+				),
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE,
+				FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE
+			);
+			INSERT INTO semantic_sources(
+				source_id, source_type, message_id, attachment_id, attachment_filename,
+				extraction_version, attachment_policy_version, attachment_chunk_version,
+				source_fingerprint, source_sequence, folder_id,
+				created_at, updated_at
+			)
+			SELECT source_id, 'message', message_id, NULL, NULL, 0, 0, 0,
+				source_fingerprint, source_sequence, folder_id, created_at, updated_at
+			FROM semantic_sources_v1;
+
+			CREATE TABLE semantic_chunks (
+				vector_id TEXT PRIMARY KEY,
+				source_id TEXT NOT NULL,
+				source_type TEXT NOT NULL CHECK(source_type IN ('message', 'attachment')),
+				message_id TEXT NOT NULL,
+				attachment_id TEXT,
+				source_fingerprint TEXT NOT NULL,
+				ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 100),
+				content TEXT NOT NULL,
+				excerpt TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				CHECK(
+					(source_type = 'message' AND attachment_id IS NULL)
+					OR (source_type = 'attachment' AND attachment_id IS NOT NULL)
+				),
+				UNIQUE(source_id, ordinal),
+				FOREIGN KEY(source_id) REFERENCES semantic_sources(source_id) ON DELETE CASCADE,
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE,
+				FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE
+			);
+			INSERT INTO semantic_chunks(
+				vector_id, source_id, source_type, message_id, attachment_id,
+				source_fingerprint, ordinal, content, excerpt, created_at
+			)
+			SELECT vector_id, source_id, 'message', message_id, NULL,
+				source_fingerprint, ordinal, content, content, created_at
+			FROM semantic_chunks_v1;
+
+			CREATE TABLE semantic_attachment_versions (
+				attachment_id TEXT PRIMARY KEY,
+				message_id TEXT NOT NULL,
+				version INTEGER NOT NULL CHECK(version > 0),
+				FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+			INSERT INTO semantic_attachment_versions(attachment_id, message_id, version)
+			SELECT id, email_id, 1 FROM attachments;
+
+			CREATE TABLE semantic_attachment_extractions (
+				attachment_id TEXT PRIMARY KEY,
+				message_id TEXT NOT NULL,
+				attachment_version INTEGER NOT NULL CHECK(attachment_version > 0),
+				filename TEXT NOT NULL,
+				mimetype TEXT NOT NULL,
+				declared_size INTEGER NOT NULL CHECK(declared_size >= 0),
+				content_id TEXT,
+				disposition TEXT,
+				state TEXT NOT NULL CHECK(state IN ('pending', 'processing', 'ready', 'unsupported', 'failed')),
+				attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+				next_attempt_at INTEGER NOT NULL,
+				lease_token TEXT,
+				lease_expires_at INTEGER,
+				byte_sha256 TEXT,
+				r2_version TEXT,
+				r2_etag TEXT,
+				actual_size INTEGER CHECK(actual_size IS NULL OR actual_size >= 0),
+				last_error_code TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				FOREIGN KEY(attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_semantic_attachment_extractions_due
+				ON semantic_attachment_extractions(state, next_attempt_at, attachment_id);
+
+			DROP TABLE semantic_chunks_v1;
+			DROP TABLE semantic_sources_v1;
+			DROP TABLE semantic_projection_state_v1;
+
+			CREATE VIRTUAL TABLE semantic_chunks_fts USING fts5(
+				vector_id UNINDEXED,
+				content,
+				tokenize = 'unicode61 remove_diacritics 2'
+			);
+			INSERT INTO semantic_chunks_fts(vector_id, content)
+			SELECT vector_id, content FROM semantic_chunks;
+
+			CREATE INDEX idx_semantic_chunks_message
+				ON semantic_chunks(message_id, source_type, attachment_id, ordinal);
+			CREATE UNIQUE INDEX idx_semantic_sources_message_unique
+				ON semantic_sources(message_id) WHERE source_type = 'message';
+			CREATE UNIQUE INDEX idx_semantic_sources_attachment_unique
+				ON semantic_sources(message_id, attachment_id) WHERE source_type = 'attachment';
+
+			CREATE TRIGGER semantic_sources_attachment_pair_insert
+			BEFORE INSERT ON semantic_sources
+			WHEN NEW.source_type = 'attachment' AND NOT EXISTS (
+				SELECT 1 FROM attachments
+				WHERE id = NEW.attachment_id AND email_id = NEW.message_id
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic attachment ownership mismatch');
+			END;
+			CREATE TRIGGER semantic_sources_attachment_pair_update
+			BEFORE UPDATE OF source_type, message_id, attachment_id ON semantic_sources
+			WHEN NEW.source_type = 'attachment' AND NOT EXISTS (
+				SELECT 1 FROM attachments
+				WHERE id = NEW.attachment_id AND email_id = NEW.message_id
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic attachment ownership mismatch');
+			END;
+			CREATE TRIGGER semantic_sources_identity_immutable
+			BEFORE UPDATE OF source_id, source_type, message_id, attachment_id,
+			 attachment_filename, extraction_version, attachment_policy_version,
+			 attachment_chunk_version, source_fingerprint, source_sequence
+			ON semantic_sources
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic source identity is immutable');
+			END;
+			CREATE TRIGGER semantic_chunks_source_guard
+			BEFORE INSERT ON semantic_chunks
+			WHEN NOT EXISTS (
+				SELECT 1 FROM semantic_sources
+				WHERE source_id = NEW.source_id
+				  AND source_type = NEW.source_type
+				  AND message_id = NEW.message_id
+				  AND attachment_id IS NEW.attachment_id
+				  AND source_fingerprint = NEW.source_fingerprint
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic chunk source mismatch');
+			END;
+			CREATE TRIGGER semantic_chunks_immutable
+			BEFORE UPDATE ON semantic_chunks
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic chunks are immutable');
+			END;
+			CREATE TRIGGER semantic_attachment_versions_pair_insert
+			BEFORE INSERT ON semantic_attachment_versions
+			WHEN NOT EXISTS (
+				SELECT 1 FROM attachments
+				WHERE id = NEW.attachment_id AND email_id = NEW.message_id
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic attachment version ownership mismatch');
+			END;
+			CREATE TRIGGER semantic_attachment_versions_pair_update
+			BEFORE UPDATE OF attachment_id, message_id ON semantic_attachment_versions
+			WHEN NOT EXISTS (
+				SELECT 1 FROM attachments
+				WHERE id = NEW.attachment_id AND email_id = NEW.message_id
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic attachment version ownership mismatch');
+			END;
+			CREATE TRIGGER semantic_attachment_extractions_pair_insert
+			BEFORE INSERT ON semantic_attachment_extractions
+			WHEN NOT EXISTS (
+				SELECT 1 FROM attachments
+				WHERE id = NEW.attachment_id AND email_id = NEW.message_id
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic attachment extraction ownership mismatch');
+			END;
+			CREATE TRIGGER semantic_attachment_extractions_pair_update
+			BEFORE UPDATE OF attachment_id, message_id ON semantic_attachment_extractions
+			WHEN NOT EXISTS (
+				SELECT 1 FROM attachments
+				WHERE id = NEW.attachment_id AND email_id = NEW.message_id
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'semantic attachment extraction ownership mismatch');
+			END;
+
+			CREATE TRIGGER semantic_chunks_fts_insert AFTER INSERT ON semantic_chunks BEGIN
+				INSERT INTO semantic_chunks_fts(vector_id, content)
+				VALUES (NEW.vector_id, NEW.content);
+			END;
+			CREATE TRIGGER semantic_chunks_fts_delete BEFORE DELETE ON semantic_chunks BEGIN
+				DELETE FROM semantic_chunks_fts WHERE vector_id = OLD.vector_id;
+			END;
+			CREATE TRIGGER semantic_chunks_enqueue_upsert AFTER INSERT ON semantic_chunks BEGIN
+				INSERT INTO semantic_index_jobs(
+					vector_id, operation, state, attempt_count, next_attempt_at,
+					lease_token, lease_expires_at, submitted_at, mutation_id, last_error_code,
+					created_at, updated_at
+				) VALUES (
+					NEW.vector_id, 'upsert', 'pending', 0, 0,
+					NULL, NULL, NULL, NULL, NULL,
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				)
+				ON CONFLICT(vector_id) DO UPDATE SET
+					operation = 'upsert', state = 'pending', attempt_count = 0,
+					next_attempt_at = 0, lease_token = NULL, lease_expires_at = NULL,
+					submitted_at = NULL, mutation_id = NULL, last_error_code = NULL,
+					updated_at = excluded.updated_at;
+			END;
+			CREATE TRIGGER semantic_chunks_enqueue_delete BEFORE DELETE ON semantic_chunks BEGIN
+				INSERT INTO semantic_index_jobs(
+					vector_id, operation, state, attempt_count, next_attempt_at,
+					lease_token, lease_expires_at, submitted_at, mutation_id, last_error_code,
+					created_at, updated_at
+				) VALUES (
+					OLD.vector_id, 'delete', 'pending', 0, 0,
+					NULL, NULL, NULL, NULL, NULL,
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				)
+				ON CONFLICT(vector_id) DO UPDATE SET
+					operation = 'delete', state = 'pending', attempt_count = 0,
+					next_attempt_at = 0, lease_token = NULL, lease_expires_at = NULL,
+					submitted_at = NULL, mutation_id = NULL, last_error_code = NULL,
+					updated_at = excluded.updated_at;
+			END;
+
+			CREATE TRIGGER semantic_attachment_version_insert AFTER INSERT ON attachments BEGIN
+				INSERT INTO semantic_attachment_versions(attachment_id, message_id, version)
+				VALUES (NEW.id, NEW.email_id, 1);
+			END;
+			CREATE TRIGGER semantic_attachment_version_update
+			AFTER UPDATE OF email_id, filename, mimetype, size, content_id, disposition ON attachments
+			WHEN OLD.email_id IS NOT NEW.email_id
+			  OR OLD.filename IS NOT NEW.filename
+			  OR OLD.mimetype IS NOT NEW.mimetype
+			  OR OLD.size IS NOT NEW.size
+			  OR OLD.content_id IS NOT NEW.content_id
+			  OR OLD.disposition IS NOT NEW.disposition
+			BEGIN
+				UPDATE semantic_attachment_versions
+				SET message_id = NEW.email_id, version = version + 1
+				WHERE attachment_id = NEW.id;
+				DELETE FROM semantic_sources
+				WHERE source_type = 'attachment' AND attachment_id = NEW.id;
+				DELETE FROM semantic_attachment_extractions WHERE attachment_id = NEW.id;
+			END;
+
+			CREATE TRIGGER semantic_sources_invalidate_on_message_content_change
+			AFTER UPDATE OF subject, sender, recipient, cc, bcc, date, body ON emails
+			WHEN OLD.subject IS NOT NEW.subject
+			  OR OLD.sender IS NOT NEW.sender
+			  OR OLD.recipient IS NOT NEW.recipient
+			  OR OLD.cc IS NOT NEW.cc
+			  OR OLD.bcc IS NOT NEW.bcc
+			  OR OLD.date IS NOT NEW.date
+			  OR OLD.body IS NOT NEW.body
+			BEGIN
+				DELETE FROM semantic_sources
+				WHERE source_type = 'message' AND message_id = NEW.id;
+			END;
+			CREATE TRIGGER semantic_sources_invalidate_on_excluded_folder
+			AFTER UPDATE OF folder_id ON emails
+			WHEN OLD.folder_id IS NOT NEW.folder_id
+			 AND NEW.folder_id IN ('draft', 'outbox', 'trash', 'spam', '_cancelled_outbound')
+			BEGIN
+				DELETE FROM semantic_sources WHERE message_id = NEW.id;
+				DELETE FROM semantic_attachment_extractions WHERE message_id = NEW.id;
+			END;
+			CREATE TRIGGER semantic_sources_track_eligible_folder
+			AFTER UPDATE OF folder_id ON emails
+			WHEN OLD.folder_id IS NOT NEW.folder_id
+			 AND NEW.folder_id NOT IN ('draft', 'outbox', 'trash', 'spam', '_cancelled_outbound')
+			BEGIN
+				UPDATE semantic_sources SET folder_id = NEW.folder_id,
+					updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				WHERE message_id = NEW.id;
+			END;
+		`),
+	},
 ];
