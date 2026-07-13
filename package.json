@@ -9,6 +9,7 @@
 			"Workers",
 			"Durable Objects",
 			"R2",
+			"Queues",
 			"Workers AI"
 		],
 		"bindings": {

@@ -38,6 +38,20 @@ type MailboxEmailStore = {
 	): Promise<unknown>;
 	findThreadBySubject(subject: string, senderAddress?: string): Promise<string | null>;
 	getEmail(id: string): Promise<unknown | null>;
+	isEmailDeleted?(id: string): Promise<boolean>;
+	claimInboundPush?(id: string): Promise<boolean>;
+	recordInboundTerminalFailure?(input: {
+		id: string;
+		queueMessageId: string;
+		attempts: number;
+		errorCode: string;
+	}): Promise<void>;
+	getInboundTerminalFailure?(id: string): Promise<{
+		queueMessageId: string;
+		attempts: number;
+		errorCode: string;
+		recordedAt: string;
+	} | null>;
 };
 
 export type EmailStorageDependencies = {
@@ -62,9 +76,7 @@ function messageIds(value: string | undefined): string[] {
 }
 
 function addresses(entries: Email["to"]): string[] {
-	return (entries ?? []).flatMap((entry) =>
-		entry.address ? [entry.address.toLowerCase()] : [],
-	);
+	return (entries ?? []).flatMap((entry) => (entry.address ? [entry.address.toLowerCase()] : []));
 }
 
 /**
@@ -105,8 +117,7 @@ export async function storeParsedEmail(
 		const inReplyTo = messageIds(parsed.inReplyTo)[0] ?? null;
 		const references = messageIds(parsed.references);
 		const tokenThreadId = extractThreadToken(references, inReplyTo);
-		let threadId =
-			options.threadId ?? tokenThreadId ?? references[0] ?? inReplyTo ?? messageId;
+		let threadId = options.threadId ?? tokenThreadId ?? references[0] ?? inReplyTo ?? messageId;
 
 		if (!options.threadId && !tokenThreadId && !inReplyTo && references.length === 0) {
 			threadId =
@@ -156,10 +167,10 @@ export async function storeParsedEmail(
 				(result) => result.status === "rejected",
 			).length;
 			if (cleanupFailures > 0) {
-				console.error(
-					"[mail-store] failed to remove attachment objects after persistence error",
-					{ messageId, cleanupFailures },
-				);
+				console.error("[mail-store] failed to remove attachment objects after persistence error", {
+					messageId,
+					cleanupFailures,
+				});
 			}
 		}
 		throw error;

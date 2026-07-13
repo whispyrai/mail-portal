@@ -60,7 +60,7 @@ const SORT_COLUMN_MAP = {
 	date: schema.emails.date,
 	read: schema.emails.read,
 	starred: schema.emails.starred,
-} satisfies Record<SortColumn, typeof schema.emails[keyof typeof schema.emails]>;
+} satisfies Record<SortColumn, (typeof schema.emails)[keyof typeof schema.emails]>;
 
 interface SearchFilterOptions {
 	query: string;
@@ -173,9 +173,7 @@ export class MailboxDO extends DurableObject<Env> {
 		// Cap pagination limit to prevent unbounded queries
 		const limit = Math.min(Math.max(rawLimit, 1), 100);
 
-		const sortColumn: SortColumn = ALLOWED_SORT_COLUMNS.includes(
-			rawSortColumn as SortColumn,
-		)
+		const sortColumn: SortColumn = ALLOWED_SORT_COLUMNS.includes(rawSortColumn as SortColumn)
 			? rawSortColumn
 			: "date";
 
@@ -234,9 +232,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const params: (string | number)[] = [];
 
 		if (folder) {
-			conditions.push(
-				"folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)",
-			);
+			conditions.push("folder_id = (SELECT id FROM folders WHERE name = ?1 OR id = ?1 LIMIT 1)");
 			params.push(folder);
 		}
 
@@ -245,13 +241,9 @@ export class MailboxDO extends DurableObject<Env> {
 			params.push(thread_id);
 		}
 
-		const where =
-			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+		const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 		const row = [
-			...this.ctx.storage.sql.exec(
-				`SELECT COUNT(*) as total FROM emails ${where}`,
-				...params,
-			),
+			...this.ctx.storage.sql.exec(`SELECT COUNT(*) as total FROM emails ${where}`, ...params),
 		][0] as { total: number } | undefined;
 
 		return row?.total ?? 0;
@@ -260,11 +252,7 @@ export class MailboxDO extends DurableObject<Env> {
 	// ── Threaded queries (raw SQL — too complex for Drizzle's builder) ──
 
 	async getThreadedEmails(options: GetEmailsOptions = {}) {
-		const {
-			folder,
-			page = 1,
-			limit: rawLimit = 25,
-		} = options;
+		const { folder, page = 1, limit: rawLimit = 25 } = options;
 		const limit = Math.min(Math.max(rawLimit, 1), 100);
 
 		if (!folder) {
@@ -323,7 +311,9 @@ export class MailboxDO extends DurableObject<Env> {
 				WHERE lp.rn = 1
 				ORDER BY lp.date DESC
 				LIMIT ?2 OFFSET ?3`,
-				folder, limit, offset
+				folder,
+				limit,
+				offset,
 			);
 
 			const rows = [...result];
@@ -418,7 +408,9 @@ export class MailboxDO extends DurableObject<Env> {
 			WHERE lif.rn = 1
 			ORDER BY lif.date DESC
 			LIMIT ?2 OFFSET ?3`,
-			folder, limit, offset
+			folder,
+			limit,
+			offset,
 		);
 
 		const rows = [...result];
@@ -486,11 +478,7 @@ export class MailboxDO extends DurableObject<Env> {
 	// ── Single email operations (Drizzle) ──────────────────────────
 
 	async getEmail(id: string) {
-		const email = this.db
-			.select()
-			.from(schema.emails)
-			.where(eq(schema.emails.id, id))
-			.get();
+		const email = this.db.select().from(schema.emails).where(eq(schema.emails.id, id)).get();
 
 		if (!email) return null;
 
@@ -550,10 +538,7 @@ export class MailboxDO extends DurableObject<Env> {
 		}));
 	}
 
-	async updateEmail(
-		id: string,
-		{ read, starred }: { read?: boolean; starred?: boolean },
-	) {
+	async updateEmail(id: string, { read, starred }: { read?: boolean; starred?: boolean }) {
 		const data: { read?: number; starred?: number } = {};
 		if (read !== undefined) {
 			data.read = read ? 1 : 0;
@@ -566,11 +551,7 @@ export class MailboxDO extends DurableObject<Env> {
 			return this.getEmail(id);
 		}
 
-		this.db
-			.update(schema.emails)
-			.set(data)
-			.where(eq(schema.emails.id, id))
-			.run();
+		this.db.update(schema.emails).set(data).where(eq(schema.emails.id, id)).run();
 
 		return this.getEmail(id);
 	}
@@ -601,21 +582,92 @@ export class MailboxDO extends DurableObject<Env> {
 			.where(eq(schema.attachments.email_id, id))
 			.all();
 
-		this.db
-			.delete(schema.emails)
-			.where(eq(schema.emails.id, id))
-			.run();
+		this.ctx.storage.transactionSync(() => {
+			this.ctx.storage.sql.exec(
+				`INSERT OR REPLACE INTO email_deletion_tombstones (id, deleted_at)
+				 VALUES (?1, datetime('now'))`,
+				id,
+			);
+			this.db.delete(schema.emails).where(eq(schema.emails.id, id)).run();
+		});
 
 		return emailAttachments;
 	}
 
+	async isEmailDeleted(id: string): Promise<boolean> {
+		return (
+			[
+				...this.ctx.storage.sql.exec(
+					`SELECT 1 AS found FROM email_deletion_tombstones WHERE id = ?1 LIMIT 1`,
+					id,
+				),
+			].length > 0
+		);
+	}
+
+	async claimInboundPush(id: string): Promise<boolean> {
+		return this.ctx.storage.transactionSync(() => {
+			const alreadyClaimed = [
+				...this.ctx.storage.sql.exec(
+					`SELECT 1 AS found FROM inbound_push_claims WHERE id = ?1 LIMIT 1`,
+					id,
+				),
+			].length > 0;
+
+			if (alreadyClaimed) return false;
+
+			this.ctx.storage.sql.exec(`INSERT INTO inbound_push_claims (id) VALUES (?1)`, id);
+			return true;
+		});
+	}
+
+	async recordInboundTerminalFailure(input: {
+		id: string;
+		queueMessageId: string;
+		attempts: number;
+		errorCode: string;
+	}): Promise<void> {
+		this.ctx.storage.sql.exec(
+			`INSERT OR IGNORE INTO inbound_terminal_failures
+			 (id, queue_message_id, attempts, error_code)
+			 VALUES (?1, ?2, ?3, ?4)`,
+			input.id,
+			input.queueMessageId,
+			input.attempts,
+			input.errorCode,
+		);
+	}
+
+	async getInboundTerminalFailure(id: string): Promise<{
+		queueMessageId: string;
+		attempts: number;
+		errorCode: string;
+		recordedAt: string;
+	} | null> {
+		const row = [
+			...this.ctx.storage.sql.exec<{
+				queue_message_id: string;
+				attempts: number;
+				error_code: string;
+				recorded_at: string;
+			}>(
+				`SELECT queue_message_id, attempts, error_code, recorded_at
+				 FROM inbound_terminal_failures WHERE id = ?1 LIMIT 1`,
+				id,
+			),
+		][0];
+		if (!row) return null;
+		return {
+			queueMessageId: row.queue_message_id,
+			attempts: row.attempts,
+			errorCode: row.error_code,
+			recordedAt: row.recorded_at,
+		};
+	}
+
 	async getAttachment(id: string) {
 		return (
-			this.db
-				.select()
-				.from(schema.attachments)
-				.where(eq(schema.attachments.id, id))
-				.get() ?? null
+			this.db.select().from(schema.attachments).where(eq(schema.attachments.id, id)).get() ?? null
 		);
 	}
 
@@ -626,7 +678,10 @@ export class MailboxDO extends DurableObject<Env> {
 			.select({
 				id: schema.folders.id,
 				name: schema.folders.name,
-				unreadCount: sql<number>`COALESCE(SUM(CASE WHEN ${schema.emails.read} = 0 THEN 1 ELSE 0 END), 0)`.mapWith(Number),
+				unreadCount:
+					sql<number>`COALESCE(SUM(CASE WHEN ${schema.emails.read} = 0 THEN 1 ELSE 0 END), 0)`.mapWith(
+						Number,
+					),
 			})
 			.from(schema.folders)
 			.leftJoin(schema.emails, eq(schema.emails.folder_id, schema.folders.id))
@@ -672,10 +727,7 @@ export class MailboxDO extends DurableObject<Env> {
 			return false;
 		}
 
-		this.db
-			.delete(schema.folders)
-			.where(eq(schema.folders.id, id))
-			.run();
+		this.db.delete(schema.folders).where(eq(schema.folders.id, id)).run();
 
 		return true;
 	}
@@ -708,7 +760,18 @@ export class MailboxDO extends DurableObject<Env> {
 		options: SearchFilterOptions,
 		tableAlias = "",
 	): { conditions: string[]; params: (string | number)[] } {
-		const { query, folder, from, to, subject, date_start, date_end, is_read, is_starred, has_attachment } = options;
+		const {
+			query,
+			folder,
+			from,
+			to,
+			subject,
+			date_start,
+			date_end,
+			is_read,
+			is_starred,
+			has_attachment,
+		} = options;
 		const prefix = tableAlias ? `${tableAlias}.` : "";
 		const conditions: string[] = [];
 		const params: (string | number)[] = [];
@@ -725,20 +788,49 @@ export class MailboxDO extends DurableObject<Env> {
 			const p2 = addParam(`%${query}%`);
 			const p3 = addParam(`%${query}%`);
 			const p4 = addParam(`%${query}%`);
-			conditions.push(`(${prefix}subject LIKE ${p1} OR ${prefix}body LIKE ${p2} OR ${prefix}sender LIKE ${p3} OR ${prefix}recipient LIKE ${p4} OR ${prefix}cc LIKE ${p4} OR ${prefix}bcc LIKE ${p4})`);
+			conditions.push(
+				`(${prefix}subject LIKE ${p1} OR ${prefix}body LIKE ${p2} OR ${prefix}sender LIKE ${p3} OR ${prefix}recipient LIKE ${p4} OR ${prefix}cc LIKE ${p4} OR ${prefix}bcc LIKE ${p4})`,
+			);
 		}
 		if (folder) {
 			const p = addParam(folder);
-			conditions.push(`${prefix}folder_id = (SELECT id FROM folders WHERE name = ${p} OR id = ${p} LIMIT 1)`);
+			conditions.push(
+				`${prefix}folder_id = (SELECT id FROM folders WHERE name = ${p} OR id = ${p} LIMIT 1)`,
+			);
 		}
-		if (from) { const p = addParam(`%${from}%`); conditions.push(`${prefix}sender LIKE ${p}`); }
-		if (to) { const p = addParam(`%${to}%`); conditions.push(`(${prefix}recipient LIKE ${p} OR ${prefix}cc LIKE ${p} OR ${prefix}bcc LIKE ${p})`); }
-		if (subject) { const p = addParam(`%${subject}%`); conditions.push(`${prefix}subject LIKE ${p}`); }
-		if (date_start) { const p = addParam(date_start); conditions.push(`${prefix}date >= ${p}`); }
-		if (date_end) { const p = addParam(date_end); conditions.push(`${prefix}date <= ${p}`); }
-		if (is_read !== undefined) { const p = addParam(is_read ? 1 : 0); conditions.push(`${prefix}read = ${p}`); }
-		if (is_starred !== undefined) { const p = addParam(is_starred ? 1 : 0); conditions.push(`${prefix}starred = ${p}`); }
-		if (has_attachment) { conditions.push(`${prefix}id IN (SELECT DISTINCT email_id FROM attachments)`); }
+		if (from) {
+			const p = addParam(`%${from}%`);
+			conditions.push(`${prefix}sender LIKE ${p}`);
+		}
+		if (to) {
+			const p = addParam(`%${to}%`);
+			conditions.push(
+				`(${prefix}recipient LIKE ${p} OR ${prefix}cc LIKE ${p} OR ${prefix}bcc LIKE ${p})`,
+			);
+		}
+		if (subject) {
+			const p = addParam(`%${subject}%`);
+			conditions.push(`${prefix}subject LIKE ${p}`);
+		}
+		if (date_start) {
+			const p = addParam(date_start);
+			conditions.push(`${prefix}date >= ${p}`);
+		}
+		if (date_end) {
+			const p = addParam(date_end);
+			conditions.push(`${prefix}date <= ${p}`);
+		}
+		if (is_read !== undefined) {
+			const p = addParam(is_read ? 1 : 0);
+			conditions.push(`${prefix}read = ${p}`);
+		}
+		if (is_starred !== undefined) {
+			const p = addParam(is_starred ? 1 : 0);
+			conditions.push(`${prefix}starred = ${p}`);
+		}
+		if (has_attachment) {
+			conditions.push(`${prefix}id IN (SELECT DISTINCT email_id FROM attachments)`);
+		}
 
 		return { conditions, params };
 	}
@@ -840,23 +932,27 @@ export class MailboxDO extends DurableObject<Env> {
 	 * Returns null if under limit, or an error message string if exceeded.
 	 */
 	async checkSendRateLimit(): Promise<string | null> {
-		const hourRow = [...this.ctx.storage.sql.exec(
-			`SELECT COUNT(*) as cnt FROM emails
+		const hourRow = [
+			...this.ctx.storage.sql.exec(
+				`SELECT COUNT(*) as cnt FROM emails
 			 WHERE folder_id = ?1
 			   AND date >= datetime('now', '-1 hour')`,
-			Folders.SENT,
-		)][0] as { cnt: number } | undefined;
+				Folders.SENT,
+			),
+		][0] as { cnt: number } | undefined;
 
 		if ((hourRow?.cnt ?? 0) >= 20) {
 			return "Rate limit exceeded: max 20 emails per hour per mailbox";
 		}
 
-		const dayRow = [...this.ctx.storage.sql.exec(
-			`SELECT COUNT(*) as cnt FROM emails
+		const dayRow = [
+			...this.ctx.storage.sql.exec(
+				`SELECT COUNT(*) as cnt FROM emails
 			 WHERE folder_id = ?1
 			   AND date >= datetime('now', '-1 day')`,
-			Folders.SENT,
-		)][0] as { cnt: number } | undefined;
+				Folders.SENT,
+			),
+		][0] as { cnt: number } | undefined;
 
 		if ((dayRow?.cnt ?? 0) >= 100) {
 			return "Rate limit exceeded: max 100 emails per day per mailbox";
@@ -867,11 +963,7 @@ export class MailboxDO extends DurableObject<Env> {
 
 	// ── Email creation (Drizzle) ───────────────────────────────────
 
-	async createEmail(
-		folder: string,
-		email: EmailData,
-		attachments: AttachmentData[],
-	) {
+	async createEmail(folder: string, email: EmailData, attachments: AttachmentData[]) {
 		// Resolve folder name or ID to the actual folder ID.
 		const folderRow = this.db
 			.select({ id: schema.folders.id })
@@ -904,7 +996,7 @@ export class MailboxDO extends DurableObject<Env> {
 					cc: email.cc ?? null,
 					bcc: email.bcc ?? null,
 					date: email.date,
-					read: isSent ? 1 : (email.read ? 1 : 0),
+					read: isSent ? 1 : email.read ? 1 : 0,
 					starred: email.starred ? 1 : 0,
 					body: email.body,
 					in_reply_to: email.in_reply_to ?? null,
@@ -987,12 +1079,19 @@ export class MailboxDO extends DurableObject<Env> {
 		const attachments: BulkAttachment[] = [];
 		const uploadIds = input.attachmentUploadIds ?? [];
 		if (uploadIds.length > 0) {
-			const staged: { bytes: ArrayBuffer; filename: string; type: string; srcKey: string }[] = [];
+			const staged: {
+				bytes: ArrayBuffer;
+				filename: string;
+				type: string;
+				srcKey: string;
+			}[] = [];
 			for (const uploadId of uploadIds) {
 				const srcKey = uploadKey(input.fromEmail, uploadId);
 				const obj = await this.env.BUCKET.get(srcKey);
 				if (!obj) {
-					throw new Error("An attachment upload was not found or has expired. Re-attach and try again.");
+					throw new Error(
+						"An attachment upload was not found or has expired. Re-attach and try again.",
+					);
 				}
 				const meta = obj.customMetadata ?? {};
 				staged.push({
@@ -1012,7 +1111,12 @@ export class MailboxDO extends DurableObject<Env> {
 				await this.env.BUCKET.put(key, arrayBufferToBase64(s.bytes), {
 					customMetadata: { filename: s.filename, type: s.type },
 				});
-				attachments.push({ key, filename: s.filename, type: s.type, size: s.bytes.byteLength });
+				attachments.push({
+					key,
+					filename: s.filename,
+					type: s.type,
+					size: s.bytes.byteLength,
+				});
 			}
 			// Staging copies are no longer needed now the encoded job copies exist.
 			await Promise.all(staged.map((s) => this.env.BUCKET.delete(s.srcKey).catch(() => {})));
@@ -1190,10 +1294,10 @@ export class MailboxDO extends DurableObject<Env> {
 			input.userAgent,
 			input.deviceLabel,
 		);
-		const [row] = this.ctx.storage.sql.exec<{ id: string; device_label: string }>(
-			`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`,
-			input.endpoint,
-		);
+		const [row] = this.ctx.storage.sql.exec<{
+			id: string;
+			device_label: string;
+		}>(`SELECT id, device_label FROM push_subscriptions WHERE endpoint = ?`, input.endpoint);
 		if (!row) throw new Error("Push subscription was not stored");
 		return { id: row.id, deviceLabel: row.device_label };
 	}
@@ -1251,9 +1355,11 @@ export class MailboxDO extends DurableObject<Env> {
 			if (!vapid) return; // push not configured for this env — no-op
 
 			const rows = [
-				...this.ctx.storage.sql.exec<{ endpoint: string; p256dh: string; auth: string }>(
-					`SELECT endpoint, p256dh, auth FROM push_subscriptions`,
-				),
+				...this.ctx.storage.sql.exec<{
+					endpoint: string;
+					p256dh: string;
+					auth: string;
+				}>(`SELECT endpoint, p256dh, auth FROM push_subscriptions`),
 			];
 			if (rows.length === 0) return;
 

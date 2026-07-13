@@ -74,19 +74,28 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler d1 migrations apply sales_portal_users --remote
    ```
 
-2. **R2 bucket**
+2. **R2 buckets and inbound queues**
 
    ```bash
    npx wrangler r2 bucket create sales-mail-portal
+   npx wrangler r2 bucket create sales-mail-raw-archive
+   npx wrangler r2 bucket create sales-mail-raw-archive-preview
+   npx wrangler queues create sales-mail-inbound
+   npx wrangler queues create sales-mail-inbound-dlq
    ```
+
+   `sales-mail-raw-archive` is the private authoritative copy of every accepted raw inbound message. The separate preview bucket prevents remote development from writing to the production archive. Apply an explicitly approved Bucket Lock and lifecycle policy to the production `raw/` prefix before routing live mail.
 
 3. **Secrets**
 
    ```bash
-   npx wrangler secret put AWS_ACCESS_KEY_ID       # SES IAM user (ses:SendEmail)
-   npx wrangler secret put AWS_SECRET_ACCESS_KEY
-   npx wrangler secret put JWT_SECRET              # openssl rand -base64 48
-   npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL   # e.g. hesham@whispyrcrm.com
+   npx wrangler secret put AWS_ACCESS_KEY_ID --env whispyr       # SES IAM user (ses:SendEmail)
+   npx wrangler secret put AWS_SECRET_ACCESS_KEY --env whispyr
+   npx wrangler secret put JWT_SECRET --env whispyr              # openssl rand -base64 48
+   npx wrangler secret put EMERGENCY_FORWARD_TO --env whispyr    # verified external fallback destination
+   npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL --env whispyr   # e.g. hesham@whispyrcrm.com
+   npx wrangler secret put VAPID_PUBLIC_KEY --env whispyr
+   npx wrangler secret put VAPID_PRIVATE_KEY --env whispyr
    ```
    `AWS_REGION` and `DOMAINS` are plain vars already set in `wrangler.jsonc`.
 

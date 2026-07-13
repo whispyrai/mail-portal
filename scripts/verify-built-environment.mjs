@@ -3,71 +3,212 @@
 // mistakes, so this script inspects the exact artifact Wrangler will deploy.
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 
 const brand = process.argv[2];
-const environments = {
-	whispyr: {
-		name: "sales-mail-portal",
-		brand: "whispyr",
-		domains: "whispyrcrm.com",
-		features: ["quiz"],
-		databaseName: "sales_portal_users",
-		databaseId: "f322fd13-dc49-4390-888c-ff862ca05882",
-		bucket: "sales-mail-portal",
-		kvId: "cd541026bdf949d9ac63b3b5fdff4969",
-		route: "mail.whispyrcrm.com",
-		forbidden: [
-			"wiser-mail-portal",
-			"wiser_mail_portal_users",
-			"87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
-			"c934d803c2f8430d9088f4a5d9f29d55",
-			"wiserchat.ai",
-		],
-	},
-	wiser: {
-		name: "wiser-mail-portal",
-		brand: "wiser",
-		domains: "wiserchat.ai,test.wiserchat.ai",
-		features: [],
-		databaseName: "wiser_mail_portal_users",
-		databaseId: "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
-		bucket: "wiser-mail-portal",
-		kvId: "c934d803c2f8430d9088f4a5d9f29d55",
-		route: "mail.wiserchat.ai",
-		forbidden: [
-			"sales-mail-portal",
-			"sales_portal_users",
-			"f322fd13-dc49-4390-888c-ff862ca05882",
-			"cd541026bdf949d9ac63b3b5fdff4969",
-			"whispyrcrm.com",
-		],
-	},
-};
+assert.ok(
+  brand === "whispyr" || brand === "wiser",
+  "usage: verify-built-environment.mjs <whispyr|wiser>",
+);
 
-assert.ok(brand === "whispyr" || brand === "wiser", "usage: verify-built-environment.mjs <whispyr|wiser>");
-const expected = environments[brand];
-const config = JSON.parse(await readFile("build/server/wrangler.json", "utf8"));
+const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+const logDirectory = "script-logs";
+const logFilePath = `${logDirectory}/verify-built-environment-${brand}-${timestamp}.log`;
+await mkdir(logDirectory, { recursive: true });
 
-assert.equal(config.name, expected.name, "Worker name");
-assert.equal(config.vars.BRAND, expected.brand, "BRAND");
-assert.equal(config.vars.DOMAINS, expected.domains, "DOMAINS");
-assert.deepEqual(config.vars.FEATURES, expected.features, "FEATURES");
-assert.equal(config.routes[0]?.pattern, expected.route, "custom domain");
-assert.equal(config.routes[0]?.custom_domain, true, "custom-domain flag");
-assert.equal(config.d1_databases[0]?.database_name, expected.databaseName, "D1 name");
-assert.equal(config.d1_databases[0]?.database_id, expected.databaseId, "D1 id");
-assert.equal(config.r2_buckets[0]?.bucket_name, expected.bucket, "R2 bucket");
-assert.equal(config.r2_buckets[0]?.preview_bucket_name, expected.bucket, "R2 preview bucket");
-assert.equal(config.kv_namespaces[0]?.id, expected.kvId, "OAuth KV id");
-
-const serialized = JSON.stringify(config);
-for (const forbidden of expected.forbidden) {
-	assert.equal(
-		serialized.includes(forbidden),
-		false,
-		`${brand} artifact leaked forbidden identifier ${forbidden}`,
-	);
+async function detail(message) {
+  await appendFile(logFilePath, `${new Date().toISOString()} ${message}\n`);
 }
 
-console.log(`${brand} built environment is isolated and valid`);
+async function progress(message) {
+  console.log(message);
+  await detail(message);
+}
+
+async function equal(actual, expected, label) {
+  await detail(
+    `${label}: actual=${JSON.stringify(actual)} expected=${JSON.stringify(expected)}`,
+  );
+  assert.deepEqual(actual, expected, label);
+}
+
+const environments = {
+  whispyr: {
+    name: "sales-mail-portal",
+    brand: "whispyr",
+    domains: "whispyrcrm.com",
+    features: ["quiz"],
+    databaseName: "sales_portal_users",
+    databaseId: "f322fd13-dc49-4390-888c-ff862ca05882",
+    bucket: "sales-mail-portal",
+    rawBucket: "sales-mail-raw-archive",
+    rawPreviewBucket: "sales-mail-raw-archive-preview",
+    inboundQueue: "sales-mail-inbound",
+    inboundDlq: "sales-mail-inbound-dlq",
+    kvId: "cd541026bdf949d9ac63b3b5fdff4969",
+    route: "mail.whispyrcrm.com",
+    forbidden: [
+      "wiser-mail-portal",
+      "wiser_mail_portal_users",
+      "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
+      "c934d803c2f8430d9088f4a5d9f29d55",
+      "wiser-mail-raw-archive",
+      "wiser-mail-inbound",
+      "wiserchat.ai",
+    ],
+  },
+  wiser: {
+    name: "wiser-mail-portal",
+    brand: "wiser",
+    domains: "wiserchat.ai,test.wiserchat.ai",
+    features: [],
+    databaseName: "wiser_mail_portal_users",
+    databaseId: "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
+    bucket: "wiser-mail-portal",
+    rawBucket: "wiser-mail-raw-archive",
+    rawPreviewBucket: "wiser-mail-raw-archive-preview",
+    inboundQueue: "wiser-mail-inbound",
+    inboundDlq: "wiser-mail-inbound-dlq",
+    kvId: "c934d803c2f8430d9088f4a5d9f29d55",
+    route: "mail.wiserchat.ai",
+    forbidden: [
+      "sales-mail-portal",
+      "sales_portal_users",
+      "f322fd13-dc49-4390-888c-ff862ca05882",
+      "cd541026bdf949d9ac63b3b5fdff4969",
+      "sales-mail-raw-archive",
+      "sales-mail-inbound",
+      "whispyrcrm.com",
+    ],
+  },
+};
+
+const expected = environments[brand];
+const expectedRequiredSecrets = [
+  "ADMIN_BOOTSTRAP_EMAIL",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "EMERGENCY_FORWARD_TO",
+  "JWT_SECRET",
+  "VAPID_PRIVATE_KEY",
+  "VAPID_PUBLIC_KEY",
+];
+
+try {
+  await progress(`Verifying ${brand} deployment artifact`);
+  await progress(`Detailed log: ${logFilePath}`);
+  await progress("Phase 1/3: reading resolved Worker configuration");
+  const config = JSON.parse(
+    await readFile("build/server/wrangler.json", "utf8"),
+  );
+  await detail(`Resolved configuration: ${JSON.stringify(config)}`);
+
+  await progress("Phase 2/3: checking required isolated resources");
+  await equal(config.name, expected.name, "Worker name");
+  await equal(config.vars.BRAND, expected.brand, "BRAND");
+  await equal(config.vars.DOMAINS, expected.domains, "DOMAINS");
+  await equal(config.vars.FEATURES, expected.features, "FEATURES");
+  await equal(
+    config.vars.INBOUND_DLQ_NAME,
+    expected.inboundDlq,
+    "INBOUND_DLQ_NAME",
+  );
+  await equal(
+    [...config.secrets.required].sort(),
+    expectedRequiredSecrets,
+    "required secrets",
+  );
+  await equal(config.routes[0]?.pattern, expected.route, "custom domain");
+  await equal(config.routes[0]?.custom_domain, true, "custom-domain flag");
+  await equal(
+    config.d1_databases[0]?.database_name,
+    expected.databaseName,
+    "D1 name",
+  );
+  await equal(
+    config.d1_databases[0]?.database_id,
+    expected.databaseId,
+    "D1 id",
+  );
+  await equal(
+    config.r2_buckets[0]?.bucket_name,
+    expected.bucket,
+    "attachment R2 bucket",
+  );
+  await equal(
+    config.r2_buckets[0]?.preview_bucket_name,
+    expected.bucket,
+    "attachment R2 preview bucket",
+  );
+  await equal(
+    config.r2_buckets[1]?.binding,
+    "RAW_MAIL_BUCKET",
+    "raw R2 binding",
+  );
+  await equal(
+    config.r2_buckets[1]?.bucket_name,
+    expected.rawBucket,
+    "raw R2 bucket",
+  );
+  await equal(
+    config.r2_buckets[1]?.preview_bucket_name,
+    expected.rawPreviewBucket,
+    "raw R2 preview bucket",
+  );
+  await equal(
+    config.queues.producers[0]?.binding,
+    "INBOUND_QUEUE",
+    "Queue binding",
+  );
+  await equal(
+    config.queues.producers[0]?.queue,
+    expected.inboundQueue,
+    "inbound Queue",
+  );
+  await equal(
+    config.queues.consumers[0]?.queue,
+    expected.inboundQueue,
+    "Queue consumer",
+  );
+  await equal(config.queues.consumers[0]?.max_retries, 10, "Queue max retries");
+  await equal(
+    config.queues.consumers[0]?.dead_letter_queue,
+    expected.inboundDlq,
+    "Queue DLQ",
+  );
+  await equal(
+    config.queues.consumers[1]?.queue,
+    expected.inboundDlq,
+    "DLQ consumer",
+  );
+  await equal(
+    config.queues.consumers[1]?.max_retries,
+    10,
+    "DLQ consumer max retries",
+  );
+  await equal(config.triggers.crons, ["*/5 * * * *"], "reconciliation cron");
+  await equal(config.kv_namespaces[0]?.id, expected.kvId, "OAuth KV id");
+
+  await progress("Phase 3/3: checking cross-brand leakage");
+  const serialized = JSON.stringify(config);
+  for (const forbidden of expected.forbidden) {
+    await detail(
+      `Forbidden identifier ${forbidden}: present=${serialized.includes(forbidden)}`,
+    );
+    assert.equal(
+      serialized.includes(forbidden),
+      false,
+      `${brand} artifact leaked forbidden identifier ${forbidden}`,
+    );
+  }
+
+  await progress(`${brand} built environment is isolated and valid`);
+} catch (error) {
+  const message =
+    error instanceof Error ? (error.stack ?? error.message) : String(error);
+  await detail(`FAILED: ${message}`);
+  console.error(
+    `${brand} built environment verification failed. See ${logFilePath}`,
+  );
+  process.exitCode = 1;
+}

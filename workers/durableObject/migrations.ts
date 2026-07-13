@@ -26,12 +26,7 @@ export function applyMigrations(
 	)`);
 
 	for (const migration of migrations) {
-		const applied = [
-			...sql.exec(
-				`SELECT 1 FROM d1_migrations WHERE name = ?`,
-				migration.name,
-			),
-		];
+		const applied = [...sql.exec(`SELECT 1 FROM d1_migrations WHERE name = ?`, migration.name)];
 		if (applied.length > 0) continue;
 
 		// Strip any existing BEGIN/COMMIT wrapper from the migration SQL.
@@ -44,9 +39,7 @@ export function applyMigrations(
 		const escapedName = migration.name.replace(/'/g, "''");
 		const run = () => {
 			sql.exec(migrationSql);
-			sql.exec(
-				`INSERT INTO d1_migrations (name) VALUES ('${escapedName}')`,
-			);
+			sql.exec(`INSERT INTO d1_migrations (name) VALUES ('${escapedName}')`);
 		};
 
 		if (storage) {
@@ -185,6 +178,30 @@ export const mailboxMigrations: Migration[] = [
                 device_label TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `,
+	},
+	{
+		// Inbound Queue delivery is at least once. These ledgers keep a user's
+		// explicit deletion authoritative and make notification fanout single-winner.
+		name: "10_add_inbound_delivery_ledgers",
+		sql: `
+            CREATE TABLE IF NOT EXISTS email_deletion_tombstones (
+                id TEXT PRIMARY KEY,
+                deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS inbound_push_claims (
+                id TEXT PRIMARY KEY,
+                claimed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS inbound_terminal_failures (
+                id TEXT PRIMARY KEY,
+                queue_message_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                error_code TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
         `,
 	},
