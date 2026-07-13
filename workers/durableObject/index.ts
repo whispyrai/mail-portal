@@ -185,6 +185,7 @@ import {
 } from "../lib/semantic-index.ts";
 import { advanceSemanticMailboxIndex } from "../lib/semantic-index-runtime.ts";
 import { createSemanticIndexProvider } from "../lib/semantic-provider.ts";
+import { createWorkersAiSemanticRichDocumentConverter } from "../lib/semantic-attachment-converter.ts";
 import { semanticMailboxNamespace } from "../lib/semantic-search.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
 import { resolveBrand } from "../routes/brand.ts";
@@ -3651,6 +3652,7 @@ export class MailboxDO extends DurableObject<Env> {
 						return object && "body" in object ? object : null;
 					},
 				},
+					converter: createWorkersAiSemanticRichDocumentConverter(this.env),
 				provider: createSemanticIndexProvider(this.env, mailboxId),
 				namespace: await semanticMailboxNamespace(brand.id, mailboxId),
 				onObservationError: (error) => {

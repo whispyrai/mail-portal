@@ -1,10 +1,16 @@
 import { attachmentKey } from "./attachments.ts";
 import {
-	SEMANTIC_ATTACHMENT_LIMITS,
 	SemanticAttachmentExtractionError,
 	extractSemanticAttachmentText,
+	semanticAttachmentAdmission,
 	semanticAttachmentFingerprint,
+	semanticAttachmentText,
 } from "./semantic-attachment.ts";
+import {
+	SemanticRichDocumentProviderError,
+	type SemanticRichDocumentConverter,
+} from "./semantic-attachment-converter.ts";
+import { preflightSemanticRichDocument } from "./semantic-rich-document.ts";
 import type {
 	SemanticAttachmentExtractionCompletion,
 	SemanticAttachmentExtractionLease,
@@ -12,8 +18,9 @@ import type {
 
 // Head, conditional get, and body read each have a 10-second budget. The lease
 // also needs room for hashing and the fenced Durable Object commit.
-const LEASE_MS = 60_000;
+const LEASE_MS = 90_000;
 const R2_TIMEOUT_MS = 10_000;
+const CONVERSION_TIMEOUT_MS = 15_000;
 const RETRY_DELAY_MS = 30_000;
 
 type SemanticR2Head = {
@@ -76,15 +83,49 @@ function bounded<T>(work: Promise<T>): Promise<T> {
 }
 
 function runtimeErrorCode(error: unknown): string {
+	if (error instanceof SemanticRichDocumentProviderError) return error.code;
+	if (error instanceof SemanticConversionTimeoutError) return "conversion_timeout";
 	if (error instanceof Error && error.name) {
 		return `r2_${error.name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`.slice(0, 64);
 	}
 	return "r2_error";
 }
 
+class SemanticConversionTimeoutError extends Error {
+	constructor() {
+		super("Semantic attachment conversion timed out");
+		this.name = "SemanticConversionTimeoutError";
+	}
+}
+
+function boundedConversion(work: Promise<string>): Promise<string> {
+	return new Promise<string>((resolve, reject) => {
+		const timer = setTimeout(
+			() => reject(new SemanticConversionTimeoutError()),
+			CONVERSION_TIMEOUT_MS,
+		);
+		work.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(error) => {
+				clearTimeout(timer);
+				reject(
+					error instanceof SemanticAttachmentExtractionError ||
+						error instanceof SemanticRichDocumentProviderError
+						? error
+						: new SemanticRichDocumentProviderError("provider_error"),
+				);
+			},
+		);
+	});
+}
+
 export async function advanceSemanticAttachmentExtraction(input: {
 	mailbox: SemanticAttachmentRuntimeMailbox;
 	bucket: SemanticAttachmentRuntimeBucket;
+	converter?: SemanticRichDocumentConverter;
 	now?: () => number;
 	createLeaseToken?: () => string;
 }): Promise<boolean> {
@@ -96,6 +137,17 @@ export async function advanceSemanticAttachmentExtraction(input: {
 		LEASE_MS,
 	);
 	if (!lease) return false;
+	const admission = semanticAttachmentAdmission(lease.filename, lease.mimetype);
+	if (!admission) {
+		await input.mailbox.rejectSemanticAttachmentExtraction({
+			attachmentId: lease.attachmentId,
+			leaseToken: lease.leaseToken,
+			rejectedAt: now(),
+			errorCode: "unsupported_format",
+			terminal: false,
+		});
+		return true;
+	}
 	const fail = (error: unknown) => input.mailbox.retrySemanticAttachmentExtraction({
 		attachmentId: lease.attachmentId,
 		leaseToken: lease.leaseToken,
@@ -114,18 +166,13 @@ export async function advanceSemanticAttachmentExtraction(input: {
 			await fail(new Error("missing_object"));
 			return true;
 		}
-		if (
-			head.size !== lease.declaredSize ||
-			head.size > SEMANTIC_ATTACHMENT_LIMITS.inputBytes
-		) {
+		if (head.size !== lease.declaredSize || head.size > admission.maxBytes) {
 			await input.mailbox.rejectSemanticAttachmentExtraction({
 				attachmentId: lease.attachmentId,
 				leaseToken: lease.leaseToken,
 				rejectedAt: now(),
-				errorCode: head.size > SEMANTIC_ATTACHMENT_LIMITS.inputBytes
-					? "size_exceeded"
-					: "size_mismatch",
-				terminal: head.size <= SEMANTIC_ATTACHMENT_LIMITS.inputBytes,
+				errorCode: head.size > admission.maxBytes ? "size_exceeded" : "size_mismatch",
+				terminal: head.size !== lease.declaredSize,
 			});
 			return true;
 		}
@@ -150,12 +197,33 @@ export async function advanceSemanticAttachmentExtraction(input: {
 			});
 			return true;
 		}
-		const extracted = extractSemanticAttachmentText({
-			filename: lease.filename,
-			mimetype: lease.mimetype,
-			declaredSize: lease.declaredSize,
-			bytes,
-		});
+		let extracted: { format: typeof admission.format; text: string };
+		if (admission.kind === "direct") {
+			extracted = extractSemanticAttachmentText({
+				filename: lease.filename,
+				mimetype: lease.mimetype,
+				declaredSize: lease.declaredSize,
+				bytes,
+			});
+		} else {
+			await preflightSemanticRichDocument({ format: admission.format, bytes });
+			if (!input.converter) {
+				throw new SemanticRichDocumentProviderError("provider_error");
+			}
+			extracted = {
+				format: admission.format,
+				text: semanticAttachmentText(
+					await boundedConversion(
+						input.converter.convert({
+							filename: lease.filename,
+							mimetype: admission.mimetype,
+							format: admission.format,
+							bytes,
+						}),
+					),
+				),
+			};
+		}
 		const fingerprint = await semanticAttachmentFingerprint({
 			bytes,
 			format: extracted.format,

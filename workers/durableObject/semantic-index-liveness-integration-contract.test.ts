@@ -12,6 +12,10 @@ test("semantic indexing is durably scheduled and advances before later shared al
 	assert.match(durableObject, /async scheduleSemanticIndexAdvance\(mailboxId: string\)/);
 	assert.match(durableObject, /SEMANTIC_SCHEDULER_MAILBOX_KEY/);
 	assert.match(durableObject, /advanceSemanticMailboxIndex\(/);
+	assert.match(
+		durableObject,
+		/converter: createWorkersAiSemanticRichDocumentConverter\(this\.env\)/,
+	);
 	assert.doesNotMatch(durableObject, /advanceSemanticAttachmentExtraction\(/);
 	assert.match(durableObject, /\.nextAdvanceAt\(Date\.now\(\)\)/);
 	const alarmStart = durableObject.indexOf("async alarm(): Promise<void>");

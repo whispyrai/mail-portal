@@ -14,7 +14,23 @@ test("the production semantic alarm turn composes extraction through final vecto
 	const database = new DatabaseSync(":memory:");
 	database.exec("PRAGMA foreign_keys = ON");
 	for (const migration of mailboxMigrations) database.exec(migration.sql);
-	const documentBytes = new TextEncoder().encode("The signed contract arrives Tuesday.");
+	const pdfHeader = "%PDF-1.7\n";
+	const pdfObject = "1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+	const xrefOffset = pdfHeader.length + pdfObject.length;
+	const encodedDocument = new TextEncoder().encode([
+		pdfHeader + pdfObject + "xref",
+		"0 2",
+		"0000000000 65535 f ",
+		`${pdfHeader.length.toString().padStart(10, "0")} 00000 n `,
+		"trailer",
+		"<< /Size 2 /Root 1 0 R >>",
+		"startxref",
+		xrefOffset.toString(),
+		"%%EOF",
+		"",
+	].join("\n"));
+	const documentBytes = new Uint8Array(encodedDocument.byteLength);
+	documentBytes.set(encodedDocument);
 	database.prepare(`
 		INSERT INTO emails(id, folder_id, subject, sender, recipient, date, body)
 		VALUES ('message-1', 'inbox', 'Contract', 'sam@example.com',
@@ -22,7 +38,7 @@ test("the production semantic alarm turn composes extraction through final vecto
 	`).run();
 	database.prepare(`
 		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
-		VALUES ('attachment-1', 'message-1', 'contract.md', 'text/markdown', ?, 'attachment')
+		VALUES ('attachment-1', 'message-1', 'contract.pdf', 'application/pdf', ?, 'attachment')
 	`).run(documentBytes.byteLength);
 
 	let nextId = 0;
@@ -81,6 +97,12 @@ test("the production semantic alarm turn composes extraction through final vecto
 	};
 	const visible = new Set<string>();
 	const embeddedFeatures: string[] = [];
+	const conversionCalls: Array<{
+		filename: string;
+		mimetype: string;
+		format: string;
+		byteLength: number;
+	}> = [];
 	const provider: SemanticIndexRuntimeProvider = {
 		async embed(texts, feature) {
 			embeddedFeatures.push(feature);
@@ -98,7 +120,7 @@ test("the production semantic alarm turn composes extraction through final vecto
 			return ids.filter((id) => visible.has(id)).map((id) => ({ id }));
 		},
 	};
-	const key = attachmentKey("message-1", "attachment-1", "contract.md");
+	const key = attachmentKey("message-1", "attachment-1", "contract.pdf");
 	const bucket = {
 		async head(candidate: string) {
 			return candidate === key
@@ -111,7 +133,7 @@ test("the production semantic alarm turn composes extraction through final vecto
 				size: documentBytes.byteLength,
 				version: "version-1",
 				etag: "etag-1",
-				async arrayBuffer() { return documentBytes.buffer as ArrayBuffer; },
+				async arrayBuffer() { return documentBytes.buffer; },
 			};
 		},
 	};
@@ -120,6 +142,17 @@ test("the production semantic alarm turn composes extraction through final vecto
 	const runTurn = () => advanceSemanticMailboxIndex({
 		mailbox,
 		bucket,
+		converter: {
+			async convert(input) {
+				conversionCalls.push({
+					filename: input.filename,
+					mimetype: input.mimetype,
+					format: input.format,
+					byteLength: input.bytes.byteLength,
+				});
+				return "The signed contract arrives Tuesday.";
+			},
+		},
 		provider,
 		namespace: "mailbox-namespace",
 		now: () => currentTime,
@@ -142,6 +175,12 @@ test("the production semantic alarm turn composes extraction through final vecto
 	assert.equal(database.prepare(
 		"SELECT state FROM semantic_attachment_extractions WHERE attachment_id = 'attachment-1'",
 	).get()?.state, "ready");
+	assert.deepEqual(conversionCalls, [{
+		filename: "contract.pdf",
+		mimetype: "application/pdf",
+		format: "pdf",
+		byteLength: documentBytes.byteLength,
+	}]);
 	assert.equal(database.prepare(
 		"SELECT COUNT(*) AS total FROM semantic_chunks WHERE source_type = 'attachment'",
 	).get()?.total, 1);

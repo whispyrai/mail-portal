@@ -5,8 +5,35 @@ import {
 	advanceSemanticAttachmentExtraction,
 	type SemanticAttachmentRuntimeMailbox,
 } from "./semantic-attachment-runtime.ts";
+import { createSemanticRichDocumentConverter } from "./semantic-attachment-converter.ts";
 
-const documentBytes = new TextEncoder().encode("The signed contract arrives Tuesday.").buffer as ArrayBuffer;
+function encodedBuffer(value: string): ArrayBuffer {
+	const encoded = new TextEncoder().encode(value);
+	const output = new Uint8Array(encoded.byteLength);
+	output.set(encoded);
+	return output.buffer;
+}
+
+function pdfBuffer(): ArrayBuffer {
+	const header = "%PDF-1.7\n";
+	const object = "1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+	const xrefOffset = header.length + object.length;
+	return encodedBuffer([
+		header + object + "xref",
+		"0 2",
+		"0000000000 65535 f ",
+		`${header.length.toString().padStart(10, "0")} 00000 n `,
+		"trailer",
+		"<< /Size 2 /Root 1 0 R >>",
+		"startxref",
+		xrefOffset.toString(),
+		"%%EOF",
+		"",
+	].join("\n"));
+}
+
+const richBytes = pdfBuffer();
+const documentBytes = encodedBuffer("The signed contract arrives Tuesday.");
 
 function setup(overrides?: {
 	lease?: SemanticAttachmentExtractionLease | null;
@@ -80,7 +107,7 @@ test("attachment runtime conditionally reads exact R2 bytes and completes fenced
 	assert.deepEqual(state.retried, []);
 	assert.match(JSON.stringify(state.completed[0]), /signed contract arrives Tuesday/);
 	assert.doesNotMatch(JSON.stringify(state.completed[0]), /attachments\//);
-	assert.deepEqual(state.leaseDurations, [60_000]);
+	assert.deepEqual(state.leaseDurations, [90_000]);
 });
 
 test("attachment runtime fails closed on size and format policy outcomes", async () => {
@@ -114,7 +141,7 @@ test("attachment runtime fails closed on size and format policy outcomes", async
 	assert.match(JSON.stringify(html.rejected), /unsupported_format/);
 	assert.deepEqual(html.completed, []);
 
-	const emptyBytes = new TextEncoder().encode("  \n").buffer as ArrayBuffer;
+	const emptyBytes = encodedBuffer("  \n");
 	const empty = setup({
 		lease: {
 			attachmentId: "attachment-1",
@@ -190,4 +217,126 @@ test("attachment runtime bounds a stalled R2 operation and retries without evide
 		nextAttemptAt: 31_000,
 		errorCode: "r2_error",
 	}]);
+});
+
+test("attachment runtime preflights and converts one exact rich document before fenced completion", async () => {
+	const state = setup({
+		lease: {
+			attachmentId: "attachment-1", messageId: "message-1", attachmentVersion: 2,
+			filename: "contract.pdf", mimetype: "application/pdf",
+			declaredSize: richBytes.byteLength, leaseToken: "lease", attemptCount: 1,
+		},
+		head: { size: richBytes.byteLength, version: "version-1", etag: "etag-1" },
+		object: { size: richBytes.byteLength, version: "version-1", etag: "etag-1", bytes: richBytes },
+	});
+	const converted: unknown[] = [];
+	await advanceSemanticAttachmentExtraction({
+		mailbox: state.mailbox,
+		bucket: state.bucket,
+		converter: { async convert(input) { converted.push(input); return "# Signed contract\nArrives Tuesday."; } },
+		now: () => 1_000,
+		createLeaseToken: () => "lease",
+	});
+	assert.equal(converted.length, 1);
+	assert.match(JSON.stringify(converted[0]), /contract\.pdf/);
+	assert.doesNotMatch(JSON.stringify(converted[0]), /document bytes/);
+	assert.equal(state.completed.length, 1);
+	assert.match(JSON.stringify(state.completed[0]), /Signed contract/);
+	assert.deepEqual(state.rejected, []);
+	assert.deepEqual(state.retried, []);
+	assert.deepEqual(state.leaseDurations, [90_000]);
+});
+
+test("rich runtime rejects invalid bytes and the actual four-megabyte boundary before conversion", async () => {
+	const invalid = setup({
+		lease: {
+			attachmentId: "attachment-1", messageId: "message-1", attachmentVersion: 2,
+			filename: "contract.pdf", mimetype: "application/pdf",
+			declaredSize: documentBytes.byteLength, leaseToken: "lease", attemptCount: 1,
+		},
+	});
+	let conversionCalls = 0;
+	await advanceSemanticAttachmentExtraction({
+		mailbox: invalid.mailbox,
+		bucket: invalid.bucket,
+		converter: { async convert() { conversionCalls += 1; return "never"; } },
+		now: () => 1_000,
+	});
+	assert.equal(conversionCalls, 0);
+	assert.match(JSON.stringify(invalid.rejected), /invalid_container/);
+	assert.match(JSON.stringify(invalid.rejected), /"terminal":false/);
+
+	const oversized = setup({
+		lease: {
+			attachmentId: "attachment-1", messageId: "message-1", attachmentVersion: 2,
+			filename: "contract.pdf", mimetype: "application/pdf",
+			declaredSize: 4 * 1024 * 1024 + 1, leaseToken: "lease", attemptCount: 1,
+		},
+		head: { size: 4 * 1024 * 1024 + 1, version: "version-1", etag: "etag-1" },
+	});
+	await advanceSemanticAttachmentExtraction({
+		mailbox: oversized.mailbox,
+		bucket: oversized.bucket,
+		converter: { async convert() { conversionCalls += 1; return "never"; } },
+		now: () => 1_000,
+	});
+	assert.equal(conversionCalls, 0);
+	assert.match(JSON.stringify(oversized.rejected), /size_exceeded/);
+});
+
+test("a stalled rich conversion retries at the elapsed bound and a late result cannot commit", async (context) => {
+	context.mock.timers.enable({ apis: ["setTimeout"] });
+	const state = setup({
+		lease: {
+			attachmentId: "attachment-1", messageId: "message-1", attachmentVersion: 2,
+			filename: "contract.pdf", mimetype: "application/pdf",
+			declaredSize: richBytes.byteLength, leaseToken: "lease", attemptCount: 1,
+		},
+		head: { size: richBytes.byteLength, version: "version-1", etag: "etag-1" },
+		object: { size: richBytes.byteLength, version: "version-1", etag: "etag-1", bytes: richBytes },
+	});
+	let resolveConversion: ((value: string) => void) | undefined;
+	const operation = advanceSemanticAttachmentExtraction({
+		mailbox: state.mailbox,
+		bucket: state.bucket,
+		converter: { convert: () => new Promise((resolve) => { resolveConversion = resolve; }) },
+		now: () => 1_000,
+	});
+	for (let turn = 0; turn < 20 && !resolveConversion; turn += 1) await Promise.resolve();
+	assert.ok(resolveConversion);
+	context.mock.timers.tick(15_000);
+	assert.equal(await operation, true);
+	assert.match(JSON.stringify(state.retried), /conversion_timeout/);
+	assert.deepEqual(state.completed, []);
+	resolveConversion("late evidence");
+	await Promise.resolve();
+	assert.deepEqual(state.completed, []);
+});
+
+test("a stable provider conversion rejection becomes unsupported without exposing its raw error", async () => {
+	const state = setup({
+		lease: {
+			attachmentId: "attachment-1", messageId: "message-1", attachmentVersion: 2,
+			filename: "contract.pdf", mimetype: "application/pdf",
+			declaredSize: richBytes.byteLength, leaseToken: "lease", attemptCount: 1,
+		},
+		head: { size: richBytes.byteLength, version: "version-1", etag: "etag-1" },
+		object: { size: richBytes.byteLength, version: "version-1", etag: "etag-1", bytes: richBytes },
+	});
+	const rawProviderError = "secret filename and converted document contents";
+	await advanceSemanticAttachmentExtraction({
+		mailbox: state.mailbox,
+		bucket: state.bucket,
+		converter: createSemanticRichDocumentConverter({ async convert() {
+			return { id: "conversion-1", name: "contract.pdf", mimeType: "application/pdf", format: "error", error: rawProviderError };
+		} }),
+		now: () => 1_000,
+	});
+	assert.deepEqual(state.rejected, [{
+		attachmentId: "attachment-1", leaseToken: "lease", rejectedAt: 1_000,
+		errorCode: "conversion_rejected", terminal: false,
+	}]);
+	assert.deepEqual(state.retried, []);
+	assert.deepEqual(state.completed, []);
+	assert.doesNotMatch(JSON.stringify(state), new RegExp(rawProviderError));
 });

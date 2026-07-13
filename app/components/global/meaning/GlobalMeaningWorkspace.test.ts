@@ -59,6 +59,21 @@ test("Meaning evidence remains compound, attributable, read-only, and free of mo
 	assert.doesNotMatch(`${workspace}\n${resultRow}\n${route}`, /markRead|markUnread|toggleUnread|score\}|vectorId|modelName/);
 });
 
+test("Meaning renders extracted markup and prompt text as inert visible text", () => {
+	assert.match(
+		resultRow,
+		/<p id=\{excerptId\}[\s\S]*\{expanded \? result\.excerpt : collapsedExcerpt\}[\s\S]*<\/p>/,
+	);
+	assert.doesNotMatch(
+		resultRow,
+		/dangerouslySetInnerHTML|ReactMarkdown|remarkGfm|DOMParser|innerHTML/,
+	);
+	assert.doesNotMatch(
+		resultRow,
+		/href=\{(?:result\.)?excerpt|src=\{(?:result\.)?excerpt/,
+	);
+});
+
 test("Meaning keeps sensitive query and evidence state out of URLs and persistent storage", () => {
 	assert.match(service, /fetch\("\/api\/v1\/semantic-search"/);
 	assert.match(service, /method: "POST"/);

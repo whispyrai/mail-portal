@@ -8,6 +8,7 @@ import {
 	type SemanticAttachmentRuntimeBucket,
 	type SemanticAttachmentRuntimeMailbox,
 } from "./semantic-attachment-runtime.ts";
+import type { SemanticRichDocumentConverter } from "./semantic-attachment-converter.ts";
 
 // A mixed turn can run two embed/upsert pairs and one delete. Keep the durable
 // lease beyond all five provider budgets with ample commit and scheduler margin.
@@ -365,6 +366,7 @@ export async function advanceSemanticIndex(input: {
 export async function advanceSemanticMailboxIndex(input: {
 	mailbox: SemanticMailboxIndexRuntime;
 	bucket: SemanticAttachmentRuntimeBucket;
+	converter: SemanticRichDocumentConverter;
 	provider: SemanticIndexRuntimeProvider;
 	namespace: string;
 	now?: () => number;
@@ -375,6 +377,7 @@ export async function advanceSemanticMailboxIndex(input: {
 	await advanceSemanticAttachmentExtraction({
 		mailbox: input.mailbox,
 		bucket: input.bucket,
+		converter: input.converter,
 		now: input.now,
 		createLeaseToken: input.createLeaseToken,
 	});

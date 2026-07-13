@@ -17,7 +17,7 @@ import { semanticMailboxNamespace } from "./semantic-search.ts";
 import { mailboxAccess } from "./mailbox-access.ts";
 
 const MAILBOX_CONCURRENCY = 4;
-const CANDIDATES_PER_MAILBOX = 12;
+export const SEMANTIC_CANDIDATES_PER_MAILBOX = 12;
 export type SemanticSearchTiming = {
   requestMs: number;
   rosterMs: number;
@@ -302,7 +302,7 @@ async function runAttempt(
         const vectorCandidates = await dependencies.queryIndex({
           mailboxId: item.mailbox.address,
           queryVector: embeddedQuery,
-          limit: CANDIDATES_PER_MAILBOX,
+          limit: SEMANTIC_CANDIDATES_PER_MAILBOX,
         });
         if (expired()) throw new SemanticSearchTimeoutError();
         const resolved = await dependencies.resolveCandidates({
@@ -475,7 +475,10 @@ export function createGlobalSemanticSearchDependencies(
       // https://developers.cloudflare.com/vectorize/reference/client-api/
       const matches = await index.query(queryVector, {
         namespace,
-        topK: Math.min(Math.max(Math.trunc(limit), 1), CANDIDATES_PER_MAILBOX),
+        topK: Math.min(
+          Math.max(Math.trunc(limit), 1),
+          SEMANTIC_CANDIDATES_PER_MAILBOX,
+        ),
         returnMetadata: "none",
         returnValues: false,
       });

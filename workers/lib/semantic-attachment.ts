@@ -1,11 +1,12 @@
 import { truncateSemanticSearchText } from "../../shared/semantic-search.ts";
 
-export const SEMANTIC_ATTACHMENT_POLICY_VERSION = 1;
-export const SEMANTIC_ATTACHMENT_EXTRACTION_VERSION = 1;
+export const SEMANTIC_ATTACHMENT_POLICY_VERSION = 2;
+export const SEMANTIC_ATTACHMENT_EXTRACTION_VERSION = 2;
 export const SEMANTIC_ATTACHMENT_CHUNK_VERSION = 1;
 
 export const SEMANTIC_ATTACHMENT_LIMITS = {
 	inputBytes: 64 * 1024,
+	richInputBytes: 4 * 1024 * 1024,
 	outputBytes: 64 * 1024,
 	outputChars: 48_000,
 	filenameChars: 255,
@@ -14,7 +15,36 @@ export const SEMANTIC_ATTACHMENT_LIMITS = {
 	chunksPerAttachment: 40,
 } as const;
 
-export type SemanticDirectTextFormat = "text" | "markdown" | "json" | "xml" | "csv";
+export type SemanticDirectTextFormat =
+	| "text"
+	| "markdown"
+	| "json"
+	| "xml"
+	| "csv";
+export type SemanticRichDocumentFormat =
+	| "pdf"
+	| "docx"
+	| "xls"
+	| "xlsx"
+	| "odt"
+	| "ods"
+	| "numbers";
+export type SemanticAttachmentFormat =
+	| SemanticDirectTextFormat
+	| SemanticRichDocumentFormat;
+export type SemanticAttachmentAdmission =
+	| {
+		kind: "direct";
+		format: SemanticDirectTextFormat;
+		mimetype: string;
+		maxBytes: number;
+	}
+	| {
+		kind: "rich";
+		format: SemanticRichDocumentFormat;
+		mimetype: string;
+		maxBytes: number;
+	};
 
 export type SemanticAttachmentChunk = {
 	ordinal: number;
@@ -28,6 +58,11 @@ export type SemanticAttachmentExtractionFailure =
 	| "size_exceeded"
 	| "invalid_utf8"
 	| "unsafe_text"
+	| "invalid_container"
+	| "encrypted_document"
+	| "active_content"
+	| "decompression_exceeded"
+	| "conversion_rejected"
 	| "empty_output"
 	| "output_exceeded";
 
@@ -48,6 +83,45 @@ const MIME_BY_EXTENSION = new Map<string, ReadonlySet<string>>([
 	["json", new Set(["application/json"])],
 	["xml", new Set(["application/xml", "text/xml"])],
 	["csv", new Set(["text/csv"])],
+]);
+
+const RICH_ADMISSION_BY_EXTENSION = new Map<
+	string,
+	{
+		format: SemanticRichDocumentFormat;
+		mimetype: string;
+	}
+>([
+	["pdf", { format: "pdf", mimetype: "application/pdf" }],
+	[
+		"docx",
+		{
+			format: "docx",
+			mimetype:
+				"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		},
+	],
+	["xls", { format: "xls", mimetype: "application/vnd.ms-excel" }],
+	[
+		"xlsx",
+		{
+			format: "xlsx",
+			mimetype:
+				"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		},
+	],
+	[
+		"odt",
+		{ format: "odt", mimetype: "application/vnd.oasis.opendocument.text" },
+	],
+	[
+		"ods",
+		{
+			format: "ods",
+			mimetype: "application/vnd.oasis.opendocument.spreadsheet",
+		},
+	],
+	["numbers", { format: "numbers", mimetype: "application/vnd.apple.numbers" }],
 ]);
 
 const MAX_COMBINING_MARK_RUN = 64;
@@ -98,6 +172,31 @@ export function semanticDirectTextFormat(
 	return "text";
 }
 
+export function semanticAttachmentAdmission(
+	filename: string,
+	mimetype: string,
+): SemanticAttachmentAdmission | null {
+	const normalized = normalizedMime(mimetype);
+	const direct = semanticDirectTextFormat(filename, normalized);
+	if (direct) {
+		return {
+			kind: "direct",
+			format: direct,
+			mimetype: normalized,
+			maxBytes: SEMANTIC_ATTACHMENT_LIMITS.inputBytes,
+		};
+	}
+	const fileExtension = extension(filename);
+	const richAdmission = RICH_ADMISSION_BY_EXTENSION.get(fileExtension);
+	if (!richAdmission || richAdmission.mimetype !== normalized) return null;
+	return {
+		kind: "rich",
+		format: richAdmission.format,
+		mimetype: richAdmission.mimetype,
+		maxBytes: SEMANTIC_ATTACHMENT_LIMITS.richInputBytes,
+	};
+}
+
 function normalizeExtractedText(value: string): string {
 	return value
 		.replace(/\r\n?/g, "\n")
@@ -105,6 +204,27 @@ function normalizeExtractedText(value: string): string {
 		.replace(/[ \t]+$/gm, "")
 		.replace(/\n{4,}/g, "\n\n\n")
 		.trim();
+}
+
+export function semanticAttachmentText(value: string): string {
+	if (
+		/[\uD800-\uDFFF]/u.test(value) ||
+		/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u061C\u200B\u200E\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/u.test(
+			value,
+		)
+	) {
+		throw new SemanticAttachmentExtractionError("unsafe_text");
+	}
+	const text = normalizeExtractedText(value);
+	if (!text) throw new SemanticAttachmentExtractionError("empty_output");
+	assertSemanticAttachmentText(text);
+	if (text.length > SEMANTIC_ATTACHMENT_LIMITS.outputChars) {
+		throw new SemanticAttachmentExtractionError("output_exceeded");
+	}
+	if (new TextEncoder().encode(text).byteLength > SEMANTIC_ATTACHMENT_LIMITS.outputBytes) {
+		throw new SemanticAttachmentExtractionError("output_exceeded");
+	}
+	return text;
 }
 
 function assertSemanticAttachmentText(value: string): void {
@@ -158,22 +278,7 @@ export function extractSemanticAttachmentText(input: {
 	} catch {
 		throw new SemanticAttachmentExtractionError("invalid_utf8");
 	}
-	if (
-		/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u061C\u200B\u200E\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/u.test(
-			decoded,
-		)
-	) {
-		throw new SemanticAttachmentExtractionError("unsafe_text");
-	}
-	const text = normalizeExtractedText(decoded);
-	if (!text) throw new SemanticAttachmentExtractionError("empty_output");
-	assertSemanticAttachmentText(text);
-	if (text.length > SEMANTIC_ATTACHMENT_LIMITS.outputChars) {
-		throw new SemanticAttachmentExtractionError("output_exceeded");
-	}
-	if (new TextEncoder().encode(text).byteLength > SEMANTIC_ATTACHMENT_LIMITS.outputBytes) {
-		throw new SemanticAttachmentExtractionError("output_exceeded");
-	}
+	const text = semanticAttachmentText(decoded);
 	return { format, text };
 }
 
@@ -257,7 +362,7 @@ export function semanticAttachmentVectorId(sourceToken: string, ordinal: number)
 
 export async function semanticAttachmentFingerprint(input: {
 	bytes: ArrayBuffer;
-	format: SemanticDirectTextFormat;
+	format: SemanticAttachmentFormat;
 }): Promise<{ byteSha256: string; sourceFingerprint: string }> {
 	const byteDigest = await crypto.subtle.digest("SHA-256", input.bytes);
 	const byteSha256 = Array.from(new Uint8Array(byteDigest), (byte) =>

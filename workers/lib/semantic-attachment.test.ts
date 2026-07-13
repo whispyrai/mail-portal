@@ -5,13 +5,19 @@ import {
 	SemanticAttachmentExtractionError,
 	extractSemanticAttachmentText,
 	semanticAttachmentChunks,
+	semanticAttachmentAdmission,
 	semanticAttachmentFingerprint,
 	semanticAttachmentVectorId,
 	semanticDirectTextFormat,
+	type SemanticDirectTextFormat,
+	type SemanticRichDocumentFormat,
 } from "./semantic-attachment.ts";
 
 function bytes(value: string): ArrayBuffer {
-	return new TextEncoder().encode(value).buffer as ArrayBuffer;
+	const encoded = new TextEncoder().encode(value);
+	const output = new Uint8Array(encoded.byteLength);
+	output.set(encoded);
+	return output.buffer;
 }
 
 test("direct attachment admission requires an exact allowlisted extension and MIME pair", () => {
@@ -28,6 +34,68 @@ test("direct attachment admission requires an exact allowlisted extension and MI
 	]) assert.equal(semanticDirectTextFormat(filename, mimetype), null);
 });
 
+test("attachment admission pins the seven rich-document pairs and route-specific byte limits", () => {
+	const richPairs: Array<[string, string, SemanticRichDocumentFormat]> = [
+		["document.pdf", "application/pdf", "pdf"],
+		[
+			"contract.docx",
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			"docx",
+		],
+		["legacy.xls", "application/vnd.ms-excel", "xls"],
+		[
+			"forecast.xlsx",
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			"xlsx",
+		],
+		["brief.odt", "application/vnd.oasis.opendocument.text", "odt"],
+		["forecast.ods", "application/vnd.oasis.opendocument.spreadsheet", "ods"],
+		["plan.numbers", "application/vnd.apple.numbers", "numbers"],
+	];
+	for (const [filename, mimetype, format] of richPairs) {
+		assert.deepEqual(semanticAttachmentAdmission(filename, mimetype), {
+			kind: "rich",
+			format,
+			mimetype,
+			maxBytes: 4 * 1024 * 1024,
+		});
+		assert.deepEqual(
+			semanticAttachmentAdmission(
+				filename.toUpperCase(),
+				mimetype.toUpperCase(),
+			),
+			{ kind: "rich", format, mimetype, maxBytes: 4 * 1024 * 1024 },
+		);
+		assert.equal(
+			semanticAttachmentAdmission(filename, "application/octet-stream"),
+			null,
+		);
+	}
+	assert.deepEqual(
+		semanticAttachmentAdmission("notes.txt", "text/plain; charset=utf-8"),
+		{
+			kind: "direct",
+			format: "text",
+			mimetype: "text/plain",
+			maxBytes: 64 * 1024,
+		},
+	);
+	for (const [filename, mimetype] of [
+		["macro.xlsm", "application/vnd.ms-excel.sheet.macroenabled.12"],
+		["binary.xlsb", "application/vnd.ms-excel.sheet.binary.macroenabled.12"],
+		["sheet.et", "application/vnd.ms-excel"],
+		["page.html", "text/html"],
+		["scan.png", "image/png"],
+		["archive.zip", "application/zip"],
+		[
+			"document.docx.exe",
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		],
+		["document", "application/pdf"],
+	])
+		assert.equal(semanticAttachmentAdmission(filename, mimetype), null);
+});
+
 test("direct extraction is fatal UTF-8, byte-exact, control-safe, and bounded", () => {
 	const input = bytes("First line\r\nSecond line  \r\n");
 	assert.deepEqual(extractSemanticAttachmentText({
@@ -36,13 +104,14 @@ test("direct extraction is fatal UTF-8, byte-exact, control-safe, and bounded", 
 		declaredSize: input.byteLength,
 		bytes: input,
 	}), { format: "markdown", text: "First line\nSecond line" });
-	for (const [filename, mimetype, format] of [
+	const directPairs: Array<[string, string, SemanticDirectTextFormat]> = [
 		["notes.txt", "text/plain", "text"],
 		["notes.md", "text/markdown", "markdown"],
 		["data.json", "application/json", "json"],
 		["feed.xml", "application/xml", "xml"],
 		["rows.csv", "text/csv", "csv"],
-	] as const) {
+	];
+	for (const [filename, mimetype, format] of directPairs) {
 		const multilingual = bytes("موعد\u200Cالعقد 👩🏽‍💻\u2028अगला कदम");
 		assert.deepEqual(extractSemanticAttachmentText({
 			filename,

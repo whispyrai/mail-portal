@@ -14,9 +14,9 @@ import {
 	SEMANTIC_ATTACHMENT_EXTRACTION_VERSION,
 	SEMANTIC_ATTACHMENT_LIMITS,
 	SEMANTIC_ATTACHMENT_POLICY_VERSION,
+	semanticAttachmentAdmission,
 	semanticAttachmentChunks,
 	semanticAttachmentVectorId,
-	semanticDirectTextFormat,
 } from "./semantic-attachment.ts";
 
 const BACKFILL_BATCH = 20;
@@ -427,14 +427,14 @@ export function createSemanticIndex(input: {
 			});
 			return false;
 		}
-		const format = semanticDirectTextFormat(attachment.filename, attachment.mimetype);
+		const admission = semanticAttachmentAdmission(attachment.filename, attachment.mimetype);
 		const declaredSizeValid = Number.isSafeInteger(attachment.declaredSize) &&
 			attachment.declaredSize >= 0;
-		const supported = format !== null &&
+		const supported = admission !== null &&
 			declaredSizeValid &&
-			attachment.declaredSize <= SEMANTIC_ATTACHMENT_LIMITS.inputBytes;
+			attachment.declaredSize <= admission.maxBytes;
 		const declaredSize = declaredSizeValid ? attachment.declaredSize : 0;
-		const unsupportedError = format === null
+		const unsupportedError = admission === null
 			? "unsupported_format"
 			: !declaredSizeValid
 				? "invalid_size"
@@ -1169,7 +1169,7 @@ export function createSemanticIndex(input: {
 			!completion.r2Version ||
 			!completion.r2Etag ||
 			completion.actualSize < 0 ||
-			completion.actualSize > SEMANTIC_ATTACHMENT_LIMITS.inputBytes
+			completion.actualSize > SEMANTIC_ATTACHMENT_LIMITS.richInputBytes
 		) return false;
 		const chunks = semanticAttachmentChunks("", completion.text);
 		if (chunks.length === 0) return false;
@@ -1194,8 +1194,16 @@ export function createSemanticIndex(input: {
 					completion.attachmentId,
 				),
 			);
+			const currentAdmission = current
+				? semanticAttachmentAdmission(
+					text(current, "filename"),
+					text(current, "mimetype"),
+				)
+				: null;
 			if (
 				!current ||
+				!currentAdmission ||
+				completion.actualSize > currentAdmission.maxBytes ||
 				text(current, "leaseToken") !== completion.leaseToken ||
 				integer(current, "leaseExpiresAt") <= completion.completedAt ||
 				text(current, "messageId") !== completion.messageId ||

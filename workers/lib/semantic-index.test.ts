@@ -425,6 +425,65 @@ test("unsupported, inline, and CID attachments never block semantic readiness", 
 	state.database.close();
 });
 
+test("rich attachments enter the existing lifecycle with the exact four-megabyte boundary", async () => {
+	const state = setup();
+	insertMessage(state.database, "message-1", "inbox", "Parent evidence");
+	state.database
+		.prepare(
+			`
+		INSERT INTO attachments(id, email_id, filename, mimetype, size, disposition)
+		VALUES ('rich', 'message-1', 'contract.pdf', 'application/pdf', ?, 'attachment'),
+		       ('oversized', 'message-1', 'large.pdf', 'application/pdf', ?, 'attachment'),
+		       ('mismatch', 'message-1', 'renamed.pdf', 'application/octet-stream', 100, 'attachment')
+	`,
+		)
+		.run(4 * 1024 * 1024, 4 * 1024 * 1024 + 1);
+	await state.index.prepare();
+	assert.deepEqual(
+		state.database
+			.prepare(
+				`
+		SELECT attachment_id AS id, state, last_error_code AS errorCode
+		FROM semantic_attachment_extractions ORDER BY attachment_id
+	`,
+			)
+			.all()
+			.map((row) => ({ ...row })),
+		[
+			{ id: "mismatch", state: "unsupported", errorCode: "unsupported_format" },
+			{ id: "oversized", state: "unsupported", errorCode: "size_exceeded" },
+			{ id: "rich", state: "pending", errorCode: null },
+		],
+	);
+	const lease = state.index.leaseAttachmentExtraction("lease", 1_000, 100_000);
+	assert.equal(lease?.attachmentId, "rich");
+	assert.equal(
+		state.index.completeAttachmentExtraction({
+			attachmentId: "rich",
+			messageId: "message-1",
+			attachmentVersion: 1,
+			leaseToken: "lease",
+			completedAt: 2_000,
+			byteSha256: "a".repeat(64),
+			sourceFingerprint: "b".repeat(64),
+			r2Version: "version-1",
+			r2Etag: "etag-1",
+			actualSize: 4 * 1024 * 1024,
+			text: "Converted rich evidence",
+		}),
+		true,
+	);
+	assert.equal(
+		state.database
+			.prepare(
+				"SELECT state FROM semantic_attachment_extractions WHERE attachment_id = 'rich'",
+			)
+			.get()?.state,
+		"ready",
+	);
+	state.database.close();
+});
+
 test("invalid legacy attachment sizes are classified without crashing projection preparation", async () => {
 	const state = setup();
 	insertMessage(state.database, "message-1", "inbox", "Message evidence");
@@ -494,7 +553,7 @@ test("attachment extraction, policy, or chunk version drift rebuilds only attach
 		 attachment_policy_version AS policyVersion,
 		 attachment_chunk_version AS chunkVersion
 		FROM semantic_projection_state WHERE id = 1
-	`).get()! }, { extractionVersion: 1, policyVersion: 1, chunkVersion: 1 });
+	`).get()! }, { extractionVersion: 2, policyVersion: 2, chunkVersion: 1 });
 	state.database.close();
 });
 
