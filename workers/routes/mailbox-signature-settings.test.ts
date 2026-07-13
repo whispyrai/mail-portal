@@ -103,6 +103,72 @@ test("missing mailbox settings return a stable not-found response", async () => 
 	assert.deepEqual(await response.json(), { error: "Mailbox settings were not found", code: "NOT_FOUND" });
 });
 
+test("settings GET suppresses R2 output when Shared access is revoked in flight", async () => {
+	let accessChecks = 0;
+	const operations: MailboxSignatureSettingsOperations = {
+		async access() {
+			accessChecks += 1;
+			return accessChecks === 1
+				? { canRead: true, canManage: false }
+				: { canRead: false, canManage: false };
+		},
+		async read() {
+			return { signature: { enabled: true, text: "private signature" } };
+		},
+		async updateSignature() {
+			throw new Error("not used");
+		},
+	};
+	const root = new Hono<MailboxSignatureSettingsRouteContext>();
+	root.use("*", async (c, next) => {
+		c.set("session", session);
+		await next();
+	});
+	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
+
+	const response = await request(root, "/settings");
+
+	assert.equal(response.status, 403);
+	assert.deepEqual(await response.json(), {
+		error: "Mailbox settings are not available",
+		code: "FORBIDDEN",
+	});
+	assert.equal(accessChecks, 2);
+});
+
+test("settings revocation wins over an in-flight R2 failure", async () => {
+	let accessChecks = 0;
+	const operations: MailboxSignatureSettingsOperations = {
+		async access() {
+			accessChecks += 1;
+			return accessChecks === 1
+				? { canRead: true, canManage: false }
+				: { canRead: false, canManage: false };
+		},
+		async read() {
+			throw new Error("private R2 failure");
+		},
+		async updateSignature() {
+			throw new Error("not used");
+		},
+	};
+	const root = new Hono<MailboxSignatureSettingsRouteContext>();
+	root.use("*", async (c, next) => {
+		c.set("session", session);
+		await next();
+	});
+	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
+
+	const response = await request(root, "/settings");
+
+	assert.equal(response.status, 403);
+	assert.deepEqual(await response.json(), {
+		error: "Mailbox settings are not available",
+		code: "FORBIDDEN",
+	});
+	assert.equal(accessChecks, 2);
+});
+
 test("unexpected settings failures use a stable credential-free response", async () => {
 	const operations: MailboxSignatureSettingsOperations = {
 		async access() { return { canRead: true, canManage: true }; },

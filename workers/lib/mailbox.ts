@@ -18,6 +18,7 @@ import type { SessionClaims } from "./auth";
 import { systemPromptFor } from "./prompts.ts";
 import { resolveBrand } from "../routes/brand.ts";
 import { mailboxAccess } from "./mailbox-access.ts";
+import { replaceWithPrivateResponse } from "./response-privacy.ts";
 
 export type MailboxContext = {
 	Bindings: Env;
@@ -43,11 +44,19 @@ export async function hasLiveMailboxContentAccess(
 	return mailboxAccess(c.env).canAccessMailbox(session.sub, mailboxId);
 }
 
+function isReadMethod(method: string): boolean {
+	return method === "GET" || method === "HEAD";
+}
+
+function replaceWithForbidden(c: Context<MailboxContext>): void {
+	replaceWithPrivateResponse(c, c.json({ error: "Forbidden" }, 403));
+}
+
 /** Settings-only routes authorize themselves and must never resolve a mailbox DO. */
 export function bypassMailboxContentAuthorization(method: string, pathname: string): boolean {
 	const parts = pathname.split("/").filter(Boolean);
 	return (
-		method === "GET" &&
+		isReadMethod(method) &&
 		parts.length === 5 &&
 		parts[0] === "api" && parts[1] === "v1" && parts[2] === "mailboxes" &&
 		parts[4] === "settings"
@@ -108,6 +117,27 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	c.set("mailboxStub", stub);
 
 	await next();
+	if (isReadMethod(c.req.method)) {
+		let hasAccess: boolean;
+		try {
+			hasAccess = await hasLiveMailboxContentAccess(c);
+		} catch (error) {
+			console.error("[mailbox] live authorization check failed", {
+				operation: "mailbox_authorization_check",
+				phase: "after_read",
+				method: c.req.method,
+				path: new URL(c.req.url).pathname,
+				actorUserId: session.sub,
+				errorName: error instanceof Error ? error.name : "UnknownError",
+			});
+			replaceWithPrivateResponse(
+				c,
+				c.json({ error: "Authorization unavailable" }, 500),
+			);
+			return;
+		}
+		if (!hasAccess) replaceWithForbidden(c);
+	}
 });
 
 /**

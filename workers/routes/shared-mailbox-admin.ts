@@ -102,10 +102,14 @@ export function createSharedMailboxAdminApp(
 
 	app.get("/mailboxes", async (c) => {
 		const session = c.get("session")!;
-		const rows = await dependencies
-			.access(c.env)
-			.listManagedMailboxes(session.sub);
-		return c.json({ mailboxes: rows.map(mailboxMetadata) });
+		const access = dependencies.access(c.env);
+		const read = await access.listManagedMailboxes(session.sub).then(
+			(rows) => ({ status: "success" as const, rows }),
+			(error: unknown) => ({ status: "failed" as const, error }),
+		);
+		await access.requireMailboxAdministrator(session.sub);
+		if (read.status === "failed") throw read.error;
+		return c.json({ mailboxes: read.rows.map(mailboxMetadata) });
 	});
 
 	app.post("/shared-mailboxes", async (c) => {
@@ -129,10 +133,16 @@ export function createSharedMailboxAdminApp(
 
 	app.get("/shared-mailboxes/:mailboxId/members", async (c) => {
 		const session = c.get("session")!;
-		const members = await dependencies
-			.access(c.env)
-			.listSharedMailboxMembers(session.sub, c.req.param("mailboxId")!);
-		return c.json({ members: members.map(memberMetadata) });
+		const access = dependencies.access(c.env);
+		const read = await access
+			.listSharedMailboxMembers(session.sub, c.req.param("mailboxId")!)
+			.then(
+				(members) => ({ status: "success" as const, members }),
+				(error: unknown) => ({ status: "failed" as const, error }),
+			);
+		await access.requireMailboxAdministrator(session.sub);
+		if (read.status === "failed") throw read.error;
+		return c.json({ members: read.members.map(memberMetadata) });
 	});
 
 	app.post("/shared-mailboxes/:mailboxId/members", async (c) => {

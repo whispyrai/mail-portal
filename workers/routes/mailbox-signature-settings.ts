@@ -164,11 +164,24 @@ export function createMailboxSignatureSettingsRoutes(
 		if (!access.canRead && !access.canManage) {
 			throw new SignatureRouteError("FORBIDDEN", "Mailbox settings are not available", 403);
 		}
-		const settings = await dependencies.operations.read(c.env, mailbox);
+		const read = await dependencies.operations.read(c.env, mailbox).then(
+			(settings) => ({ status: "success" as const, settings }),
+			(error: unknown) => ({ status: "failed" as const, error }),
+		);
+		const currentAccess = await dependencies.operations.access(
+			c.env,
+			c.get("session")!.sub,
+			mailbox,
+		);
+		if (!currentAccess.canRead && !currentAccess.canManage) {
+			throw new SignatureRouteError("FORBIDDEN", "Mailbox settings are not available", 403);
+		}
+		if (read.status === "failed") throw read.error;
+		const settings = read.settings;
 		if (!settings) throw new SignatureRouteError("NOT_FOUND", "Mailbox settings were not found", 404);
 		const response: MailboxSignatureSettingsResponse = {
 			signature: normalizeEffectiveSignature(settings.signature),
-			canManage: access.canManage,
+			canManage: currentAccess.canManage,
 		};
 		return c.json(response);
 	});

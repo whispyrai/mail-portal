@@ -178,6 +178,66 @@ test("An administrator can list management metadata without mailbox content", as
 	});
 });
 
+test("admin revocation suppresses in-flight mailbox management metadata", async () => {
+	let adminChecks = 0;
+	const access = managementAccess({
+		async requireMailboxAdministrator() {
+			adminChecks += 1;
+			throw new MailboxAccessError(
+				"FORBIDDEN",
+				"Only an active administrator can manage mailboxes",
+			);
+		},
+		async listManagedMailboxes() {
+			return [{
+				id: "private@wiserchat.ai",
+				address: "private@wiserchat.ai",
+				type: "SHARED",
+				owner_user_id: null,
+				is_active: 1,
+				created_at: 1,
+				updated_at: 1,
+				member_count: 3,
+			}];
+		},
+	});
+
+	const response = await jsonRequest(
+		testApp({ access }),
+		"/api/v1/admin/mailboxes",
+	);
+
+	assert.equal(response.status, 403);
+	assert.deepEqual(await response.json(), {
+		error: "Only an active administrator can manage mailboxes",
+	});
+	assert.equal(adminChecks, 1);
+});
+
+test("admin revocation wins over an in-flight mailbox metadata failure", async () => {
+	const access = managementAccess({
+		async requireMailboxAdministrator() {
+			throw new MailboxAccessError(
+				"FORBIDDEN",
+				"Only an active administrator can manage mailboxes",
+			);
+		},
+		async listManagedMailboxes() {
+			throw new Error("private mailbox metadata failure");
+		},
+	});
+
+	const response = await jsonRequest(
+		testApp({ access }),
+		"/api/v1/admin/mailboxes",
+	);
+
+	assert.equal(response.status, 403);
+	assert.deepEqual(await response.json(), {
+		error: "Only an active administrator can manage mailboxes",
+	});
+});
+
 test("An administrator can register existing R2 mailbox metadata as Shared", async () => {
 	let registeredBy: string | undefined;
 	let registeredAddress: string | undefined;
@@ -290,6 +350,35 @@ test("An administrator can list Shared Mailbox members", async () => {
 				isActive: true,
 			},
 		],
+	});
+});
+
+test("admin revocation suppresses an in-flight Shared member roster", async () => {
+	const access = managementAccess({
+		async requireMailboxAdministrator() {
+			throw new MailboxAccessError(
+				"FORBIDDEN",
+				"Only an active administrator can manage mailboxes",
+			);
+		},
+		async listSharedMailboxMembers() {
+			return [{
+				id: "private-user",
+				email: "private-user@wiserchat.ai",
+				role: "AGENT",
+				is_active: 1,
+			}];
+		},
+	});
+
+	const response = await jsonRequest(
+		testApp({ access }),
+		"/api/v1/admin/shared-mailboxes/support%40wiserchat.ai/members",
+	);
+
+	assert.equal(response.status, 403);
+	assert.deepEqual(await response.json(), {
+		error: "Only an active administrator can manage mailboxes",
 	});
 });
 

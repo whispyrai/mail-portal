@@ -34,7 +34,10 @@ import {
 import { pageShell, brandLogo, resolveBrand, type BrandConfig } from "./brand";
 import { adminQuizApp } from "../quiz/admin-routes";
 import type { Env } from "../types";
-import { mailboxAccess } from "../lib/mailbox-access";
+import {
+  MailboxAccessError,
+  mailboxAccess,
+} from "../lib/mailbox-access";
 import { renderAdminMailboxesPage } from "./admin-mailboxes-page";
 import { renderAdminAiCostPage } from "./admin-ai-cost-page.ts";
 import { resolveAiCostControlConfig } from "../lib/ai-cost-control.ts";
@@ -46,6 +49,7 @@ import {
 } from "../lib/recovery-directory.ts";
 import { accountLifecycle } from "../lib/account-lifecycle-runtime.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
+import { createAdminReadDisclosureGuard } from "./admin-read-disclosure-guard.ts";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
@@ -93,6 +97,22 @@ adminApp.use("*", async (c, next) => {
   if (session.role !== "ADMIN") return c.text("Forbidden", 403);
   return next();
 });
+adminApp.use(
+  "*",
+  createAdminReadDisclosureGuard({
+    checkAdministrator: async (env, userId) => {
+      try {
+        await mailboxAccess(env).requireMailboxAdministrator(userId);
+        return true;
+      } catch (error) {
+        if (error instanceof MailboxAccessError && error.code === "FORBIDDEN") {
+          return false;
+        }
+        throw error;
+      }
+    },
+  }),
+);
 
 // Quiz admin console (open/close, edit questions, grade, results, seed). Mounted
 // inside adminApp so it inherits the ADMIN-only guard above.

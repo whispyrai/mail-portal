@@ -50,6 +50,11 @@ import {
   handleCredentialRecoveryRequest,
 } from "./routes/credential-recovery";
 import { mutationOriginDecision } from "./lib/request-security";
+import {
+  isSensitiveAuthenticationPath,
+  setPrivateNoStore,
+  withPrivateNoStore,
+} from "./lib/response-privacy";
 import type { Env } from "./types";
 
 export { MailboxDO } from "./durableObject";
@@ -199,7 +204,10 @@ app.use("*", async (c, next) => {
       }),
     );
   }
-  return next();
+  await next();
+  if (!path.startsWith("/agents/")) {
+    setPrivateNoStore(c);
+  }
 });
 
 // ── Bulk send (mail merge) page, with API authorization per mailbox ──
@@ -296,6 +304,7 @@ async function fetchWithBranding(
 ): Promise<Response> {
   const res = await oauthProvider.fetch(request, env, ctx);
   const path = new URL(request.url).pathname;
+  if (isSensitiveAuthenticationPath(path)) return withPrivateNoStore(res);
   // Match both the bare docs and the RFC-9728 path-aware variant Claude actually
   // fetches (/.well-known/oauth-protected-resource/mcp).
   if (

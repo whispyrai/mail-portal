@@ -83,6 +83,7 @@ import {
 	requireMailbox,
 	type MailboxContext,
 } from "./lib/mailbox";
+import { privateNoStore } from "./lib/response-privacy";
 import {
 	isAddressInConfiguredMailDomains,
 	normalizeMailAddress,
@@ -159,6 +160,7 @@ app.use(
 		},
 	}),
 );
+app.use("/api/*", privateNoStore);
 app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 app.use("/api/v1/mailboxes/:mailboxId", requireMailbox);
 app.route("/", mailPeopleRoutes);
