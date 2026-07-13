@@ -6,7 +6,7 @@
 // callers (route handlers) translate failures into user-facing responses.
 
 import { drizzle } from "drizzle-orm/d1";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import * as schema from "../db/users-schema.ts";
 import type { UserRole, UserRow } from "../db/users-schema.ts";
 import type { Env } from "../types.ts";
@@ -142,25 +142,6 @@ export async function updateUserRecoveryEmail(
     .update(schema.users)
     .set({
       recovery_email: recoveryEmail.toLowerCase(),
-      updated_at: Date.now(),
-    })
-    .where(eq(schema.users.id, id))
-    .run();
-}
-
-export async function updateUserPassword(
-  env: Env,
-  id: string,
-  passwordHash: string,
-  passwordSalt: string,
-): Promise<void> {
-  await db(env)
-    .update(schema.users)
-    .set({
-      password_hash: passwordHash,
-      password_salt: passwordSalt,
-      session_version: sql`${schema.users.session_version} + 1`,
-      mcp_token_hash: null,
       updated_at: Date.now(),
     })
     .where(eq(schema.users.id, id))
