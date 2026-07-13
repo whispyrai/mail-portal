@@ -8,6 +8,7 @@ export default [
 	layout("routes/global.tsx", [
 		index("routes/global-index.tsx"),
 		route("today", "routes/global-today.tsx"),
+		route("meaning", "routes/global-meaning.tsx"),
 		route("mailboxes", "routes/home.tsx"),
 	]),
 	route("mailbox/:mailboxId", "routes/mailbox.tsx", [

@@ -12,13 +12,14 @@ export type MailPaletteCommand = {
 	action:
 			| { kind: "mail"; command: MailCommand }
 			| { kind: "folder"; folderId: string }
-			| { kind: "destination"; to: "/today" | "/mailboxes" };
+			| { kind: "destination"; to: "/today" | "/meaning" | "/mailboxes" };
 };
 
 export function buildMailPaletteCommands(context: {
 	hasMailboxContext?: boolean;
 	folderId?: string;
 	hasSelectedMessage: boolean;
+	semanticSearchEnabled?: boolean;
 }): MailPaletteCommand[] {
 	const commands: MailPaletteCommand[] = [
 		{
@@ -29,15 +30,25 @@ export function buildMailPaletteCommands(context: {
 			keywords: ["global", "overview", "follow ups", "unread"],
 			action: { kind: "destination", to: "/today" },
 		},
-		{
+	];
+	if (context.semanticSearchEnabled) {
+		commands.push({
+			id: "global-meaning",
+			title: "Meaning",
+			description: "Find evidence across Mailboxes by what it means",
+			group: "Navigate",
+			keywords: ["semantic", "idea", "evidence", "concept", "across mailboxes"],
+			action: { kind: "destination", to: "/meaning" },
+		});
+	}
+	commands.push({
 			id: "mailboxes",
 			title: "Mailboxes",
 			description: "Choose a Personal or Shared Mailbox",
 			group: "Navigate",
 			keywords: ["accounts", "shared", "personal"],
 			action: { kind: "destination", to: "/mailboxes" },
-		},
-	];
+		});
 	if (context.hasMailboxContext === false) return commands;
 	commands.push(
 		{

@@ -170,8 +170,8 @@ const api = {
 		get<{ domains: string[]; emailAddresses: string[]; vapidPublicKey: string | null }>(
 			"/api/v1/config",
 		),
-	getCurrentActor: () =>
-		get<{ email: string; role: string; mailbox: string }>("/api/v1/me"),
+	getCurrentActor: (opts?: { signal?: AbortSignal }) =>
+		get<{ email: string; role: string; mailbox: string }>("/api/v1/me", opts),
 
 	listLabels: (mailboxId: string) =>
 		get<{ labels: Label[] }>(`/api/v1/mailboxes/${mailboxId}/labels`),
@@ -199,7 +199,8 @@ const api = {
 		del<void>(`/api/v1/mailboxes/${mailboxId}/push-subscriptions/${id}`),
 
 	// Mailboxes
-	listMailboxes: () => get<Mailbox[]>("/api/v1/mailboxes"),
+	listMailboxes: (opts?: { signal?: AbortSignal }) =>
+		get<Mailbox[]>("/api/v1/mailboxes", opts),
 	createMailbox: (email: string, name: string, settings?: unknown) =>
 		post<Mailbox>("/api/v1/mailboxes", { email, name, settings }),
 	getMailbox: (mailboxId: string) =>

@@ -19,6 +19,7 @@ const FALLBACK = {
 	legacyFaviconType: "image/x-icon",
 	legacyFaviconSizes: "48x48 32x32 16x16",
 	quizEnabled: true,
+	semanticSearchEnabled: false,
 	themeColor: "#faf8f5",
 } as const;
 

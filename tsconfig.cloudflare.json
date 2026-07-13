@@ -11,7 +11,7 @@
   ],
   // *.test.ts are standalone node scripts (run via `node --experimental-strip-types`),
   // not part of the Workers build — they import node:* and use .ts import specifiers.
-  "exclude": ["workers/**/*.test.ts", "app/**/*.test.ts"],
+  "exclude": ["workers/**/*.test.ts", "app/**/*.test.ts", "shared/**/*.test.ts"],
   "compilerOptions": {
     "composite": true,
     "strict": true,

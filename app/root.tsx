@@ -26,7 +26,10 @@ import { ApiError } from "~/services/api";
 import { useBrand } from "~/hooks/useBrand";
 import { ServiceWorkerRegistrar } from "~/components/pwa/ServiceWorkerRegistrar";
 import { resolveBrand } from "../workers/routes/brand";
-import { isQuizEnabled } from "../workers/lib/features";
+import {
+	isQuizEnabled,
+	isSemanticSearchEnabled,
+} from "../workers/lib/features";
 import type { Route } from "./+types/root";
 import "./index.css";
 
@@ -48,6 +51,7 @@ export async function loader({ context }: Route.LoaderArgs) {
 		legacyFaviconType: b.legacyFaviconType,
 		legacyFaviconSizes: b.legacyFaviconSizes,
 		quizEnabled: isQuizEnabled(env.FEATURES, b.id),
+		semanticSearchEnabled: isSemanticSearchEnabled(env.FEATURES, b.id),
 		themeColor: b.themeColor,
 	};
 }

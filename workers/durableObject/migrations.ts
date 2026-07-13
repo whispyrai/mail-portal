@@ -1094,4 +1094,171 @@ export const mailboxMigrations: Migration[] = [
 			END;
 		`),
 	},
+	{
+		name: "27_add_semantic_message_projection",
+		sql: txn(`
+			CREATE TABLE semantic_message_versions (
+				message_id TEXT PRIMARY KEY,
+				version INTEGER NOT NULL CHECK(version > 0),
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+			INSERT INTO semantic_message_versions(message_id, version)
+			SELECT id, 1 FROM emails;
+
+			CREATE TABLE semantic_projection_state (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+				policy_version INTEGER NOT NULL CHECK(policy_version = 1),
+				chunk_version INTEGER NOT NULL CHECK(chunk_version = 1),
+				status TEXT NOT NULL CHECK(status IN ('building', 'ready', 'failed')),
+				baseline_change_sequence INTEGER NOT NULL CHECK(baseline_change_sequence >= 0),
+				applied_change_sequence INTEGER NOT NULL CHECK(applied_change_sequence >= 0),
+				backfill_date TEXT,
+				backfill_message_id TEXT,
+				processed_messages INTEGER NOT NULL DEFAULT 0 CHECK(processed_messages >= 0),
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				last_error_code TEXT
+			);
+
+			CREATE TABLE semantic_sources (
+				source_id TEXT PRIMARY KEY,
+				message_id TEXT NOT NULL UNIQUE,
+				source_fingerprint TEXT NOT NULL,
+				source_sequence INTEGER NOT NULL CHECK(source_sequence >= 0),
+				folder_id TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				UNIQUE(source_id, message_id),
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+
+			CREATE TABLE semantic_chunks (
+				vector_id TEXT PRIMARY KEY,
+				source_id TEXT NOT NULL,
+				message_id TEXT NOT NULL,
+				source_fingerprint TEXT NOT NULL,
+				ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 100),
+				content TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				UNIQUE(source_id, ordinal),
+				FOREIGN KEY(source_id, message_id)
+					REFERENCES semantic_sources(source_id, message_id) ON DELETE CASCADE,
+				FOREIGN KEY(message_id) REFERENCES emails(id) ON DELETE CASCADE
+			);
+
+			CREATE VIRTUAL TABLE semantic_chunks_fts USING fts5(
+				vector_id UNINDEXED,
+				content,
+				tokenize = 'unicode61 remove_diacritics 2'
+			);
+
+			CREATE TABLE semantic_index_jobs (
+				vector_id TEXT PRIMARY KEY,
+				operation TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
+				state TEXT NOT NULL CHECK(state IN ('pending', 'processing', 'submitted', 'failed')),
+				attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+				next_attempt_at INTEGER NOT NULL,
+				lease_token TEXT,
+				lease_expires_at INTEGER,
+				submitted_at INTEGER,
+				mutation_id TEXT,
+				last_error_code TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_semantic_jobs_due
+				ON semantic_index_jobs(state, next_attempt_at, vector_id);
+			CREATE INDEX idx_semantic_chunks_message
+				ON semantic_chunks(message_id, ordinal);
+
+			CREATE TRIGGER semantic_message_version_insert AFTER INSERT ON emails BEGIN
+				INSERT INTO semantic_message_versions(message_id, version) VALUES (NEW.id, 1);
+			END;
+			CREATE TRIGGER semantic_message_version_content_update
+			AFTER UPDATE OF subject, sender, recipient, cc, bcc, date, body ON emails
+			WHEN OLD.subject IS NOT NEW.subject
+			  OR OLD.sender IS NOT NEW.sender
+			  OR OLD.recipient IS NOT NEW.recipient
+			  OR OLD.cc IS NOT NEW.cc
+			  OR OLD.bcc IS NOT NEW.bcc
+			  OR OLD.date IS NOT NEW.date
+			  OR OLD.body IS NOT NEW.body
+			BEGIN
+				UPDATE semantic_message_versions SET version = version + 1
+				WHERE message_id = NEW.id;
+			END;
+
+			CREATE TRIGGER semantic_chunks_fts_insert AFTER INSERT ON semantic_chunks BEGIN
+				INSERT INTO semantic_chunks_fts(vector_id, content)
+				VALUES (NEW.vector_id, NEW.content);
+			END;
+			CREATE TRIGGER semantic_chunks_fts_delete BEFORE DELETE ON semantic_chunks BEGIN
+				DELETE FROM semantic_chunks_fts WHERE vector_id = OLD.vector_id;
+			END;
+			CREATE TRIGGER semantic_chunks_enqueue_upsert AFTER INSERT ON semantic_chunks BEGIN
+				INSERT INTO semantic_index_jobs(
+					vector_id, operation, state, attempt_count, next_attempt_at,
+					lease_token, lease_expires_at, submitted_at, mutation_id, last_error_code,
+					created_at, updated_at
+				) VALUES (
+					NEW.vector_id, 'upsert', 'pending', 0, 0,
+					NULL, NULL, NULL, NULL, NULL,
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				)
+				ON CONFLICT(vector_id) DO UPDATE SET
+					operation = 'upsert', state = 'pending', attempt_count = 0,
+					next_attempt_at = 0, lease_token = NULL, lease_expires_at = NULL,
+					submitted_at = NULL, mutation_id = NULL, last_error_code = NULL,
+					updated_at = excluded.updated_at;
+			END;
+			CREATE TRIGGER semantic_chunks_enqueue_delete BEFORE DELETE ON semantic_chunks BEGIN
+				INSERT INTO semantic_index_jobs(
+					vector_id, operation, state, attempt_count, next_attempt_at,
+					lease_token, lease_expires_at, submitted_at, mutation_id, last_error_code,
+					created_at, updated_at
+				) VALUES (
+					OLD.vector_id, 'delete', 'pending', 0, 0,
+					NULL, NULL, NULL, NULL, NULL,
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+					strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				)
+				ON CONFLICT(vector_id) DO UPDATE SET
+					operation = 'delete', state = 'pending', attempt_count = 0,
+					next_attempt_at = 0, lease_token = NULL, lease_expires_at = NULL,
+					submitted_at = NULL, mutation_id = NULL, last_error_code = NULL,
+					updated_at = excluded.updated_at;
+			END;
+
+			CREATE TRIGGER semantic_sources_invalidate_on_message_content_change
+			AFTER UPDATE OF subject, sender, recipient, cc, bcc, date, body ON emails
+			WHEN OLD.subject IS NOT NEW.subject
+			  OR OLD.sender IS NOT NEW.sender
+			  OR OLD.recipient IS NOT NEW.recipient
+			  OR OLD.cc IS NOT NEW.cc
+			  OR OLD.bcc IS NOT NEW.bcc
+			  OR OLD.date IS NOT NEW.date
+			  OR OLD.body IS NOT NEW.body
+			BEGIN
+				DELETE FROM semantic_sources WHERE message_id = NEW.id;
+			END;
+			CREATE TRIGGER semantic_sources_invalidate_on_excluded_folder
+			AFTER UPDATE OF folder_id ON emails
+			WHEN OLD.folder_id IS NOT NEW.folder_id
+			 AND NEW.folder_id IN ('draft', 'outbox', 'trash', 'spam', '_cancelled_outbound')
+			BEGIN
+				DELETE FROM semantic_sources WHERE message_id = NEW.id;
+			END;
+			CREATE TRIGGER semantic_sources_track_eligible_folder
+			AFTER UPDATE OF folder_id ON emails
+			WHEN OLD.folder_id IS NOT NEW.folder_id
+			 AND NEW.folder_id NOT IN ('draft', 'outbox', 'trash', 'spam', '_cancelled_outbound')
+			BEGIN
+				UPDATE semantic_sources SET folder_id = NEW.folder_id,
+					updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				WHERE message_id = NEW.id;
+			END;
+		`),
+	},
 ];

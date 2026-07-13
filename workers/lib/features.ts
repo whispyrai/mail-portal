@@ -3,8 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 //
 // Per-brand feature gating (WISER-239). One shared codebase serves multiple
-// brands; brand-specific modules are gated by the `FEATURES` env var. The only
-// gated module today is the Whispyr rep-quiz (`workers/quiz`), off for Wiser.
+// brands; brand-specific modules are gated by the `FEATURES` env var. Both the
+// Whispyr rep-quiz and semantic evidence search remain explicit capabilities.
 //
 // Resolution: an explicit `FEATURES` array (declared per env in wrangler.jsonc)
 // is the source of truth; when it is unset the brand's baseline applies, so a
@@ -13,7 +13,7 @@
 
 import type { Brand } from "../routes/brand";
 
-type Feature = "quiz";
+type Feature = "quiz" | "semantic_search";
 
 // The brand-specific modules a brand ships when `FEATURES` is unset. Whispyr
 // ships the rep-quiz; a neutral brand ships none.
@@ -35,10 +35,18 @@ function isFeatureEnabled(
 	return active.includes(feature);
 }
 
-/** Convenience for the one gated module — the rep-quiz surface. */
+/** Convenience for the rep-quiz surface. */
 export function isQuizEnabled(
 	features: readonly string[] | undefined,
 	brand: Brand,
 ): boolean {
 	return isFeatureEnabled(features, brand, "quiz");
+}
+
+/** Semantic evidence search is opt-in for every brand until its index exists. */
+export function isSemanticSearchEnabled(
+	features: readonly string[] | undefined,
+	brand: Brand,
+): boolean {
+	return isFeatureEnabled(features, brand, "semantic_search");
 }

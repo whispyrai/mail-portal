@@ -13,10 +13,16 @@ import {
 	exitRevokedMailbox,
 	invalidateMailboxChangeQueries,
 	mailboxChangeCursorStorageKey,
+	reconcileMailboxChangeFeedOnce,
 	resolveMailboxChangeFeedStorage,
+	resetMailboxChangeFeedBaseline,
 	type MailboxChangeFeedRuntime,
 	type MailboxChangeFeedStorage,
 } from "./mailbox-change-feed.ts";
+import {
+	readSemanticSearchSession,
+	writeSemanticSearchSession,
+} from "../lib/semantic-search-session.ts";
 
 function createRuntime(input: {
 	online?: boolean;
@@ -224,6 +230,45 @@ test("message and folder changes refresh Files metadata while attachment changes
 	}
 });
 
+test("content-bearing changes clear represented semantic evidence before query invalidation", async () => {
+	const mailboxId = "team@example.com";
+	for (const resource of ["message", "attachment", "folder"] as const) {
+		writeSemanticSearchSession({
+			actorEmail: "operator@example.com",
+			createdAt: "2026-07-13T10:00:00.000Z",
+			draftQuery: "renewal risk",
+			submittedQuery: "renewal risk",
+			response: {
+				state: "complete",
+				accessChanged: false,
+				results: [],
+				mailboxes: [{ mailboxId, mailboxAddress: mailboxId, state: "complete" }],
+			},
+			expandedResultIds: [],
+			scrollTop: 0,
+		});
+		await invalidateMailboxChangeQueries(new QueryClient(), mailboxId, [change(resource)]);
+		assert.equal(readSemanticSearchSession(), null, resource);
+	}
+
+	writeSemanticSearchSession({
+		actorEmail: "operator@example.com",
+		createdAt: "2026-07-13T10:00:00.000Z",
+		draftQuery: "renewal risk",
+		submittedQuery: "renewal risk",
+		response: {
+			state: "complete",
+			accessChanged: false,
+			results: [],
+			mailboxes: [{ mailboxId, mailboxAddress: mailboxId, state: "complete" }],
+		},
+		expandedResultIds: [],
+		scrollTop: 0,
+	});
+	await invalidateMailboxChangeQueries(new QueryClient(), mailboxId, [change("label")]);
+	assert.ok(readSemanticSearchSession());
+});
+
 test("attachment changes refresh People evidence without refetching the People list", async () => {
 	const mailboxId = "team@example.com";
 	const queryClient = new QueryClient();
@@ -306,6 +351,132 @@ test("the feed resumes from and stores one versioned mailbox cursor without mail
 		"version",
 		"cursor",
 	]);
+});
+
+test("a fresh semantic result resets stale feed cursors to an authorized current baseline", async () => {
+	const mailboxId = "team@example.com";
+	const key = mailboxChangeCursorStorageKey(mailboxId);
+	const memory = memoryStorage({
+		[key]: JSON.stringify({ version: 1, cursor: encodeMailboxChangeCursor(2) }),
+	});
+	const currentCursor = encodeMailboxChangeCursor(90);
+	const requests: Array<string | null> = [];
+	const baseline = await resetMailboxChangeFeedBaseline({
+		mailboxId,
+		storage: memory.storage,
+		request: async (_mailboxId, cursor) => {
+			requests.push(cursor);
+			return { changes: [], nextCursor: currentCursor };
+		},
+	});
+	assert.deepEqual(requests, [null]);
+	assert.equal(baseline, currentCursor);
+	assert.equal(memory.values.get(key), JSON.stringify({ version: 1, cursor: currentCursor }));
+});
+
+test("semantic reconciliation uses its captured cursor even if another feed advances storage", async () => {
+	const mailboxId = "team@example.com";
+	const key = mailboxChangeCursorStorageKey(mailboxId);
+	const baseline = encodeMailboxChangeCursor(90);
+	const memory = memoryStorage({
+		[key]: JSON.stringify({ version: 1, cursor: encodeMailboxChangeCursor(99) }),
+	});
+	let requestedCursor: string | null = null;
+	const changes = await reconcileMailboxChangeFeedOnce({
+		mailboxId,
+		queryClient: new QueryClient(),
+		storage: memory.storage,
+		cursor: baseline,
+		request: async (_mailboxId, cursor) => {
+			requestedCursor = cursor;
+			return {
+				changes: [change("message")],
+				nextCursor: encodeMailboxChangeCursor(100),
+			};
+		},
+	});
+	assert.equal(requestedCursor, baseline);
+	assert.equal(changes[0]?.resource, "message");
+});
+
+test("a superseded semantic reconciliation cannot clear evidence, invalidate mail, or move its cursor", async () => {
+	const mailboxId = "team@example.com";
+	const key = mailboxChangeCursorStorageKey(mailboxId);
+	const originalCursor = encodeMailboxChangeCursor(90);
+	const memory = memoryStorage({
+		[key]: JSON.stringify({ version: 1, cursor: originalCursor }),
+	});
+	const queryClient = new QueryClient();
+	const emailKey = ["emails", mailboxId, { folder: "inbox" }] as const;
+	queryClient.setQueryData(emailKey, { ready: true });
+	writeSemanticSearchSession({
+		actorEmail: "operator@example.com",
+		createdAt: "2026-07-13T10:00:00.000Z",
+		draftQuery: "renewal risk",
+		submittedQuery: "renewal risk",
+		response: {
+			state: "complete",
+			accessChanged: false,
+			results: [],
+			mailboxes: [{ mailboxId, mailboxAddress: mailboxId, state: "complete" }],
+		},
+		expandedResultIds: [],
+		scrollTop: 0,
+	});
+	const controller = new AbortController();
+	let receivedSignal: AbortSignal | undefined;
+	const changes = await reconcileMailboxChangeFeedOnce({
+		mailboxId,
+		queryClient,
+		storage: memory.storage,
+		signal: controller.signal,
+		isCurrent: () => false,
+		request: async (_mailboxId, _cursor, options) => {
+			receivedSignal = options?.signal;
+			return {
+				changes: [change("message")],
+				nextCursor: encodeMailboxChangeCursor(91),
+			};
+		},
+	});
+
+	assert.equal(receivedSignal, controller.signal);
+	assert.deepEqual(changes, []);
+	assert.ok(readSemanticSearchSession());
+	assert.equal(queryClient.getQueryState(emailKey)?.isInvalidated, false);
+	assert.equal(
+		memory.values.get(key),
+		JSON.stringify({ version: 1, cursor: originalCursor }),
+	);
+});
+
+test("a superseded semantic baseline forwards cancellation and cannot move its cursor", async () => {
+	const mailboxId = "team@example.com";
+	const key = mailboxChangeCursorStorageKey(mailboxId);
+	const originalCursor = encodeMailboxChangeCursor(2);
+	const nextCursor = encodeMailboxChangeCursor(90);
+	const memory = memoryStorage({
+		[key]: JSON.stringify({ version: 1, cursor: originalCursor }),
+	});
+	const controller = new AbortController();
+	let receivedSignal: AbortSignal | undefined;
+	const baseline = await resetMailboxChangeFeedBaseline({
+		mailboxId,
+		storage: memory.storage,
+		signal: controller.signal,
+		isCurrent: () => false,
+		request: async (_mailboxId, _cursor, options) => {
+			receivedSignal = options?.signal;
+			return { changes: [], nextCursor };
+		},
+	});
+
+	assert.equal(receivedSignal, controller.signal);
+	assert.equal(baseline, nextCursor);
+	assert.equal(
+		memory.values.get(key),
+		JSON.stringify({ version: 1, cursor: originalCursor }),
+	);
 });
 
 test("one owner polls every five seconds when visible, thirty when hidden, and wakes immediately on browser signals", async () => {

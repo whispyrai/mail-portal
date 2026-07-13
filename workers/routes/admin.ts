@@ -45,6 +45,7 @@ import {
   recoveryAddressFor,
 } from "../lib/recovery-directory.ts";
 import { accountLifecycle } from "../lib/account-lifecycle-runtime.ts";
+import { isSemanticSearchEnabled } from "../lib/features.ts";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
@@ -243,6 +244,47 @@ adminApp.get("/users", async (c) => {
   </div>`,
     ),
   );
+});
+
+adminApp.post("/mailboxes/:mailboxId/semantic-rebuild", async (c) => {
+  const brand = resolveBrand(c.env.BRAND);
+  if (
+    !isSemanticSearchEnabled(c.env.FEATURES, brand.id) ||
+    !c.env.SEMANTIC_INDEX
+  ) {
+    return c.redirect(
+      `/admin/mailboxes?err=${encodeURIComponent("Meaning search is not enabled in this environment.")}`,
+      302,
+    );
+  }
+  const mailboxId = normalizeMailAddress(c.req.param("mailboxId"));
+  const managed = await mailboxAccess(c.env).listManagedMailboxes(
+    c.get("session")!.sub,
+  );
+  if (
+    !mailboxId ||
+    !managed.some(
+      (mailbox) => mailbox.address === mailboxId && mailbox.is_active === 1,
+    )
+  ) {
+    return c.redirect(
+      `/admin/mailboxes?err=${encodeURIComponent("Active Mailbox not found.")}`,
+      302,
+    );
+  }
+  try {
+    const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+    await stub.rebuildSemanticIndex(mailboxId);
+    return c.redirect(
+      `/admin/mailboxes?ok=${encodeURIComponent("Meaning index rebuild scheduled.")}`,
+      302,
+    );
+  } catch {
+    return c.redirect(
+      `/admin/mailboxes?err=${encodeURIComponent("Meaning index rebuild could not be scheduled.")}`,
+      302,
+    );
+  }
 });
 
 adminApp.post("/users", async (c) => {

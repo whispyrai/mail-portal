@@ -1,6 +1,7 @@
 import { Button, Tooltip } from "@cloudflare/kumo";
 import {
 	CalendarCheckIcon,
+	BinocularsIcon,
 	CommandIcon,
 	EnvelopeSimpleIcon,
 	SignOutIcon,
@@ -10,10 +11,15 @@ import { NavLink, Outlet } from "react-router";
 import { useBrand } from "~/hooks/useBrand";
 import MailCommandPalette, { MAIL_COMMAND_PALETTE_OPEN_EVENT } from "~/components/MailCommandPalette";
 
-const destinations = [
+const coreDestinations = [
 	{ to: "/today", label: "Today", icon: CalendarCheckIcon },
-	{ to: "/mailboxes", label: "Mailboxes", icon: EnvelopeSimpleIcon },
 ] as const;
+
+const mailboxDestination = {
+	to: "/mailboxes",
+	label: "Mailboxes",
+	icon: EnvelopeSimpleIcon,
+} as const;
 
 function signOut() {
 	const form = document.createElement("form");
@@ -24,6 +30,14 @@ function signOut() {
 }
 
 function DestinationLinks({ mobile = false }: { mobile?: boolean }) {
+	const { semanticSearchEnabled } = useBrand();
+	const destinations = [
+		...coreDestinations,
+		...(semanticSearchEnabled
+			? [{ to: "/meaning" as const, label: "Meaning", icon: BinocularsIcon }]
+			: []),
+		mailboxDestination,
+	];
 	return destinations.map(({ to, label, icon: Icon }) => (
 		<NavLink
 			key={to}

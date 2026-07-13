@@ -179,6 +179,15 @@ import {
 	readAutomationDryRunContexts,
 	readAutomationPlanningContext,
 } from "../lib/automation-rules/mailbox-runtime.ts";
+import {
+	createSemanticIndex,
+	type SemanticIndexReadiness,
+} from "../lib/semantic-index.ts";
+import { advanceSemanticIndex } from "../lib/semantic-index-runtime.ts";
+import { createSemanticIndexProvider } from "../lib/semantic-provider.ts";
+import { semanticMailboxNamespace } from "../lib/semantic-search.ts";
+import { isSemanticSearchEnabled } from "../lib/features.ts";
+import { resolveBrand } from "../routes/brand.ts";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -201,6 +210,15 @@ const ALLOWED_SORT_COLUMNS = [
 	"read",
 	"starred",
 ] as const;
+
+const SEMANTIC_SCHEDULER_MAILBOX_KEY = "semantic:index:mailbox";
+const SEMANTIC_SCHEDULER_FAILURES_KEY = "semantic:index:failures";
+const SEMANTIC_SCHEDULER_MAX_FAILURES = 5;
+
+function semanticSchedulerErrorCode(error: unknown): string {
+	const name = error instanceof Error ? error.name : "unknown";
+	return `scheduler_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`.slice(0, 64);
+}
 
 type SortColumn = (typeof ALLOWED_SORT_COLUMNS)[number];
 
@@ -317,6 +335,7 @@ interface BulkJob {
 export class MailboxDO extends DurableObject<Env> {
 	declare __DURABLE_OBJECT_BRAND: never;
 	db: ReturnType<typeof drizzle>;
+	#semanticPreparation: Promise<SemanticIndexReadiness> | null = null;
 
 	constructor(state: DurableObjectState, env: Env) {
 		super(state, env);
@@ -975,6 +994,130 @@ export class MailboxDO extends DurableObject<Env> {
 	/** Mutation-free sequence check for aggregate Today AI freshness gates. */
 	async getGlobalTodayBriefSequence() {
 		return readMailboxCurrentSequence(this.ctx.storage.sql);
+	}
+
+	/** Advance the bounded local semantic projection and return truthful readiness. */
+	async prepareSemanticIndex() {
+		if (!this.#semanticPreparation) {
+			this.#semanticPreparation = createSemanticIndex({ store: this.ctx.storage })
+				.prepare()
+				.finally(() => {
+					this.#semanticPreparation = null;
+				});
+		}
+		return this.#semanticPreparation;
+	}
+
+	async readSemanticIndexReadiness() {
+		return createSemanticIndex({ store: this.ctx.storage }).readiness();
+	}
+
+	/** Persist one autonomous semantic continuation lane for this Mailbox. */
+	async scheduleSemanticIndexAdvance(mailboxId: string) {
+		const normalized = normalizeMailAddress(mailboxId);
+		if (!normalized || normalized !== mailboxId) {
+			throw new Error("Semantic scheduler received an invalid Mailbox identity");
+		}
+		const existing = await this.ctx.storage.get<string>(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+		if (existing && existing !== normalized) {
+			throw new Error("Semantic scheduler Mailbox identity changed");
+		}
+		if (!existing) await this.ctx.storage.put(SEMANTIC_SCHEDULER_MAILBOX_KEY, normalized);
+		await this.#scheduleAlarmAt(Date.now() + 100);
+	}
+
+	/** Operator repair primitive. The next alarm rebuilds solely from current mail truth. */
+	async rebuildSemanticIndex(mailboxId: string) {
+		const normalized = normalizeMailAddress(mailboxId);
+		if (!normalized || normalized !== mailboxId) {
+			throw new Error("Semantic rebuild received an invalid Mailbox identity");
+		}
+		const existing = await this.ctx.storage.get<string>(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+		if (existing && existing !== normalized) {
+			throw new Error("Semantic rebuild Mailbox identity changed");
+		}
+		createSemanticIndex({ store: this.ctx.storage }).rebuild();
+		await this.ctx.storage.put(SEMANTIC_SCHEDULER_MAILBOX_KEY, normalized);
+		await this.ctx.storage.delete(SEMANTIC_SCHEDULER_FAILURES_KEY);
+		await this.#scheduleAlarmAt(Date.now() + 100);
+	}
+
+	/** Lease bounded opaque vector mutations. Content never persists outside this RPC. */
+	async leaseSemanticIndexJobs(
+		leaseToken: string,
+		nowMs: number,
+		leaseMs: number,
+		limit: number,
+	) {
+		return createSemanticIndex({ store: this.ctx.storage }).leaseJobs(
+			leaseToken,
+			nowMs,
+			leaseMs,
+			limit,
+		);
+	}
+
+	async submitSemanticIndexJobs(
+		jobs: Array<{ vectorId: string; leaseToken: string }>,
+		mutationId: string,
+		submittedAt: number,
+	) {
+		return createSemanticIndex({ store: this.ctx.storage }).submitJobs(
+			jobs,
+			mutationId,
+			submittedAt,
+		);
+	}
+
+	async retrySemanticIndexJobs(
+		jobs: Array<{
+			vectorId: string;
+			leaseToken: string;
+			nextAttemptAt: number;
+			errorCode: string;
+			failedAt: number;
+		}>,
+	) {
+		return createSemanticIndex({ store: this.ctx.storage }).retryJobs(jobs);
+	}
+
+	async deferSemanticIndexJobs(
+		jobs: Array<{
+			vectorId: string;
+			leaseToken: string;
+			nextAttemptAt: number;
+			reasonCode: string;
+			deferredAt: number;
+		}>,
+	) {
+		return createSemanticIndex({ store: this.ctx.storage }).deferJobs(jobs);
+	}
+
+	async listSubmittedSemanticIndexJobs(limit: number, observedAt: number) {
+		return createSemanticIndex({ store: this.ctx.storage }).dueSubmittedJobs(
+			observedAt,
+			limit,
+		);
+	}
+
+	async confirmSemanticIndexVisibility(
+		observations: Array<{ vectorId: string; visible: boolean }>,
+		observedAt: number,
+	) {
+		createSemanticIndex({ store: this.ctx.storage }).confirmVisibility(
+			observations,
+			observedAt,
+		);
+	}
+
+	async resolveSemanticCandidates(
+		candidates: ReadonlyArray<{ vectorId: string; score: number }>,
+	) {
+		const semanticIndex = createSemanticIndex({ store: this.ctx.storage });
+		return {
+			candidates: semanticIndex.resolveCandidates(candidates),
+			readiness: semanticIndex.readiness(),
+		};
 	}
 
 	/** Coordinate paid Today inference across every Worker isolate for this mailbox. */
@@ -3414,6 +3557,58 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 	}
 
+	async #processSemanticIndexAlarm(alarmNow: number): Promise<number | null> {
+		const mailboxId = await this.ctx.storage.get<string>(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+		if (!mailboxId) return null;
+		const brand = resolveBrand(this.env.BRAND);
+		if (
+			!isSemanticSearchEnabled(this.env.FEATURES, brand.id) ||
+			!this.env.SEMANTIC_INDEX
+		) {
+			await this.ctx.storage.delete(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+			await this.ctx.storage.delete(SEMANTIC_SCHEDULER_FAILURES_KEY);
+			return null;
+		}
+
+		try {
+			await advanceSemanticIndex({
+				mailbox: this,
+				provider: createSemanticIndexProvider(this.env, mailboxId),
+				namespace: await semanticMailboxNamespace(brand.id, mailboxId),
+				onObservationError: (error) => {
+					console.error("[semantic-index] visibility observation failed", {
+						errorCode: semanticSchedulerErrorCode(error),
+					});
+				},
+			});
+			await this.ctx.storage.delete(SEMANTIC_SCHEDULER_FAILURES_KEY);
+			const next = createSemanticIndex({ store: this.ctx.storage })
+				.nextAdvanceAt(Date.now());
+			if (next === null) {
+				await this.ctx.storage.delete(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+				return null;
+			}
+			return Math.max(Date.now() + 100, next);
+		} catch (error) {
+			const failures = (await this.ctx.storage.get<number>(
+				SEMANTIC_SCHEDULER_FAILURES_KEY,
+			) ?? 0) + 1;
+			console.error("[semantic-index] alarm turn failed", {
+				errorCode: semanticSchedulerErrorCode(error),
+				attempt: failures,
+			});
+			if (failures >= SEMANTIC_SCHEDULER_MAX_FAILURES) {
+				createSemanticIndex({ store: this.ctx.storage })
+					.failProjection("scheduler_exhausted");
+				await this.ctx.storage.delete(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+				await this.ctx.storage.delete(SEMANTIC_SCHEDULER_FAILURES_KEY);
+				return null;
+			}
+			await this.ctx.storage.put(SEMANTIC_SCHEDULER_FAILURES_KEY, failures);
+			return alarmNow + Math.min(30_000 * 2 ** (failures - 1), 15 * 60_000);
+		}
+	}
+
 	#nextAutomationAlarmAt(): number | null {
 		const row = [...this.ctx.storage.sql.exec<{ dueAt: string | null }>(
 			`SELECT MIN(due_at) AS dueAt FROM (
@@ -4332,6 +4527,8 @@ export class MailboxDO extends DurableObject<Env> {
 	/** Enqueue the next recipient of the head job, persist progress, reschedule. */
 	async alarm(): Promise<void> {
 		const alarmNow = Date.now();
+		const nextSemanticAt = await this.#processSemanticIndexAlarm(alarmNow);
+		if (nextSemanticAt !== null) await this.#scheduleAlarmAt(nextSemanticAt);
 		try {
 			const nextAutomationAt = this.#processAutomationRulesAlarm();
 			if (nextAutomationAt !== null) {

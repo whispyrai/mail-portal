@@ -10,6 +10,7 @@ import {
 } from "~/lib/command-palette";
 import { isMailShortcutProtectedTarget } from "~/lib/mail-keyboard";
 import { useUIStore } from "~/hooks/useUIStore";
+import { useBrand } from "~/hooks/useBrand";
 import { MAIL_COMMAND_EVENT } from "./MailKeyboardController";
 
 export const MAIL_COMMAND_PALETTE_OPEN_EVENT = "mail-portal:open-command-palette";
@@ -18,6 +19,7 @@ export default function MailCommandPalette() {
 	const { mailboxId, folder } = useParams<{ mailboxId: string; folder: string }>();
 	const navigate = useNavigate();
 	const selectedEmailId = useUIStore((state) => state.selectedEmailId);
+	const { semanticSearchEnabled } = useBrand();
 	const [open, setOpen] = useState(false);
 	const [query, setQuery] = useState("");
 	const [activeIndex, setActiveIndex] = useState(0);
@@ -28,8 +30,9 @@ export default function MailCommandPalette() {
 			hasMailboxContext: Boolean(mailboxId),
 			folderId: folder,
 			hasSelectedMessage: Boolean(selectedEmailId),
+			semanticSearchEnabled,
 		}),
-		[folder, selectedEmailId],
+		[folder, mailboxId, selectedEmailId, semanticSearchEnabled],
 	);
 	const filteredCommands = useMemo(
 		() => filterMailPaletteCommands(commands, query),

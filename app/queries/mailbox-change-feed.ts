@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
 import { useUIStore } from "../hooks/useUIStore.ts";
@@ -8,6 +8,11 @@ import {
 	type MailboxChangePage,
 } from "../../shared/mailbox-change-feed.ts";
 import api, { ApiError } from "../services/api.ts";
+import {
+	clearSemanticSearchSession,
+	clearSemanticSearchSessionForMailbox,
+	clearSemanticSearchSessionForMailboxChanges,
+} from "../lib/semantic-search-session.ts";
 
 export const MAILBOX_CHANGE_VISIBLE_POLL_MS = 5_000;
 export const MAILBOX_CHANGE_HIDDEN_POLL_MS = 30_000;
@@ -129,6 +134,7 @@ export function invalidateMailboxChangeQueries(
 	mailboxId: string,
 	changes: readonly MailboxChange[],
 ): Promise<void> {
+	clearSemanticSearchSessionForMailboxChanges(mailboxId, changes);
 	const roots = new Set<InvalidatedQueryRoot>();
 	let messagePeopleChanged = false;
 	let attachmentPeopleChanged = false;
@@ -189,6 +195,7 @@ export function evictRevokedMailbox(
 	mailboxId: string,
 	options: { preserveGlobalToday?: boolean } = {},
 ): void {
+	clearSemanticSearchSessionForMailbox(mailboxId);
 	queryClient.removeQueries({
 		predicate: (query) => query.queryKey[1] === mailboxId,
 	});
@@ -223,6 +230,7 @@ export function createMailboxChangeFeedController(input: {
 	runtime: MailboxChangeFeedRuntime;
 	request?: MailboxChangeFeedRequest;
 	onAccessLost?: (mailboxId: string) => void;
+	onSessionLost?: () => void;
 }) {
 	const request = input.request ?? api.listMailboxChanges;
 	let started = false;
@@ -274,7 +282,12 @@ export function createMailboxChangeFeedController(input: {
 			writeCursor(input.storage, input.mailboxId, cursor);
 			consecutiveFailures = 0;
 		} catch (error) {
-			if (error instanceof ApiError && error.status === 403) {
+			if (error instanceof ApiError && error.status === 401) {
+				active = false;
+				clearTimer();
+				detachListeners();
+				input.onSessionLost?.();
+			} else if (error instanceof ApiError && error.status === 403) {
 				active = false;
 				clearTimer();
 				detachListeners();
@@ -341,6 +354,46 @@ export function createMailboxChangeFeedController(input: {
 	};
 }
 
+export async function reconcileMailboxChangeFeedOnce(input: {
+	mailboxId: string;
+	queryClient: QueryClient;
+	storage: MailboxChangeFeedStorage;
+	request?: MailboxChangeFeedRequest;
+	cursor?: string;
+	signal?: AbortSignal;
+	isCurrent?: () => boolean;
+}): Promise<readonly MailboxChange[]> {
+	const cursor = input.cursor ?? readCursor(input.storage, input.mailboxId);
+	const page = await (input.request ?? api.listMailboxChanges)(
+		input.mailboxId,
+		cursor,
+		{ signal: input.signal },
+	);
+	if (input.signal?.aborted || input.isCurrent?.() === false) return [];
+	await invalidateMailboxChangeQueries(input.queryClient, input.mailboxId, page.changes);
+	if (input.signal?.aborted || input.isCurrent?.() === false) return page.changes;
+	writeCursor(input.storage, input.mailboxId, page.nextCursor);
+	return page.changes;
+}
+
+export async function resetMailboxChangeFeedBaseline(input: {
+	mailboxId: string;
+	storage: MailboxChangeFeedStorage;
+	request?: MailboxChangeFeedRequest;
+	signal?: AbortSignal;
+	isCurrent?: () => boolean;
+}): Promise<string> {
+	const page = await (input.request ?? api.listMailboxChanges)(
+		input.mailboxId,
+		null,
+		{ signal: input.signal },
+	);
+	if (input.signal?.aborted || input.isCurrent?.() === false)
+		return page.nextCursor;
+	writeCursor(input.storage, input.mailboxId, page.nextCursor);
+	return page.nextCursor;
+}
+
 function browserRuntime(): MailboxChangeFeedRuntime {
 	return {
 		isOnline: () => navigator.onLine,
@@ -365,8 +418,43 @@ export function useMailboxChangeFeed(mailboxId: string | undefined): void {
 			storage: resolveMailboxChangeFeedStorage(() => window.localStorage),
 			runtime: browserRuntime(),
 			onAccessLost: () => navigate("/", { replace: true }),
+			onSessionLost: () => {
+				clearSemanticSearchSession();
+				queryClient.clear();
+				const ui = useUIStore.getState();
+				ui.closeCompose(false);
+				ui.closePanel();
+				window.location.replace("/login");
+			},
 		});
 		controller.start();
 		return () => controller.stop();
 	}, [mailboxId, navigate, queryClient]);
+}
+
+export function useMailboxChangeFeeds(
+	mailboxIds: readonly string[],
+	onSessionLost: () => void,
+): void {
+	const queryClient = useQueryClient();
+	const idsKey = JSON.stringify([...new Set(mailboxIds)].sort());
+	const onSessionLostRef = useRef(onSessionLost);
+	onSessionLostRef.current = onSessionLost;
+	useEffect(() => {
+		const ids = JSON.parse(idsKey) as string[];
+		if (ids.length === 0) return;
+		const storage = resolveMailboxChangeFeedStorage(() => window.localStorage);
+		const runtime = browserRuntime();
+		const controllers = ids.map((mailboxId) => createMailboxChangeFeedController({
+			mailboxId,
+			queryClient,
+			storage,
+			runtime,
+			onSessionLost: () => onSessionLostRef.current(),
+		}));
+		for (const controller of controllers) controller.start();
+		return () => {
+			for (const controller of controllers) controller.stop();
+		};
+	}, [idsKey, queryClient]);
 }

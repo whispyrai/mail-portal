@@ -34,8 +34,24 @@ test("palette includes core commands and context-valid triage", () => {
 });
 
 test("global palette exposes destinations without Mailbox-only actions", () => {
-	const commands = buildMailPaletteCommands({ hasMailboxContext: false, hasSelectedMessage: false });
-	assert.deepEqual(commands.map((command) => command.id), ["global-today", "mailboxes"]);
+	const commands = buildMailPaletteCommands({
+		hasMailboxContext: false,
+		hasSelectedMessage: false,
+		semanticSearchEnabled: true,
+	});
+	assert.deepEqual(commands.map((command) => command.id), [
+		"global-today",
+		"global-meaning",
+		"mailboxes",
+	]);
+	assert.deepEqual(
+		buildMailPaletteCommands({
+			hasMailboxContext: false,
+			hasSelectedMessage: false,
+			semanticSearchEnabled: false,
+		}).map((command) => command.id),
+		["global-today", "mailboxes"],
+	);
 });
 
 test("search ranks title matches and finds descriptions and aliases", () => {

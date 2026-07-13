@@ -5,6 +5,9 @@
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 
 export interface Env extends Cloudflare.Env {
+  // Provisioned per brand before semantic_search is enabled. Optional keeps the
+  // dormant feature deployable while external Vectorize creation is pending.
+  SEMANTIC_INDEX?: VectorizeIndex;
   // AWS SES credentials for outbound mail (set via `wrangler secret put`).
   // AWS_REGION is a plain var in wrangler.jsonc and comes through Cloudflare.Env.
   AWS_ACCESS_KEY_ID: string;

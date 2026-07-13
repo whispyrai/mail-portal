@@ -28,3 +28,9 @@ test("palette uses the existing command bus and is mounted with an obvious heade
 	assert.match(header, />Commands</);
 	assert.match(mailbox, /<MailCommandPalette/);
 });
+
+test("palette forwards the server-resolved Meaning feature gate into command construction", () => {
+	assert.match(palette, /const \{ semanticSearchEnabled \} = useBrand\(\)/);
+	assert.match(palette, /buildMailPaletteCommands\(\{[\s\S]*semanticSearchEnabled/);
+	assert.match(palette, /\[folder, mailboxId, selectedEmailId, semanticSearchEnabled\]/);
+});

@@ -9,6 +9,10 @@ import {
 	purgeRemovedGlobalTodayMailboxes,
 	recoverGlobalTodayReminderError,
 } from "./global-today-recovery.ts";
+import {
+	readSemanticSearchSession,
+	writeSemanticSearchSession,
+} from "./semantic-search-session.ts";
 
 test("a real reminder 403 purges scoped caches, aggregate data, and selected UI state", () => {
 	const queryClient = new QueryClient();
@@ -49,6 +53,15 @@ test("a reminder 401 clears every cached Mailbox and routes to sign-in", () => {
 	queryClient.setQueryData(["emails", "team@example.com"], { secret: true });
 	queryClient.setQueryData(["global-today", "UTC"], { aggregate: true });
 	useUIStore.getState().selectEmail("message-1");
+	writeSemanticSearchSession({
+		actorEmail: "operator@example.com",
+		createdAt: "2026-07-13T10:00:00.000Z",
+		draftQuery: "private plan",
+		submittedQuery: "private plan",
+		response: { state: "complete", accessChanged: false, results: [], mailboxes: [] },
+		expandedResultIds: [],
+		scrollTop: 0,
+	});
 	const feedback = recoverGlobalTodayReminderError(
 		new FollowUpReminderApiError(401, "Unauthorized"),
 		"team@example.com",
@@ -56,6 +69,7 @@ test("a reminder 401 clears every cached Mailbox and routes to sign-in", () => {
 	);
 	assert.equal(queryClient.getQueryCache().getAll().length, 0);
 	assert.equal(useUIStore.getState().selectedEmailId, null);
+	assert.equal(readSemanticSearchSession(), null);
 	assert.equal(feedback.redirectTo, "/login");
 });
 

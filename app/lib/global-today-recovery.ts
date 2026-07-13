@@ -4,6 +4,7 @@ import { useUIStore } from "../hooks/useUIStore.ts";
 import { evictRevokedMailbox } from "../queries/mailbox-change-feed.ts";
 import { ApiError } from "../services/api.ts";
 import { FollowUpReminderApiError } from "../services/follow-up-reminders.ts";
+import { clearSemanticSearchSession } from "./semantic-search-session.ts";
 
 export type GlobalTodayFeedback = {
 	kind: "success" | "error";
@@ -73,6 +74,7 @@ export function isGlobalTodayAuthorizationError(error: unknown) {
 }
 
 export function purgeAllCachedMailState(queryClient: QueryClient) {
+	clearSemanticSearchSession();
 	queryClient.clear();
 	const ui = useUIStore.getState();
 	ui.closeCompose(false);
