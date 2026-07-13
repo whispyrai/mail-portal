@@ -163,6 +163,19 @@ body {
   font-family: var(--font-sans);
 }
 
+/* Kumo leaves dialog portals unlayered. Give the whole portal a stacking
+   context so its backdrop and surface stay above sticky app chrome. */
+body > [data-base-ui-portal]:has(> [role="dialog"]) {
+  position: relative;
+  z-index: 60;
+}
+
+/* Toast outcomes must remain visible while a dialog stays open. */
+body > [data-base-ui-portal]:has(> [role="region"][aria-label="Notifications"]) {
+  position: relative;
+  z-index: 70;
+}
+
 /* TipTap list styles */
 .ProseMirror ul {
   list-style-type: disc;

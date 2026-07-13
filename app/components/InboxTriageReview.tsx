@@ -433,7 +433,7 @@ export default function InboxTriageReview({
 		<Dialog.Root open={open} onOpenChange={changeOpen}>
 			<Dialog
 				size="lg"
-				className="flex max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-[700px] flex-col overflow-hidden p-0"
+				className="flex min-w-0 max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-[700px] flex-col overflow-hidden p-0 sm:min-w-[32rem]"
 			>
 				<header className="shrink-0 border-b border-kumo-line px-4 py-4 sm:px-5">
 					<div className="flex items-start gap-3">

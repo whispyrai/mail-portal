@@ -55,6 +55,7 @@ export default function RichTextEditor({
 	const onInlineImagesRef = useRef(onInlineImages);
 	onInlineImagesRef.current = onInlineImages;
 	const editorRef = useRef<Editor | null>(null);
+	const initialValueRef = useRef(value);
 	const imageInputRef = useRef<HTMLInputElement>(null);
 	const previewRegistryRef = useRef<InlineImagePreviewRegistry | null>(null);
 	if (!previewRegistryRef.current) {
@@ -139,9 +140,12 @@ export default function RichTextEditor({
 	}, [inlineImagePreviews, previewRegistry]);
 
 	useEffect(() => {
-		if (editor && !editor.isDestroyed && value !== editor.getHTML()) {
+		if (!editor || editor.isDestroyed) return;
+		const shouldRestoreEditorFocus = value !== initialValueRef.current;
+		if (value !== editor.getHTML()) {
 			editor.commands.setContent(value, { emitUpdate: false });
-			// Place cursor at the start of the document (above quoted text)
+			if (!shouldRestoreEditorFocus) return;
+			// External updates, such as AI drafting, should return focus above quoted text.
 			const rafId = requestAnimationFrame(() => {
 				if (!editor.isDestroyed) {
 					editor.commands.focus('start');

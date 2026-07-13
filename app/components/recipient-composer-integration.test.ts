@@ -16,6 +16,10 @@ const composeForm = readFileSync(
 	new URL("../hooks/useComposeForm.ts", import.meta.url),
 	"utf8",
 );
+const richTextEditor = readFileSync(
+	new URL("./RichTextEditor.tsx", import.meta.url),
+	"utf8",
+);
 
 test("compose mounts the accessible mailbox-scoped recipient combobox for To, Cc, and Bcc", () => {
 	assert.match(compose, /import RecipientCombobox from "\.\/RecipientCombobox"/);
@@ -33,6 +37,14 @@ test("compose mounts the accessible mailbox-scoped recipient combobox for To, Cc
 	assert.match(compose, /field="to"[\s\S]*?autoFocus[\s\S]*?required/);
 	assert.match(compose, /!showCcBcc/);
 	assert.equal((compose.match(/showCcBcc &&/g) ?? []).length >= 2, true);
+});
+
+test("initial editor normalization does not steal focus from the To field", () => {
+	assert.match(richTextEditor, /const initialValueRef = useRef\(value\)/);
+	assert.match(
+		richTextEditor,
+		/const shouldRestoreEditorFocus = value !== initialValueRef\.current;[\s\S]*?if \(!shouldRestoreEditorFocus\) return;[\s\S]*?editor\.commands\.focus\('start'\)/,
+	);
 });
 
 test("compose recipient behavior preserves free-form input and isolates mailbox sessions", () => {

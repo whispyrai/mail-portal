@@ -71,18 +71,36 @@ export default function EmailPanelDialogs({
 					if (!open) onCloseSource();
 				}}
 			>
-				<Dialog size="lg">
-					<Dialog.Title>
+				<Dialog
+					size="lg"
+					className="flex min-w-0 max-h-[calc(100dvh-1rem)] flex-col overflow-hidden sm:min-w-[32rem]"
+				>
+					<Dialog.Title className="min-w-0 shrink-0 break-words">
 						Email Source Headers
 						{sourceViewEmail && (
-							<span className="text-sm font-normal text-kumo-subtle ml-2">
+							<span className="block min-w-0 break-words text-sm font-normal text-kumo-subtle sm:ml-2 sm:inline">
 								{sourceViewEmail.subject}
 							</span>
 						)}
 					</Dialog.Title>
 					{sourceViewEmail && (
-						<div className="mt-4 max-h-[60vh] overflow-y-auto">
-							<table className="w-full text-sm border-collapse">
+						<div className="mt-4 min-h-0 flex-1 overflow-y-auto">
+							<dl className="space-y-2 sm:hidden">
+								{sourceHeaders.map((header, idx) => (
+									<div
+										key={`${header.key}-${idx}`}
+										className="min-w-0 rounded-lg bg-kumo-tint/50 px-3 py-2.5"
+									>
+										<dt className="break-all font-mono text-xs font-semibold text-kumo-default">
+											{header.key}
+										</dt>
+										<dd className="mt-1 break-all font-mono text-sm text-kumo-subtle">
+											{header.value}
+										</dd>
+									</div>
+								))}
+							</dl>
+							<table className="hidden w-full border-collapse text-sm sm:table">
 								<tbody>
 									{sourceHeaders.map((header, idx) => (
 										<tr
@@ -106,12 +124,14 @@ export default function EmailPanelDialogs({
 							)}
 						</div>
 					)}
-					<div className="flex justify-end mt-4">
-						<Dialog.Close>
-							<Button variant="secondary" size="sm">
-								Close
-							</Button>
-						</Dialog.Close>
+					<div className="mt-4 flex shrink-0 justify-end">
+						<Dialog.Close
+							render={(props) => (
+								<Button {...props} variant="secondary" size="sm">
+									Close
+								</Button>
+							)}
+						/>
 					</div>
 				</Dialog>
 			</Dialog.Root>
@@ -122,18 +142,25 @@ export default function EmailPanelDialogs({
 					if (!open) onClosePreview();
 				}}
 			>
-				<Dialog size="lg">
-					<Dialog.Title>{previewImage?.filename}</Dialog.Title>
+				<Dialog
+					size="lg"
+					className="flex min-w-0 h-[min(744px,calc(100dvh-1rem))] max-h-[calc(100dvh-1rem)] flex-col overflow-hidden sm:min-w-[32rem]"
+				>
+					<Dialog.Title className="min-w-0 shrink-0 break-all">
+						{previewImage?.filename}
+					</Dialog.Title>
 					{previewImage && (
-						<div className="mt-4 flex flex-col items-center justify-center bg-kumo-tint/30 rounded-lg p-4 min-h-[200px]">
-							<img
-								src={previewImage.url}
-								alt={previewImage.filename}
-								className="max-w-full max-h-[70vh] object-contain rounded shadow-sm"
-							/>
+						<div className="mt-4 flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg bg-kumo-tint/30 p-4">
+							<div className="relative h-full min-h-0 w-full">
+								<img
+									src={previewImage.url}
+									alt={previewImage.filename}
+									className="absolute inset-0 h-full w-full rounded object-contain shadow-sm"
+								/>
+							</div>
 						</div>
 					)}
-					<div className="flex justify-between items-center mt-4">
+					<div className="mt-4 flex shrink-0 items-center justify-between gap-2">
 						<Button
 							variant="secondary"
 							size="sm"
@@ -145,11 +172,13 @@ export default function EmailPanelDialogs({
 						>
 							Download Original
 						</Button>
-						<Dialog.Close>
-							<Button variant="primary" size="sm">
-								Close
-							</Button>
-						</Dialog.Close>
+						<Dialog.Close
+							render={(props) => (
+								<Button {...props} variant="primary" size="sm">
+									Close
+								</Button>
+							)}
+						/>
 					</div>
 				</Dialog>
 			</Dialog.Root>

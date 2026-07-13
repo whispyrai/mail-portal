@@ -34,3 +34,9 @@ test("palette forwards the server-resolved Meaning feature gate into command con
 	assert.match(palette, /buildMailPaletteCommands\(\{[\s\S]*semanticSearchEnabled/);
 	assert.match(palette, /\[folder, mailboxId, selectedEmailId, semanticSearchEnabled\]/);
 });
+
+test("palette leaves coarse-pointer search opt-in and provides initial close focus", () => {
+	assert.doesNotMatch(palette, /\bautoFocus\b/);
+	assert.match(palette, /matchMedia\("\(pointer: coarse\)"\)/);
+	assert.match(palette, /aria-label="Close command palette"/);
+});

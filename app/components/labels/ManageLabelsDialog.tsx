@@ -74,7 +74,7 @@ export default function ManageLabelsDialog({ mailboxId, open, onOpenChange }: { 
 	};
 	return (
 		<Dialog.Root open={open} onOpenChange={onOpenChange}>
-			<Dialog size="lg" className="max-h-[85vh] overflow-y-auto p-6">
+			<Dialog size="lg" className="min-w-0 max-h-[85vh] overflow-y-auto p-6 sm:min-w-[32rem]">
 				<Dialog.Title className="text-lg font-semibold">Manage mailbox labels</Dialog.Title>
 				<p className="mt-1 text-sm text-kumo-subtle">Labels are shared by everyone with access to this mailbox. Deleting a label never deletes mail.</p>
 				<form onSubmit={create} className="mt-5 grid gap-3 rounded-xl bg-kumo-tint p-4 sm:grid-cols-[1fr_9rem_auto] sm:items-end">
@@ -84,10 +84,19 @@ export default function ManageLabelsDialog({ mailboxId, open, onOpenChange }: { 
 							{COLORS.map((value) => <option key={value} value={value}>{humanizeColor(value)}</option>)}
 						</select>
 					</label>
-					<Button className="min-h-11" type="submit" disabled={!name.trim() || createLabel.isPending}>Create</Button>
+					<Button className="min-h-11 w-full sm:w-auto" type="submit" disabled={!name.trim() || createLabel.isPending}>Create</Button>
 				</form>
 				<div className="mt-5 space-y-2">
 					{labels.length === 0 ? <div className="rounded-lg border border-dashed border-kumo-line p-8 text-center"><p className="text-sm text-kumo-subtle">No labels yet.</p><div className="mt-3"><LabelChip label={{ id: "preview", name: "Your first label", color }} /></div></div> : labels.map((label) => <LabelEditor key={`${label.id}:${label.updatedAt ?? ""}`} mailboxId={mailboxId} label={label} />)}
+				</div>
+				<div className="sticky bottom-0 -mx-6 -mb-6 mt-5 flex justify-end border-t border-kumo-line bg-kumo-base px-6 py-4">
+					<Dialog.Close
+						render={(props) => (
+							<Button {...props} variant="secondary" className="w-full sm:w-auto">
+								Done
+							</Button>
+						)}
+					/>
 				</div>
 			</Dialog>
 		</Dialog.Root>

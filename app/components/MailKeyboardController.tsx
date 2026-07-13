@@ -1,5 +1,5 @@
 import { Button, Dialog } from "@cloudflare/kumo";
-import { KeyboardIcon } from "@phosphor-icons/react";
+import { KeyboardIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import {
@@ -175,19 +175,32 @@ export default function MailKeyboardController() {
 
 	return (
 		<Dialog.Root open={showShortcuts} onOpenChange={setShowShortcuts}>
-			<Dialog size="lg" className="max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] overflow-y-auto p-0 sm:w-auto">
-				<div className="flex items-center gap-3 border-b border-kumo-line px-4 py-4 sm:px-6 sm:py-5">
-					<div className="rounded-lg bg-kumo-fill p-2 text-kumo-strong">
-						<KeyboardIcon size={22} />
+			<Dialog size="lg" className="min-w-0 max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] overflow-y-auto p-0 sm:min-w-[32rem] sm:w-auto">
+				<div className="flex items-center justify-between gap-3 border-b border-kumo-line px-4 py-4 sm:px-6 sm:py-5">
+					<div className="flex min-w-0 items-center gap-3">
+						<div className="shrink-0 rounded-lg bg-kumo-fill p-2 text-kumo-strong">
+							<KeyboardIcon size={22} />
+						</div>
+						<div className="min-w-0">
+							<Dialog.Title className="text-base font-semibold text-kumo-default">
+								Keyboard shortcuts
+							</Dialog.Title>
+							<p className="mt-0.5 text-sm text-kumo-subtle">
+								Move through mail without leaving the keyboard.
+							</p>
+						</div>
 					</div>
-					<div>
-						<Dialog.Title className="text-base font-semibold text-kumo-default">
-							Keyboard shortcuts
-						</Dialog.Title>
-						<p className="mt-0.5 text-sm text-kumo-subtle">
-							Move through mail without leaving the keyboard.
-						</p>
-					</div>
+					<Dialog.Close
+						render={(props) => (
+							<Button
+								{...props}
+								variant="ghost"
+								shape="square"
+								icon={<XIcon size={18} />}
+								aria-label="Close keyboard shortcuts"
+							/>
+						)}
+					/>
 				</div>
 				<div className="grid gap-6 px-4 py-5 sm:grid-cols-3 sm:px-6">
 					{SHORTCUT_GROUPS.map((group) => (

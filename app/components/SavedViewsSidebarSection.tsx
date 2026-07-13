@@ -128,7 +128,7 @@ export default function SavedViewsSidebarSection({
       >
         <Dialog
           size="lg"
-          className="max-h-[min(720px,calc(100dvh-1rem))] overflow-y-auto p-5 sm:p-6"
+          className="min-w-0 max-h-[min(720px,calc(100dvh-1rem))] overflow-y-auto p-5 sm:min-w-[32rem] sm:p-6"
         >
           <Dialog.Title className="text-base font-semibold text-kumo-default">
             Manage saved views

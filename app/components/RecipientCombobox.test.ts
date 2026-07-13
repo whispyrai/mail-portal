@@ -32,5 +32,9 @@ test("recipient combobox handles keyboard, mouse, async, and clearing states", (
 	assert.match(source, /No matching recipients/);
 	assert.match(source, /setAnnouncement/);
 	assert.match(source, /mailboxId, field/);
+	assert.match(
+		source,
+		/segment\.token\.length > 0 \|\| suggestions\.length > 0/,
+	);
 	assert.doesNotMatch(source, /displayName|fullName|contactName/);
 });

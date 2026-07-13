@@ -78,7 +78,11 @@ export default function RecipientCombobox({
 		[query.data, recipients, mailboxId],
 	);
 	const ready = focused && query.ready && query.debouncedToken === segment.token;
-	const expanded = ready && !disabled && !dismissed;
+	const expanded =
+		ready &&
+		!disabled &&
+		!dismissed &&
+		(segment.token.length > 0 || suggestions.length > 0);
 	const activeSuggestion = activeIndex >= 0 ? suggestions[activeIndex] : undefined;
 
 	useEffect(() => {

@@ -308,7 +308,7 @@ export default function ComposeEmail() {
       >
         <Dialog
           size="lg"
-          className="flex max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] flex-col overflow-hidden p-0 sm:w-[min(820px,94vw)]"
+          className="flex min-w-0 max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] flex-col overflow-hidden p-0 sm:min-w-[32rem] sm:w-[min(820px,94vw)]"
         >
           {/* Header */}
           <div className="flex items-center justify-between border-b border-kumo-line px-4 py-3 sm:px-6 sm:py-4 shrink-0">
@@ -605,11 +605,11 @@ export default function ComposeEmail() {
               >
                 Discard
               </Button>
-              <div className="flex min-w-0 flex-1 items-center justify-end gap-2 sm:flex-none">
+              <div className="grid min-w-0 basis-full grid-cols-1 gap-2 min-[360px]:flex min-[360px]:basis-auto min-[360px]:flex-1 min-[360px]:items-center min-[360px]:justify-end sm:flex-none">
                 <Button
                   type="button"
                   variant="secondary"
-                  className="min-h-11 min-w-0 flex-1 sm:flex-none"
+                  className="min-h-11 min-w-0 w-full min-[360px]:flex-1 sm:w-auto sm:flex-none"
                   loading={isSavingDraft}
                   disabled={
                     isSending ||
@@ -624,7 +624,7 @@ export default function ComposeEmail() {
                 >
                   {isSavingDraft ? "Saving…" : "Save draft"}
                 </Button>
-                <div className="flex min-w-0 flex-1 sm:flex-none">
+                <div className="flex min-w-0 w-full min-[360px]:flex-1 sm:w-auto sm:flex-none">
                   <Button
                     type="submit"
                     variant="primary"

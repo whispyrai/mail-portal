@@ -5,6 +5,7 @@
 import {
 	Button,
 	Dialog,
+	Loader,
 	Pagination,
 	Tooltip,
 	useKumoToastManager,
@@ -194,20 +195,44 @@ function EmailListSkeleton() {
 function InboxTriageReviewLoadingFallback({ onClose }: { onClose: () => void }) {
 	return (
 		<Dialog.Root open onOpenChange={(open) => !open && onClose()}>
-			<Dialog size="lg" className="w-[calc(100vw-1rem)] max-w-[700px]">
-				<Dialog.Title className="font-semibold text-kumo-default">
-					Opening Inbox suggestion review
-				</Dialog.Title>
-				<Dialog.Description
-					className="mt-2 text-sm text-kumo-subtle"
+			<Dialog
+				size="lg"
+				className="flex min-w-0 w-[calc(100vw-1rem)] max-w-[700px] flex-col overflow-hidden p-0 sm:min-w-[32rem]"
+			>
+				<header className="shrink-0 border-b border-kumo-line px-4 py-4 sm:px-5">
+					<div className="flex items-start gap-3">
+						<SparkleIcon
+							size={19}
+							className="mt-0.5 shrink-0 text-kumo-brand"
+							aria-hidden="true"
+						/>
+						<div className="min-w-0">
+							<Dialog.Title className="text-lg font-semibold text-kumo-default">
+								Opening Inbox suggestion review
+							</Dialog.Title>
+							<Dialog.Description className="mt-1 text-sm leading-6 text-kumo-subtle">
+								No mail is changing while the review surface loads.
+							</Dialog.Description>
+						</div>
+					</div>
+				</header>
+				<div
+					className="flex min-h-40 flex-col items-center justify-center gap-3 px-5 py-8 text-center text-sm text-kumo-subtle"
 					role="status"
 					aria-live="polite"
 				>
-					Loading the review surface. No mail is changing.
-				</Dialog.Description>
-				<Button className="mt-4 min-h-11" variant="secondary" onClick={onClose}>
-					Close
-				</Button>
+					<Loader size="lg" />
+					Preparing suggestions for the conversations on this page…
+				</div>
+				<footer className="flex shrink-0 border-t border-kumo-line bg-kumo-base px-4 py-3 sm:justify-end sm:px-5">
+					<Button
+						className="min-h-11 w-full sm:w-auto"
+						variant="secondary"
+						onClick={onClose}
+					>
+						Close
+					</Button>
+				</footer>
 			</Dialog>
 		</Dialog.Root>
 	);
@@ -222,24 +247,48 @@ function InboxTriageReviewLoadError({
 }) {
 	return (
 		<Dialog.Root open onOpenChange={(open) => !open && onClose()}>
-			<Dialog size="lg" className="w-[calc(100vw-1rem)] max-w-[700px]">
-				<Dialog.Title className="font-semibold text-kumo-default">
-					Suggestion review could not open
-				</Dialog.Title>
-				<Dialog.Description
-					className="mt-2 text-sm leading-6 text-kumo-subtle"
-					role="alert"
-				>
-					Inbox and every manual action remain available.
-				</Dialog.Description>
-				<div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-					<Button className="min-h-11" variant="secondary" onClick={onClose}>
+			<Dialog
+				size="lg"
+				className="flex min-w-0 w-[calc(100vw-1rem)] max-w-[700px] flex-col overflow-hidden p-0 sm:min-w-[32rem]"
+			>
+				<header className="shrink-0 border-b border-kumo-line px-4 py-4 sm:px-5">
+					<div className="flex items-start gap-3">
+						<SparkleIcon
+							size={19}
+							className="mt-0.5 shrink-0 text-kumo-brand"
+							aria-hidden="true"
+						/>
+						<div className="min-w-0">
+							<Dialog.Title className="text-lg font-semibold text-kumo-default">
+								Suggestion review could not open
+							</Dialog.Title>
+							<Dialog.Description className="mt-1 text-sm leading-6 text-kumo-subtle">
+								No mail changed. Inbox and every manual action remain available.
+							</Dialog.Description>
+						</div>
+					</div>
+				</header>
+				<div className="flex min-h-32 items-center px-4 py-6 sm:px-5" role="alert">
+					<p className="text-sm leading-6 text-kumo-subtle">
+						Retry to reopen the review without leaving your Inbox.
+					</p>
+				</div>
+				<footer className="flex shrink-0 flex-col-reverse gap-2 border-t border-kumo-line bg-kumo-base px-4 py-3 sm:flex-row sm:justify-end sm:px-5">
+					<Button
+						className="min-h-11 w-full sm:w-auto"
+						variant="secondary"
+						onClick={onClose}
+					>
 						Close
 					</Button>
-					<Button className="min-h-11" onClick={onRetry}>
+					<Button
+						className="min-h-11 w-full sm:w-auto"
+						icon={<ArrowCounterClockwiseIcon size={16} />}
+						onClick={onRetry}
+					>
 						Try again
 					</Button>
-				</div>
+				</footer>
 			</Dialog>
 		</Dialog.Root>
 	);

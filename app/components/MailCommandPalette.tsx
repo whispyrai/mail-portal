@@ -1,5 +1,5 @@
-import { Dialog } from "@cloudflare/kumo";
-import { MagnifyingGlassIcon } from "@phosphor-icons/react";
+import { Button, Dialog } from "@cloudflare/kumo";
+import { MagnifyingGlassIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import {
@@ -23,6 +23,7 @@ export default function MailCommandPalette() {
 	const [open, setOpen] = useState(false);
 	const [query, setQuery] = useState("");
 	const [activeIndex, setActiveIndex] = useState(0);
+	const [isCoarsePointer, setIsCoarsePointer] = useState(false);
 	const previousFocusRef = useRef<HTMLElement | null>(null);
 	const listboxId = useId();
 	const commands = useMemo(
@@ -39,6 +40,14 @@ export default function MailCommandPalette() {
 		[commands, query],
 	);
 	const activeCommand = filteredCommands[activeIndex];
+
+	useEffect(() => {
+		const pointer = window.matchMedia("(pointer: coarse)");
+		const syncPointer = () => setIsCoarsePointer(pointer.matches);
+		syncPointer();
+		pointer.addEventListener("change", syncPointer);
+		return () => pointer.removeEventListener("change", syncPointer);
+	}, []);
 
 	const changeOpen = (next: boolean) => {
 		if (next) {
@@ -103,13 +112,24 @@ export default function MailCommandPalette() {
 		<Dialog.Root open={open} onOpenChange={changeOpen}>
 			<Dialog
 				size="lg"
-				className="flex max-h-[min(680px,calc(100dvh-1rem))] w-[calc(100vw-1rem)] flex-col overflow-hidden p-0 sm:w-[min(680px,92vw)]"
+				className="flex min-w-0 max-h-[min(680px,calc(100dvh-1rem))] w-[calc(100vw-1rem)] flex-col overflow-hidden p-0 sm:min-w-[32rem] sm:w-[min(680px,92vw)]"
 			>
 				<Dialog.Title className="sr-only">Command palette</Dialog.Title>
 				<div className="flex min-h-14 items-center gap-3 border-b border-kumo-line px-4">
-					<MagnifyingGlassIcon size={20} className="shrink-0 text-kumo-subtle" aria-hidden="true" />
+					<Dialog.Close
+						render={(props) => (
+							<Button
+								{...props}
+								variant="ghost"
+								shape="square"
+								className={isCoarsePointer ? "order-4 shrink-0" : "hidden"}
+								icon={<XIcon size={18} />}
+								aria-label="Close command palette"
+							/>
+						)}
+					/>
+					<MagnifyingGlassIcon size={20} className="order-1 shrink-0 text-kumo-subtle" aria-hidden="true" />
 					<input
-						autoFocus
 						value={query}
 						onChange={(event) => setQuery(event.target.value)}
 						onKeyDown={(event) => {
@@ -130,7 +150,7 @@ export default function MailCommandPalette() {
 							}
 						}}
 						placeholder="Type a command or destination…"
-						className="min-h-12 min-w-0 flex-1 bg-transparent text-base text-kumo-default outline-none placeholder:text-kumo-subtle"
+						className="order-2 min-h-12 min-w-0 flex-1 bg-transparent text-base text-kumo-default outline-none placeholder:text-kumo-subtle"
 						role="combobox"
 						aria-label="Search commands"
 						aria-controls={listboxId}
@@ -138,7 +158,7 @@ export default function MailCommandPalette() {
 						aria-autocomplete="list"
 						aria-activedescendant={activeCommand ? `${listboxId}-${activeCommand.id}` : undefined}
 					/>
-					<kbd className="hidden shrink-0 rounded border border-kumo-line bg-kumo-recessed px-2 py-1 text-xs font-medium text-kumo-subtle sm:block">
+					<kbd className="order-3 hidden shrink-0 rounded border border-kumo-line bg-kumo-recessed px-2 py-1 text-xs font-medium text-kumo-subtle sm:block">
 						Esc
 					</kbd>
 				</div>

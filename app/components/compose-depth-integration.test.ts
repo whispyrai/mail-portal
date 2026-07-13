@@ -42,6 +42,7 @@ test("compose shortcuts submit the form or call the existing save action without
 	assert.match(compose, /aria-keyshortcuts="Meta\+S Control\+S"/);
 	assert.match(compose, /title="Send \(⌘\/Ctrl\+Enter\)"/);
 	assert.match(compose, /title="Save draft \(⌘\/Ctrl\+S\)"/);
+	assert.match(compose, /basis-full[\s\S]*min-\[360px\]:basis-auto/);
 });
 
 test("missing attachment confirmation revalidates one fingerprint through the same perform-send path", () => {

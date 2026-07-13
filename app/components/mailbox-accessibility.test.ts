@@ -26,6 +26,7 @@ test("split view and shortcut guide expose named bounded regions", () => {
 	assert.match(split, /min-h-0/);
 	assert.match(keyboard, /max-h-\[calc\(100dvh-1rem\)\]/);
 	assert.match(keyboard, /overflow-y-auto/);
+	assert.match(keyboard, /<Dialog\.Close[\s\S]*aria-label="Close keyboard shortcuts"/);
 });
 
 test("outbox and composer expose live errors, touch targets, and named editors", () => {

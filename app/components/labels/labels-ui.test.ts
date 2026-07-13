@@ -22,6 +22,8 @@ test("label UI exposes compact chips, an accessible picker, and mailbox-wide man
 	assert.match(manager, /useKumoToastManager/);
 	assert.match(manager, /humanizeColor/);
 	assert.match(manager, /min-h-11/);
+	assert.match(manager, /w-full sm:w-auto/);
+	assert.match(manager, /<Dialog\.Close[\s\S]*render=[\s\S]*Done/);
 	assert.match(sidebar, /ManageLabelsDialog/);
 	assert.match(sidebar, /label_id=/);
 	assert.match(list, /label_id: labelId/);
