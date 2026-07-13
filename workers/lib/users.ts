@@ -147,15 +147,3 @@ export async function updateUserRecoveryEmail(
     .where(eq(schema.users.id, id))
     .run();
 }
-
-export async function setUserMcpTokenHash(
-  env: Env,
-  id: string,
-  tokenHash: string | null,
-): Promise<void> {
-  await db(env)
-    .update(schema.users)
-    .set({ mcp_token_hash: tokenHash, updated_at: Date.now() })
-    .where(eq(schema.users.id, id))
-    .run();
-}
