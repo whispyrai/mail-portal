@@ -5771,7 +5771,6 @@ export class MailboxDO extends DurableObject<Env> {
 			return {
 				status: "claim" as const,
 				claim: planned,
-				generationCleanupIntentId,
 			};
 		});
 		await this.#ensureBulkMaintenanceAlarm();
@@ -5953,56 +5952,6 @@ export class MailboxDO extends DurableObject<Env> {
 			);
 			return true;
 		});
-	}
-
-	async #bulkResultAfterFenceLoss(
-		admissionKey: string,
-		jobId: string,
-		total: number,
-		generationCleanupIntentId: string | null,
-	): Promise<BulkEnqueueResult> {
-		if (generationCleanupIntentId) {
-			this.ctx.storage.transactionSync(() =>
-				this.#markBulkCleanupDueSync(generationCleanupIntentId, Date.now()),
-			);
-		}
-		await this.#ensureBulkMaintenanceAlarm();
-		const current = this.ctx.storage.kv.get<BulkAdmissionRecord>(admissionKey);
-		if (!current) {
-			return {
-				status: "rejected",
-				code: "bulk_admission_failed",
-				error: "Bulk job state expired. Start a new submission.",
-				jobId,
-			};
-		}
-		if (current.status === "failed") {
-			return {
-				status: "rejected",
-				code: "bulk_admission_failed",
-				error: current.error ?? "Bulk job could not be prepared.",
-				jobId: current.jobId,
-			};
-		}
-		if (current.status === "queued") {
-			if (this.#repairBulkQueueMembership(current.jobId)) {
-		await this.#scheduleAlarmAt(Date.now() + 100);
-	}
-			return {
-				status: "accepted",
-				jobId: current.jobId,
-				total: current.total,
-				replayed: true,
-				admissionStatus: "queued",
-			};
-		}
-		return {
-			status: "accepted",
-			jobId: current.jobId,
-			total,
-			replayed: true,
-			admissionStatus: "preparing",
-		};
 	}
 
 	#bulkRecipientPreparationKey(jobId: string, cursor: number): string {

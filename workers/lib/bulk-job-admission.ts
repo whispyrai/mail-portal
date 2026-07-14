@@ -2,7 +2,6 @@ import { validateInlineImageMappings } from "../../shared/inline-image-mappings.
 import { escapeHtml } from "./email-helpers.ts";
 import { InlineImageMappingError } from "./inline-image-authority.ts";
 
-export const BULK_ADMISSION_LEASE_MS = 60_000;
 export const BULK_PREPARATION_MAX_AGE_MS = 10 * 60_000;
 export const BULK_STALE_WRITER_VERIFY_MS = 2 * BULK_PREPARATION_MAX_AGE_MS;
 export const BULK_RESERVATION_TTL_MS = 10 * 60_000;
@@ -46,7 +45,6 @@ export type BulkAdmissionRecord = {
 	total: number;
 	status: "preparing" | "queued" | "failed";
 	generation: number;
-	leaseExpiresAt: number | null;
 	error: string | null;
 	createdAt: number;
 	updatedAt: number;
@@ -369,7 +367,6 @@ export function planBulkAdmissionClaim(input: {
 				total,
 				status: "preparing",
 				generation: 1,
-				leaseExpiresAt: now + BULK_ADMISSION_LEASE_MS,
 				error: null,
 				createdAt: now,
 				updatedAt: now,
@@ -404,7 +401,6 @@ export function completeBulkAdmission(
 	return {
 		...existing,
 		status: "queued",
-		leaseExpiresAt: null,
 		updatedAt: now,
 	};
 }
@@ -421,7 +417,6 @@ export function failBulkAdmission(
 	return {
 		...existing,
 		status: "failed",
-		leaseExpiresAt: null,
 		error,
 		updatedAt: now,
 	};

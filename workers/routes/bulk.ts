@@ -125,8 +125,6 @@ let pendingSubmission = null;
 let submissionLocked = false;
 let confirmInFlight = false;
 let activePollJobId = null;
-let retryAllowedAt = 0;
-let retryTimer = null;
 let confirmationMessage = '';
 let confirmationMode = 'confirm';
 let lastProgressAnnouncement = '';
@@ -392,9 +390,8 @@ function setConfirmationState(message, mode, moveFocus = false) {
   $('cancelSubmitBtn').classList.toggle('hide', mode === 'uncertain');
   $('cancelSubmitBtn').disabled = confirmInFlight;
   $('confirmSubmitBtn').classList.toggle('hide', mode === 'definitive');
-  const retryWaiting = mode === 'retryable' && Date.now() < retryAllowedAt;
-  $('confirmSubmitBtn').disabled = confirmInFlight || retryWaiting;
-  $('confirmSubmitBtn').textContent = retryWaiting ? 'Retry not available yet' : (mode === 'uncertain' || mode === 'retryable' ? 'Retry safely' : 'Confirm and queue');
+  $('confirmSubmitBtn').disabled = confirmInFlight;
+  $('confirmSubmitBtn').textContent = mode === 'uncertain' ? 'Retry safely' : 'Confirm and queue';
   if (moveFocus) {
     const target = mode === 'definitive' ? $('cancelSubmitBtn') : $('submitConfirmText');
     target.focus();
@@ -476,24 +473,7 @@ async function recoverPendingOperation() {
   }
 }
 
-function setRetryWindow(retryAt) {
-  if (retryTimer) clearTimeout(retryTimer);
-  const parsed = Date.parse(retryAt || '');
-  retryAllowedAt = Number.isFinite(parsed) ? parsed : Date.now() + 60000;
-  const wait = Math.max(0, retryAllowedAt - Date.now());
-  retryTimer = setTimeout(() => {
-    retryAllowedAt = 0;
-    retryTimer = null;
-    setConfirmationState(confirmationMessage, confirmationMode);
-    $('status').className = 'muted';
-    $('status').textContent = 'Retry safely is now available for this exact submission.';
-  }, wait);
-}
-
 function clearConfirmation() {
-  if (retryTimer) clearTimeout(retryTimer);
-  retryTimer = null;
-  retryAllowedAt = 0;
   $('submitConfirm').classList.add('hide');
   $('cancelSubmitBtn').classList.remove('hide');
   $('confirmSubmitBtn').classList.remove('hide');

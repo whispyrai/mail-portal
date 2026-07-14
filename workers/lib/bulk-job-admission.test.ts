@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	BulkRecipientAttachmentUnavailableError,
-	BULK_ADMISSION_LEASE_MS,
 	BULK_LIMITS,
 	BULK_RESERVATION_TTL_MS,
 	BULK_STALE_WRITER_VERIFY_MS,
@@ -209,7 +208,6 @@ test("the same bulk operation has one stable fingerprint and one claimed job", a
 		total: 1,
 		status: "preparing",
 		generation: 1,
-		leaseExpiresAt: 1_000 + BULK_ADMISSION_LEASE_MS,
 		error: null,
 		createdAt: 1_000,
 		updatedAt: 1_000,
@@ -243,7 +241,6 @@ test("a definitive preparation failure is durable and generation fenced", () => 
 		total: 2,
 		status: "preparing" as const,
 		generation: 3,
-		leaseExpiresAt: 61_000,
 		error: null,
 		createdAt: 1_000,
 		updatedAt: 1_000,
@@ -258,7 +255,6 @@ test("a definitive preparation failure is durable and generation fenced", () => 
 		{
 			...record,
 			status: "failed",
-			leaseExpiresAt: null,
 			error: "Attachments could not be prepared.",
 			updatedAt: 2_000,
 		},
@@ -274,7 +270,6 @@ test("only the current preparing generation can commit a queued admission", () =
 		total: 2,
 		status: "preparing" as const,
 		generation: 2,
-		leaseExpiresAt: 61_000,
 		error: null,
 		createdAt: 1_000,
 		updatedAt: 1_000,
@@ -284,7 +279,6 @@ test("only the current preparing generation can commit a queued admission", () =
 	assert.deepEqual(completeBulkAdmission(record, 2, 2_000), {
 		...record,
 		status: "queued",
-		leaseExpiresAt: null,
 		updatedAt: 2_000,
 	});
 });
@@ -298,7 +292,6 @@ test("exact retries never create a second preparation writer", () => {
 		total: 2,
 		status: "preparing" as const,
 		generation: 1,
-		leaseExpiresAt: 61_000,
 		error: null,
 		createdAt: 1_000,
 		updatedAt: 1_000,
@@ -324,12 +317,10 @@ test("exact retries never create a second preparation writer", () => {
 	assert.equal(expired.status, "preparing");
 	assert.equal(expired.record.jobId, "job_stable");
 	assert.equal(expired.record.generation, 1);
-	assert.equal(expired.record.leaseExpiresAt, 61_000);
 
 	const queued = {
 		...preparing,
 		status: "queued" as const,
-		leaseExpiresAt: null,
 	};
 	assert.equal(
 		planBulkAdmissionClaim({ ...base, existing: queued, now: 90_000 }).status,
@@ -355,7 +346,6 @@ test("an opaque operation identity cannot cross actors", () => {
 		total: 1,
 		status: "preparing" as const,
 		generation: 1,
-		leaseExpiresAt: 61_000,
 		error: null,
 		createdAt: 1_000,
 		updatedAt: 1_000,

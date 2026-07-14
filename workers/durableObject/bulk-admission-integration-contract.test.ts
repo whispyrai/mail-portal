@@ -187,7 +187,7 @@ test("bulk progress returns a strict public projection rather than the stored jo
 
 test("opaque operation recovery is actor-private and content-free", () => {
 	const recoveryStart = source.indexOf("async getBulkJobByOperation");
-	const recoveryEnd = source.indexOf("async #bulkResultAfterFenceLoss", recoveryStart);
+	const recoveryEnd = source.indexOf("#bulkRecipientPreparationKey", recoveryStart);
 	const recovery = source.slice(recoveryStart, recoveryEnd);
 	assert.match(recovery, /job\.actorUserId !== actorUserId/);
 	assert.match(recovery, /jobId: admission\.jobId/);
