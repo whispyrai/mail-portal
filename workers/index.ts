@@ -5,10 +5,7 @@
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
-import {
-	uploadKey,
-	sanitizeFilename,
-} from "./lib/attachments";
+import { uploadKey, sanitizeFilename } from "./lib/attachments";
 import {
 	ATTACHMENT_LIMITS,
 	validateSingleFile,
@@ -64,6 +61,13 @@ import {
 	handleSetConversationRead,
 	handleTrashConversation,
 } from "./routes/conversation-actions";
+import {
+	handleCancelBulkReservation,
+	handleCreateBulkJob,
+	handleGetBulkJob,
+	handleRecoverBulkOperation,
+	handleReserveBulkOperation,
+} from "./routes/bulk-api.ts";
 import { handleBatchTriage } from "./routes/batch-triage";
 import {
 	handleCreateLabel,
@@ -339,7 +343,10 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const body = await c.req.json().catch(() => null);
 	const requested = isRecord(body) ? body.settings : null;
 	if (!isRecord(requested)) {
-		return c.json({ error: "Mailbox settings are invalid", code: "INVALID" }, 400);
+		return c.json(
+			{ error: "Mailbox settings are invalid", code: "INVALID" },
+			400,
+		);
 	}
 	try {
 		const settings = await updateMailboxSettings(
@@ -347,7 +354,12 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 			mailboxId,
 			(current) => mergeGeneralMailboxSettings(current, requested),
 		);
-		return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
+		return c.json({
+			id: mailboxId,
+			name: mailboxId,
+			email: mailboxId,
+			settings,
+		});
 	} catch (error) {
 		if (error instanceof MailboxSettingsNotFoundError) {
 			return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
@@ -355,7 +367,13 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 		if (error instanceof MailboxSettingsConflictError) {
 			return c.json({ error: error.message, code: "SETTINGS_CONFLICT" }, 409);
 		}
-		return c.json({ error: "Mailbox settings are unavailable", code: "SETTINGS_UNAVAILABLE" }, 500);
+		return c.json(
+			{
+				error: "Mailbox settings are unavailable",
+				code: "SETTINGS_UNAVAILABLE",
+			},
+			500,
+		);
 	}
 });
 
@@ -481,6 +499,10 @@ app.post(
 		return c.json({ status: "marked_read" });
 	},
 );
+app.delete(
+	"/api/v1/mailboxes/:mailboxId/bulk/operations/:operationId/reservation",
+	handleCancelBulkReservation,
+);
 
 app.post(
 	"/api/v1/mailboxes/:mailboxId/conversations/:conversationId/read",
@@ -521,61 +543,16 @@ app.post(
 
 // -- Bulk send (mail merge, F-06) -----------------------------------
 
-const BulkSendBody = z.object({
-	subject: z.string().min(1),
-	html: z.string().optional(),
-	text: z.string().optional(),
-	recipients: z.array(z.record(z.string())).min(1).max(200),
-	// Optional shared attachment(s), uploaded once and attached to every recipient.
-	attachmentUploadIds: z
-		.array(z.string().min(1))
-		.max(ATTACHMENT_LIMITS.maxFiles)
-		.optional(),
-});
-
-app.post("/api/v1/mailboxes/:mailboxId/bulk", async (c: AppContext) => {
-	const mailboxId = c.req.param("mailboxId")!;
-	const session = c.get("session");
-	if (!session) return c.json({ error: "Unauthorized" }, 401);
-	let body: z.infer<typeof BulkSendBody>;
-	try {
-		body = BulkSendBody.parse(await c.req.json());
-	} catch (e) {
-		return c.json(
-			{ error: `Invalid bulk request: ${(e as Error).message}` },
-			400,
-		);
-	}
-	if (!body.html && !body.text) {
-		return c.json({ error: "Provide an HTML or text body." }, 400);
-	}
-	// From-name comes from the mailbox settings; the from-address is the mailbox.
-	const settingsObj = await c.env.BUCKET.get(`mailboxes/${mailboxId}.json`);
-	const settings = settingsObj
-		? await settingsObj.json<{ fromName?: string }>()
-		: {};
-	const fromName = settings.fromName || mailboxId.split("@")[0];
-	try {
-		const result = await c.var.mailboxStub.enqueueBulkJob({
-			actorUserId: session.sub,
-			fromEmail: mailboxId,
-			fromName,
-			subject: body.subject,
-			html: body.html,
-			text: body.text,
-			recipients: body.recipients,
-			attachmentUploadIds: body.attachmentUploadIds,
-		});
-		return c.json(result, 202);
-	} catch (e) {
-		return c.json({ error: (e as Error).message }, 400);
-	}
-});
-
-app.get("/api/v1/mailboxes/:mailboxId/bulk/:jobId", async (c: AppContext) => {
-	const job = await c.var.mailboxStub.getBulkJob(c.req.param("jobId")!);
-	return job ? c.json(job) : c.json({ error: "Job not found" }, 404);
-});
+app.post("/api/v1/mailboxes/:mailboxId/bulk", handleCreateBulkJob);
+app.post(
+	"/api/v1/mailboxes/:mailboxId/bulk/operations/:operationId/reserve",
+	handleReserveBulkOperation,
+);
+app.get(
+	"/api/v1/mailboxes/:mailboxId/bulk/operations/:operationId",
+	handleRecoverBulkOperation,
+);
+app.get("/api/v1/mailboxes/:mailboxId/bulk/:jobId", handleGetBulkJob);
 
 // -- Folders --------------------------------------------------------
 

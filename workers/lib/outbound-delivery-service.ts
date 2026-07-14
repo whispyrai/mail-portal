@@ -179,6 +179,13 @@ export class DuplicateRiskAcknowledgementRequiredError extends Error {
 	}
 }
 
+export class OutboundRetryCapacityError extends Error {
+	constructor() {
+		super("This Mailbox has the maximum safe bulk backlog.");
+		this.name = "OutboundRetryCapacityError";
+	}
+}
+
 export class SourceDraftConflictError extends Error {
 	readonly reason: "not_found" | "not_draft" | "version_conflict";
 	readonly currentVersion?: number;
@@ -211,22 +218,27 @@ export class TruthfulOutboxService {
 		this.#defaultMaxAttempts = options.defaultMaxAttempts ?? 4;
 	}
 
-	enqueue(command: EnqueueOutboundCommand): EnqueuedDelivery {
+	enqueue(
+		command: EnqueueOutboundCommand,
+		onCommitted?: (result: EnqueuedDelivery) => void,
+	): EnqueuedDelivery {
 		return this.#storage.transaction((tx) => {
-			const existing = tx.findDeliveryByIdempotencyKey(
-				command.idempotencyKey,
-			);
+			const finish = (result: EnqueuedDelivery): EnqueuedDelivery => {
+				onCommitted?.(result);
+				return result;
+			};
+			const existing = tx.findDeliveryByIdempotencyKey(command.idempotencyKey);
 			if (existing) {
 				const snapshot = tx.getSnapshot(existing.emailId);
 				if (!snapshot) {
 					throw new Error(`Missing outbox snapshot for ${existing.id}`);
 				}
-				return {
+				return finish({
 					delivery: existing,
 					snapshot,
 					replayed: true,
 					outcome: outboundEnqueueOutcome(existing, true),
-				};
+				});
 			}
 			const sourceDraft = validateSourceDraftReference(command.snapshot);
 			if (sourceDraft.draftId !== undefined) {
@@ -235,22 +247,24 @@ export class TruthfulOutboxService {
 							sourceDraft.draftId,
 							sourceDraft.draftVersion!,
 						)
-					: tx.listDeliveries().find(
+					: (tx
+							.listDeliveries()
+							.find(
 							(delivery) =>
 								delivery.draftId === sourceDraft.draftId &&
 								delivery.draftVersion === sourceDraft.draftVersion,
-						) ?? null;
+							) ?? null);
 				if (sameDraft) {
 					const snapshot = tx.getSnapshot(sameDraft.emailId);
 					if (!snapshot) {
 						throw new Error(`Missing outbox snapshot for ${sameDraft.id}`);
 					}
-					return {
+					return finish({
 						delivery: sameDraft,
 						snapshot,
 						replayed: true,
 						outcome: outboundEnqueueOutcome(sameDraft, true),
-					};
+					});
 				}
 			}
 
@@ -297,12 +311,12 @@ export class TruthfulOutboxService {
 
 			tx.insertSnapshot(emailId, snapshot);
 			tx.insertDelivery(delivery);
-			return {
+			return finish({
 				delivery,
 				snapshot,
 				replayed: false,
 				outcome: "enqueued",
-			};
+			});
 		});
 	}
 
@@ -339,9 +353,9 @@ export class TruthfulOutboxService {
 		return this.#storage.transaction((tx) =>
 			tx.listDeliveriesByStatuses
 				? tx.listDeliveriesByStatuses(statuses)
-				: tx.listDeliveries().filter((delivery) =>
-						statuses.includes(delivery.status),
-					),
+				: tx
+						.listDeliveries()
+						.filter((delivery) => statuses.includes(delivery.status)),
 		);
 	}
 
@@ -398,15 +412,17 @@ export class TruthfulOutboxService {
 
 	claimNext(now: string, leaseDurationMs: number): ClaimedDelivery | null {
 		return this.#storage.transaction((tx) => {
-			const delivery = (tx.findNextDispatchable
+			const delivery = (
+				tx.findNextDispatchable
 				? [tx.findNextDispatchable(now)].filter(
-						(candidate): candidate is StoredOutboundDelivery => Boolean(candidate),
+							(candidate): candidate is StoredOutboundDelivery =>
+								Boolean(candidate),
+						)
+					: tx.listDeliveries()
 					)
-				: tx.listDeliveries())
 				.filter(
 					(candidate) =>
-						(candidate.status === "queued" &&
-							candidate.availableAt <= now) ||
+						(candidate.status === "queued" && candidate.availableAt <= now) ||
 						(candidate.status === "retrying" &&
 							candidate.nextAttemptAt !== undefined &&
 							candidate.nextAttemptAt <= now),
@@ -415,8 +431,7 @@ export class TruthfulOutboxService {
 					(a, b) =>
 						(a.nextAttemptAt ?? a.availableAt).localeCompare(
 							b.nextAttemptAt ?? b.availableAt,
-						) ||
-						a.createdAt.localeCompare(b.createdAt),
+						) || a.createdAt.localeCompare(b.createdAt),
 				)[0];
 			if (!delivery) return null;
 
@@ -497,10 +512,7 @@ export class TruthfulOutboxService {
 			return {
 				delivery: finalizedDelivery,
 				attempt: finalizedAttempt,
-				sourceDraftAction: sourceDraftAction(
-					finalizedDelivery,
-					"retain",
-				),
+				sourceDraftAction: sourceDraftAction(finalizedDelivery, "retain"),
 			};
 		});
 	}
@@ -549,6 +561,7 @@ export class TruthfulOutboxService {
 		deliveryId: string,
 		actor: OutboundDeliveryActor,
 		at: string,
+		assertRetryAllowed?: (delivery: StoredOutboundDelivery) => void,
 	): DeliveryMutationResult {
 		return this.#storage.transaction((tx) => {
 			const delivery = tx.getDelivery(deliveryId);
@@ -563,6 +576,7 @@ export class TruthfulOutboxService {
 				lastErrorMessage: undefined,
 				updatedAt: at,
 			};
+			assertRetryAllowed?.(delivery);
 			tx.updateDelivery(queued);
 			return {
 				delivery: queued,
@@ -616,6 +630,7 @@ export class TruthfulOutboxService {
 		actor: OutboundDeliveryActor,
 		acknowledgeDuplicateRisk: true,
 		at: string,
+		assertRetryAllowed?: (delivery: StoredOutboundDelivery) => void,
 	): DeliveryMutationResult {
 		if (acknowledgeDuplicateRisk !== true) {
 			throw new DuplicateRiskAcknowledgementRequiredError(deliveryId);
@@ -625,16 +640,14 @@ export class TruthfulOutboxService {
 			if (!delivery) throw new OutboundDeliveryNotFoundError(deliveryId);
 			const queued: StoredOutboundDelivery = {
 				...delivery,
-				status: transitionDelivery(
-					delivery.status,
-					"force_retry_unknown",
-				),
+				status: transitionDelivery(delivery.status, "force_retry_unknown"),
 				availableAt: at,
 				unknownAt: undefined,
 				lastErrorCode: undefined,
 				lastErrorMessage: undefined,
 				updatedAt: at,
 			};
+			assertRetryAllowed?.(delivery);
 			tx.updateDelivery(queued);
 			return {
 				delivery: queued,
@@ -728,10 +741,7 @@ export class TruthfulOutboxService {
 					continue;
 				}
 
-				const attempt = tx.findAttemptByLease(
-					delivery.id,
-					delivery.leaseToken,
-				);
+				const attempt = tx.findAttemptByLease(delivery.id, delivery.leaseToken);
 				if (!attempt) {
 					throw new Error(`Missing leased attempt for ${delivery.id}`);
 				}

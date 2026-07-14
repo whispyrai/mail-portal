@@ -7,6 +7,13 @@ interface AuthoritativeInlineAttachment {
 	content_id?: string | null;
 }
 
+export class InlineImageMappingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "InlineImageMappingError";
+	}
+}
+
 /** Validate message HTML against the exact authoritative metadata being stored. */
 export function validateResolvedInlineImages(
 	bodyHtml: string,

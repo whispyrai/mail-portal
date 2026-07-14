@@ -247,7 +247,7 @@ test("the Durable Object validates authoritative inline mappings before outbox m
 	const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 	assert.match(
 		source,
-		/async enqueueOutbound\([\s\S]*?validateResolvedInlineImages\([\s\S]*?if \(!inlineMapping\.ok\)[\s\S]*?this\.#outboxService\(attachments, emailId\)\.enqueue\(command\)/,
+		/async #enqueueOutboundInternal\([\s\S]*?validateResolvedInlineImages\([\s\S]*?if \(!inlineMapping\.ok\)[\s\S]*?this\.#outboxService\(attachments, emailId\)\.enqueue\(\s*command/,
 	);
 });
 

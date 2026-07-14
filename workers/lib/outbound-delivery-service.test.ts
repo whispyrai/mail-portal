@@ -176,8 +176,11 @@ test("a cancelled source-revision replay is explicit and never masquerades as a 
 
 test("direct compose enqueues and sends without inventing a source draft", () => {
 	const { service } = createService();
-	const { draftId: _draftId, draftVersion: _draftVersion, ...directSnapshot } =
-		command().snapshot;
+	const {
+		draftId: _draftId,
+		draftVersion: _draftVersion,
+		...directSnapshot
+	} = command().snapshot;
 
 	const enqueued = service.enqueue(
 		command({ snapshot: directSnapshot as EnqueueOutboundCommand["snapshot"] }),
@@ -185,10 +188,7 @@ test("direct compose enqueues and sends without inventing a source draft", () =>
 	assert.equal(enqueued.delivery.draftId, undefined);
 	assert.equal(enqueued.delivery.draftVersion, undefined);
 
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 	const sent = service.finalizeAccepted(
 		claimed.delivery.id,
@@ -237,19 +237,10 @@ test("undo and Send Later deadlines both gate an atomic lease claim", () => {
 		}),
 	);
 
-	assert.equal(
-		service.claimNext("2026-07-11T10:00:11.000Z", 30_000),
-		null,
-	);
-	assert.equal(
-		service.claimNext("2026-07-11T11:59:59.999Z", 30_000),
-		null,
-	);
+	assert.equal(service.claimNext("2026-07-11T10:00:11.000Z", 30_000), null);
+	assert.equal(service.claimNext("2026-07-11T11:59:59.999Z", 30_000), null);
 
-	const claimed = service.claimNext(
-		"2026-07-11T12:00:00.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T12:00:00.000Z", 30_000);
 	assert.ok(claimed);
 	assert.equal(claimed.delivery.status, "sending");
 	assert.equal(claimed.delivery.attemptCount, 1);
@@ -283,28 +274,20 @@ test("a delivery waiting for an automatic retry can still be cancelled", () => {
 test("an expired sending lease becomes unknown and is never automatically reclaimed", () => {
 	const { service } = createService();
 	service.enqueue(command());
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 
 	assert.deepEqual(
 		service.recoverExpiredLeases("2026-07-11T10:00:39.999Z"),
 		[],
 	);
-	const recovered = service.recoverExpiredLeases(
-		"2026-07-11T10:00:40.000Z",
-	);
+	const recovered = service.recoverExpiredLeases("2026-07-11T10:00:40.000Z");
 
 	assert.equal(recovered.length, 1);
 	assert.equal(recovered[0]?.delivery.status, "unknown");
 	assert.equal(recovered[0]?.attempt.status, "unknown");
 	assert.equal(recovered[0]?.delivery.unknownAt, "2026-07-11T10:00:40.000Z");
-	assert.equal(
-		service.claimNext("2026-07-11T10:00:41.000Z", 30_000),
-		null,
-	);
+	assert.equal(service.claimNext("2026-07-11T10:00:41.000Z", 30_000), null);
 });
 
 test("a proven retryable rejection waits in retrying before a new leased attempt", () => {
@@ -328,10 +311,7 @@ test("a proven retryable rejection waits in retrying before a new leased attempt
 	assert.equal(retrying.delivery.status, "retrying");
 	assert.equal(retrying.delivery.nextAttemptAt, "2026-07-11T10:00:41.000Z");
 	assert.equal(retrying.attempt.status, "rejected_retryable");
-	assert.equal(
-		service.claimNext("2026-07-11T10:00:40.999Z", 30_000),
-		null,
-	);
+	assert.equal(service.claimNext("2026-07-11T10:00:40.999Z", 30_000), null);
 	const second = service.claimNext("2026-07-11T10:00:41.000Z", 30_000);
 	assert.ok(second);
 	assert.equal(second.delivery.status, "sending");
@@ -339,15 +319,9 @@ test("a proven retryable rejection waits in retrying before a new leased attempt
 });
 
 test("a retryable rejection becomes failed when the automatic attempt budget is exhausted", () => {
-	const { service } = createService(
-		new MemoryOutboundDeliveryStorage(),
-		1,
-	);
+	const { service } = createService(new MemoryOutboundDeliveryStorage(), 1);
 	service.enqueue(command());
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 
 	const exhausted = service.finalizeRetryableFailure(
@@ -369,10 +343,7 @@ test("a retryable rejection becomes failed when the automatic attempt budget is 
 test("only a matching lease plus SES MessageId confirms sent and consumes the source draft", () => {
 	const { service } = createService();
 	service.enqueue(command());
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 
 	assert.throws(
@@ -402,10 +373,7 @@ test("only a matching lease plus SES MessageId confirms sent and consumes the so
 test("a later provider bounce is recorded separately from confirmed SES acceptance", () => {
 	const { service } = createService();
 	service.enqueue(command());
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 	const sent = service.finalizeAccepted(
 		claimed.delivery.id,
@@ -439,19 +407,13 @@ test("cancelling queued mail prevents dispatch and retains the recoverable draft
 	assert.equal(cancelled.delivery.status, "cancelled");
 	assert.equal(cancelled.delivery.cancelledAt, "2026-07-11T10:00:05.000Z");
 	assert.equal(cancelled.sourceDraftAction, "retain");
-	assert.equal(
-		service.claimNext("2026-07-11T10:00:10.000Z", 30_000),
-		null,
-	);
+	assert.equal(service.claimNext("2026-07-11T10:00:10.000Z", 30_000), null);
 });
 
 test("a definitive failure retains the draft and an explicit retry creates a new attempt", () => {
 	const { service, storage } = createService();
 	service.enqueue(command());
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 
 	const failed = service.finalizeDefinitiveFailure(
@@ -474,6 +436,19 @@ test("a definitive failure retains the draft and an explicit retry creates a new
 	assert.equal(replay.delivery.status, "failed");
 	assert.equal(replay.delivery.id, failed.delivery.id);
 	assert.equal(storage.deliveries.size, 1);
+	assert.throws(
+		() =>
+			service.retryFailed(
+				failed.delivery.id,
+				{ kind: "user", id: "user-1" },
+				"2026-07-11T10:01:00.000Z",
+				() => {
+					throw new Error("capacity closed");
+				},
+			),
+		/capacity closed/,
+	);
+	assert.equal(service.get(failed.delivery.id)?.status, "failed");
 
 	const retried = service.retryFailed(
 		failed.delivery.id,
@@ -490,10 +465,7 @@ test("a definitive failure retains the draft and an explicit retry creates a new
 test("an ambiguous outcome retains the draft and retry requires duplicate-risk acknowledgement", () => {
 	const { service, storage } = createService();
 	service.enqueue(command());
-	const claimed = service.claimNext(
-		"2026-07-11T10:00:10.000Z",
-		30_000,
-	);
+	const claimed = service.claimNext("2026-07-11T10:00:10.000Z", 30_000);
 	assert.ok(claimed);
 
 	const unknown = service.finalizeUnknown(

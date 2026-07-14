@@ -144,9 +144,37 @@ test("unknown retry requires an explicit duplicate-risk acknowledgement", async 
 	});
 });
 
+test("bulk retry capacity is a truthful retryable response", async () => {
+	const app = appWithStub({
+		async retryOutboundDelivery() {
+			const error = new Error(
+				"This Mailbox has the maximum safe bulk backlog.",
+			);
+			error.name = "OutboundRetryCapacityError";
+			throw error;
+		},
+	});
+	const response = await app.request(`http://local${base}/delivery-1/retry`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ acknowledgeDuplicateRisk: false }),
+	});
+	assert.equal(response.status, 429);
+	assert.equal(response.headers.get("retry-after"), "60");
+	assert.deepEqual(await response.json(), {
+		error:
+			"This Mailbox has the maximum safe bulk backlog. Wait for current jobs to progress.",
+		code: "bulk_capacity_reached",
+	});
+});
+
 test("acknowledged unknown retry is attributed and queued", async () => {
 	const app = appWithStub({
-		async retryOutboundDelivery(id: string, actor: unknown, acknowledged: boolean) {
+		async retryOutboundDelivery(
+			id: string,
+			actor: unknown,
+			acknowledged: boolean,
+		) {
 			assert.equal(id, "delivery-1");
 			assert.deepEqual(actor, { kind: "user", id: "user-1" });
 			assert.equal(acknowledged, true);

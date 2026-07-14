@@ -4,7 +4,17 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { drizzle } from "drizzle-orm/durable-sqlite";
-import { eq, and, or, asc, desc, inArray, isNotNull, lte, sql } from "drizzle-orm";
+import {
+	eq,
+	and,
+	or,
+	asc,
+	desc,
+	inArray,
+	isNotNull,
+	lte,
+	sql,
+} from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import * as schema from "../db/schema";
 import {
@@ -19,14 +29,16 @@ import {
 	generateMessageId,
 	buildThreadToken,
 	buildThreadingHeaders,
-	escapeHtml,
 } from "../lib/email-helpers";
 import {
 	arrayBufferToBase64,
 	attachmentKey,
 	uploadKey,
 } from "../lib/attachments";
-import { validateAttachmentSet } from "../../shared/attachments";
+import {
+	ATTACHMENT_LIMITS,
+	validateAttachmentSet,
+} from "../../shared/attachments";
 import { vapidConfig } from "../lib/push/transport";
 import { sendWebPush } from "../lib/push/send";
 import type { PushPayload } from "../lib/push/types";
@@ -65,7 +77,12 @@ import {
 	type OutboundDeliveryStatus,
 } from "../lib/outbound-delivery-contract";
 import { CONVERSATION_ID_SQL } from "../lib/conversation-identity";
-import { TruthfulOutboxService } from "../lib/outbound-delivery-service";
+import {
+	OutboundRetryCapacityError,
+	TruthfulOutboxService,
+	type EnqueuedDelivery,
+	type StoredOutboundDelivery,
+} from "../lib/outbound-delivery-service";
 import {
 	DurableObjectOutboundDeliveryStorage,
 	deserializeOutboundSnapshot,
@@ -77,6 +94,42 @@ import {
 } from "./batch-triage.ts";
 import type { BatchTriageCommand } from "../../shared/batch-triage.ts";
 import { planBulkEnqueueReconciliation } from "../lib/outbound-enqueue-recovery.ts";
+import {
+	bulkCleanupBacklogCount,
+	bulkCleanupNextAt,
+	completeBulkCleanupClaim,
+	planBulkCleanupClaim,
+	retryBulkCleanupClaim,
+	type BulkCleanupIntent,
+} from "../lib/bulk-cleanup-intent.ts";
+import {
+	bulkAdmissionFingerprint,
+	bulkAttachmentPreparationKey,
+	bulkPersonalizedHtmlValidationError,
+	BulkRecipientAttachmentUnavailableError,
+	bulkNextUtcDayAt,
+	BULK_JOB_ID_PATTERN,
+	BULK_OPERATION_ID_PATTERN,
+	BULK_LIMITS,
+	BULK_PREPARATION_MAX_AGE_MS,
+	BULK_STALE_WRITER_VERIFY_MS,
+	completeBulkAdmission,
+	ensureBulkQueueMembership,
+	failBulkAdmission,
+	planBulkDailyAdmission,
+	planBulkDailyReservation,
+	planBulkAdmissionReservation,
+	planBulkAdmissionClaim,
+	planBulkRecipientEnqueueDisposition,
+	renderBulkTemplate,
+	removeBulkQueueMembership,
+	type BulkAdmissionRecord,
+	type BulkAdmissionReservation,
+	type BulkDailyAdmissionRecord,
+	type BulkDailyReservationRecord,
+	type BulkEnqueueResult,
+	type BulkReservationResult,
+} from "../lib/bulk-job-admission.ts";
 import { mailboxSendCutoffs } from "../lib/send-rate-limit.ts";
 import { finalizeCommittedOutboundMutation } from "../lib/outbound-liveness.ts";
 import {
@@ -109,7 +162,10 @@ import {
 import { readStoredReminderAnchor } from "../lib/follow-up-reminder-anchor.ts";
 import { readFollowUpReminderPreviews } from "../lib/follow-up-reminder-previews.ts";
 import { followUpReminderD1Store } from "../lib/follow-up-reminders-d1.ts";
-import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
+import {
+	InlineImageMappingError,
+	validateResolvedInlineImages,
+} from "../lib/inline-image-authority.ts";
 import {
 	processOneFollowUpReplyCompletion,
 	type FollowUpReplyQueueRepository,
@@ -148,7 +204,10 @@ import {
 	readMailboxAttachmentForEmail,
 	readMailboxAttachmentPage,
 } from "../lib/mailbox-attachments.ts";
-import { readMailboxChanges, readMailboxCurrentSequence } from "../lib/mailbox-change-feed.ts";
+import {
+	readMailboxChanges,
+	readMailboxCurrentSequence,
+} from "../lib/mailbox-change-feed.ts";
 import {
 	validateNormalizedMailboxChangeQuery,
 	type NormalizedMailboxChangeQuery,
@@ -218,7 +277,10 @@ const SEMANTIC_SCHEDULER_MAX_FAILURES = 5;
 
 function semanticSchedulerErrorCode(error: unknown): string {
 	const name = error instanceof Error ? error.name : "unknown";
-	return `scheduler_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`.slice(0, 64);
+	return `scheduler_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`.slice(
+		0,
+		64,
+	);
 }
 
 type SortColumn = (typeof ALLOWED_SORT_COLUMNS)[number];
@@ -286,7 +348,6 @@ interface AttachmentData {
 
 // ── Bulk send (mail merge, F-06) ───────────────────────────────────
 
-const BULK_MAX_RECIPIENTS = 200; // hard cap per job (locked-decisions F-06)
 const ATTACHMENT_CLEANUP_QUEUE_KEY = "attachment-cleanup:queue";
 
 type AttachmentCleanupJob = {
@@ -297,6 +358,21 @@ type AttachmentCleanupJob = {
 	createdAt: number;
 };
 const BULK_QUEUE_KEY = "bulk:queue";
+const BULK_ACTIVE_KEY = "bulk:active";
+const BULK_TERMINAL_HISTORY_KEY = "bulk:terminal-history";
+const BULK_DAILY_ADMISSION_KEY = "bulk:daily-admission";
+const BULK_DAILY_RESERVATION_KEY = "bulk:daily-reservation";
+const BULK_DAILY_RESERVATION_ACTOR_PREFIX = "bulk:daily-reservation:actor:";
+const BULK_RESERVATION_PREFIX = "bulk:reservation:";
+const BULK_ATTACHMENT_CLEANUP_PREFIX = "bulk:attachment-cleanup:";
+const BULK_RECIPIENT_PREPARATION_PREFIX = "bulk:recipient-preparation:";
+const SAFE_BULK_ERRORS = new Set([
+	"An attachment upload was not found or has expired. Re-attach and try again.",
+	"Bulk attachments could not be prepared. Re-attach them and try again.",
+	"Bulk job preparation expired. Start a new submission.",
+	"Job cancelled because the initiating user's mailbox access ended.",
+	"Recipient could not be queued.",
+]);
 
 type BulkRecipient = Record<string, string>; // must include `email`
 
@@ -310,7 +386,8 @@ interface BulkAttachment {
 
 interface BulkJob {
 	id: string;
-	status: "queued" | "running" | "done" | "cancelled";
+	operationId: string;
+	status: "preparing" | "queued" | "running" | "done" | "failed" | "cancelled";
 	actorUserId: string;
 	fromEmail: string;
 	fromName: string;
@@ -331,7 +408,52 @@ interface BulkJob {
 	nextEnqueueAt?: number;
 	/** Shared attachments delivered to every recipient (manifest only; bytes in R2). */
 	attachments?: BulkAttachment[];
+	/** Original upload objects retained until the fenced admission commit. */
+	preparationAttachmentKeys?: string[];
+	/** Cleanup authority for the alarm-owned generation copy. */
+	preparationCleanupIntentId?: string;
+	preparationGeneration?: number;
 }
+
+type BulkActiveEntry = {
+	jobId: string;
+	admissionKey: string;
+	total: number;
+	createdAt: number;
+};
+
+type BulkTerminalEntry = {
+	jobId: string;
+	admissionKey: string;
+	completedAt: number;
+};
+
+type BulkRecipientPreparation = {
+	jobId: string;
+	cursor: number;
+	idempotencyKey: string;
+	messageId: string;
+	attachments: PendingOutboundAttachment[];
+	keys: string[];
+	cleanupIntentId: string;
+	createdAt: number;
+};
+
+type BulkJobProgress = Pick<
+	BulkJob,
+	| "id"
+	| "status"
+	| "total"
+	| "enqueued"
+	| "failed"
+	| "cursor"
+	| "createdAt"
+	| "updatedAt"
+> & {
+	errors: Array<{ email: string; error: string }>;
+	errorCount: number;
+	errorsTruncated: boolean;
+};
 
 export class MailboxDO extends DurableObject<Env> {
 	declare __DURABLE_OBJECT_BRAND: never;
@@ -822,10 +944,12 @@ export class MailboxDO extends DurableObject<Env> {
 				folderId: schema.emails.folder_id,
 			})
 			.from(schema.emails)
-			.where(and(
+			.where(
+				and(
 				eq(schema.emails.id, id),
 				sql`${schema.emails.folder_id} <> ${InternalFolders.RETIRED_OUTBOUND}`,
-			))
+				),
+			)
 			.get();
 		return row ?? null;
 	}
@@ -988,7 +1112,9 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	/** Mutation-free evidence for only globally selected compound Conversations. */
-	async getGlobalTodayBriefEvidence(requests: GlobalTodayBriefEvidenceRequest[]) {
+	async getGlobalTodayBriefEvidence(
+		requests: GlobalTodayBriefEvidenceRequest[],
+	) {
 		return readGlobalTodayBriefEvidence(this.ctx.storage.sql, requests);
 	}
 
@@ -1000,7 +1126,9 @@ export class MailboxDO extends DurableObject<Env> {
 	/** Advance the bounded local semantic projection and return truthful readiness. */
 	async prepareSemanticIndex() {
 		if (!this.#semanticPreparation) {
-			this.#semanticPreparation = createSemanticIndex({ store: this.ctx.storage })
+			this.#semanticPreparation = createSemanticIndex({
+				store: this.ctx.storage,
+			})
 				.prepare()
 				.finally(() => {
 					this.#semanticPreparation = null;
@@ -1017,13 +1145,18 @@ export class MailboxDO extends DurableObject<Env> {
 	async scheduleSemanticIndexAdvance(mailboxId: string) {
 		const normalized = normalizeMailAddress(mailboxId);
 		if (!normalized || normalized !== mailboxId) {
-			throw new Error("Semantic scheduler received an invalid Mailbox identity");
+			throw new Error(
+				"Semantic scheduler received an invalid Mailbox identity",
+			);
 		}
-		const existing = await this.ctx.storage.get<string>(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+		const existing = await this.ctx.storage.get<string>(
+			SEMANTIC_SCHEDULER_MAILBOX_KEY,
+		);
 		if (existing && existing !== normalized) {
 			throw new Error("Semantic scheduler Mailbox identity changed");
 		}
-		if (!existing) await this.ctx.storage.put(SEMANTIC_SCHEDULER_MAILBOX_KEY, normalized);
+		if (!existing)
+			await this.ctx.storage.put(SEMANTIC_SCHEDULER_MAILBOX_KEY, normalized);
 		await this.#scheduleAlarmAt(Date.now() + 100);
 	}
 
@@ -1033,7 +1166,9 @@ export class MailboxDO extends DurableObject<Env> {
 		if (!normalized || normalized !== mailboxId) {
 			throw new Error("Semantic rebuild received an invalid Mailbox identity");
 		}
-		const existing = await this.ctx.storage.get<string>(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+		const existing = await this.ctx.storage.get<string>(
+			SEMANTIC_SCHEDULER_MAILBOX_KEY,
+		);
 		if (existing && existing !== normalized) {
 			throw new Error("Semantic rebuild Mailbox identity changed");
 		}
@@ -1116,8 +1251,9 @@ export class MailboxDO extends DurableObject<Env> {
 		nowMs: number,
 		leaseMs: number,
 	) {
-		return createSemanticIndex({ store: this.ctx.storage })
-			.leaseAttachmentExtraction(leaseToken, nowMs, leaseMs);
+		return createSemanticIndex({
+			store: this.ctx.storage,
+		}).leaseAttachmentExtraction(leaseToken, nowMs, leaseMs);
 	}
 
 	async completeSemanticAttachmentExtraction(
@@ -1125,8 +1261,9 @@ export class MailboxDO extends DurableObject<Env> {
 			ReturnType<typeof createSemanticIndex>["completeAttachmentExtraction"]
 		>[0],
 	) {
-		return createSemanticIndex({ store: this.ctx.storage })
-			.completeAttachmentExtraction(completion);
+		return createSemanticIndex({
+			store: this.ctx.storage,
+		}).completeAttachmentExtraction(completion);
 	}
 
 	async rejectSemanticAttachmentExtraction(
@@ -1134,8 +1271,9 @@ export class MailboxDO extends DurableObject<Env> {
 			ReturnType<typeof createSemanticIndex>["rejectAttachmentExtraction"]
 		>[0],
 	) {
-		return createSemanticIndex({ store: this.ctx.storage })
-			.rejectAttachmentExtraction(input);
+		return createSemanticIndex({
+			store: this.ctx.storage,
+		}).rejectAttachmentExtraction(input);
 	}
 
 	async retrySemanticAttachmentExtraction(
@@ -1143,8 +1281,9 @@ export class MailboxDO extends DurableObject<Env> {
 			ReturnType<typeof createSemanticIndex>["retryAttachmentExtraction"]
 		>[0],
 	) {
-		return createSemanticIndex({ store: this.ctx.storage })
-			.retryAttachmentExtraction(input);
+		return createSemanticIndex({
+			store: this.ctx.storage,
+		}).retryAttachmentExtraction(input);
 	}
 
 	async resolveSemanticCandidates(
@@ -1153,20 +1292,24 @@ export class MailboxDO extends DurableObject<Env> {
 		const semanticIndex = createSemanticIndex({ store: this.ctx.storage });
 		const initiallyResolved = semanticIndex.resolveCandidates(candidates);
 		const attachmentAuthority = new Map<string, boolean>();
-		await Promise.all(initiallyResolved.map(async (candidate) => {
+		await Promise.all(
+			initiallyResolved.map(async (candidate) => {
 			if (
 				candidate.source !== "attachment" ||
 				!candidate.attachmentId ||
 				!candidate.attachmentStorageFilename
-			) return;
+				)
+					return;
 			const object = await this.env.BUCKET.head(attachmentKey(
 				candidate.messageId,
 				candidate.attachmentId,
 				candidate.attachmentStorageFilename,
 			));
 			const authoritative = Boolean(
-				object && object.version === candidate.r2Version &&
-				object.etag === candidate.r2Etag && object.size === candidate.actualSize,
+					object &&
+					object.version === candidate.r2Version &&
+					object.etag === candidate.r2Etag &&
+					object.size === candidate.actualSize,
 			);
 			if (!authoritative) {
 				semanticIndex.invalidateAttachmentAuthority({
@@ -1180,9 +1323,14 @@ export class MailboxDO extends DurableObject<Env> {
 				});
 			}
 			attachmentAuthority.set(candidate.vectorId, authoritative);
-		}));
-		const current = semanticIndex.resolveCandidates(candidates).filter((candidate) =>
-			candidate.source === "message" || attachmentAuthority.get(candidate.vectorId) === true,
+			}),
+		);
+		const current = semanticIndex
+			.resolveCandidates(candidates)
+			.filter(
+				(candidate) =>
+					candidate.source === "message" ||
+					attachmentAuthority.get(candidate.vectorId) === true,
 		);
 		return {
 			candidates: current,
@@ -1224,7 +1372,8 @@ export class MailboxDO extends DurableObject<Env> {
 			),
 		][0];
 		if (current && current.expires_at > now) {
-			const sameOwner = current.owner_user_id === ownerUserId &&
+			const sameOwner =
+				current.owner_user_id === ownerUserId &&
 				current.claim_token === claimToken;
 			if (sameOwner && expiresAt > current.expires_at) {
 				this.ctx.storage.sql.exec(
@@ -1266,7 +1415,8 @@ export class MailboxDO extends DurableObject<Env> {
 		) {
 			return false;
 		}
-		const before = [
+		const before =
+			[
 			...this.ctx.storage.sql.exec<{ total: number }>(
 				`SELECT COUNT(*) AS total FROM today_brief_generation_claims
 				 WHERE cache_key = ?1 AND owner_user_id = ?2 AND claim_token = ?3`,
@@ -1569,7 +1719,8 @@ export class MailboxDO extends DurableObject<Env> {
 		return {
 			transaction: (run) => this.ctx.storage.transactionSync(run),
 			resolveScope: (scope, mode) => {
-				const folderReference = mode === "unsnooze"
+				const folderReference =
+					mode === "unsnooze"
 					? Folders.SNOOZED
 					: scope.kind === "conversation"
 						? scope.folderId
@@ -1600,18 +1751,26 @@ export class MailboxDO extends DurableObject<Env> {
 				if (rows.length !== emailIds.length) return null;
 				return rows;
 			},
-			hasActiveOutbound: (emailIds) => Boolean(
+			hasActiveOutbound: (emailIds) =>
+				Boolean(
 				this.db
 					.select({ id: schema.outboundDeliveries.id })
 					.from(schema.outboundDeliveries)
-					.where(and(
+						.where(
+							and(
 						inArray(schema.outboundDeliveries.email_id, emailIds),
-						inArray(schema.outboundDeliveries.status, ["queued", "sending", "retrying"]),
-					))
+								inArray(schema.outboundDeliveries.status, [
+									"queued",
+									"sending",
+									"retrying",
+								]),
+							),
+						)
 					.limit(1)
 					.get(),
 			),
-			folderExists: (folderId) => Boolean(
+			folderExists: (folderId) =>
+				Boolean(
 				this.db
 					.select({ id: schema.folders.id })
 					.from(schema.folders)
@@ -1655,7 +1814,8 @@ export class MailboxDO extends DurableObject<Env> {
 		if (result.status === "snoozed") {
 			await finalizeCommittedSnooze({
 				ensureAlarm: () => this.#scheduleAlarmAt(Date.parse(request.wakeAt)),
-				logFailure: (error) => console.error("failed to schedule Snooze wake alarm", {
+				logFailure: (error) =>
+					console.error("failed to schedule Snooze wake alarm", {
 					wakeAt: request.wakeAt,
 					error: error instanceof Error ? error.message : String(error),
 				}),
@@ -1691,14 +1851,16 @@ export class MailboxDO extends DurableObject<Env> {
 		const snoozedMember = this.db
 			.select({ id: schema.emails.id })
 			.from(schema.emails)
-			.where(and(
+			.where(
+				and(
 				inArray(schema.emails.id, scope.emailIds),
 				or(
 					eq(schema.emails.folder_id, Folders.SNOOZED),
 					isNotNull(schema.emails.snoozed_until),
 					isNotNull(schema.emails.snooze_source_folder_id),
 				),
-			))
+				),
+			)
 			.limit(1)
 			.get();
 		if (snoozedMember) {
@@ -1784,7 +1946,8 @@ export class MailboxDO extends DurableObject<Env> {
 				wakeAt: email.snoozed_until,
 				sourceFolderId: email.snooze_source_folder_id,
 			})
-		) return null;
+		)
+			return null;
 
 		const emailAttachments = this.db
 			.select({
@@ -1974,7 +2137,10 @@ export class MailboxDO extends DurableObject<Env> {
 					input.createFingerprint,
 				);
 				if (replay.status === "replay") {
-					return { status: "creation_replay" as const, draftId: replay.draftId };
+					return {
+						status: "creation_replay" as const,
+						draftId: replay.draftId,
+					};
 				}
 				if (replay.status === "conflict") {
 					return { ...replay, status: "creation_conflict" as const };
@@ -2241,11 +2407,13 @@ export class MailboxDO extends DurableObject<Env> {
 		if (isInternalFolderId(email.folder_id)) {
 			return { status: "protected_internal_state" as const };
 		}
-		if (snoozeBlocksGenericMove({
+		if (
+			snoozeBlocksGenericMove({
 			folderId: email.folder_id,
 			wakeAt: email.snoozed_until,
 			sourceFolderId: email.snooze_source_folder_id,
-		})) {
+			})
+		) {
 			return { status: "snoozed_state_requires_unsnooze" as const };
 		}
 		const activeDelivery = this.#activeOutboundDeliveryForEmail(id);
@@ -2378,7 +2546,9 @@ export class MailboxDO extends DurableObject<Env> {
 		);
 	}
 
-	async listMailboxAttachments(options: NormalizedMailboxAttachmentListOptions) {
+	async listMailboxAttachments(
+		options: NormalizedMailboxAttachmentListOptions,
+	) {
 		return readMailboxAttachmentPage(
 			this.ctx.storage.sql,
 			validateNormalizedMailboxAttachmentListOptions(options),
@@ -2408,10 +2578,14 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async claimImportedEmail(emailId: string, legacyId: string, token: string) {
 		if (
-			!emailId || emailId.length > 300 ||
-			!legacyId || legacyId.length > 300 ||
-			token.length < 16 || token.length > 100
-		) throw new Error("Import claim identity is invalid");
+			!emailId ||
+			emailId.length > 300 ||
+			!legacyId ||
+			legacyId.length > 300 ||
+			token.length < 16 ||
+			token.length > 100
+		)
+			throw new Error("Import claim identity is invalid");
 		const now = Date.now();
 		return this.ctx.storage.transactionSync(() =>
 			claimImportedEmailRecord(
@@ -2421,25 +2595,31 @@ export class MailboxDO extends DurableObject<Env> {
 				token,
 				now,
 				now + 15 * 60_000,
-			)
+			),
 		);
 	}
 
 	async releaseImportedEmailClaim(emailId: string, token: string) {
 		if (
-			!emailId || emailId.length > 300 ||
-			token.length < 16 || token.length > 100
-		) return;
+			!emailId ||
+			emailId.length > 300 ||
+			token.length < 16 ||
+			token.length > 100
+		)
+			return;
 		this.ctx.storage.transactionSync(() =>
-			releaseImportedEmailClaimRecord(this.ctx.storage.sql, emailId, token)
+			releaseImportedEmailClaimRecord(this.ctx.storage.sql, emailId, token),
 		);
 	}
 
 	async renewImportedEmailClaim(emailId: string, token: string) {
 		if (
-			!emailId || emailId.length > 300 ||
-			token.length < 16 || token.length > 100
-		) return false;
+			!emailId ||
+			emailId.length > 300 ||
+			token.length < 16 ||
+			token.length > 100
+		)
+			return false;
 		const now = Date.now();
 		return this.ctx.storage.transactionSync(() =>
 			renewImportedEmailClaimRecord(
@@ -2448,17 +2628,19 @@ export class MailboxDO extends DurableObject<Env> {
 				token,
 				now,
 				now + 15 * 60_000,
-			)
+			),
 		);
 	}
 
 	async hasEmailOrThreadIdentity(identity: string) {
 		if (!identity || identity.length > 300) return false;
-		const row = [...this.ctx.storage.sql.exec<{ found: number }>(
+		const row = [
+			...this.ctx.storage.sql.exec<{ found: number }>(
 			`SELECT 1 AS found FROM emails
 			 WHERE id = ?1 OR thread_id = ?1 LIMIT 1`,
 			identity,
-		)][0];
+			),
+		][0];
 		return row?.found === 1;
 	}
 
@@ -2803,11 +2985,13 @@ export class MailboxDO extends DurableObject<Env> {
 			.where(eq(schema.emails.id, id))
 			.get();
 		if (!email || isInternalFolderId(email.folder_id)) return false;
-		if (snoozeBlocksGenericMove({
+		if (
+			snoozeBlocksGenericMove({
 			folderId: email.folder_id,
 			wakeAt: email.snoozed_until,
 			sourceFolderId: email.snooze_source_folder_id,
-		})) {
+			})
+		) {
 			return { status: "snoozed_state_requires_unsnooze" as const };
 		}
 		const activeDelivery = this.#activeOutboundDeliveryForEmail(id);
@@ -2878,17 +3062,16 @@ export class MailboxDO extends DurableObject<Env> {
 		const plan = buildMailSearchPlan(options);
 		const row = [
 			...this.ctx.storage.sql.exec(plan.countSql, ...plan.countParams),
-		][0] as
-			| { total: number }
-			| undefined;
+		][0] as { total: number } | undefined;
 		return row?.total ?? 0;
 	}
 
 	// ── Threading helpers (raw SQL) ────────────────────────────────
 
 	async resolveCanonicalThreadId(messageIds: string[]): Promise<string | null> {
-		const ids = [...new Set(messageIds.map((id) => id.trim()).filter(Boolean))]
-			.slice(0, 50);
+		const ids = [
+			...new Set(messageIds.map((id) => id.trim()).filter(Boolean)),
+		].slice(0, 50);
 		if (ids.length === 0) return null;
 		const rows = this.db
 			.select({
@@ -2897,10 +3080,12 @@ export class MailboxDO extends DurableObject<Env> {
 				threadId: schema.emails.thread_id,
 			})
 			.from(schema.emails)
-			.where(or(
+			.where(
+				or(
 				inArray(schema.emails.message_id, ids),
 				inArray(schema.emails.id, ids),
-			))
+				),
+			)
 			.all();
 		return resolveUnambiguousThreadReference(ids, rows);
 	}
@@ -2978,7 +3163,8 @@ export class MailboxDO extends DurableObject<Env> {
 				email.automation_trigger !== "live_inbound" ||
 				folderId !== Folders.INBOX ||
 				email.recipient_memory_origin !== RecipientMemoryOrigins.LIVE_INBOUND
-			) throw new Error("Automation trigger is not eligible for this Message");
+			)
+				throw new Error("Automation trigger is not eligible for this Message");
 			// Register the alarm before accepting the Message. The Durable Object input
 			// gate keeps it from running until this event completes; a later transaction
 			// failure leaves only a harmless alarm with no due work.
@@ -3054,7 +3240,9 @@ export class MailboxDO extends DurableObject<Env> {
 				);
 			}
 			if (folderId === Folders.INBOX && email.follow_up_reply_mailbox_address) {
-				this.db.insert(schema.followUpReplyCompletionQueue).values({
+				this.db
+					.insert(schema.followUpReplyCompletionQueue)
+					.values({
 					inbound_message_id: email.id,
 					mailbox_address: email.follow_up_reply_mailbox_address,
 					conversation_key: email.thread_id?.trim() || email.id,
@@ -3063,7 +3251,9 @@ export class MailboxDO extends DurableObject<Env> {
 					next_attempt_at: Date.now(),
 					created_at: Date.now(),
 					last_error: null,
-				}).onConflictDoNothing().run();
+					})
+					.onConflictDoNothing()
+					.run();
 			}
 			if (actor) {
 				this.#recordActivity(
@@ -3078,9 +3268,11 @@ export class MailboxDO extends DurableObject<Env> {
 			if (email.push_notification !== undefined) {
 				if (
 					folderId !== Folders.INBOX ||
-					email.recipient_memory_origin !== RecipientMemoryOrigins.LIVE_INBOUND ||
+					email.recipient_memory_origin !==
+						RecipientMemoryOrigins.LIVE_INBOUND ||
 					!mailboxAddress
-				) throw new Error("Push notification is not eligible for this Message");
+				)
+					throw new Error("Push notification is not eligible for this Message");
 				pushTargetCount = enqueuePushNotification(this.ctx.storage.sql, {
 					emailId: email.id,
 					mailboxId: mailboxAddress,
@@ -3090,12 +3282,16 @@ export class MailboxDO extends DurableObject<Env> {
 			}
 		});
 		if (automationCaptureError) {
-			console.error("[automation-rules] capture failed after Message acceptance", {
+			console.error(
+				"[automation-rules] capture failed after Message acceptance",
+				{
 				emailId: email.id,
-				error: automationCaptureError instanceof Error
+					error:
+						automationCaptureError instanceof Error
 					? automationCaptureError.message
 					: String(automationCaptureError),
-			});
+				},
+			);
 		}
 		if (pushTargetCount !== null) {
 			await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
@@ -3109,10 +3305,12 @@ export class MailboxDO extends DurableObject<Env> {
 			const queued = this.db
 				.select({ threadId: schema.snoozeReplyWakeQueue.thread_id })
 				.from(schema.snoozeReplyWakeQueue)
-				.where(eq(
+				.where(
+					eq(
 					schema.snoozeReplyWakeQueue.thread_id,
 					email.snooze_wake_thread_id,
-				))
+					),
+				)
 				.get();
 			if (queued) {
 				await this.#scheduleAlarmAt(Date.now() + 100).catch((error) =>
@@ -3154,21 +3352,23 @@ export class MailboxDO extends DurableObject<Env> {
 		});
 	}
 
-	async enqueueOutbound(
+	async #enqueueOutboundInternal(
 		command: EnqueueOutboundCommand,
 		attachments: readonly PendingOutboundAttachment[],
 		emailId: string,
+		onCommittedSync?: (result: EnqueuedDelivery) => void,
 	) {
 		const inlineMapping = validateResolvedInlineImages(
 			command.snapshot.html ?? "",
 			attachments,
 		);
 		if (!inlineMapping.ok) {
-			const error = new Error(inlineMapping.error);
-			error.name = "InlineImageMappingError";
-			throw error;
+			throw new InlineImageMappingError(inlineMapping.error);
 		}
-		const result = this.#outboxService(attachments, emailId).enqueue(command);
+		const result = this.#outboxService(attachments, emailId).enqueue(
+			command,
+			onCommittedSync,
+		);
 		await finalizeCommittedOutboundMutation({
 			ensureAlarm: () => this.#ensureOutboundAlarm(),
 			recordActivity: () =>
@@ -3198,6 +3398,14 @@ export class MailboxDO extends DurableObject<Env> {
 			}
 		}
 		return result;
+	}
+
+	async enqueueOutbound(
+		command: EnqueueOutboundCommand,
+		attachments: readonly PendingOutboundAttachment[],
+		emailId: string,
+	) {
+		return this.#enqueueOutboundInternal(command, attachments, emailId);
 	}
 
 	async listOutboundDeliveries() {
@@ -3538,8 +3746,11 @@ export class MailboxDO extends DurableObject<Env> {
 						actor,
 						acknowledgeDuplicateRisk as true,
 						at,
+						(delivery) => this.#assertBulkRetryCapacitySync(delivery),
 					)
-				: this.#outboxService().retryFailed(deliveryId, actor, at);
+				: this.#outboxService().retryFailed(deliveryId, actor, at, (delivery) =>
+						this.#assertBulkRetryCapacitySync(delivery),
+					);
 		await finalizeCommittedOutboundMutation({
 			ensureAlarm: () => this.#ensureOutboundAlarm(),
 			recordActivity: () =>
@@ -3627,8 +3838,60 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 	}
 
+	async #scheduleBulkAlarmAt(
+		timestamp: number,
+		input: {
+			stage: "throttle_schedule" | "next_job_schedule";
+			startedAt: number;
+			jobId: string;
+			job?: BulkJob;
+		},
+	): Promise<void> {
+		try {
+			await this.#scheduleAlarmAt(timestamp);
+		} catch (error) {
+			console.error("[bulk-send] alarm pass failed", {
+				operation: "bulk_alarm_pass",
+				stage: input.stage,
+				mailboxId: input.job?.fromEmail,
+				operationId: input.job?.operationId,
+				jobId: input.jobId,
+				result: "failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - input.startedAt,
+			});
+			throw error;
+		}
+	}
+
+	async #ensureBulkMaintenanceAlarmForJob(input: {
+		startedAt: number;
+		jobId: string;
+		job?: BulkJob;
+	}): Promise<void> {
+		try {
+			await this.#ensureBulkMaintenanceAlarm();
+		} catch (error) {
+			console.error("[bulk-send] alarm pass failed", {
+				operation: "bulk_alarm_pass",
+				stage: "terminal_maintenance_schedule",
+				mailboxId: input.job?.fromEmail,
+				operationId: input.job?.operationId,
+				jobId: input.jobId,
+				result: "failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - input.startedAt,
+			});
+			throw error;
+		}
+	}
+
 	async #processSemanticIndexAlarm(alarmNow: number): Promise<number | null> {
-		const mailboxId = await this.ctx.storage.get<string>(SEMANTIC_SCHEDULER_MAILBOX_KEY);
+		const mailboxId = await this.ctx.storage.get<string>(
+			SEMANTIC_SCHEDULER_MAILBOX_KEY,
+		);
 		if (!mailboxId) return null;
 		const brand = resolveBrand(this.env.BRAND);
 		if (
@@ -3662,24 +3925,27 @@ export class MailboxDO extends DurableObject<Env> {
 				},
 			});
 			await this.ctx.storage.delete(SEMANTIC_SCHEDULER_FAILURES_KEY);
-			const next = createSemanticIndex({ store: this.ctx.storage })
-				.nextAdvanceAt(Date.now());
+			const next = createSemanticIndex({
+				store: this.ctx.storage,
+			}).nextAdvanceAt(Date.now());
 			if (next === null) {
 				await this.ctx.storage.delete(SEMANTIC_SCHEDULER_MAILBOX_KEY);
 				return null;
 			}
 			return Math.max(Date.now() + 100, next);
 		} catch (error) {
-			const failures = (await this.ctx.storage.get<number>(
+			const failures =
+				((await this.ctx.storage.get<number>(
 				SEMANTIC_SCHEDULER_FAILURES_KEY,
-			) ?? 0) + 1;
+				)) ?? 0) + 1;
 			console.error("[semantic-index] alarm turn failed", {
 				errorCode: semanticSchedulerErrorCode(error),
 				attempt: failures,
 			});
 			if (failures >= SEMANTIC_SCHEDULER_MAX_FAILURES) {
-				createSemanticIndex({ store: this.ctx.storage })
-					.failProjection("scheduler_exhausted");
+				createSemanticIndex({ store: this.ctx.storage }).failProjection(
+					"scheduler_exhausted",
+				);
 				await this.ctx.storage.delete(SEMANTIC_SCHEDULER_MAILBOX_KEY);
 				await this.ctx.storage.delete(SEMANTIC_SCHEDULER_FAILURES_KEY);
 				return null;
@@ -3690,7 +3956,8 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	#nextAutomationAlarmAt(): number | null {
-		const row = [...this.ctx.storage.sql.exec<{ dueAt: string | null }>(
+		const row = [
+			...this.ctx.storage.sql.exec<{ dueAt: string | null }>(
 			`SELECT MIN(due_at) AS dueAt FROM (
 			 SELECT next_attempt_at AS due_at FROM automation_runs
 			 WHERE state = 'pending' AND next_attempt_at IS NOT NULL
@@ -3698,7 +3965,8 @@ export class MailboxDO extends DurableObject<Env> {
 			 SELECT lease_expires_at AS due_at FROM automation_runs
 			 WHERE state = 'processing' AND lease_expires_at IS NOT NULL
 			)`,
-		)][0];
+			),
+		][0];
 		if (!row?.dueAt) return null;
 		const timestamp = Date.parse(row.dueAt);
 		return Number.isFinite(timestamp) ? timestamp : null;
@@ -3733,7 +4001,8 @@ export class MailboxDO extends DurableObject<Env> {
 						claim,
 						context,
 						ownedPlan,
-						(activity) => this.#recordActivity(
+						(activity) =>
+							this.#recordActivity(
 							activity.actor,
 							activity.action,
 							activity.entityType,
@@ -3752,12 +4021,16 @@ export class MailboxDO extends DurableObject<Env> {
 				try {
 					recorded = automation.failClaim(claim, "runtime_failure", true);
 				} catch (failureError) {
-					console.error("[automation-rules] could not persist execution failure", {
+					console.error(
+						"[automation-rules] could not persist execution failure",
+						{
 						runId: claim.id,
-						error: failureError instanceof Error
+							error:
+								failureError instanceof Error
 							? failureError.message
 							: String(failureError),
-					});
+						},
+					);
 				}
 				console.error("[automation-rules] execution failed", {
 					runId: claim.id,
@@ -3770,7 +4043,8 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	#processDueSnoozeBatch(now = Date.now()): number | null {
-		const rows = [...this.ctx.storage.sql.exec(
+		const rows = [
+			...this.ctx.storage.sql.exec(
 			`SELECT id,
 			        snooze_source_folder_id AS sourceFolderId,
 			        snoozed_until AS wakeAt
@@ -3779,7 +4053,8 @@ export class MailboxDO extends DurableObject<Env> {
 			 ORDER BY snoozed_until ASC, id ASC
 			 LIMIT 101`,
 			Folders.SNOOZED,
-		)] as Array<{ id: string; sourceFolderId: string | null; wakeAt: string }>;
+			),
+		] as Array<{ id: string; sourceFolderId: string | null; wakeAt: string }>;
 		const visibleFolders = new Set(
 			this.db
 				.select({ id: schema.folders.id })
@@ -3787,10 +4062,8 @@ export class MailboxDO extends DurableObject<Env> {
 				.all()
 				.map((folder) => folder.id),
 		);
-		const plan = planDueSnoozeWake(
-			rows,
-			now,
-			(folderId) => visibleFolders.has(folderId),
+		const plan = planDueSnoozeWake(rows, now, (folderId) =>
+			visibleFolders.has(folderId),
 		);
 		if (plan.wake.length > 0) {
 			const occurredAt = new Date(now).toISOString();
@@ -3803,10 +4076,12 @@ export class MailboxDO extends DurableObject<Env> {
 							snooze_source_folder_id: null,
 							snoozed_until: null,
 						})
-						.where(and(
+						.where(
+							and(
 							eq(schema.emails.id, target.id),
 							eq(schema.emails.folder_id, Folders.SNOOZED),
-						))
+							),
+						)
 						.run();
 				}
 				this.#recordActivity(
@@ -3833,14 +4108,16 @@ export class MailboxDO extends DurableObject<Env> {
 			.limit(1)
 			.get();
 		if (!queued) return false;
-		const rows = [...this.ctx.storage.sql.exec(
+		const rows = [
+			...this.ctx.storage.sql.exec(
 			`SELECT id FROM emails
 			 WHERE folder_id = ?1 AND thread_id = ?2
 			 ORDER BY date ASC, id ASC
 			 LIMIT 100`,
 			Folders.SNOOZED,
 			queued.thread_id,
-		)] as Array<{ id: string }>;
+			),
+		] as Array<{ id: string }>;
 		const occurredAt = new Date().toISOString();
 		this.ctx.storage.transactionSync(() => {
 			if (rows.length > 0) {
@@ -3851,7 +4128,12 @@ export class MailboxDO extends DurableObject<Env> {
 						snooze_source_folder_id: null,
 						snoozed_until: null,
 					})
-					.where(inArray(schema.emails.id, rows.map((row) => row.id)))
+					.where(
+						inArray(
+							schema.emails.id,
+							rows.map((row) => row.id),
+						),
+					)
 					.run();
 				this.#recordActivity(
 					{ kind: "system" },
@@ -3865,10 +4147,12 @@ export class MailboxDO extends DurableObject<Env> {
 			const remaining = this.db
 				.select({ id: schema.emails.id })
 				.from(schema.emails)
-				.where(and(
+				.where(
+					and(
 					eq(schema.emails.folder_id, Folders.SNOOZED),
 					eq(schema.emails.thread_id, queued.thread_id),
-				))
+					),
+				)
 				.limit(1)
 				.get();
 			if (!remaining) {
@@ -3879,57 +4163,73 @@ export class MailboxDO extends DurableObject<Env> {
 			}
 		});
 		return Boolean(
-			this.db.select({ threadId: schema.snoozeReplyWakeQueue.thread_id })
+			this.db
+				.select({ threadId: schema.snoozeReplyWakeQueue.thread_id })
 				.from(schema.snoozeReplyWakeQueue)
 				.limit(1)
 				.get(),
 		);
 	}
 
-	async #processFollowUpReplyCompletionQueue(now: number): Promise<number | null> {
+	async #processFollowUpReplyCompletionQueue(
+		now: number,
+	): Promise<number | null> {
 		const repository: FollowUpReplyQueueRepository = {
 			nextDue: async (dueAt) => {
 				const row = this.db
 					.select()
 					.from(schema.followUpReplyCompletionQueue)
-					.where(lte(schema.followUpReplyCompletionQueue.next_attempt_at, dueAt))
+					.where(
+						lte(schema.followUpReplyCompletionQueue.next_attempt_at, dueAt),
+					)
 					.orderBy(
 						asc(schema.followUpReplyCompletionQueue.next_attempt_at),
 						asc(schema.followUpReplyCompletionQueue.inbound_message_id),
 					)
 					.limit(1)
 					.get();
-				return row ? {
+				return row
+					? {
 					inboundMessageId: row.inbound_message_id,
 					mailboxAddress: row.mailbox_address,
 					conversationKey: row.conversation_key,
 					inboundMessageDate: row.inbound_message_date,
 					attempts: row.attempts,
-				} : null;
+						}
+					: null;
 			},
 			remove: async (inboundMessageId) => {
-				this.db.delete(schema.followUpReplyCompletionQueue)
-					.where(eq(
+				this.db
+					.delete(schema.followUpReplyCompletionQueue)
+					.where(
+						eq(
 						schema.followUpReplyCompletionQueue.inbound_message_id,
 						inboundMessageId,
-					))
+						),
+					)
 					.run();
 			},
 			retry: async (input) => {
-				this.db.update(schema.followUpReplyCompletionQueue)
+				this.db
+					.update(schema.followUpReplyCompletionQueue)
 					.set({
 						attempts: input.attempts,
 						next_attempt_at: input.nextAttemptAt,
 						last_error: input.lastError,
 					})
-					.where(eq(
+					.where(
+						eq(
 						schema.followUpReplyCompletionQueue.inbound_message_id,
 						input.inboundMessageId,
-					))
+						),
+					)
 					.run();
 			},
-			nextAttemptAt: async () => this.db
-				.select({ nextAttemptAt: schema.followUpReplyCompletionQueue.next_attempt_at })
+			nextAttemptAt: async () =>
+				this.db
+					.select({
+						nextAttemptAt: schema.followUpReplyCompletionQueue.next_attempt_at,
+					})
 				.from(schema.followUpReplyCompletionQueue)
 				.orderBy(
 					asc(schema.followUpReplyCompletionQueue.next_attempt_at),
@@ -3941,8 +4241,8 @@ export class MailboxDO extends DurableObject<Env> {
 		return processOneFollowUpReplyCompletion({
 			repository,
 			now,
-			complete: (item) => followUpReminderD1Store(this.env)
-				.completeForInboundReply({
+			complete: (item) =>
+				followUpReminderD1Store(this.env).completeForInboundReply({
 					mailboxAddress: item.mailboxAddress,
 					conversationKey: item.conversationKey,
 					inboundMessageId: item.inboundMessageId,
@@ -3964,10 +4264,10 @@ export class MailboxDO extends DurableObject<Env> {
 		if (next !== null) {
 			await finalizeCommittedSnooze({
 				ensureAlarm: () => this.#scheduleAlarmAt(Math.max(now, next)),
-				logFailure: (error) => console.error(
-					"failed to re-arm Snooze during read self-heal",
-					{ error: error instanceof Error ? error.message : String(error) },
-				),
+				logFailure: (error) =>
+					console.error("failed to re-arm Snooze during read self-heal", {
+						error: error instanceof Error ? error.message : String(error),
+					}),
 			});
 		}
 	}
@@ -3992,7 +4292,9 @@ export class MailboxDO extends DurableObject<Env> {
 			.from(schema.emails)
 			.where(eq(schema.emails.id, emailId))
 			.get();
-		const snapshot = deserializeOutboundSnapshot(snapshotRow?.raw_headers ?? null);
+		const snapshot = deserializeOutboundSnapshot(
+			snapshotRow?.raw_headers ?? null,
+		);
 		this.ctx.storage.transactionSync(() => {
 			this.db
 				.update(schema.emails)
@@ -4001,8 +4303,7 @@ export class MailboxDO extends DurableObject<Env> {
 					date: at,
 					message_id: sesMessageId,
 					read: 1,
-					recipient_memory_origin:
-						RecipientMemoryOrigins.ACCEPTED_OUTBOUND,
+					recipient_memory_origin: RecipientMemoryOrigins.ACCEPTED_OUTBOUND,
 				})
 				.where(eq(schema.emails.id, emailId))
 				.run();
@@ -4090,10 +4391,7 @@ export class MailboxDO extends DurableObject<Env> {
 		);
 	}
 
-	async getRelationshipBriefEvidence(
-		mailboxAddress: string,
-		personId: string,
-	) {
+	async getRelationshipBriefEvidence(mailboxAddress: string, personId: string) {
 		const normalizedMailbox = normalizeMailAddress(mailboxAddress);
 		if (!normalizedMailbox || normalizedMailbox !== mailboxAddress) {
 			throw new Error("Mailbox address is invalid");
@@ -4449,12 +4747,495 @@ export class MailboxDO extends DurableObject<Env> {
 		return [...out];
 	}
 
-	/** Substitute {{key}} from the row; HTML-escape values when `escape` is set. */
-	#renderTemplate(tpl: string, row: BulkRecipient, escape: boolean): string {
-		return tpl.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_full, key: string) => {
-			const v = row[key] ?? "";
-			return escape ? escapeHtml(v) : v;
+	#removeBulkActiveSync(jobId: string): void {
+		const active =
+			this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+		this.ctx.storage.kv.put(
+			BULK_ACTIVE_KEY,
+			active.filter((entry) => entry.jobId !== jobId),
+			);
+		}
+
+	#recordBulkTerminalSync(
+		jobId: string,
+		admissionKey: string,
+		completedAt: number,
+	): void {
+		const prior =
+			this.ctx.storage.kv.get<BulkTerminalEntry[]>(BULK_TERMINAL_HISTORY_KEY) ??
+			[];
+		const existing = prior.find((entry) => entry.jobId === jobId);
+		this.ctx.storage.kv.put(BULK_TERMINAL_HISTORY_KEY, [
+			...prior.filter((entry) => entry.jobId !== jobId),
+			{
+				jobId,
+				admissionKey,
+				completedAt: existing?.completedAt ?? completedAt,
+			},
+		]);
+		}
+
+	#bulkCleanupEntriesSync(): Array<[string, BulkCleanupIntent]> {
+		return [
+			...this.ctx.storage.kv.list<BulkCleanupIntent>({
+				prefix: BULK_ATTACHMENT_CLEANUP_PREFIX,
+			}),
+		];
+		}
+
+	#bulkReservationEntriesSync(): Array<
+		[string, BulkAdmissionReservation]
+	> {
+		return [
+			...this.ctx.storage.kv.list<BulkAdmissionReservation>({
+				prefix: BULK_RESERVATION_PREFIX,
+			}),
+		];
+	}
+
+	#pruneBulkReservationsSync(now: number): void {
+		for (const [key, reservation] of this.#bulkReservationEntriesSync()) {
+			if (reservation.expiresAt <= now) {
+				this.ctx.storage.kv.delete(key);
+			}
+		}
+	}
+
+	#createBulkCleanupIntentSync(input: {
+		ownerId: string;
+		keys: string[];
+		dueAt: number;
+		verifyAt?: number;
+		protectAdmissionKey?: string;
+		protectGeneration?: number;
+		protectDeliveryKey?: string;
+		protectEmailId?: string;
+		protectPreparationKey?: string;
+	}): string | null {
+		const keys = [...new Set(input.keys)].slice(0, ATTACHMENT_LIMITS.maxFiles);
+		if (keys.length === 0) return null;
+		const id = crypto.randomUUID();
+		const intent: BulkCleanupIntent = {
+			id,
+			ownerId: input.ownerId,
+			keys,
+			dueAt: input.dueAt,
+			leaseToken: null,
+			leaseExpiresAt: null,
+			attempts: 0,
+			createdAt: Date.now(),
+			...(input.verifyAt ? { verifyAt: input.verifyAt } : {}),
+			...(input.protectAdmissionKey
+				? { protectAdmissionKey: input.protectAdmissionKey }
+				: {}),
+			...(input.protectGeneration !== undefined
+				? { protectGeneration: input.protectGeneration }
+				: {}),
+			...(input.protectDeliveryKey
+				? { protectDeliveryKey: input.protectDeliveryKey }
+				: {}),
+			...(input.protectEmailId ? { protectEmailId: input.protectEmailId } : {}),
+			...(input.protectPreparationKey
+				? { protectPreparationKey: input.protectPreparationKey }
+				: {}),
+		};
+		this.ctx.storage.kv.put(`${BULK_ATTACHMENT_CLEANUP_PREFIX}${id}`, intent);
+		return id;
+	}
+
+	#markBulkCleanupDueSync(id: string, dueAt: number): void {
+		const key = `${BULK_ATTACHMENT_CLEANUP_PREFIX}${id}`;
+		const intent = this.ctx.storage.kv.get<BulkCleanupIntent>(key);
+		if (!intent) return;
+		const next: BulkCleanupIntent = {
+			...intent,
+			dueAt,
+			leaseToken: null,
+			leaseExpiresAt: null,
+		};
+		delete next.deleteConfirmedAt;
+		this.ctx.storage.kv.put(key, next);
+	}
+
+	#markBulkGenerationCleanupDueSync(jobId: string, dueAt: number): void {
+		for (const [, intent] of this.#bulkCleanupEntriesSync()) {
+			if (!intent.ownerId.startsWith(`${jobId}:generation-`)) continue;
+			this.#markBulkCleanupDueSync(intent.id, dueAt);
+				}
+			}
+
+	#bulkOutstandingRecipientCountSync(): number {
+		const active =
+			this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+		const countedJobIds = new Set<string>();
+		let unfinishedRecipients = 0;
+		for (const entry of active) {
+			const job = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${entry.jobId}`);
+			if (!job) continue;
+			countedJobIds.add(entry.jobId);
+			unfinishedRecipients += Math.max(0, job.total - job.cursor);
+		}
+		const legacyQueue = this.ctx.storage.kv.get<string[]>(BULK_QUEUE_KEY) ?? [];
+		for (const jobId of new Set(legacyQueue)) {
+			if (countedJobIds.has(jobId)) continue;
+			const job = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${jobId}`);
+			if (
+				!job ||
+				job.status === "done" ||
+				job.status === "cancelled" ||
+				job.status === "failed"
+			) {
+				continue;
+			}
+			unfinishedRecipients += Math.max(0, job.total - job.cursor);
+		}
+		const outboxRow = [
+			...this.ctx.storage.sql.exec<{ count: number }>(
+				`SELECT COUNT(*) AS count FROM outbound_deliveries
+         WHERE source = 'bulk' AND status IN ('queued', 'sending', 'retrying')`,
+			),
+		][0];
+		return unfinishedRecipients + Number(outboxRow?.count ?? 0);
+	}
+
+	#assertBulkRetryCapacitySync(delivery: StoredOutboundDelivery): void {
+		if (delivery.source !== "bulk") return;
+		if (
+			this.#bulkOutstandingRecipientCountSync() >=
+			BULK_LIMITS.maxOutstandingRecipients
+		) {
+			throw new OutboundRetryCapacityError();
+		}
+	}
+
+	#abandonBulkRecipientPreparationSync(
+		jobId: string,
+		cursor: number,
+		now: number,
+	): void {
+		const key = `${BULK_RECIPIENT_PREPARATION_PREFIX}${jobId}:${cursor}`;
+		const preparation = this.ctx.storage.kv.get<BulkRecipientPreparation>(key);
+		if (!preparation) return;
+		this.#markBulkCleanupDueSync(preparation.cleanupIntentId, now);
+		this.ctx.storage.kv.delete(key);
+	}
+
+	#pruneBulkTerminalSync(now: number): void {
+		const history =
+			this.ctx.storage.kv.get<BulkTerminalEntry[]>(BULK_TERMINAL_HISTORY_KEY) ??
+			[];
+		const retained: BulkTerminalEntry[] = [];
+		for (const entry of history) {
+			if (entry.completedAt + BULK_LIMITS.terminalRetentionMs > now) {
+				retained.push(entry);
+				continue;
+			}
+			this.ctx.storage.kv.delete(`bulk:job:${entry.jobId}`);
+			this.ctx.storage.kv.delete(`bulk:rows:${entry.jobId}`);
+			this.ctx.storage.kv.delete(entry.admissionKey);
+		}
+		this.ctx.storage.kv.put(BULK_TERMINAL_HISTORY_KEY, retained);
+	}
+
+	#expireBulkPreparationsSync(now: number): void {
+		const prior =
+			this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+		const active: BulkActiveEntry[] = [];
+		for (const entry of prior) {
+			const job = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${entry.jobId}`);
+			if (
+				!job ||
+				job.status === "done" ||
+				job.status === "failed" ||
+				job.status === "cancelled"
+			) {
+				continue;
+			}
+			if (
+				job.status !== "preparing" ||
+				now < job.createdAt + BULK_PREPARATION_MAX_AGE_MS
+			) {
+				active.push(entry);
+				continue;
+			}
+			const admission = this.ctx.storage.kv.get<BulkAdmissionRecord>(
+				entry.admissionKey,
+			);
+			if (admission?.status === "preparing") {
+				const failed = failBulkAdmission(
+					admission,
+					admission.generation,
+					"Bulk job preparation expired. Start a new submission.",
+					now,
+				);
+				if (failed) this.ctx.storage.kv.put(entry.admissionKey, failed);
+			}
+			const failedJob: BulkJob = {
+				...job,
+				status: "failed",
+				errors: [
+					{
+						email: "",
+						error: "Bulk job preparation expired. Start a new submission.",
+					},
+				],
+				updatedAt: now,
+			};
+			this.ctx.storage.kv.put(`bulk:job:${entry.jobId}`, failedJob);
+			this.ctx.storage.kv.delete(`bulk:rows:${entry.jobId}`);
+			this.#createBulkCleanupIntentSync({
+				ownerId: `${entry.jobId}:expired-preparation`,
+				keys: job.preparationAttachmentKeys ?? [],
+				dueAt: now,
+				});
+			this.#markBulkGenerationCleanupDueSync(entry.jobId, now);
+			this.#recordBulkTerminalSync(entry.jobId, entry.admissionKey, now);
+			console.error("[bulk-send] admission preparation completed", {
+				operation: "bulk_admission_prepare",
+				mailboxId: job.fromEmail,
+				operationId: job.operationId,
+				jobId: job.id,
+				stage: "preparation_deadline",
+				result: "expired",
+				errorCode: "preparation_expired",
+				retryDecision: "terminal",
+				durationMs: now - job.createdAt,
+			});
+			}
+		this.ctx.storage.kv.put(BULK_ACTIVE_KEY, active);
+	}
+
+	#bulkMaintenanceAtSync(): number | null {
+		const candidates: number[] = [];
+		for (const [, reservation] of this.#bulkReservationEntriesSync()) {
+			candidates.push(reservation.expiresAt);
+		}
+		const cleanupAt = bulkCleanupNextAt(
+			this.#bulkCleanupEntriesSync().map(([, intent]) => intent),
+			);
+		if (cleanupAt !== null) candidates.push(cleanupAt);
+		const active =
+			this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+		for (const entry of active) {
+			const job = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${entry.jobId}`);
+			if (job?.status === "preparing") {
+				candidates.push(job.createdAt + BULK_PREPARATION_MAX_AGE_MS);
+			}
+		}
+		const queue = this.ctx.storage.kv.get<string[]>(BULK_QUEUE_KEY) ?? [];
+		const head = queue[0]
+			? this.ctx.storage.kv.get<BulkJob>(`bulk:job:${queue[0]}`)
+			: null;
+		if (head?.status === "queued" || head?.status === "running") {
+			candidates.push(head.nextEnqueueAt ?? head.createdAt);
+		}
+		const history =
+			this.ctx.storage.kv.get<BulkTerminalEntry[]>(BULK_TERMINAL_HISTORY_KEY) ??
+			[];
+		for (const entry of history) {
+			candidates.push(entry.completedAt + BULK_LIMITS.terminalRetentionMs);
+		}
+		return candidates.length > 0 ? Math.min(...candidates) : null;
+	}
+
+	async #ensureBulkMaintenanceAlarm(): Promise<void> {
+		const next = this.ctx.storage.transactionSync(() =>
+			this.#bulkMaintenanceAtSync(),
+		);
+		if (next !== null) await this.#scheduleAlarmAt(Math.max(Date.now(), next));
+	}
+
+	async #processBulkAdmissionPreparation(): Promise<boolean> {
+		const preparation = this.ctx.storage.transactionSync(() => {
+			const active =
+				this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+			for (const entry of active) {
+				const job = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${entry.jobId}`);
+				const admission =
+					this.ctx.storage.kv.get<BulkAdmissionRecord>(entry.admissionKey);
+				if (
+					job?.status === "preparing" &&
+					admission?.status === "preparing" &&
+					job.preparationGeneration === admission.generation
+				) {
+					return { entry, job, admission };
+				}
+			}
+			return null;
 		});
+		if (!preparation) return false;
+
+		const startedAt = Date.now();
+		const { entry, job, admission } = preparation;
+		const attachments: BulkAttachment[] = [];
+		try {
+			const staged: Array<{
+				bytes: ArrayBuffer;
+				filename: string;
+				type: string;
+				size: number;
+			}> = [];
+			for (const sourceKey of job.preparationAttachmentKeys ?? []) {
+				const object = await this.env.BUCKET.get(sourceKey);
+				if (!object) {
+					throw new Error("missing_bulk_upload");
+				}
+				const metadata = object.customMetadata ?? {};
+				staged.push({
+					bytes: await object.arrayBuffer(),
+					filename: (metadata.filename || "untitled").replace(
+						/[\/\\:*?"<>|\x00-\x1f]/g,
+						"_",
+					),
+					type:
+						metadata.type ||
+						object.httpMetadata?.contentType ||
+						"application/octet-stream",
+					size: object.size,
+				});
+			}
+			const setError = validateAttachmentSet(
+				staged.map((attachment) => ({
+					filename: attachment.filename,
+					size: attachment.size,
+				})),
+			);
+			if (setError) throw new Error("invalid_bulk_attachment_set");
+
+			// This is the sole R2 writer for admission copies. Durable Object alarm
+			// invocations have a 15-minute hard wall-time limit, so the later
+			// 20-minute deletion verification cannot race an unbounded HTTP writer.
+			// https://developers.cloudflare.com/workers/platform/limits/#wall-time-limits-by-invocation-type
+			for (const [index, attachment] of staged.entries()) {
+				const key = bulkAttachmentPreparationKey(
+					job.id,
+					admission.generation,
+					index,
+				);
+				await this.env.BUCKET.put(key, attachment.bytes, {
+					httpMetadata: { contentType: attachment.type },
+				});
+				attachments.push({
+					key,
+					filename: attachment.filename,
+					type: attachment.type,
+					size: attachment.size,
+				});
+			}
+		} catch (error) {
+			const failedAt = Date.now();
+			const missing =
+				error instanceof Error && error.message === "missing_bulk_upload";
+			const publicError = missing
+				? "An attachment upload was not found or has expired. Re-attach and try again."
+				: "Bulk attachments could not be prepared. Re-attach them and try again.";
+			const committed = this.ctx.storage.transactionSync(() => {
+				const current =
+					this.ctx.storage.kv.get<BulkAdmissionRecord>(entry.admissionKey);
+				if (!current) return false;
+				const failed = failBulkAdmission(
+					current,
+					admission.generation,
+					publicError,
+					failedAt,
+				);
+				if (!failed) return false;
+				this.ctx.storage.kv.put(entry.admissionKey, failed);
+				this.ctx.storage.kv.put(`bulk:job:${job.id}`, {
+					...job,
+					status: "failed",
+					errors: [{ email: "", error: publicError }],
+					updatedAt: failedAt,
+				});
+				this.ctx.storage.kv.delete(`bulk:rows:${job.id}`);
+				this.#createBulkCleanupIntentSync({
+					ownerId: `${job.id}:failed-preparation`,
+					keys: job.preparationAttachmentKeys ?? [],
+					dueAt: failedAt + BULK_PREPARATION_MAX_AGE_MS,
+				});
+				if (job.preparationCleanupIntentId) {
+					this.#markBulkCleanupDueSync(
+						job.preparationCleanupIntentId,
+						failedAt,
+					);
+				}
+				this.#removeBulkActiveSync(job.id);
+				this.#recordBulkTerminalSync(job.id, entry.admissionKey, failedAt);
+				return true;
+			});
+			console.error("[bulk-send] admission preparation completed", {
+				operation: "bulk_admission_prepare",
+				mailboxId: job.fromEmail,
+				operationId: job.operationId,
+				jobId: job.id,
+				stage: "r2_generation_copy",
+				result: committed ? "failed" : "fence_lost",
+				errorCode: missing ? "missing_upload" : "r2_or_validation_failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				durationMs: failedAt - startedAt,
+				retryDecision: "terminal",
+			});
+			await this.#ensureBulkMaintenanceAlarm();
+			await this.#scheduleAlarmAt(Date.now() + 100);
+			return true;
+		}
+
+		const committedAt = Date.now();
+		const committed = this.ctx.storage.transactionSync(() => {
+			const currentAdmission =
+				this.ctx.storage.kv.get<BulkAdmissionRecord>(entry.admissionKey);
+			const currentJob = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${job.id}`);
+			if (!currentAdmission || !currentJob) return false;
+			const nextAdmission = completeBulkAdmission(
+				currentAdmission,
+				admission.generation,
+				committedAt,
+			);
+			if (!nextAdmission || currentJob.status !== "preparing") return false;
+			const queuedJob: BulkJob = {
+				...currentJob,
+				status: "queued",
+				updatedAt: committedAt,
+				nextEnqueueAt: committedAt + 100,
+				attachments: attachments.length > 0 ? attachments : undefined,
+			};
+			delete queuedJob.preparationCleanupIntentId;
+			delete queuedJob.preparationGeneration;
+			const queue = this.ctx.storage.kv.get<string[]>(BULK_QUEUE_KEY) ?? [];
+			this.ctx.storage.kv.put(`bulk:job:${job.id}`, queuedJob);
+			this.ctx.storage.kv.put(
+				BULK_QUEUE_KEY,
+				ensureBulkQueueMembership(queue, job.id),
+			);
+			this.ctx.storage.kv.put(entry.admissionKey, nextAdmission);
+			this.#createBulkCleanupIntentSync({
+				ownerId: `${job.id}:staging`,
+				keys: currentJob.preparationAttachmentKeys ?? [],
+				dueAt: committedAt + BULK_PREPARATION_MAX_AGE_MS,
+			});
+			return true;
+		});
+		if (!committed && job.preparationCleanupIntentId) {
+			this.ctx.storage.transactionSync(() =>
+				this.#markBulkCleanupDueSync(
+					job.preparationCleanupIntentId!,
+					committedAt,
+				),
+			);
+		}
+		console.info("[bulk-send] admission preparation completed", {
+			operation: "bulk_admission_prepare",
+			mailboxId: job.fromEmail,
+			operationId: job.operationId,
+			jobId: job.id,
+			stage: "r2_generation_copy",
+			result: committed ? "success" : "fence_lost",
+			durationMs: committedAt - startedAt,
+			retryDecision: committed ? "queue" : "cleanup",
+		});
+		await this.#ensureBulkMaintenanceAlarm();
+		await this.#scheduleAlarmAt(Date.now() + 100);
+		return true;
 	}
 
 	/**
@@ -4463,7 +5244,163 @@ export class MailboxDO extends DurableObject<Env> {
 	 * message per tick with a randomized throttle, so even a 200-recipient job
 	 * stays well within per-invocation Worker limits and survives restarts.
 	 */
+	async reserveBulkOperation(input: {
+		operationId: string;
+		actorUserId: string;
+		fingerprint: string;
+		total: number;
+	}): Promise<BulkReservationResult> {
+		if (
+			!BULK_OPERATION_ID_PATTERN.test(input.operationId) ||
+			typeof input.actorUserId !== "string" ||
+			input.actorUserId.length === 0 ||
+			input.actorUserId.length > BULK_LIMITS.actorIdChars ||
+			!/^[0-9a-f]{64}$/.test(input.fingerprint) ||
+			!Number.isInteger(input.total) ||
+			input.total < 1 ||
+			input.total > BULK_LIMITS.maxRecipients
+		) {
+			return { status: "forbidden" };
+		}
+
+		const now = Date.now();
+		const result = this.ctx.storage.transactionSync(() => {
+			this.#pruneBulkReservationsSync(now);
+			const reservationKey = `${BULK_RESERVATION_PREFIX}${input.operationId}`;
+			const existingReservation =
+				this.ctx.storage.kv.get<BulkAdmissionReservation>(reservationKey) ??
+				null;
+			const existingAdmission =
+				this.ctx.storage.kv.get<BulkAdmissionRecord>(
+					`bulk:admission:${input.operationId}`,
+				) ?? null;
+			const planned = planBulkAdmissionReservation({
+				existingReservation,
+				existingAdmission,
+				...input,
+				now,
+			});
+			if (planned.status !== "reserved" || planned.replayed) return planned;
+			const mailboxDailyPlan = planBulkDailyReservation(
+				this.ctx.storage.kv.get<BulkDailyReservationRecord>(
+					BULK_DAILY_RESERVATION_KEY,
+				) ?? null,
+				now,
+			);
+			const actorDailyKey = `${BULK_DAILY_RESERVATION_ACTOR_PREFIX}${encodeURIComponent(input.actorUserId)}`;
+			const actorDailyPlan = planBulkDailyReservation(
+				this.ctx.storage.kv.get<BulkDailyReservationRecord>(actorDailyKey) ??
+					null,
+				now,
+				BULK_LIMITS.maxReservationsPerActorPerUtcDay,
+			);
+			if (
+				mailboxDailyPlan.status === "capacity" ||
+				actorDailyPlan.status === "capacity"
+			) {
+				return {
+					status: "capacity" as const,
+					retryAt: bulkNextUtcDayAt(now),
+				};
+			}
+
+			const reservations = this.#bulkReservationEntriesSync();
+			const activeReservations = reservations.filter(
+				([, reservation]) => reservation.expiresAt > now,
+			);
+			const actorActiveReservations = activeReservations.filter(
+				([, reservation]) => reservation.actorUserId === input.actorUserId,
+			);
+			if (reservations.length >= BULK_LIMITS.maxReservationRecords) {
+				const retryAt = Math.min(
+					...reservations.map(
+						([, reservation]) => reservation.expiresAt,
+					),
+				);
+				return {
+					status: "capacity" as const,
+					retryAt: Number.isFinite(retryAt) ? retryAt : now + 60_000,
+				};
+			}
+			if (activeReservations.length >= BULK_LIMITS.maxPendingReservations) {
+				const retryAt = Math.min(
+					...activeReservations.map(([, reservation]) => reservation.expiresAt),
+				);
+				return {
+					status: "capacity" as const,
+					retryAt: Number.isFinite(retryAt) ? retryAt : now + 60_000,
+				};
+			}
+			if (
+				actorActiveReservations.length >=
+				BULK_LIMITS.maxPendingReservationsPerActor
+			) {
+				const retryAt = Math.min(
+					...actorActiveReservations.map(
+						([, reservation]) => reservation.expiresAt,
+					),
+				);
+				return {
+					status: "capacity" as const,
+					retryAt: Number.isFinite(retryAt) ? retryAt : now + 60_000,
+				};
+			}
+			this.ctx.storage.kv.put(reservationKey, planned.record);
+			this.ctx.storage.kv.put(
+				BULK_DAILY_RESERVATION_KEY,
+				mailboxDailyPlan.record,
+			);
+			this.ctx.storage.kv.put(actorDailyKey, actorDailyPlan.record);
+			return planned;
+		});
+		await this.#ensureBulkMaintenanceAlarm();
+		return result;
+	}
+
+	async cancelBulkReservation(operationId: string, actorUserId: string) {
+		if (
+			!BULK_OPERATION_ID_PATTERN.test(operationId) ||
+			typeof actorUserId !== "string" ||
+			actorUserId.length === 0 ||
+			actorUserId.length > BULK_LIMITS.actorIdChars
+		) {
+			return { status: "forbidden" as const };
+		}
+		const now = Date.now();
+		const result = this.ctx.storage.transactionSync(() => {
+			const admission = this.ctx.storage.kv.get<BulkAdmissionRecord>(
+				`bulk:admission:${operationId}`,
+			);
+			if (admission) {
+				if (admission.actorUserId !== actorUserId) {
+					return { status: "forbidden" as const };
+				}
+				return {
+					status: "admitted" as const,
+					jobId: admission.jobId,
+					total: admission.total,
+					admissionStatus: admission.status,
+				};
+			}
+			const key = `${BULK_RESERVATION_PREFIX}${operationId}`;
+			const reservation =
+				this.ctx.storage.kv.get<BulkAdmissionReservation>(key);
+			if (!reservation) return { status: "missing" as const };
+			if (reservation.actorUserId !== actorUserId) {
+				return { status: "forbidden" as const };
+			}
+			if (reservation.expiresAt <= now) {
+				return { status: "expired" as const };
+			}
+			this.ctx.storage.kv.delete(key);
+			return { status: "cancelled" as const };
+		});
+		await this.#ensureBulkMaintenanceAlarm();
+		return result;
+	}
+
 	async enqueueBulkJob(input: {
+		operationId: string;
 		actorUserId: string;
 		fromEmail: string;
 		fromName: string;
@@ -4472,21 +5409,167 @@ export class MailboxDO extends DurableObject<Env> {
 		text?: string;
 		recipients: BulkRecipient[];
 		attachmentUploadIds?: string[];
-	}): Promise<{ jobId: string; total: number }> {
-		const recipients = input.recipients ?? [];
-		if (recipients.length === 0) throw new Error("No recipients provided.");
-		if (recipients.length > BULK_MAX_RECIPIENTS) {
-			throw new Error(
-				`Too many recipients: max ${BULK_MAX_RECIPIENTS} per job.`,
-			);
+	}): Promise<BulkEnqueueResult> {
+		if (
+			typeof input.operationId !== "string" ||
+			typeof input.actorUserId !== "string" ||
+			typeof input.fromEmail !== "string" ||
+			typeof input.fromName !== "string" ||
+			typeof input.subject !== "string" ||
+			(input.html !== undefined && typeof input.html !== "string") ||
+			(input.text !== undefined && typeof input.text !== "string") ||
+			!Array.isArray(input.recipients) ||
+			(input.attachmentUploadIds !== undefined &&
+				!Array.isArray(input.attachmentUploadIds))
+		) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Bulk request is invalid.",
+			};
 		}
-		if (!input.subject.trim()) throw new Error("Subject is required.");
-		if (!input.html && !input.text) throw new Error("Email body is required.");
+		const recipients = input.recipients;
+		const uuid =
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+		if (
+			input.actorUserId.length === 0 ||
+			input.actorUserId.length > BULK_LIMITS.actorIdChars ||
+			input.fromEmail.length === 0 ||
+			input.fromEmail.length > BULK_LIMITS.emailChars ||
+			input.fromName.length > BULK_LIMITS.fromNameChars
+		) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Bulk sender context is invalid.",
+			};
+		}
+		if (!uuid.test(input.operationId)) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Bulk operation identity is invalid.",
+			};
+		}
+		if (recipients.length === 0) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "No recipients provided.",
+			};
+		}
+		if (recipients.length > BULK_LIMITS.maxRecipients) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: `Too many recipients: max ${BULK_LIMITS.maxRecipients} per job.`,
+			};
+		}
+		if (
+			!input.subject.trim() ||
+			input.subject.length > BULK_LIMITS.subjectChars
+		) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Subject is required.",
+			};
+		}
+		if (
+			(!input.html && !input.text) ||
+			(input.html?.length ?? 0) > BULK_LIMITS.bodyChars ||
+			(input.text?.length ?? 0) > BULK_LIMITS.bodyChars
+		) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Email body is required.",
+			};
+		}
+		const htmlError = bulkPersonalizedHtmlValidationError(
+			input.html,
+			recipients,
+		);
+		if (htmlError) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: htmlError,
+			};
+		}
+		if ((input.attachmentUploadIds?.length ?? 0) > ATTACHMENT_LIMITS.maxFiles) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: `Too many attachments: max ${ATTACHMENT_LIMITS.maxFiles}.`,
+			};
+		}
+		if (
+			(input.attachmentUploadIds ?? []).some(
+				(uploadId) => typeof uploadId !== "string" || !uuid.test(uploadId),
+			)
+		) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Attachment upload identity is invalid.",
+			};
+		}
 
 		for (const r of recipients) {
-			if (!r.email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(r.email)) {
-				throw new Error("Every recipient row needs a valid 'email' column.");
+			if (!r || typeof r !== "object" || Array.isArray(r)) {
+				return {
+					status: "rejected",
+					code: "invalid_bulk_request",
+					error: "Recipient rows are invalid.",
+				};
 			}
+			const entries = Object.entries(r);
+			if (
+				entries.length === 0 ||
+				entries.length > BULK_LIMITS.maxColumns ||
+				entries.some(
+					([key, value]) =>
+						key.length === 0 ||
+						key.length > BULK_LIMITS.columnNameChars ||
+						typeof value !== "string" ||
+						value.length > BULK_LIMITS.recipientValueChars,
+				)
+			) {
+				return {
+					status: "rejected",
+					code: "invalid_bulk_request",
+					error: "Recipient columns exceed the bulk request limits.",
+				};
+			}
+			if (
+				!r.email ||
+				r.email.length > BULK_LIMITS.emailChars ||
+				!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(r.email)
+			) {
+				return {
+					status: "rejected",
+					code: "invalid_bulk_request",
+					error: "Every recipient row needs a valid 'email' column.",
+				};
+			}
+		}
+		const canonicalPayload = JSON.stringify({
+			subject: input.subject,
+			html: input.html,
+			text: input.text,
+			recipients,
+			attachmentUploadIds: input.attachmentUploadIds ?? [],
+		});
+		if (
+			new TextEncoder().encode(canonicalPayload).byteLength >
+			BULK_LIMITS.requestBytes
+		) {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: `Bulk request exceeds the ${BULK_LIMITS.requestBytes / 1_024} KB limit.`,
+			};
 		}
 
 		// Every {{var}} in the template must exist as a column in the CSV.
@@ -4498,74 +5581,134 @@ export class MailboxDO extends DurableObject<Env> {
 		const columns = new Set(Object.keys(recipients[0]));
 		const missing = [...vars].filter((v) => !columns.has(v));
 		if (missing.length > 0) {
-			throw new Error(
-				`Template uses columns not in the CSV: ${missing.join(", ")}`,
-			);
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: `Template uses columns not in the CSV: ${missing.join(", ")}`,
+			};
 		}
 
-		const jobId = `job_${crypto.randomUUID()}`;
-
-		// Resolve the shared attachments once: read each staged upload, enforce the
-		// limits, and stash immutable raw bytes under the job. Each recipient gets a
-		// separate outbox-owned copy, so job cleanup cannot invalidate a delivery.
-		const attachments: BulkAttachment[] = [];
-		const uploadIds = input.attachmentUploadIds ?? [];
-		if (uploadIds.length > 0) {
-			const staged: {
-				bytes: ArrayBuffer;
-				filename: string;
-				type: string;
-				srcKey: string;
-			}[] = [];
-			for (const uploadId of uploadIds) {
-				const srcKey = uploadKey(input.fromEmail, uploadId);
-				const obj = await this.env.BUCKET.get(srcKey);
-				if (!obj) {
-					throw new Error(
-						"An attachment upload was not found or has expired. Re-attach and try again.",
-					);
-				}
-				const meta = obj.customMetadata ?? {};
-				staged.push({
-					bytes: await obj.arrayBuffer(),
-					filename: (meta.filename || "untitled").replace(
-						/[\/\\:*?"<>|\x00-\x1f]/g,
-						"_",
-					),
-					type:
-						meta.type ||
-						obj.httpMetadata?.contentType ||
-						"application/octet-stream",
-					srcKey,
-				});
-			}
-			const setError = validateAttachmentSet(
-				staged.map((s) => ({ filename: s.filename, size: s.bytes.byteLength })),
-			);
-			if (setError) throw new Error(setError);
-			for (let i = 0; i < staged.length; i++) {
-				const s = staged[i];
-				const key = `bulk-attachments/${jobId}/${i}`;
-				await this.env.BUCKET.put(key, s.bytes, {
-					customMetadata: { filename: s.filename, type: s.type },
-				});
-				attachments.push({
-					key,
-					filename: s.filename,
-					type: s.type,
-					size: s.bytes.byteLength,
-				});
-			}
-			// Staging copies are no longer needed now the immutable job copies exist.
-			await Promise.all(
-				staged.map((s) => this.env.BUCKET.delete(s.srcKey).catch(() => {})),
-			);
-		}
-
+		const fingerprint = await bulkAdmissionFingerprint({
+			actorUserId: input.actorUserId,
+			subject: input.subject,
+			html: input.html,
+			text: input.text,
+			recipients,
+			attachmentUploadIds: input.attachmentUploadIds,
+		});
+		const admissionKey = `bulk:admission:${input.operationId}`;
 		const now = Date.now();
-		const job: BulkJob = {
-			id: jobId,
-			status: "queued",
+		// Cloudflare's Durable Objects rules warn that input gates do not protect
+		// across R2 I/O. Claim in one local storage transaction before touching R2,
+		// then fence the later commit by generation.
+		// https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/
+		const claimResult = this.ctx.storage.transactionSync(() => {
+			const active =
+				this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+			const existingAdmission =
+				this.ctx.storage.kv.get<BulkAdmissionRecord>(admissionKey) ?? null;
+			let dailyPlan: ReturnType<typeof planBulkDailyAdmission> | null = null;
+			if (!existingAdmission) {
+				const reservation = this.ctx.storage.kv.get<BulkAdmissionReservation>(
+					`${BULK_RESERVATION_PREFIX}${input.operationId}`,
+				);
+				if (
+					!reservation ||
+					reservation.actorUserId !== input.actorUserId ||
+					reservation.fingerprint !== fingerprint ||
+					reservation.total !== recipients.length ||
+					reservation.expiresAt <= now
+				) {
+					return { status: "reservation_invalid" as const };
+				}
+				const rejectCapacity = (
+					reason: "active_backlog" | "cleanup_backlog" | "daily_limit",
+					retryAt: number,
+				) => {
+					this.ctx.storage.kv.delete(
+						`${BULK_RESERVATION_PREFIX}${input.operationId}`,
+					);
+					return { status: "capacity" as const, reason, retryAt };
+				};
+				const activeJobIds = new Set(active.map((entry) => entry.jobId));
+				let outstandingJobs = 0;
+				for (const entry of active) {
+					const job = this.ctx.storage.kv.get<BulkJob>(
+						`bulk:job:${entry.jobId}`,
+					);
+					if (!job) continue;
+					outstandingJobs += 1;
+				}
+				const legacyQueue =
+					this.ctx.storage.kv.get<string[]>(BULK_QUEUE_KEY) ?? [];
+				for (const queuedJobId of new Set(legacyQueue)) {
+					if (activeJobIds.has(queuedJobId)) continue;
+					const queuedJob = this.ctx.storage.kv.get<BulkJob>(
+						`bulk:job:${queuedJobId}`,
+					);
+					if (
+						!queuedJob ||
+						queuedJob.status === "done" ||
+						queuedJob.status === "cancelled" ||
+						queuedJob.status === "failed"
+					)
+						continue;
+					outstandingJobs += 1;
+				}
+				const outstandingRecipients = this.#bulkOutstandingRecipientCountSync();
+				const cleanupBacklog = bulkCleanupBacklogCount(
+					this.#bulkCleanupEntriesSync().map(([, intent]) => intent),
+					now,
+					60_000,
+				);
+				dailyPlan = planBulkDailyAdmission(
+					this.ctx.storage.kv.get<BulkDailyAdmissionRecord>(
+						BULK_DAILY_ADMISSION_KEY,
+					) ?? null,
+					now,
+					recipients.length,
+				);
+				if (dailyPlan.status === "capacity") {
+					return rejectCapacity("daily_limit", bulkNextUtcDayAt(now));
+				}
+				if (cleanupBacklog >= BULK_LIMITS.maxCleanupJobs) {
+					return rejectCapacity("cleanup_backlog", now + 60_000);
+				}
+				if (
+					outstandingJobs >= BULK_LIMITS.maxActiveJobs ||
+					outstandingRecipients + recipients.length >
+						BULK_LIMITS.maxOutstandingRecipients
+				) {
+					return rejectCapacity("active_backlog", now + 60_000);
+				}
+			}
+
+			const planned = planBulkAdmissionClaim({
+				existing: existingAdmission,
+				operationId: input.operationId,
+				actorUserId: input.actorUserId,
+				fingerprint,
+				total: recipients.length,
+				now,
+				createJobId: () => `job_${crypto.randomUUID()}`,
+			});
+			let generationCleanupIntentId: string | null = null;
+			if (planned.status === "claimed") {
+				this.#markBulkGenerationCleanupDueSync(planned.record.jobId, now);
+				this.ctx.storage.kv.put(admissionKey, planned.record);
+				this.ctx.storage.kv.delete(
+					`${BULK_RESERVATION_PREFIX}${input.operationId}`,
+				);
+				if (!existingAdmission && dailyPlan?.status === "accepted") {
+					this.ctx.storage.kv.put(BULK_DAILY_ADMISSION_KEY, dailyPlan.record);
+				}
+				const existingJob = this.ctx.storage.kv.get<BulkJob>(
+					`bulk:job:${planned.record.jobId}`,
+				);
+				this.ctx.storage.kv.put(`bulk:job:${planned.record.jobId}`, {
+					...(existingJob ?? {
+						id: planned.record.jobId,
+						operationId: input.operationId,
 			actorUserId: input.actorUserId,
 			fromEmail: input.fromEmail.toLowerCase(),
 			fromName: input.fromName,
@@ -4577,42 +5720,628 @@ export class MailboxDO extends DurableObject<Env> {
 			failed: 0,
 			cursor: 0,
 			errors: [],
-			createdAt: now,
+						createdAt: planned.record.createdAt,
+					}),
+					status: "preparing",
+					preparationAttachmentKeys: (input.attachmentUploadIds ?? []).map(
+						(uploadId) => uploadKey(input.fromEmail, uploadId),
+					),
 			updatedAt: now,
-			nextEnqueueAt: now + 100,
-			attachments: attachments.length > 0 ? attachments : undefined,
-		};
-		await this.ctx.storage.put(`bulk:job:${jobId}`, job);
-		await this.ctx.storage.put(`bulk:rows:${jobId}`, recipients);
-		const queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];
-		queue.push(jobId);
-		await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
+				} satisfies BulkJob);
+				const generationKeys = (input.attachmentUploadIds ?? []).map(
+					(_uploadId, index) =>
+						bulkAttachmentPreparationKey(
+							planned.record.jobId,
+							planned.record.generation,
+							index,
+						),
+				);
+				generationCleanupIntentId = this.#createBulkCleanupIntentSync({
+					ownerId: `${planned.record.jobId}:generation-${planned.record.generation}`,
+					keys: generationKeys,
+					dueAt: planned.record.createdAt + BULK_PREPARATION_MAX_AGE_MS,
+					verifyAt: planned.record.createdAt + BULK_STALE_WRITER_VERIFY_MS,
+					protectAdmissionKey: admissionKey,
+					protectGeneration: planned.record.generation,
+				});
+				const preparingJob = this.ctx.storage.kv.get<BulkJob>(
+					`bulk:job:${planned.record.jobId}`,
+				);
+				if (preparingJob) {
+					this.ctx.storage.kv.put(`bulk:job:${planned.record.jobId}`, {
+						...preparingJob,
+						preparationCleanupIntentId: generationCleanupIntentId,
+						preparationGeneration: planned.record.generation,
+					});
+				}
+				this.ctx.storage.kv.put(
+					`bulk:rows:${planned.record.jobId}`,
+					recipients,
+				);
+				if (!active.some((entry) => entry.jobId === planned.record.jobId)) {
+					active.push({
+						jobId: planned.record.jobId,
+						admissionKey,
+						total: recipients.length,
+						createdAt: planned.record.createdAt,
+					});
+				}
+			}
+			this.ctx.storage.kv.put(BULK_ACTIVE_KEY, active);
+			return {
+				status: "claim" as const,
+				claim: planned,
+				generationCleanupIntentId,
+			};
+		});
+		await this.#ensureBulkMaintenanceAlarm();
+		if (claimResult.status === "reservation_invalid") {
+			return {
+				status: "rejected",
+				code: "bulk_reservation_expired",
+				error:
+					"This bulk operation reservation is unavailable or expired. Start a new submission.",
+			};
+		}
+		if (claimResult.status === "capacity") {
+			const messages = {
+				active_backlog:
+					"This Mailbox has the maximum safe bulk backlog. Wait for current jobs to progress.",
+				cleanup_backlog:
+					"This Mailbox is finishing attachment cleanup. Retry shortly.",
+				daily_limit:
+					"This Mailbox reached today's safe bulk sending limit. Retry after the next UTC day begins.",
+			} as const;
+			return {
+				status: "capacity",
+				code: "bulk_capacity_reached",
+				error: messages[claimResult.reason],
+				reason: claimResult.reason,
+				retryAt: claimResult.retryAt,
+			};
+		}
+		const claim = claimResult.claim;
+		if (claim.status === "forbidden") {
+			return {
+				status: "rejected",
+				code: "invalid_bulk_request",
+				error: "Bulk operation identity is unavailable.",
+			};
+		}
 
+		if (claim.status === "conflict") {
+			return {
+				status: "conflict",
+				jobId: claim.record.jobId,
+				total: claim.record.total,
+			};
+		}
+		if (claim.status === "failed") {
+			return {
+				status: "rejected",
+				code: "bulk_admission_failed",
+				error: claim.record.error ?? "Bulk job could not be prepared.",
+				jobId: claim.record.jobId,
+			};
+		}
+		if (claim.status === "preparing") {
+			await this.#scheduleAlarmAt(Date.now() + 100);
+			return {
+				status: "accepted",
+				jobId: claim.record.jobId,
+				total: claim.record.total,
+				replayed: true,
+				admissionStatus: "preparing",
+			};
+		}
+		if (claim.status === "replay") {
+			if (this.#repairBulkQueueMembership(claim.record.jobId)) {
+				await this.#scheduleAlarmAt(Date.now() + 100);
+			}
+			return {
+				status: "accepted",
+				jobId: claim.record.jobId,
+				total: claim.record.total,
+				replayed: true,
+				admissionStatus: "queued",
+			};
+		}
 		await this.#scheduleAlarmAt(Date.now() + 100);
-		return { jobId, total: recipients.length };
+		return {
+			status: "accepted",
+			jobId: claim.record.jobId,
+			total: recipients.length,
+			replayed: false,
+			admissionStatus: "preparing",
+		};
 	}
 
-	async getBulkJob(jobId: string): Promise<BulkJob | null> {
-		return (await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`)) ?? null;
+	async getBulkJob(jobId: string): Promise<BulkJobProgress | null> {
+		if (!BULK_JOB_ID_PATTERN.test(jobId)) return null;
+		const job = await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`);
+		if (!job) return null;
+		return {
+			id: job.id,
+			status: job.status,
+			total: job.total,
+			enqueued: job.enqueued,
+			failed: job.failed,
+			cursor: job.cursor,
+			createdAt: job.createdAt,
+			updatedAt: job.updatedAt,
+			errorCount: job.errors.length,
+			errorsTruncated: job.errors.length > BULK_LIMITS.maxRecipients + 1,
+			errors: job.errors
+				.slice(0, BULK_LIMITS.maxRecipients + 1)
+				.map((error) => ({
+					email: error.email.slice(0, BULK_LIMITS.emailChars),
+					error: SAFE_BULK_ERRORS.has(error.error)
+						? error.error
+						: "Recipient could not be queued.",
+				})),
+		};
 	}
 
-	/** Delete a finished job's stashed attachment objects from R2. */
-	async #deleteBulkAttachments(job: BulkJob | undefined): Promise<void> {
-		if (!job?.attachments?.length) return;
-		await this.env.BUCKET.delete(job.attachments.map((a) => a.key)).catch(
-			() => {},
+	async getBulkJobByOperation(operationId: string, actorUserId: string) {
+		if (
+			!BULK_OPERATION_ID_PATTERN.test(operationId) ||
+			typeof actorUserId !== "string" ||
+			actorUserId.length === 0 ||
+			actorUserId.length > BULK_LIMITS.actorIdChars
+		) {
+			return null;
+		}
+		const recovered = this.ctx.storage.transactionSync(() => {
+			const admission = this.ctx.storage.kv.get<BulkAdmissionRecord>(
+				`bulk:admission:${operationId}`,
+			);
+			if (admission) {
+				if (admission.actorUserId !== actorUserId) return null;
+				const job = this.ctx.storage.kv.get<BulkJob>(
+					`bulk:job:${admission.jobId}`,
+				);
+				if (job && job.actorUserId !== actorUserId) return null;
+				return {
+					state: "admitted" as const,
+					jobId: admission.jobId,
+					total: admission.total,
+					admissionStatus: admission.status,
+					jobStatus: job?.status ?? null,
+				};
+			}
+			const reservation =
+				this.ctx.storage.kv.get<BulkAdmissionReservation>(
+					`${BULK_RESERVATION_PREFIX}${operationId}`,
+				);
+			if (!reservation || reservation.actorUserId !== actorUserId) return null;
+			if (reservation.expiresAt <= Date.now()) {
+				return { state: "expired" as const };
+			}
+			return {
+				state: "reserved" as const,
+				expiresAt: reservation.expiresAt,
+			};
+		});
+		if (!recovered) return null;
+		await this.#ensureBulkMaintenanceAlarm();
+		if (recovered.state === "admitted") {
+			if (
+				recovered.jobStatus === "queued" ||
+				recovered.jobStatus === "running"
+			) {
+				this.#repairBulkQueueMembership(recovered.jobId);
+				await this.#scheduleAlarmAt(Date.now() + 100);
+			} else if (recovered.jobStatus === "preparing") {
+				await this.#scheduleAlarmAt(Date.now() + 100);
+			}
+			const { jobStatus: _jobStatus, ...projection } = recovered;
+			return projection;
+		}
+		return recovered;
+	}
+
+	#repairBulkQueueMembership(jobId: string): boolean {
+		return this.ctx.storage.transactionSync(() => {
+			const job = this.ctx.storage.kv.get<BulkJob>(`bulk:job:${jobId}`);
+			if (!job || (job.status !== "queued" && job.status !== "running")) {
+				return false;
+			}
+			const queue = this.ctx.storage.kv.get<string[]>(BULK_QUEUE_KEY) ?? [];
+			this.ctx.storage.kv.put(
+				BULK_QUEUE_KEY,
+				ensureBulkQueueMembership(queue, jobId),
+			);
+			return true;
+		});
+	}
+
+	async #bulkResultAfterFenceLoss(
+		admissionKey: string,
+		jobId: string,
+		total: number,
+		generationCleanupIntentId: string | null,
+	): Promise<BulkEnqueueResult> {
+		if (generationCleanupIntentId) {
+			this.ctx.storage.transactionSync(() =>
+				this.#markBulkCleanupDueSync(generationCleanupIntentId, Date.now()),
+			);
+		}
+		await this.#ensureBulkMaintenanceAlarm();
+		const current = this.ctx.storage.kv.get<BulkAdmissionRecord>(admissionKey);
+		if (!current) {
+			return {
+				status: "rejected",
+				code: "bulk_admission_failed",
+				error: "Bulk job state expired. Start a new submission.",
+				jobId,
+			};
+		}
+		if (current.status === "failed") {
+			return {
+				status: "rejected",
+				code: "bulk_admission_failed",
+				error: current.error ?? "Bulk job could not be prepared.",
+				jobId: current.jobId,
+			};
+		}
+		if (current.status === "queued") {
+			if (this.#repairBulkQueueMembership(current.jobId)) {
+		await this.#scheduleAlarmAt(Date.now() + 100);
+	}
+			return {
+				status: "accepted",
+				jobId: current.jobId,
+				total: current.total,
+				replayed: true,
+				admissionStatus: "queued",
+			};
+		}
+		return {
+			status: "accepted",
+			jobId: current.jobId,
+			total,
+			replayed: true,
+			admissionStatus: "preparing",
+		};
+	}
+
+	#bulkRecipientPreparationKey(jobId: string, cursor: number): string {
+		return `${BULK_RECIPIENT_PREPARATION_PREFIX}${jobId}:${cursor}`;
+	}
+
+	#createBulkRecipientPreparationSync(
+		job: BulkJob,
+		messageId: string,
+	): BulkRecipientPreparation | null {
+		if (!job.attachments?.length) return null;
+		const key = this.#bulkRecipientPreparationKey(job.id, job.cursor);
+		const existing = this.ctx.storage.kv.get<BulkRecipientPreparation>(key);
+		if (existing) return existing;
+		const attachments = job.attachments.map(
+			(attachment, index) =>
+				({
+					id: `bulk_attachment_${index}_${crypto.randomUUID()}`,
+					email_id: messageId,
+					filename: attachment.filename,
+					mimetype: attachment.type,
+					size: attachment.size,
+					disposition: "attachment",
+				}) satisfies PendingOutboundAttachment,
 		);
+		const keys = attachments.map((attachment) =>
+			attachmentKey(messageId, attachment.id, attachment.filename),
+		);
+		const idempotencyKey = `bulk:${job.id}:${job.cursor}`;
+		const cleanupIntentId = this.#createBulkCleanupIntentSync({
+			ownerId: `${job.id}:recipient-${job.cursor}`,
+			keys,
+			dueAt: Date.now() + BULK_LIMITS.recipientCleanupDelayMs,
+			protectDeliveryKey: idempotencyKey,
+			protectEmailId: messageId,
+			protectPreparationKey: key,
+		});
+		if (!cleanupIntentId) return null;
+		const preparation: BulkRecipientPreparation = {
+			jobId: job.id,
+			cursor: job.cursor,
+			idempotencyKey,
+			messageId,
+			attachments,
+			keys,
+			cleanupIntentId,
+			createdAt: Date.now(),
+		};
+		this.ctx.storage.kv.put(key, preparation);
+		return preparation;
+	}
+
+	#finishBulkRecipientPreparationSync(
+		preparation: BulkRecipientPreparation,
+		committedToEmailId: string | null,
+	): void {
+		const preparationKey = this.#bulkRecipientPreparationKey(
+			preparation.jobId,
+			preparation.cursor,
+		);
+		if (committedToEmailId === preparation.messageId) {
+			this.ctx.storage.kv.delete(
+				`${BULK_ATTACHMENT_CLEANUP_PREFIX}${preparation.cleanupIntentId}`,
+			);
+		} else {
+			this.#markBulkCleanupDueSync(preparation.cleanupIntentId, Date.now());
+		}
+		this.ctx.storage.kv.delete(preparationKey);
+	}
+
+	async #processBulkAttachmentCleanup(): Promise<void> {
+		const claim = this.ctx.storage.transactionSync(() => {
+			const planned = planBulkCleanupClaim(
+				this.#bulkCleanupEntriesSync(),
+				Date.now(),
+				crypto.randomUUID(),
+				BULK_LIMITS.cleanupLeaseMs,
+			);
+			if (!planned) return null;
+			this.ctx.storage.kv.put(planned.key, planned.intent);
+			return planned;
+		});
+		if (!claim) return;
+		const cleanupStartedAt = Date.now();
+
+		const retry = () => {
+			this.ctx.storage.transactionSync(() => {
+				const current = this.ctx.storage.kv.get<BulkCleanupIntent>(claim.key);
+				if (!current) return;
+				const next = retryBulkCleanupClaim(
+					current,
+					claim.intent.leaseToken!,
+					Date.now(),
+					60_000,
+				);
+				if (next) this.ctx.storage.kv.put(claim.key, next);
+			});
+		};
+		const complete = () => {
+			this.ctx.storage.transactionSync(() => {
+				const current = this.ctx.storage.kv.get<BulkCleanupIntent>(claim.key);
+				if (
+					current &&
+					completeBulkCleanupClaim(current, claim.intent.leaseToken!)
+				) {
+					this.ctx.storage.kv.delete(claim.key);
+	}
+			});
+		};
+
+		if (claim.intent.protectAdmissionKey) {
+			const protectedByGeneration = this.ctx.storage.transactionSync(() => {
+				const admission = this.ctx.storage.kv.get<BulkAdmissionRecord>(
+					claim.intent.protectAdmissionKey!,
+		);
+				const job = admission
+					? this.ctx.storage.kv.get<BulkJob>(`bulk:job:${admission.jobId}`)
+					: null;
+				const preparing =
+					admission?.status === "preparing" &&
+					admission.generation === claim.intent.protectGeneration;
+				const jobOwnsKeys =
+					admission?.generation === claim.intent.protectGeneration &&
+					(job?.status === "queued" || job?.status === "running") &&
+					claim.intent.keys.every((key) =>
+						job.attachments?.some((attachment) => attachment.key === key),
+					);
+				if (!preparing && !jobOwnsKeys) return false;
+				const current = this.ctx.storage.kv.get<BulkCleanupIntent>(claim.key);
+				if (current) {
+					const next = retryBulkCleanupClaim(
+						current,
+						claim.intent.leaseToken!,
+						Date.now(),
+						BULK_LIMITS.recipientCleanupDelayMs,
+					);
+					if (next) this.ctx.storage.kv.put(claim.key, next);
+				}
+				return true;
+			});
+			if (protectedByGeneration) {
+				console.info("[bulk-send] attachment cleanup completed", {
+					operation: "bulk_attachment_cleanup",
+					cleanupId: claim.intent.id,
+					ownerId: claim.intent.ownerId,
+					result: "deferred_for_generation",
+					retryDecision: "retry",
+					durationMs: Date.now() - cleanupStartedAt,
+				});
+				await this.#ensureBulkMaintenanceAlarm();
+				return;
+			}
+		}
+
+		if (claim.intent.protectDeliveryKey) {
+			let delivery;
+			try {
+				delivery = await this.getOutboundDeliveryByIdempotencyKey(
+					claim.intent.protectDeliveryKey,
+				);
+			} catch (error) {
+				retry();
+				console.error("[bulk-send] attachment cleanup completed", {
+					operation: "bulk_attachment_cleanup",
+					cleanupId: claim.intent.id,
+					ownerId: claim.intent.ownerId,
+					result: "ownership_check_failure",
+					target: "outbound_delivery_store",
+					errorName: error instanceof Error ? error.name : "UnknownError",
+					retryDecision: "retry",
+					durationMs: Date.now() - cleanupStartedAt,
+				});
+				await this.#ensureBulkMaintenanceAlarm();
+				return;
+			}
+			if (delivery?.emailId === claim.intent.protectEmailId) {
+				complete();
+				console.info("[bulk-send] attachment cleanup completed", {
+					operation: "bulk_attachment_cleanup",
+					cleanupId: claim.intent.id,
+					ownerId: claim.intent.ownerId,
+					result: "transferred_to_delivery",
+					retryDecision: "complete",
+					durationMs: Date.now() - cleanupStartedAt,
+				});
+				await this.#ensureBulkMaintenanceAlarm();
+				return;
+			}
+		}
+
+		if (claim.intent.protectPreparationKey) {
+			const protectedByPreparation = this.ctx.storage.transactionSync(() => {
+				const preparation = this.ctx.storage.kv.get<BulkRecipientPreparation>(
+					claim.intent.protectPreparationKey!,
+				);
+				if (!preparation) return false;
+				const job = this.ctx.storage.kv.get<BulkJob>(
+					`bulk:job:${preparation.jobId}`,
+				);
+				if (
+					job &&
+					(job.status === "queued" || job.status === "running") &&
+					job.cursor === preparation.cursor
+				) {
+					const current = this.ctx.storage.kv.get<BulkCleanupIntent>(claim.key);
+					if (current) {
+						const next = retryBulkCleanupClaim(
+							current,
+							claim.intent.leaseToken!,
+							Date.now(),
+							BULK_LIMITS.recipientCleanupDelayMs,
+						);
+						if (next) this.ctx.storage.kv.put(claim.key, next);
+					}
+					return true;
+				}
+				this.ctx.storage.kv.delete(claim.intent.protectPreparationKey!);
+				return false;
+			});
+			if (protectedByPreparation) {
+				console.info("[bulk-send] attachment cleanup completed", {
+					operation: "bulk_attachment_cleanup",
+					cleanupId: claim.intent.id,
+					ownerId: claim.intent.ownerId,
+					result: "deferred_for_recipient",
+					retryDecision: "retry",
+					durationMs: Date.now() - cleanupStartedAt,
+				});
+				await this.#ensureBulkMaintenanceAlarm();
+				return;
+			}
+		}
+
+		try {
+			await this.env.BUCKET.delete(claim.intent.keys);
+			const deletedAt = Date.now();
+			if (claim.intent.verifyAt && claim.intent.verifyAt > deletedAt) {
+				this.ctx.storage.transactionSync(() => {
+					const current = this.ctx.storage.kv.get<BulkCleanupIntent>(claim.key);
+					if (current?.leaseToken !== claim.intent.leaseToken) return;
+					this.ctx.storage.kv.put(claim.key, {
+						...current,
+						dueAt: claim.intent.verifyAt!,
+						leaseToken: null,
+						leaseExpiresAt: null,
+						deleteConfirmedAt: deletedAt,
+					});
+				});
+			} else {
+				complete();
+			}
+			console.info("[bulk-send] attachment cleanup completed", {
+				operation: "bulk_attachment_cleanup",
+				cleanupId: claim.intent.id,
+				ownerId: claim.intent.ownerId,
+				result:
+					claim.intent.verifyAt && claim.intent.verifyAt > deletedAt
+						? "verification_scheduled"
+						: "deleted",
+				target: "r2",
+				keyCount: claim.intent.keys.length,
+				retryDecision:
+					claim.intent.verifyAt && claim.intent.verifyAt > deletedAt
+						? "verify"
+						: "complete",
+				durationMs: Date.now() - cleanupStartedAt,
+			});
+		} catch (error) {
+			retry();
+			console.error("[bulk-send] attachment cleanup completed", {
+				operation: "bulk_attachment_cleanup",
+				cleanupId: claim.intent.id,
+				ownerId: claim.intent.ownerId,
+				result: "failure",
+				target: "r2",
+				keyCount: claim.intent.keys.length,
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry",
+				durationMs: Date.now() - cleanupStartedAt,
+			});
+		}
+		await this.#ensureBulkMaintenanceAlarm();
+	}
+
+	#commitBulkTerminalSync(jobId: string, job?: BulkJob): number {
+		return this.ctx.storage.transactionSync(() => {
+			const completedAt = Date.now();
+			if (job) {
+				this.ctx.storage.kv.put(`bulk:job:${jobId}`, job);
+				this.#createBulkCleanupIntentSync({
+					ownerId: `${jobId}:terminal`,
+					keys: [
+						...(job.attachments?.map((attachment) => attachment.key) ?? []),
+					],
+					dueAt: completedAt,
+				});
+				this.#markBulkGenerationCleanupDueSync(jobId, completedAt);
+				this.#abandonBulkRecipientPreparationSync(
+					jobId,
+					job.cursor,
+					completedAt,
+				);
+			}
+			this.ctx.storage.kv.delete(`bulk:rows:${jobId}`);
+			const queue = this.ctx.storage.kv.get<string[]>(BULK_QUEUE_KEY) ?? [];
+			const remaining = removeBulkQueueMembership(queue, jobId);
+			this.ctx.storage.kv.put(BULK_QUEUE_KEY, remaining);
+			const active =
+				this.ctx.storage.kv.get<BulkActiveEntry[]>(BULK_ACTIVE_KEY) ?? [];
+			const activeEntry = active.find((entry) => entry.jobId === jobId);
+			this.#removeBulkActiveSync(jobId);
+			const admissionKey = job?.operationId
+				? `bulk:admission:${job.operationId}`
+				: activeEntry?.admissionKey;
+			if (admissionKey) {
+				this.#recordBulkTerminalSync(jobId, admissionKey, completedAt);
+			}
+			return remaining.length;
+		});
 	}
 
 	/** Enqueue the next recipient of the head job, persist progress, reschedule. */
 	async alarm(): Promise<void> {
 		const alarmNow = Date.now();
+		this.ctx.storage.transactionSync(() => {
+			this.#expireBulkPreparationsSync(alarmNow);
+			this.#pruneBulkTerminalSync(alarmNow);
+			this.#pruneBulkReservationsSync(alarmNow);
+		});
+		await this.#ensureBulkMaintenanceAlarm();
+		await this.#processBulkAdmissionPreparation();
 		const nextSemanticAt = await this.#processSemanticIndexAlarm(alarmNow);
 		if (nextSemanticAt !== null) await this.#scheduleAlarmAt(nextSemanticAt);
 		try {
 			const nextAutomationAt = this.#processAutomationRulesAlarm();
 			if (nextAutomationAt !== null) {
-				await this.#scheduleAlarmAt(Math.max(Date.now() + 100, nextAutomationAt));
+				await this.#scheduleAlarmAt(
+					Math.max(Date.now() + 100, nextAutomationAt),
+				);
 			}
 		} catch (error) {
 			console.error("[automation-rules] alarm pass failed", {
@@ -4622,8 +6351,12 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 		const pushVapid = vapidConfig(this.env);
 		const nextPushAt = await processPushOutbox({
-			storage: this.ctx.storage,
+			storage: {
+				sql: this.ctx.storage.sql,
+				transactionSync: (run) => this.ctx.storage.transactionSync(run),
+			},
 			vapidConfigured: pushVapid !== null,
+			createToken: () => crypto.randomUUID(),
 			canAccess: (userId, mailboxId) =>
 				mailboxAccess(this.env).canAccessMailbox(userId, mailboxId),
 			send: (subscription, payload, options) => {
@@ -4645,7 +6378,8 @@ export class MailboxDO extends DurableObject<Env> {
 		if (nextPushAt !== null) await this.#scheduleAlarmAt(nextPushAt);
 		const replyWakePending = this.#processReplyWakeBatch();
 		const nextSnoozeAt = this.#processDueSnoozeBatch(alarmNow);
-		const nextFollowUpAt = await this.#processFollowUpReplyCompletionQueue(alarmNow);
+		const nextFollowUpAt =
+			await this.#processFollowUpReplyCompletionQueue(alarmNow);
 		const nextSnoozeAlarm = earliestMailboxAlarm([
 			replyWakePending ? alarmNow + 100 : null,
 			nextSnoozeAt,
@@ -4655,17 +6389,65 @@ export class MailboxDO extends DurableObject<Env> {
 			await this.#scheduleAlarmAt(Math.max(alarmNow, nextSnoozeAlarm));
 		}
 		const cleanupPending = await this.#processAttachmentCleanup();
+		await this.#processBulkAttachmentCleanup();
+		if (cleanupPending) {
+			await this.#scheduleAlarmAt(Date.now() + 60_000);
+		}
 		await this.#processOutboundAlarm();
-		const queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];
+		let queue: string[];
+		try {
+			queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];
+		} catch (error) {
+			console.error("[bulk-send] alarm pass failed", {
+				operation: "bulk_alarm_pass",
+				stage: "queue_read",
+				result: "failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - alarmNow,
+			});
+			throw error;
+		}
 		if (queue.length === 0) {
-			if (cleanupPending) await this.#scheduleAlarmAt(Date.now() + 60_000);
+			await this.#ensureBulkMaintenanceAlarm();
 			return;
 		}
 
 		const jobId = queue[0];
-		const job = await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`);
-		const rows =
-			(await this.ctx.storage.get<BulkRecipient[]>(`bulk:rows:${jobId}`)) ?? [];
+		let job: BulkJob | undefined;
+		try {
+			job = await this.ctx.storage.get<BulkJob>(`bulk:job:${jobId}`);
+		} catch (error) {
+			console.error("[bulk-send] alarm pass failed", {
+				operation: "bulk_alarm_pass",
+				stage: "job_read",
+				jobId,
+				result: "failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - alarmNow,
+			});
+			throw error;
+		}
+		let rows: BulkRecipient[];
+		try {
+			rows =
+				(await this.ctx.storage.get<BulkRecipient[]>(`bulk:rows:${jobId}`)) ??
+				[];
+		} catch (error) {
+			console.error("[bulk-send] alarm pass failed", {
+				operation: "bulk_alarm_pass",
+				stage: "rows_read",
+				mailboxId: job?.fromEmail,
+				operationId: job?.operationId,
+				jobId,
+				result: "failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - alarmNow,
+			});
+			throw error;
+		}
 		if (job) job.enqueued ??= job.sent ?? 0;
 
 		// Drop a finished/missing job and move on.
@@ -4678,23 +6460,85 @@ export class MailboxDO extends DurableObject<Env> {
 			if (job && job.cursor >= rows.length) {
 				job.status = "done";
 				job.updatedAt = Date.now();
-				await this.ctx.storage.put(`bulk:job:${jobId}`, job);
 			}
-			await this.#deleteBulkAttachments(job ?? undefined);
-			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
-			queue.shift();
-			await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
-			if (queue.length > 0) await this.#scheduleAlarmAt(Date.now() + 100);
+			const remainingJobs = this.#commitBulkTerminalSync(
+				jobId,
+				job ?? undefined,
+			);
+			if (job) {
+				console.info("[bulk-send] job reached terminal state", {
+					operation: "bulk_job_terminal",
+					mailboxId: job.fromEmail,
+					actorUserId: job.actorUserId,
+					operationId: job.operationId,
+					jobId,
+					status: job.status,
+					result: "reconciled_terminal",
+					terminalReason:
+						job.cursor >= rows.length
+							? "cursor_exhausted"
+							: "already_terminal",
+					total: job.total,
+					cursor: job.cursor,
+					enqueued: job.enqueued,
+					failed: job.failed,
+					remainingJobs,
+					retryDecision: remainingJobs > 0 ? "next_job" : "maintenance_only",
+					durationMs: Date.now() - job.createdAt,
+				});
+			} else {
+				console.error("[bulk-send] job reached terminal state", {
+					operation: "bulk_job_terminal",
+					jobId,
+					result: "missing_job",
+					terminalReason: "queue_entry_without_job",
+					action: "removed_from_queue",
+					remainingJobs,
+					retryDecision: remainingJobs > 0 ? "next_job" : "maintenance_only",
+					durationMs: Date.now() - alarmNow,
+				});
+			}
+			await this.#ensureBulkMaintenanceAlarmForJob({
+				startedAt: alarmNow,
+				jobId,
+				...(job ? { job } : {}),
+			});
+			if (remainingJobs > 0) {
+				await this.#scheduleBulkAlarmAt(Date.now() + 100, {
+					stage: "next_job_schedule",
+					startedAt: alarmNow,
+					jobId,
+					...(job ? { job } : {}),
+				});
+			}
 			return;
 		}
 
-		if (
-			!job.actorUserId ||
-			!(await mailboxAccess(this.env).canAccessMailbox(
-				job.actorUserId,
-				job.fromEmail,
-			))
-		) {
+		let canAccess = false;
+		if (job.actorUserId) {
+			const authorizationStartedAt = Date.now();
+			try {
+				canAccess = await mailboxAccess(this.env).canAccessMailbox(
+					job.actorUserId,
+					job.fromEmail,
+				);
+			} catch (error) {
+				console.error("[bulk-send] job authorization failed", {
+					operation: "bulk_job_authorization",
+					mailboxId: job.fromEmail,
+					actorUserId: job.actorUserId,
+					operationId: job.operationId,
+					jobId,
+					result: "failure",
+					target: "mailbox_access",
+					errorName: error instanceof Error ? error.name : "UnknownError",
+					retryDecision: "retry_alarm",
+					durationMs: Date.now() - authorizationStartedAt,
+				});
+				throw error;
+			}
+		}
+		if (!job.actorUserId || !canAccess) {
 			job.status = "cancelled";
 			job.updatedAt = Date.now();
 			job.errors.push({
@@ -4702,19 +6546,49 @@ export class MailboxDO extends DurableObject<Env> {
 				error:
 					"Job cancelled because the initiating user's mailbox access ended.",
 			});
-			await this.ctx.storage.put(`bulk:job:${jobId}`, job);
-			await this.#deleteBulkAttachments(job);
-			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
-			queue.shift();
-			await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
-			if (queue.length > 0) await this.#scheduleAlarmAt(Date.now() + 100);
+			const remainingJobs = this.#commitBulkTerminalSync(jobId, job);
+			console.warn("[bulk-send] job reached terminal state", {
+				operation: "bulk_job_terminal",
+				mailboxId: job.fromEmail,
+				actorUserId: job.actorUserId || undefined,
+				operationId: job.operationId,
+				jobId,
+				status: job.status,
+				result: "cancelled",
+				terminalReason: job.actorUserId ? "access_revoked" : "missing_actor",
+				total: job.total,
+				cursor: job.cursor,
+				enqueued: job.enqueued,
+				failed: job.failed,
+				remainingJobs,
+				retryDecision: remainingJobs > 0 ? "next_job" : "maintenance_only",
+				durationMs: Date.now() - job.createdAt,
+			});
+			await this.#ensureBulkMaintenanceAlarmForJob({
+				startedAt: alarmNow,
+				jobId,
+				job,
+			});
+			if (remainingJobs > 0) {
+				await this.#scheduleBulkAlarmAt(Date.now() + 100, {
+					stage: "next_job_schedule",
+					startedAt: alarmNow,
+					jobId,
+					job,
+				});
+			}
 			return;
 		}
 
 		const currentTime = Date.now();
 		const nextEnqueueAt = job.nextEnqueueAt ?? job.createdAt;
 		if (nextEnqueueAt > currentTime) {
-			await this.#scheduleAlarmAt(nextEnqueueAt);
+			await this.#scheduleBulkAlarmAt(nextEnqueueAt, {
+				stage: "throttle_schedule",
+				startedAt: alarmNow,
+				jobId,
+				job,
+			});
 			return;
 		}
 
@@ -4722,51 +6596,108 @@ export class MailboxDO extends DurableObject<Env> {
 
 		const row = rows[job.cursor];
 		const to = row.email;
-		const subject = this.#renderTemplate(job.subject, row, false)
+		const subject = renderBulkTemplate(job.subject, row, false)
 			.replace(/[\r\n]+/g, " ")
 			.trim();
 		const html = job.html
-			? this.#renderTemplate(job.html, row, true)
+			? renderBulkTemplate(job.html, row, true)
 			: undefined;
 		const text = job.text
-			? this.#renderTemplate(job.text, row, false)
+			? renderBulkTemplate(job.text, row, false)
 			: undefined;
 
-		const fromDomain = job.fromEmail.split("@")[1] || "";
-		const { messageId } = generateMessageId(fromDomain);
-		const recipientAttachmentKeys: string[] = [];
+		const idempotencyKey = `bulk:${job.id}:${job.cursor}`;
+		const recipientStartedAt = Date.now();
+		let authoritative: StoredOutboundDelivery | null;
+		try {
+			authoritative =
+				await this.getOutboundDeliveryByIdempotencyKey(idempotencyKey);
+		} catch (error) {
+			console.error("[bulk-send] recipient enqueue completed", {
+				operation: "bulk_recipient_enqueue",
+				mailboxId: job.fromEmail,
+				operationId: job.operationId,
+				jobId: job.id,
+				cursor: job.cursor,
+				stage: "idempotency_lookup",
+				result: "failure",
+				target: "outbound_delivery_store",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - recipientStartedAt,
+			});
+			throw error;
+		}
+		let preparation: BulkRecipientPreparation | null = null;
+		let messageId = authoritative?.emailId ?? "";
+		if (authoritative) {
+			try {
+				this.ctx.storage.transactionSync(() => {
+					const stalePreparation =
+						this.ctx.storage.kv.get<BulkRecipientPreparation>(
+							this.#bulkRecipientPreparationKey(job.id, job.cursor),
+						);
+					if (stalePreparation) {
+						this.#finishBulkRecipientPreparationSync(
+							stalePreparation,
+							authoritative!.emailId,
+						);
+					}
+				});
+			} catch (error) {
+				console.error("[bulk-send] recipient enqueue completed", {
+					operation: "bulk_recipient_enqueue",
+					mailboxId: job.fromEmail,
+					operationId: job.operationId,
+					jobId: job.id,
+					cursor: job.cursor,
+					stage: "replay_cleanup",
+					result: "failure",
+					target: "durable_storage",
+					errorName: error instanceof Error ? error.name : "UnknownError",
+					retryDecision: "retry_alarm",
+					durationMs: Date.now() - recipientStartedAt,
+				});
+				throw error;
+			}
+		}
 
 		try {
-			const pendingAttachments: PendingOutboundAttachment[] = job.attachments
-				?.length
-				? await Promise.all(
-						job.attachments.map(async (a, index) => {
-							const o = await this.env.BUCKET.get(a.key);
-							if (!o)
-								throw new Error(
-									`Attachment "${a.filename}" is no longer available.`,
-								);
-							const id = `bulk_attachment_${index}_${crypto.randomUUID()}`;
-							const destinationKey = attachmentKey(messageId, id, a.filename);
-							recipientAttachmentKeys.push(destinationKey);
-							await this.env.BUCKET.put(destinationKey, await o.arrayBuffer(), {
-								httpMetadata: { contentType: a.type },
-							});
-							return {
-								id,
-								email_id: messageId,
-								filename: a.filename,
-								mimetype: a.type,
-								size: a.size,
-								disposition: "attachment",
-							};
-						}),
-					)
-				: [];
+			if (!authoritative) {
+				const fromDomain = job.fromEmail.split("@")[1] || "";
+				const generated = generateMessageId(fromDomain).messageId;
+				preparation = this.ctx.storage.transactionSync(() =>
+					this.#createBulkRecipientPreparationSync(job, generated),
+				);
+				messageId = preparation?.messageId ?? generated;
+				if (preparation) {
+					const activePreparation = preparation;
+					// Cloudflare alarms are at-least-once but have a bounded automatic
+					// retry count. Persist and schedule cleanup before external R2 I/O.
+					// https://developers.cloudflare.com/durable-objects/api/alarms/
+					await this.#ensureBulkMaintenanceAlarm();
+					for (const [index, attachment] of (job.attachments ?? []).entries()) {
+						const source = await this.env.BUCKET.get(attachment.key);
+						if (!source) {
+							throw new BulkRecipientAttachmentUnavailableError(
+								attachment.filename,
+							);
+						}
+						await this.env.BUCKET.put(
+							activePreparation.keys[index],
+							await source.arrayBuffer(),
+							{
+								httpMetadata: { contentType: attachment.type },
+							},
+						);
+					}
+				}
+				const pendingAttachments = preparation?.attachments ?? [];
+				const activePreparation = preparation;
 			const requestedAt = new Date().toISOString();
-			await this.enqueueOutbound(
+				await this.#enqueueOutboundInternal(
 				{
-					idempotencyKey: `bulk:${job.id}:${job.cursor}`,
+						idempotencyKey,
 					source: "bulk",
 					actor: { kind: "user", id: job.actorUserId },
 					snapshot: {
@@ -4789,37 +6720,115 @@ export class MailboxDO extends DurableObject<Env> {
 				},
 				pendingAttachments,
 				messageId,
+					activePreparation
+						? (result) =>
+								this.#finishBulkRecipientPreparationSync(
+									activePreparation,
+									result.delivery.emailId,
+								)
+						: undefined,
 			);
+			}
 			// This counter now records rows durably accepted into the truthful outbox.
 			// Provider acceptance remains visible on each outbound delivery record.
 			job.enqueued += 1;
+			console.info("[bulk-send] recipient enqueue completed", {
+				operation: "bulk_recipient_enqueue",
+				mailboxId: job.fromEmail,
+				operationId: job.operationId,
+				jobId: job.id,
+				cursor: job.cursor,
+				result: authoritative ? "replay" : "committed",
+				target: "outbound_delivery_store",
+				durationMs: Date.now() - recipientStartedAt,
+			});
 		} catch (e) {
-			let authoritative;
 			try {
-				authoritative = await this.getOutboundDeliveryByIdempotencyKey(
-					`bulk:${job.id}:${job.cursor}`,
-				);
-			} catch {
+				authoritative =
+					await this.getOutboundDeliveryByIdempotencyKey(idempotencyKey);
+			} catch (reconciliationError) {
 				// The alarm must retry while commit state is indeterminate. Deleting
 				// bytes or advancing the cursor could corrupt an accepted snapshot.
+				console.error("[bulk-send] recipient enqueue completed", {
+					operation: "bulk_recipient_enqueue",
+					mailboxId: job.fromEmail,
+					operationId: job.operationId,
+					jobId: job.id,
+					cursor: job.cursor,
+					result: "commit_state_unknown",
+					target: "outbound_delivery_store",
+					errorName:
+						reconciliationError instanceof Error
+							? reconciliationError.name
+							: "UnknownError",
+					retryDecision: "retry_alarm",
+					durationMs: Date.now() - recipientStartedAt,
+				});
 				throw e;
 			}
 			const reconciliation = planBulkEnqueueReconciliation(
 				authoritative,
 				messageId,
 			);
-			if (
-				reconciliation.deleteAttemptedBytes &&
-				recipientAttachmentKeys.length > 0
-			) {
-				await this.env.BUCKET.delete(recipientAttachmentKeys).catch(() => {});
+			const disposition = planBulkRecipientEnqueueDisposition(
+				reconciliation.status,
+				e,
+			);
+			if (disposition === "retry") {
+				console.error("[bulk-send] recipient enqueue completed", {
+					operation: "bulk_recipient_enqueue",
+					mailboxId: job.fromEmail,
+					operationId: job.operationId,
+					jobId: job.id,
+					cursor: job.cursor,
+					result: "transient_failure",
+					target: "outbound_delivery_store",
+					errorName: e instanceof Error ? e.name : "UnknownError",
+					retryDecision: "retry_alarm",
+					durationMs: Date.now() - recipientStartedAt,
+				});
+				throw e;
 			}
-			if (reconciliation.status === "committed") {
+			if (preparation) {
+				const activePreparation = preparation;
+				this.ctx.storage.transactionSync(() =>
+					this.#finishBulkRecipientPreparationSync(
+						activePreparation,
+						disposition === "committed"
+							? (authoritative?.emailId ?? null)
+							: null,
+					),
+				);
+			}
+			if (disposition === "committed") {
 				job.enqueued += 1;
+				console.info("[bulk-send] recipient enqueue completed", {
+					operation: "bulk_recipient_enqueue",
+					mailboxId: job.fromEmail,
+					operationId: job.operationId,
+					jobId: job.id,
+					cursor: job.cursor,
+					result: "recovered_commit",
+					target: "outbound_delivery_store",
+					retryDecision: "continue",
+					durationMs: Date.now() - recipientStartedAt,
+				});
 				await this.#ensureOutboundAlarm();
 			} else {
 				job.failed += 1;
-				job.errors.push({ email: to, error: (e as Error).message });
+				job.errors.push({ email: to, error: "Recipient could not be queued." });
+				console.error("[bulk-send] recipient enqueue completed", {
+					operation: "bulk_recipient_enqueue",
+					mailboxId: job.fromEmail,
+					operationId: job.operationId,
+					jobId: job.id,
+					cursor: job.cursor,
+					result: "failed",
+					target: "outbound_delivery_store",
+					errorName: e instanceof Error ? e.name : "UnknownError",
+					retryDecision: "terminal_for_recipient",
+					durationMs: Date.now() - recipientStartedAt,
+				});
 			}
 		}
 
@@ -4828,40 +6837,89 @@ export class MailboxDO extends DurableObject<Env> {
 		job.nextEnqueueAt = nextBulkEnqueueAt(job.updatedAt, Math.random());
 		if (job.cursor >= rows.length) {
 			job.status = "done";
-			await this.#deleteBulkAttachments(job);
-			await this.ctx.storage.delete(`bulk:rows:${jobId}`);
-			queue.shift();
+			const remainingJobs = this.#commitBulkTerminalSync(jobId, job);
+			console.info("[bulk-send] job reached terminal state", {
+				operation: "bulk_job_terminal",
+				mailboxId: job.fromEmail,
+				actorUserId: job.actorUserId,
+				operationId: job.operationId,
+				jobId,
+				status: job.status,
+				result: "completed",
+				terminalReason: "all_recipients_processed",
+				total: job.total,
+				cursor: job.cursor,
+				enqueued: job.enqueued,
+				failed: job.failed,
+				remainingJobs,
+				retryDecision: remainingJobs > 0 ? "next_job" : "maintenance_only",
+				durationMs: Date.now() - job.createdAt,
+			});
+			await this.#ensureBulkMaintenanceAlarmForJob({
+				startedAt: alarmNow,
+				jobId,
+				job,
+			});
+			if (remainingJobs > 0) {
+				await this.#scheduleBulkAlarmAt(Date.now() + 100, {
+					stage: "next_job_schedule",
+					startedAt: alarmNow,
+					jobId,
+					job,
+				});
+			}
+			return;
 		}
-		await this.ctx.storage.put(`bulk:job:${jobId}`, job);
-		await this.ctx.storage.put(BULK_QUEUE_KEY, queue);
-
-		if (queue.length > 0) {
-			await this.#scheduleAlarmAt(job.nextEnqueueAt);
+		try {
+			await this.ctx.storage.put(`bulk:job:${jobId}`, job);
+		} catch (error) {
+			console.error("[bulk-send] alarm pass failed", {
+				operation: "bulk_alarm_pass",
+				stage: "progress_persist",
+				mailboxId: job.fromEmail,
+				operationId: job.operationId,
+				jobId,
+				result: "failure",
+				errorName: error instanceof Error ? error.name : "UnknownError",
+				retryDecision: "retry_alarm",
+				durationMs: Date.now() - alarmNow,
+			});
+			throw error;
 		}
-	}
+		await this.#scheduleBulkAlarmAt(job.nextEnqueueAt, {
+			stage: "next_job_schedule",
+			startedAt: alarmNow,
+			jobId,
+			job,
+		});
+		}
 
 	// ── Deterministic inbound Automation Rules ─────────────────────
 
 	#automationTargetSets() {
 		return {
 			labels: new Set(
-				[...this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM labels")]
-					.map((row) => row.id),
+				[
+					...this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM labels"),
+				].map((row) => row.id),
 			),
 			folders: new Set(
-				[...this.ctx.storage.sql.exec<{ id: string }>(
+				[
+					...this.ctx.storage.sql.exec<{ id: string }>(
 					`SELECT id FROM folders
 					 WHERE id = ? OR (is_deletable = 1 AND id <> ?)`,
 					Folders.ARCHIVE,
 					InternalFolders.RETIRED_OUTBOUND,
-				)].map((row) => row.id),
+					),
+				].map((row) => row.id),
 			),
 		};
 	}
 
 	#automationRuleHistory() {
 		return new Map(
-			[...this.ctx.storage.sql.exec<{
+			[
+				...this.ctx.storage.sql.exec<{
 				ruleId: string;
 				lastRunAt: string;
 				lastMatchedAt: string | null;
@@ -4870,7 +6928,8 @@ export class MailboxDO extends DurableObject<Env> {
 				        MAX(CASE WHEN outcome NOT IN ('not_matched', 'stopped')
 				                 THEN created_at ELSE NULL END) AS lastMatchedAt
 				 FROM automation_run_results GROUP BY rule_id`,
-			)].map((row) => [row.ruleId, row]),
+				),
+			].map((row) => [row.ruleId, row]),
 		);
 	}
 
@@ -4881,8 +6940,13 @@ export class MailboxDO extends DurableObject<Env> {
 			: "automation_run_folder_refs";
 		const referenceColumn = target.labelId ? "label_id" : "folder_id";
 		const targetId = target.labelId ?? target.folderId;
-		if (!targetId) throw new AutomationRuleError("INVALID", "Automation Rule target is invalid");
-		const pending = [...this.ctx.storage.sql.exec<{ id: string; name: string }>(
+		if (!targetId)
+			throw new AutomationRuleError(
+				"INVALID",
+				"Automation Rule target is invalid",
+			);
+		const pending = [
+			...this.ctx.storage.sql.exec<{ id: string; name: string }>(
 			`SELECT DISTINCT rr.rule_id AS id, rr.rule_name AS name
 			 FROM ${referenceTable} ref
 			 JOIN automation_runs run ON run.id = ref.run_id
@@ -4890,11 +6954,17 @@ export class MailboxDO extends DurableObject<Env> {
 			 WHERE ref.${referenceColumn} = ? AND run.state IN ('pending', 'processing')
 			 ORDER BY rr.ordinal ASC, rr.rule_id ASC LIMIT 20`,
 			targetId,
-		)];
-		return [...new Set([...current, ...pending].map((rule) => rule.name))].slice(0, 5);
+			),
+		];
+		return [
+			...new Set([...current, ...pending].map((rule) => rule.name)),
+		].slice(0, 5);
 	}
 
-	#assertAutomationTargetUnused(target: { labelId?: string; folderId?: string }) {
+	#assertAutomationTargetUnused(target: {
+		labelId?: string;
+		folderId?: string;
+	}) {
 		const names = this.#automationTargetUsage(target);
 		if (names.length > 0) {
 			throw new AutomationRuleError(
@@ -4910,8 +6980,11 @@ export class MailboxDO extends DurableObject<Env> {
 		targets = this.#automationTargetSets(),
 		history = this.#automationRuleHistory(),
 	) {
-		const active = versions.find((version) => version.version === rule.activeVersion) ?? null;
-		const draft = versions.find((version) => version.version === rule.draftVersion) ?? null;
+		const active =
+			versions.find((version) => version.version === rule.activeVersion) ??
+			null;
+		const draft =
+			versions.find((version) => version.version === rule.draftVersion) ?? null;
 		let targetHealth: "ready" | "needs_attention" = "ready";
 		for (const version of [active, draft]) {
 			if (!version) continue;
@@ -4919,17 +6992,20 @@ export class MailboxDO extends DurableObject<Env> {
 				if (
 					action.kind === "apply_labels" &&
 					action.labelIds.some((labelId) => !targets.labels.has(labelId))
-				) targetHealth = "needs_attention";
+				)
+					targetHealth = "needs_attention";
 				if (
 					action.kind === "move_to_folder" &&
 					!targets.folders.has(action.folderId)
-				) targetHealth = "needs_attention";
+				)
+					targetHealth = "needs_attention";
 			}
 		}
 		return {
 			id: rule.id,
 			name: rule.name,
-			state: targetHealth === "needs_attention" && rule.state !== "archived"
+			state:
+				targetHealth === "needs_attention" && rule.state !== "archived"
 				? ("needs_attention" as const)
 				: rule.state,
 			position: rule.position,
@@ -4965,7 +7041,10 @@ export class MailboxDO extends DurableObject<Env> {
 			} catch {
 				return {
 					...this.#automationRuleView(rule, [], targets, history),
-					state: rule.state === "archived" ? rule.state : ("needs_attention" as const),
+					state:
+						rule.state === "archived"
+							? rule.state
+							: ("needs_attention" as const),
 					targetHealth: "needs_attention" as const,
 				};
 			}
@@ -4975,7 +7054,9 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async getAutomationRule(ruleId: string) {
 		const automation = this.#automationRules();
-		const rule = automation.listRules(true).find((candidate) => candidate.id === ruleId);
+		const rule = automation
+			.listRules(true)
+			.find((candidate) => candidate.id === ruleId);
 		if (!rule) return null;
 		const versions = automation.listVersions(ruleId);
 		return {
@@ -5024,8 +7105,14 @@ export class MailboxDO extends DurableObject<Env> {
 		const automation = this.#automationRules();
 		const rule = input.enabled
 			? (() => {
-				const current = automation.listRules(true).find((item) => item.id === input.ruleId);
-				if (!current) throw new AutomationRuleError("NOT_FOUND", "Automation Rule was not found");
+					const current = automation
+						.listRules(true)
+						.find((item) => item.id === input.ruleId);
+					if (!current)
+						throw new AutomationRuleError(
+							"NOT_FOUND",
+							"Automation Rule was not found",
+						);
 				return current.draftVersion === null
 					? automation.setEnabled(input)
 					: automation.enable(input);
@@ -5039,7 +7126,9 @@ export class MailboxDO extends DurableObject<Env> {
 		actorId: string;
 		expectedRevision: number;
 	}) {
-		return this.#automationMutationResult(this.#automationRules().archive(input));
+		return this.#automationMutationResult(
+			this.#automationRules().archive(input),
+		);
 	}
 
 	async reorderAutomationRules(input: {
@@ -5074,23 +7163,33 @@ export class MailboxDO extends DurableObject<Env> {
 			? currentRules.find((rule) => rule.id === input.ruleId)
 			: null;
 		if (input.ruleId && !requestedRule) {
-			throw new AutomationRuleError("NOT_FOUND", "Automation Rule was not found");
+			throw new AutomationRuleError(
+				"NOT_FOUND",
+				"Automation Rule was not found",
+			);
 		}
 		if (
 			requestedRule &&
-			(input.ruleVersion !== requestedRule.draftVersion || requestedRule.draftVersion === null)
+			(input.ruleVersion !== requestedRule.draftVersion ||
+				requestedRule.draftVersion === null)
 		) {
-			throw new AutomationRuleError("CONFLICT", "Automation Rule draft changed; refresh and try again");
+			throw new AutomationRuleError(
+				"CONFLICT",
+				"Automation Rule draft changed; refresh and try again",
+			);
 		}
-		const enabled = currentRules.filter((rule) =>
-			rule.state === "enabled" && rule.activeVersion !== null
+		const enabled = currentRules.filter(
+			(rule) => rule.state === "enabled" && rule.activeVersion !== null,
 		);
 		const orderedRules = enabled.map((rule, ordinal) => {
-			const version = automation.listVersions(rule.id).find(
-				(candidate) => candidate.version === rule.activeVersion,
-			);
+			const version = automation
+				.listVersions(rule.id)
+				.find((candidate) => candidate.version === rule.activeVersion);
 			if (!version) {
-				throw new AutomationRuleError("INVALID", "An active Automation Rule version is unavailable");
+				throw new AutomationRuleError(
+					"INVALID",
+					"An active Automation Rule version is unavailable",
+				);
 			}
 			return {
 				ordinal,
@@ -5102,27 +7201,43 @@ export class MailboxDO extends DurableObject<Env> {
 			};
 		});
 		const proposedOrdinal = requestedRule
-			? enabled.filter((rule) => rule.id !== requestedRule.id && rule.position < requestedRule.position).length
+			? enabled.filter(
+					(rule) =>
+						rule.id !== requestedRule.id &&
+						rule.position < requestedRule.position,
+				).length
 			: orderedRules.length;
-		return this.#automationTestView(await automation.dryRun({
+		return this.#automationTestView(
+			await automation.dryRun({
 			...input,
-			contexts: readAutomationDryRunContexts(this.ctx.storage.sql, Date.now()),
+				contexts: readAutomationDryRunContexts(
+					this.ctx.storage.sql,
+					Date.now(),
+				),
 			orderedRules,
 			proposedOrdinal,
-		}));
+			}),
+		);
 	}
 
-	async automationRulesUsingTarget(target: { labelId?: string; folderId?: string }) {
+	async automationRulesUsingTarget(target: {
+		labelId?: string;
+		folderId?: string;
+	}) {
 		return this.#automationRules().rulesUsingTarget(target);
 	}
 
-	async getAutomationTargetUsage(target: { labelId?: string; folderId?: string }) {
+	async getAutomationTargetUsage(target: {
+		labelId?: string;
+		folderId?: string;
+	}) {
 		return this.#automationTargetUsage(target);
 	}
 
 	#automationMessageView(messageId: string) {
 		if (!messageId || messageId.length > 300) return null;
-		const row = [...this.ctx.storage.sql.exec<{
+		const row = [
+			...this.ctx.storage.sql.exec<{
 			emailId: string;
 			folderId: string;
 			threadId: string | null;
@@ -5135,8 +7250,10 @@ export class MailboxDO extends DurableObject<Env> {
 			 FROM emails WHERE id = ? AND folder_id <> ? LIMIT 1`,
 			messageId,
 			InternalFolders.RETIRED_OUTBOUND,
-		)][0];
-		if (!row || !row.date || !Number.isFinite(Date.parse(row.date))) return null;
+			),
+		][0];
+		if (!row || !row.date || !Number.isFinite(Date.parse(row.date)))
+			return null;
 		return {
 			emailId: row.emailId,
 			folderId: row.folderId,
@@ -5163,21 +7280,29 @@ export class MailboxDO extends DurableObject<Env> {
 		beforeId: string | null;
 		limit: number;
 	}) {
-		const beforeTime = input.beforeCreatedAt === null
-			? null
-			: Date.parse(input.beforeCreatedAt);
+		const beforeTime =
+			input.beforeCreatedAt === null ? null : Date.parse(input.beforeCreatedAt);
 		if (
-			(input.state !== null && !AUTOMATION_RUN_STATES.includes(
+			(input.state !== null &&
+				!AUTOMATION_RUN_STATES.includes(
 				input.state as (typeof AUTOMATION_RUN_STATES)[number],
 			)) ||
-			!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
-			((input.beforeCreatedAt === null) !== (input.beforeId === null)) ||
+			!Number.isSafeInteger(input.limit) ||
+			input.limit < 1 ||
+			input.limit > 100 ||
+			(input.beforeCreatedAt === null) !== (input.beforeId === null) ||
 			(input.beforeCreatedAt !== null &&
 				(!Number.isFinite(beforeTime) ||
 					new Date(beforeTime!).toISOString() !== input.beforeCreatedAt)) ||
-			(input.beforeId !== null && (!input.beforeId || input.beforeId.length > 300))
-		) throw new AutomationRuleError("INVALID", "Automation Run query is invalid");
-		const rows = [...this.ctx.storage.sql.exec<AutomationRunRecord>(
+			(input.beforeId !== null &&
+				(!input.beforeId || input.beforeId.length > 300))
+		)
+			throw new AutomationRuleError(
+				"INVALID",
+				"Automation Run query is invalid",
+			);
+		const rows = [
+			...this.ctx.storage.sql.exec<AutomationRunRecord>(
 			`SELECT id, trigger_message_id AS triggerMessageId,
 			        ruleset_generation AS rulesetGeneration, state,
 			        attempt_count AS attemptCount, started_at AS startedAt,
@@ -5197,9 +7322,10 @@ export class MailboxDO extends DurableObject<Env> {
 			input.beforeCreatedAt,
 			input.beforeId,
 			input.limit + 1,
-		)];
+			),
+		];
 		const page = rows.slice(0, input.limit);
-		const last = rows.length > input.limit ? page.at(-1) ?? null : null;
+		const last = rows.length > input.limit ? (page.at(-1) ?? null) : null;
 		return {
 			runs: page.map((run) => this.#automationRunView(run)),
 			next: last ? { createdAt: last.createdAt, id: last.id } : null,
@@ -5208,9 +7334,13 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async getAutomationRun(runId: string) {
 		try {
-			return this.#automationRunView(this.#automationRules().getRun(runId), true);
+			return this.#automationRunView(
+				this.#automationRules().getRun(runId),
+				true,
+			);
 		} catch (error) {
-			if (error instanceof AutomationRuleError && error.code === "NOT_FOUND") return null;
+			if (error instanceof AutomationRuleError && error.code === "NOT_FOUND")
+				return null;
 			throw error;
 		}
 	}
@@ -5234,19 +7364,26 @@ export class MailboxDO extends DurableObject<Env> {
 		beforeId: string | null;
 		limit: number;
 	}) {
-		const beforeTime = input.beforeCreatedAt === null
-			? null
-			: Date.parse(input.beforeCreatedAt);
+		const beforeTime =
+			input.beforeCreatedAt === null ? null : Date.parse(input.beforeCreatedAt);
 		if (
 			(input.ruleId !== null && (!input.ruleId || input.ruleId.length > 300)) ||
-			!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
-			((input.beforeCreatedAt === null) !== (input.beforeId === null)) ||
+			!Number.isSafeInteger(input.limit) ||
+			input.limit < 1 ||
+			input.limit > 100 ||
+			(input.beforeCreatedAt === null) !== (input.beforeId === null) ||
 			(input.beforeCreatedAt !== null &&
 				(!Number.isFinite(beforeTime) ||
 					new Date(beforeTime!).toISOString() !== input.beforeCreatedAt)) ||
-			(input.beforeId !== null && (!input.beforeId || input.beforeId.length > 300))
-		) throw new AutomationRuleError("INVALID", "Automation Rule test query is invalid");
-		const rows = [...this.ctx.storage.sql.exec<{
+			(input.beforeId !== null &&
+				(!input.beforeId || input.beforeId.length > 300))
+		)
+			throw new AutomationRuleError(
+				"INVALID",
+				"Automation Rule test query is invalid",
+			);
+		const rows = [
+			...this.ctx.storage.sql.exec<{
 			id: string;
 			createdAt: string;
 		}>(
@@ -5261,11 +7398,12 @@ export class MailboxDO extends DurableObject<Env> {
 			input.beforeCreatedAt,
 			input.beforeId,
 			input.limit + 1,
-		)];
+			),
+		];
 		const page = rows.slice(0, input.limit);
 		const automation = this.#automationRules();
 		const tests = page.map((row) => automation.getTest(row.id));
-		const last = rows.length > input.limit ? page.at(-1) ?? null : null;
+		const last = rows.length > input.limit ? (page.at(-1) ?? null) : null;
 		return {
 			tests: tests.map((test) => this.#automationTestView(test)),
 			next: last ? { createdAt: last.createdAt, id: last.id } : null,
@@ -5354,8 +7492,10 @@ export class MailboxDO extends DurableObject<Env> {
 		userId: string,
 		expectedGeneration?: number,
 	): Promise<boolean> {
-		const generationClause = expectedGeneration === undefined ? "" : " AND generation = ?";
-		const bindings = expectedGeneration === undefined
+		const generationClause =
+			expectedGeneration === undefined ? "" : " AND generation = ?";
+		const bindings =
+			expectedGeneration === undefined
 			? [id, userId]
 			: [id, userId, expectedGeneration];
 		const existing = [
@@ -5380,7 +7520,8 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async ensurePushAlarm(): Promise<void> {
-		const row = [...this.ctx.storage.sql.exec<{ due_at: string | null }>(
+		const row = [
+			...this.ctx.storage.sql.exec<{ due_at: string | null }>(
 			`SELECT MIN(due_at) AS due_at FROM (
 			 SELECT next_attempt_at AS due_at FROM automation_runs
 			 WHERE state = 'pending' AND next_attempt_at IS NOT NULL
@@ -5398,7 +7539,8 @@ export class MailboxDO extends DurableObject<Env> {
 			 FROM push_notifications
 			 WHERE state IN ('completed', 'no_targets', 'expired')
 			)`,
-		)][0];
+			),
+		][0];
 		if (row?.due_at) await this.#scheduleAlarmAt(Date.parse(row.due_at));
 	}
 
