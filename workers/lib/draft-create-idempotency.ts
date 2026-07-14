@@ -30,6 +30,13 @@ export type DraftToolInvocation =
 			toolCallId: string;
 		};
 
+export type DraftToolUpdateInvocation = {
+	surface: "mcp";
+	toolName: "update_draft";
+	sessionId: string;
+	requestId: string | number;
+};
+
 async function sha256(value: unknown): Promise<string> {
 	const bytes = new TextEncoder().encode(JSON.stringify(value));
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -109,4 +116,48 @@ export function draftToolCreateKey(input: {
 				input.invocation.requestId,
 				input.invocation.toolCallId,
 			]);
+}
+
+export function draftToolUpdateKey(input: {
+	mailboxId: string;
+	actor: ActivityActor;
+	invocation: DraftToolUpdateInvocation;
+}): Promise<string> {
+	return sha256([
+		"mail-draft-tool-update",
+		1,
+		input.invocation.surface,
+		input.mailboxId.toLowerCase(),
+		input.actor.kind,
+		input.actor.id ?? null,
+		input.invocation.toolName,
+		input.invocation.sessionId,
+		input.invocation.requestId,
+	]);
+}
+
+export function draftToolUpdateFingerprint(
+	input: {
+		draftId: string;
+		draftVersion: number;
+		to?: string;
+		subject?: string;
+		bodyHtml?: string;
+	},
+): Promise<string> {
+	const field = (
+		key: "to" | "subject" | "bodyHtml",
+		normalize: (value: string) => string = (value) => value,
+	) => Object.prototype.hasOwnProperty.call(input, key)
+		? ["present", normalize(input[key] ?? "")]
+		: ["omitted"];
+	return sha256([
+		"mail-draft-tool-update-intent",
+		1,
+		input.draftId,
+		input.draftVersion,
+		field("to", (value) => value.toLowerCase()),
+		field("subject"),
+		field("bodyHtml"),
+	]);
 }

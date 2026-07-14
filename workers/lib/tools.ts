@@ -39,7 +39,10 @@ import { validateResolvedInlineImages } from "./inline-image-authority.ts";
 import {
 	draftCreateFingerprint,
 	draftToolCreateKey,
+	draftToolUpdateFingerprint,
+	draftToolUpdateKey,
 	type DraftToolInvocation,
+	type DraftToolUpdateInvocation,
 } from "./draft-create-idempotency.ts";
 
 // ── Type casts for DO methods not on the base stub type ────────────
@@ -571,11 +574,47 @@ export async function toolUpdateDraft(
 		bodyHtml?: string;
 	},
 	actor: ActivityActor = { kind: "system" },
+	invocation?: DraftToolUpdateInvocation,
 ): Promise<
-	| { status: string; newDraftId: string; oldDraftId: string; message: string }
-	| { error: string; currentVersion?: number }
+	| {
+			status: string;
+			newDraftId: string;
+			oldDraftId: string;
+			draftVersion?: number;
+			replayed?: boolean;
+			message: string;
+		}
+	| { error: string; currentVersion?: number; code?: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const updateIdentity = invocation
+		? {
+				updateKey: await draftToolUpdateKey({ mailboxId, actor, invocation }),
+				fingerprint: await draftToolUpdateFingerprint(params),
+			}
+		: null;
+	if (updateIdentity) {
+		const outcome = await stub.getDraftUpdateOutcome(
+			updateIdentity.updateKey,
+			updateIdentity.fingerprint,
+		);
+		if (outcome.status === "replay") {
+			return {
+				status: "draft_updated",
+				newDraftId: outcome.draftId,
+				oldDraftId: outcome.draftId,
+				draftVersion: outcome.resultVersion,
+				replayed: true,
+				message: "This exact Draft update already committed. Read the Draft before making another update.",
+			};
+		}
+		if (outcome.status === "conflict") {
+			return {
+				error: "This MCP request ID was already used for different Draft update data.",
+				code: "draft_update_idempotency_conflict",
+			};
+		}
+	}
 
 	const oldDraft = (await stub.getEmail(params.draftId)) as EmailFull | null;
 	if (!oldDraft) {
@@ -596,23 +635,38 @@ export async function toolUpdateDraft(
 	);
 	if (!inlineMapping.ok) return { error: inlineMapping.error };
 
-	const result = await stub.updateDraft(
-		params.draftId,
-		params.draftVersion,
-		{
-			subject: params.subject ?? oldDraft.subject,
-			recipient: params.to ?? oldDraft.recipient,
-			body: verifiedBody,
-		},
-		actor,
-	);
+	const changes = {
+		subject: params.subject ?? oldDraft.subject,
+		recipient: params.to ?? oldDraft.recipient,
+		body: verifiedBody,
+	};
+	const result = updateIdentity
+		? await stub.updateDraftIdempotently({
+				...updateIdentity,
+				draftId: params.draftId,
+				expectedVersion: params.draftVersion,
+				changes,
+				actor,
+			})
+		: await stub.updateDraft(
+				params.draftId,
+				params.draftVersion,
+				changes,
+				actor,
+			);
+	if (result?.status === "idempotency_conflict") {
+		return {
+			error: "This MCP request ID was already used for different Draft update data.",
+			code: "draft_update_idempotency_conflict",
+		};
+	}
 	if (result?.status === "version_conflict") {
 		return {
 			error: "Draft changed in another session. Reload it before updating.",
 			currentVersion: result.currentVersion,
 		};
 	}
-	if (!result || result.status !== "updated") {
+	if (!result || (result.status !== "updated" && result.status !== "replay")) {
 		return { error: "Draft could not be updated safely" };
 	}
 
@@ -620,7 +674,11 @@ export async function toolUpdateDraft(
 		status: "draft_updated",
 		newDraftId: params.draftId,
 		oldDraftId: params.draftId,
-		message: "Draft updated in Drafts folder.",
+		draftVersion: result.draftVersion,
+		replayed: result.status === "replay",
+		message: result.status === "replay"
+			? "This exact Draft update already committed. Read the Draft before making another update."
+			: "Draft updated in Drafts folder.",
 	};
 }
 

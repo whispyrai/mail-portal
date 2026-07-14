@@ -2137,12 +2137,12 @@ export class MailboxDO extends DurableObject<Env> {
 		return { status: "discarded" as const, attachments: emailAttachments };
 	}
 
-	async updateDraft(
-		id: string,
-		expectedVersion: number,
-		changes: { recipient: string; subject: string; body: string },
-		actor: ActivityActor = { kind: "system" },
-	) {
+	#applyDraftUpdate(input: {
+		draftId: string;
+		expectedVersion: number;
+		changes: { recipient: string; subject: string; body: string };
+		actor: ActivityActor;
+	}) {
 		const draft = this.db
 			.select({
 				id: schema.emails.id,
@@ -2150,13 +2150,13 @@ export class MailboxDO extends DurableObject<Env> {
 				draft_version: schema.emails.draft_version,
 			})
 			.from(schema.emails)
-			.where(eq(schema.emails.id, id))
+			.where(eq(schema.emails.id, input.draftId))
 			.get();
 		if (!draft) return null;
 		if (draft.folder_id !== Folders.DRAFT) {
 			return { status: "not_draft" as const };
 		}
-		if (draft.draft_version !== expectedVersion) {
+		if (draft.draft_version !== input.expectedVersion) {
 			return {
 				status: "version_conflict" as const,
 				currentVersion: draft.draft_version,
@@ -2164,36 +2164,133 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 
 		const occurredAt = new Date().toISOString();
-		this.ctx.storage.transactionSync(() => {
-			this.db
-				.update(schema.emails)
-				.set({
-					recipient: changes.recipient.toLowerCase(),
-					subject: changes.subject,
-					body: changes.body,
-					date: occurredAt,
-					draft_version: draft.draft_version + 1,
-				})
-				.where(
-					and(
-						eq(schema.emails.id, id),
-						eq(schema.emails.draft_version, expectedVersion),
-					),
-				)
-				.run();
-			this.#markDraftCreateOperation(
-				id,
-				"active",
-				draft.draft_version + 1,
-				occurredAt,
-			);
-			this.#recordActivity(actor, "draft_updated", "email", id, {}, occurredAt);
-		});
+		const resultVersion = input.expectedVersion + 1;
+		this.db
+			.update(schema.emails)
+			.set({
+				recipient: input.changes.recipient.toLowerCase(),
+				subject: input.changes.subject,
+				body: input.changes.body,
+				date: occurredAt,
+				draft_version: resultVersion,
+			})
+			.where(
+				and(
+					eq(schema.emails.id, input.draftId),
+					eq(schema.emails.draft_version, input.expectedVersion),
+				),
+			)
+			.run();
+		this.#markDraftCreateOperation(
+			input.draftId,
+			"active",
+			resultVersion,
+			occurredAt,
+		);
+		this.#recordActivity(
+			input.actor,
+			"draft_updated",
+			"email",
+			input.draftId,
+			{},
+			occurredAt,
+		);
 		return {
 			status: "updated" as const,
-			draftId: id,
-			draftVersion: expectedVersion + 1,
+			draftId: input.draftId,
+			draftVersion: resultVersion,
+			occurredAt,
 		};
+	}
+
+	async updateDraft(
+		id: string,
+		expectedVersion: number,
+		changes: { recipient: string; subject: string; body: string },
+		actor: ActivityActor = { kind: "system" },
+	) {
+		const result = this.ctx.storage.transactionSync(() =>
+			this.#applyDraftUpdate({
+				draftId: id,
+				expectedVersion,
+				changes,
+				actor,
+			}),
+		);
+		if (!result || result.status !== "updated") return result;
+		return {
+			status: result.status,
+			draftId: result.draftId,
+			draftVersion: result.draftVersion,
+		};
+	}
+
+	async getDraftUpdateOutcome(updateKey: string, fingerprint: string) {
+		const operation = this.db
+			.select()
+			.from(schema.draftUpdateOperations)
+			.where(eq(schema.draftUpdateOperations.update_key, updateKey))
+			.get();
+		if (!operation) return { status: "missing" as const };
+		if (operation.fingerprint !== fingerprint) {
+			return { status: "conflict" as const };
+		}
+		return {
+			status: "replay" as const,
+			draftId: operation.draft_id,
+			resultVersion: operation.result_version,
+		};
+	}
+
+	async updateDraftIdempotently(input: {
+		updateKey: string;
+		fingerprint: string;
+		draftId: string;
+		expectedVersion: number;
+		changes: { recipient: string; subject: string; body: string };
+		actor?: ActivityActor;
+	}) {
+		return this.ctx.storage.transactionSync(() => {
+			const prior = this.db
+				.select()
+				.from(schema.draftUpdateOperations)
+				.where(eq(schema.draftUpdateOperations.update_key, input.updateKey))
+				.get();
+			if (prior) {
+				return prior.fingerprint === input.fingerprint
+					? {
+							status: "replay" as const,
+							draftId: prior.draft_id,
+							draftVersion: prior.result_version,
+						}
+					: { status: "idempotency_conflict" as const };
+			}
+
+			const result = this.#applyDraftUpdate({
+				draftId: input.draftId,
+				expectedVersion: input.expectedVersion,
+				changes: input.changes,
+				actor: input.actor ?? { kind: "system" },
+			});
+			if (!result) return { status: "not_found" as const };
+			if (result.status !== "updated") return result;
+			this.db
+				.insert(schema.draftUpdateOperations)
+				.values({
+					update_key: input.updateKey,
+					fingerprint: input.fingerprint,
+					draft_id: input.draftId,
+					previous_version: input.expectedVersion,
+					result_version: result.draftVersion,
+					committed_at: result.occurredAt,
+				})
+				.run();
+			return {
+				status: "updated" as const,
+				draftId: input.draftId,
+				draftVersion: result.draftVersion,
+			};
+		});
 	}
 
 	#getDraftCreateRecord(createKey: string): {

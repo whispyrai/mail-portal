@@ -6,11 +6,11 @@ const agent = readFileSync(new URL("../agent/index.ts", import.meta.url), "utf8"
 const mcp = readFileSync(new URL("../mcp/index.ts", import.meta.url), "utf8");
 
 test("MCP Draft tools bind the exact session and typed JSON-RPC request", () => {
-	for (const toolName of ["draft_reply", "create_draft"]) {
+	for (const toolName of ["draft_reply", "create_draft", "update_draft"]) {
 		const start = mcp.indexOf(`this.server.tool(\n\t\t\t"${toolName}"`);
 		assert.notEqual(start, -1, toolName);
 		const block = mcp.slice(start, start + 2_800);
-		assert.match(block, /async \([^)]*}, extra\) =>/);
+		assert.match(block, /async \((?:[^)]*}|input), extra\) =>/);
 		assert.match(block, /sessionId: extra\.sessionId \?\? this\.getSessionId\(\)/);
 		assert.match(block, /requestId: extra\.requestId/);
 	}

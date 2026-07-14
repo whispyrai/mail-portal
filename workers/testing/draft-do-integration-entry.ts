@@ -37,7 +37,21 @@ export class DraftTestMailboxDO extends MailboxDO {
 			 FROM draft_save_cleanup_intents
 			 ORDER BY claim_token`,
 		)];
-		return { emails, activities, operations, saveOperations, cleanupIntents };
+		const updateOperations = [...this.ctx.storage.sql.exec(
+			`SELECT update_key AS updateKey, fingerprint, draft_id AS draftId,
+			        previous_version AS previousVersion,
+			        result_version AS resultVersion
+			 FROM draft_update_operations
+			 ORDER BY update_key`,
+		)];
+		return {
+			emails,
+			activities,
+			operations,
+			saveOperations,
+			cleanupIntents,
+			updateOperations,
+		};
 	}
 
 	seedDraftSaveOperationsForTest(input: {
@@ -84,9 +98,10 @@ type DraftTestStub = DurableObjectStub<DraftTestMailboxDO> & {
 	draftStateForTest(): Promise<{
 		emails: Array<Record<string, unknown>>;
 		activities: Array<Record<string, unknown>>;
-			operations: Array<Record<string, unknown>>;
-			saveOperations?: Array<Record<string, unknown>>;
-			cleanupIntents?: Array<Record<string, unknown>>;
+		operations: Array<Record<string, unknown>>;
+		saveOperations?: Array<Record<string, unknown>>;
+		cleanupIntents?: Array<Record<string, unknown>>;
+		updateOperations?: Array<Record<string, unknown>>;
 	}>;
 	seedDraftSaveOperationsForTest(input: Parameters<
 		DraftTestMailboxDO["seedDraftSaveOperationsForTest"]
@@ -145,6 +160,12 @@ export default {
 		if (url.pathname === "/claim-save") {
 			const body = await request.json() as Parameters<MailboxDO["claimDraftSave"]>[0];
 			return Response.json(await stub.claimDraftSave(body));
+		}
+		if (url.pathname === "/update-idempotent") {
+			const body = await request.json() as Parameters<
+				MailboxDO["updateDraftIdempotently"]
+			>[0];
+			return Response.json(await stub.updateDraftIdempotently(body));
 		}
 		if (url.pathname === "/record-save-promotion") {
 			const body = await request.json() as {

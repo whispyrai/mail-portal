@@ -11,7 +11,7 @@ const execFileAsync = promisify(execFile);
 const ROOT = process.cwd();
 
 test(
-	"MailboxDO serializes exact Draft creation retries in workerd",
+	"MailboxDO preserves exact Draft create, save, and update retry truth across lifecycle changes",
 	{ timeout: 30_000 },
 	async () => {
 		const outputDirectory = await mkdtemp(join(tmpdir(), "mail-draft-do-"));
@@ -545,6 +545,102 @@ test(
 				);
 				assert.equal(
 					state.saveOperations.some((operation) => operation.saveKey === "outside-boundary-0"),
+					false,
+				);
+
+				const updateSource = await request<UpsertResult>("/upsert", {
+					input: input(
+						"draft-update-source",
+						"draft-update-create-fingerprint",
+						"draft-update-create-key",
+					),
+					actor,
+				});
+				assert.equal(updateSource.status, "saved");
+				const updateOperation = {
+					updateKey: "draft-update-operation-1",
+					fingerprint: "draft-update-fingerprint-1",
+					draftId: updateSource.draftId,
+					expectedVersion: 1,
+					changes: {
+						recipient: "Updated@Example.com",
+						subject: "Updated subject",
+						body: "<p>Updated body</p>",
+					},
+					actor: { kind: "mcp" as const, id: "user-1" },
+				};
+				const [firstUpdate, secondUpdate] = await Promise.all([
+					request<{ status: string; draftVersion: number }>(
+						"/update-idempotent",
+						updateOperation,
+					),
+					request<{ status: string; draftVersion: number }>(
+						"/update-idempotent",
+						updateOperation,
+					),
+				]);
+				assert.deepEqual(
+					[firstUpdate.status, secondUpdate.status].sort(),
+					["replay", "updated"],
+				);
+				assert.equal(firstUpdate.draftVersion, 2);
+				assert.equal(secondUpdate.draftVersion, 2);
+				let updateState = await request<State & {
+					updateOperations: Array<{
+						updateKey: string;
+						draftId: string;
+						previousVersion: number;
+						resultVersion: number;
+					}>;
+				}>("/state");
+				assert.deepEqual(updateState.updateOperations, [{
+					updateKey: updateOperation.updateKey,
+					draftId: updateOperation.draftId,
+					fingerprint: updateOperation.fingerprint,
+					previousVersion: 1,
+					resultVersion: 2,
+				}]);
+				assert.equal(
+					updateState.activities.filter((activity) =>
+						activity.entityId === updateOperation.draftId,
+					).length,
+					2,
+				);
+				assert.equal(
+					(await request<{ status: string }>("/update-idempotent", {
+						...updateOperation,
+						fingerprint: "changed-fingerprint",
+					})).status,
+					"idempotency_conflict",
+				);
+				const staleNewInvocation = await request<{
+					status: string;
+					currentVersion: number;
+				}>("/update-idempotent", {
+					...updateOperation,
+					updateKey: "draft-update-operation-2",
+					fingerprint: "draft-update-fingerprint-2",
+				});
+				assert.equal(staleNewInvocation.status, "version_conflict");
+				assert.equal(staleNewInvocation.currentVersion, 2);
+				assert.equal(
+					(await request<{ status: string }>("/delete", {
+						draftId: updateOperation.draftId,
+					})).status,
+					"deleted",
+				);
+				const replayAfterDelete = await request<{
+					status: string;
+					draftVersion: number;
+				}>("/update-idempotent", updateOperation);
+				assert.equal(replayAfterDelete.status, "replay");
+				assert.equal(replayAfterDelete.draftVersion, 2);
+				updateState = await request<typeof updateState>("/state");
+				assert.equal(updateState.updateOperations.length, 1);
+				assert.equal(
+					updateState.emails.some((email) =>
+						email.id === updateOperation.draftId,
+					),
 					false,
 				);
 			} finally {

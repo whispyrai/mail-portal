@@ -526,18 +526,19 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 				subject: z.string().optional().describe("Updated subject line"),
 				bodyHtml: z.string().optional().describe("Updated HTML body"),
 			},
-			async ({ mailboxId, draftId, draftVersion, to, subject, bodyHtml }) => {
+			async (input, extra) => {
+				const { mailboxId } = input;
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
+				const actor = { kind: "mcp" as const, id: this.props?.userId };
 				const read = await runMailboxMutation(
 					scoped.mailboxId,
-					() => toolUpdateDraft(env, scoped.mailboxId, {
-						draftId,
-						draftVersion,
-						to,
-						subject,
-						bodyHtml,
-					}, { kind: "mcp", id: this.props?.userId }),
+					() => toolUpdateDraft(env, scoped.mailboxId, input, actor, {
+						surface: "mcp",
+						toolName: "update_draft",
+						sessionId: extra.sessionId ?? this.getSessionId(),
+						requestId: extra.requestId,
+					}),
 				);
 				if (read.status !== "success") return read.response;
 				if ("error" in read.value) {

@@ -1690,4 +1690,20 @@ export const mailboxMigrations: Migration[] = [
 				ON draft_save_cleanup_intents(next_attempt_at, claim_token);
 		`),
 	},
+	{
+		name: "34_add_draft_update_operations",
+		sql: txn(`
+			CREATE TABLE draft_update_operations (
+				update_key TEXT PRIMARY KEY,
+				fingerprint TEXT NOT NULL,
+				draft_id TEXT NOT NULL,
+				previous_version INTEGER NOT NULL CHECK(previous_version >= 1),
+				result_version INTEGER NOT NULL
+					CHECK(result_version = previous_version + 1),
+				committed_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_draft_update_operations_result
+				ON draft_update_operations(draft_id, result_version);
+		`),
+	},
 ];

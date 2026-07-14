@@ -145,3 +145,94 @@ test("automation draft updates cannot break authoritative inline mappings", asyn
 	);
 	assert.equal(updates, 0);
 });
+
+test("exact MCP Draft update replay skips Draft reads and verification", async () => {
+	let draftReads = 0;
+	let updates = 0;
+	const stub = {
+		async getDraftUpdateOutcome() {
+			return {
+				status: "replay",
+				draftId: "draft-1",
+				resultVersion: 8,
+			};
+		},
+		async getEmail() {
+			draftReads++;
+			return null;
+		},
+		async updateDraftIdempotently() {
+			updates++;
+			return { status: "updated", draftId: "draft-1", draftVersion: 8 };
+		},
+	};
+	const env = {
+		MAILBOX: { idFromName: () => "mailbox-id", get: () => stub },
+		AI: {
+			run() {
+				throw new Error("Verification must not run for replay");
+			},
+		},
+	} as never;
+
+	assert.deepEqual(
+		await toolUpdateDraft(
+			env,
+			"team@example.com",
+			{ draftId: "draft-1", draftVersion: 7, subject: "Revised" },
+			{ kind: "mcp", id: "user-1" },
+			{
+				surface: "mcp",
+				toolName: "update_draft",
+				sessionId: "session-1",
+				requestId: 1,
+			},
+		),
+		{
+			status: "draft_updated",
+			newDraftId: "draft-1",
+			oldDraftId: "draft-1",
+			draftVersion: 8,
+			replayed: true,
+			message: "This exact Draft update already committed. Read the Draft before making another update.",
+		},
+	);
+	assert.equal(draftReads, 0);
+	assert.equal(updates, 0);
+});
+
+test("changed intent under one MCP Draft update identity conflicts before reads", async () => {
+	let draftReads = 0;
+	const stub = {
+		async getDraftUpdateOutcome() {
+			return { status: "conflict" };
+		},
+		async getEmail() {
+			draftReads++;
+			return null;
+		},
+	};
+	const env = {
+		MAILBOX: { idFromName: () => "mailbox-id", get: () => stub },
+	} as never;
+
+	assert.deepEqual(
+		await toolUpdateDraft(
+			env,
+			"team@example.com",
+			{ draftId: "draft-1", draftVersion: 7, subject: "Changed" },
+			{ kind: "mcp", id: "user-1" },
+			{
+				surface: "mcp",
+				toolName: "update_draft",
+				sessionId: "session-1",
+				requestId: 1,
+			},
+		),
+		{
+			error: "This MCP request ID was already used for different Draft update data.",
+			code: "draft_update_idempotency_conflict",
+		},
+	);
+	assert.equal(draftReads, 0);
+});

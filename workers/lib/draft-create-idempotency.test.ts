@@ -5,7 +5,10 @@ import {
 	draftIdForSaveKey,
 	draftSaveFingerprint,
 	draftToolCreateKey,
+	draftToolUpdateFingerprint,
+	draftToolUpdateKey,
 	type DraftToolInvocation,
+	type DraftToolUpdateInvocation,
 } from "./draft-create-idempotency.ts";
 
 test("first-save Draft identities are stable UUIDs scoped to the mailbox", async () => {
@@ -105,4 +108,76 @@ test("tool Draft keys isolate every exact invocation namespace", async () => {
 		key(mcp, "team@example.com", "user-2"),
 	]);
 	assert.equal(new Set([baseline, ...isolated]).size, isolated.length + 1);
+});
+
+test("MCP Draft update keys preserve typed request identity and isolate create", async () => {
+	const invocation: DraftToolUpdateInvocation = {
+		surface: "mcp",
+		toolName: "update_draft",
+		sessionId: "session-1",
+		requestId: 1,
+	};
+	const input = {
+		mailboxId: "Team@Example.com",
+		actor: { kind: "mcp" as const, id: "user-1" },
+		invocation,
+	};
+	const baseline = await draftToolUpdateKey(input);
+	assert.match(baseline, /^[0-9a-f]{64}$/);
+	assert.equal(
+		await draftToolUpdateKey({ ...input, mailboxId: "team@example.com" }),
+		baseline,
+	);
+	assert.notEqual(
+		await draftToolUpdateKey({
+			...input,
+			invocation: { ...invocation, requestId: "1" },
+		}),
+		baseline,
+	);
+	assert.notEqual(
+		await draftToolCreateKey({
+			mailboxId: input.mailboxId,
+			actor: input.actor,
+			invocation: { ...invocation, toolName: "create_draft" },
+		}),
+		baseline,
+	);
+});
+
+test("Draft update intent fingerprints preserve optional-field presence", async () => {
+	const baseline = await draftToolUpdateFingerprint({
+		draftId: "draft-1",
+		draftVersion: 3,
+		to: "Person@Example.com",
+		subject: "Subject",
+	});
+	assert.equal(
+		await draftToolUpdateFingerprint({
+			draftId: "draft-1",
+			draftVersion: 3,
+			to: "person@example.com",
+			subject: "Subject",
+		}),
+		baseline,
+	);
+	assert.notEqual(
+		await draftToolUpdateFingerprint({
+			draftId: "draft-1",
+			draftVersion: 3,
+			to: "person@example.com",
+			subject: "Subject",
+			bodyHtml: "",
+		}),
+		baseline,
+	);
+	assert.notEqual(
+		await draftToolUpdateFingerprint({
+			draftId: "draft-1",
+			draftVersion: 4,
+			to: "person@example.com",
+			subject: "Subject",
+		}),
+		baseline,
+	);
 });

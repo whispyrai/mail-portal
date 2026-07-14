@@ -69,6 +69,32 @@ export const draftCreateOperations = sqliteTable(
 	],
 );
 
+export const draftUpdateOperations = sqliteTable(
+	"draft_update_operations",
+	{
+		update_key: text("update_key").primaryKey(),
+		fingerprint: text("fingerprint").notNull(),
+		draft_id: text("draft_id").notNull(),
+		previous_version: integer("previous_version").notNull(),
+		result_version: integer("result_version").notNull(),
+		committed_at: text("committed_at").notNull(),
+	},
+	(table) => [
+		check(
+			"draft_update_operations_previous_version_check",
+			sql`${table.previous_version} >= 1`,
+		),
+		check(
+			"draft_update_operations_result_version_check",
+			sql`${table.result_version} = ${table.previous_version} + 1`,
+		),
+		index("idx_draft_update_operations_result").on(
+			table.draft_id,
+			table.result_version,
+		),
+	],
+);
+
 export const draftSaveOperations = sqliteTable(
 	"draft_save_operations",
 	{
