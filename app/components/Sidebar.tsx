@@ -2,7 +2,14 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { Badge, Button, Dialog, Input, Tooltip } from "@cloudflare/kumo";
+import {
+	Badge,
+	Button,
+	Dialog,
+	Input,
+	Tooltip,
+	useKumoToastManager,
+} from "@cloudflare/kumo";
 import {
 	AddressBookTabsIcon,
 	ArchiveIcon,
@@ -99,6 +106,7 @@ export default function Sidebar() {
 	const { data: folders = [] } = useFolders(mailboxId);
 	const { data: labels = [] } = useLabels(mailboxId);
 	const createFolderMutation = useCreateFolder();
+	const toastManager = useKumoToastManager();
 	const { startCompose, closeSidebar } = useUIStore();
 	const { data: currentMailbox } = useMailbox(mailboxId);
 	const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
@@ -121,11 +129,27 @@ export default function Sidebar() {
 
 	const handleCreateFolder = (e: React.FormEvent) => {
 		e.preventDefault();
-		if (newFolderName.trim() && mailboxId) {
-			createFolderMutation.mutate({ mailboxId, name: newFolderName.trim() });
-			setNewFolderName("");
-			setIsCreateFolderOpen(false);
-		}
+		const folderName = newFolderName.trim();
+		if (!folderName || !mailboxId) return;
+		createFolderMutation.mutate(
+			{ mailboxId, name: folderName },
+			{
+				onSuccess: () => {
+					toastManager.add({ title: `Created ${folderName}` });
+					setNewFolderName("");
+					setIsCreateFolderOpen(false);
+				},
+				onError: (error) => {
+					toastManager.add({
+						title:
+							error instanceof Error && error.message
+								? error.message
+								: "Could not create folder",
+						variant: "error",
+					});
+				},
+			},
+		);
 	};
 
 	const displayName = useMemo(() => {
@@ -335,7 +359,9 @@ export default function Sidebar() {
 			{/* Create folder dialog */}
 			<Dialog.Root
 				open={isCreateFolderOpen}
-				onOpenChange={setIsCreateFolderOpen}
+				onOpenChange={(open) => {
+					if (!createFolderMutation.isPending) setIsCreateFolderOpen(open);
+				}}
 			>
 				<Dialog size="sm" className="p-6">
 					<Dialog.Title className="text-base font-semibold mb-4">
@@ -347,12 +373,18 @@ export default function Sidebar() {
 							placeholder="e.g. Projects"
 							value={newFolderName}
 							onChange={(e) => setNewFolderName(e.target.value)}
+							disabled={createFolderMutation.isPending}
 							required
 						/>
-						<div className="flex justify-end gap-2">
+						<div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
 							<Dialog.Close
 								render={(props) => (
-									<Button {...props} variant="secondary">
+									<Button
+										{...props}
+										variant="secondary"
+										disabled={createFolderMutation.isPending}
+										className="w-full sm:w-auto"
+									>
 										Cancel
 									</Button>
 								)}
@@ -360,9 +392,11 @@ export default function Sidebar() {
 							<Button
 								type="submit"
 								variant="primary"
-								disabled={!newFolderName.trim()}
+								disabled={!newFolderName.trim() || createFolderMutation.isPending}
+								loading={createFolderMutation.isPending}
+								className="w-full sm:w-auto"
 							>
-								Create
+								{createFolderMutation.isPending ? "Creating" : "Create"}
 							</Button>
 						</div>
 					</form>
