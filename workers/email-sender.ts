@@ -20,7 +20,10 @@
 // message. See architecture.md "On the Message-ID" and build-findings-2026-05-29.
 
 import { AwsClient } from "aws4fetch";
+import { safeAttachmentPresentationFilename } from "../shared/attachment-filename.ts";
 import type { SesObservedOutcome } from "./lib/outbound-delivery-contract.ts";
+import { safeSesAttachmentMimeType } from "./lib/mime-type.ts";
+import { isSesAttachmentContentId } from "./lib/ses-attachment.ts";
 import type { Env } from "./types";
 
 export interface SendEmailParams {
@@ -147,20 +150,29 @@ function buildSimpleContent(params: SendEmailParams): Record<string, unknown> {
 	}
 
 	if (params.attachments && params.attachments.length > 0) {
-		simple.Attachments = params.attachments.map((att) => ({
-			RawContent: att.content, // base64 over the wire (HTTPS interface); SES decodes it
-			FileName: att.filename,
-			ContentType: att.type,
-			// SES's enum is UPPERCASE (`ATTACHMENT | INLINE`); a lowercase value is
-			// not a valid enum and is rejected/ignored.
-			ContentDisposition: att.disposition === "inline" ? "INLINE" : "ATTACHMENT",
-			// Force base64 in the MIME SES assembles. The default (SEVEN_BIT) mangles
-			// any non-7-bit payload — i.e. every PDF, image, or office document.
-			ContentTransferEncoding: "BASE64",
-			...(att.disposition === "inline" && att.contentId
-				? { ContentId: att.contentId }
-				: {}),
-		}));
+		simple.Attachments = params.attachments.map((att) => {
+			if (
+				att.disposition === "inline" &&
+				att.contentId &&
+				!isSesAttachmentContentId(att.contentId)
+			) {
+				throw new Error("Attachment Content-ID exceeds the SES delivery boundary.");
+			}
+			return {
+				RawContent: att.content, // base64 over the wire (HTTPS interface); SES decodes it
+				FileName: safeAttachmentPresentationFilename(att.filename),
+				ContentType: safeSesAttachmentMimeType(att.type),
+				// SES's enum is UPPERCASE (`ATTACHMENT | INLINE`); a lowercase value is
+				// not a valid enum and is rejected/ignored.
+				ContentDisposition: att.disposition === "inline" ? "INLINE" : "ATTACHMENT",
+				// Force base64 in the MIME SES assembles. The default (SEVEN_BIT) mangles
+				// any non-7-bit payload — i.e. every PDF, image, or office document.
+				ContentTransferEncoding: "BASE64",
+				...(att.disposition === "inline" && att.contentId
+					? { ContentId: att.contentId }
+					: {}),
+			};
+		});
 	}
 
 	return simple;

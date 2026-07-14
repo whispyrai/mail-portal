@@ -5,13 +5,6 @@
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
-import { uploadKey, sanitizeFilename } from "./lib/attachments";
-import {
-	ATTACHMENT_LIMITS,
-	validateSingleFile,
-	isBlockedAttachment,
-	attachmentExtension,
-} from "../shared/attachments";
 import { vapidConfig } from "./lib/push/transport";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { handleSendEmail } from "./routes/send-email";
@@ -43,6 +36,7 @@ import { globalTodayBriefRoutes } from "./routes/global-today-brief";
 import { globalSemanticSearchRoutes } from "./routes/global-semantic-search";
 import { mailboxAttachmentRoutes } from "./routes/mailbox-attachments";
 import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
+import { attachmentUploadRoutes } from "./routes/attachment-uploads";
 import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
 import { mailPeopleRoutes } from "./routes/mail-people";
 import { relationshipBriefRoutes } from "./routes/relationship-brief";
@@ -175,6 +169,7 @@ app.route("/", pushHealthRoutes);
 app.route("/", pushSubscriptionRoutes);
 app.route("/", mailboxMessageLocationRoutes);
 app.route("/", automationRuleRoutes);
+app.route("/", attachmentUploadRoutes);
 
 // -- Config ---------------------------------------------------------
 
@@ -327,7 +322,7 @@ app.post("/api/v1/mailboxes", async (c: AppContext) => {
 });
 
 app.get("/api/v1/mailboxes/:mailboxId", async (c) => {
-	const mailboxId = c.req.param("mailboxId")!;
+	const mailboxId = c.var.authorizedMailboxId;
 	const obj = await c.env.BUCKET.get(`mailboxes/${mailboxId}.json`);
 	if (!obj) return c.json({ error: "Not found" }, 404);
 	return c.json({
@@ -339,7 +334,7 @@ app.get("/api/v1/mailboxes/:mailboxId", async (c) => {
 });
 
 app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
-	const mailboxId = c.req.param("mailboxId")!;
+	const mailboxId = c.var.authorizedMailboxId;
 	const body = await c.req.json().catch(() => null);
 	const requested = isRecord(body) ? body.settings : null;
 	if (!isRecord(requested)) {
@@ -380,7 +375,7 @@ app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 app.delete("/api/v1/mailboxes/:mailboxId", async (c: AppContext) => {
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);
-	const mailboxId = c.req.param("mailboxId")!;
+	const mailboxId = c.var.authorizedMailboxId;
 	const key = `mailboxes/${mailboxId}.json`;
 	if (!(await c.env.BUCKET.head(key)))
 		return c.json({ error: "Not found" }, 404);
@@ -581,51 +576,5 @@ app.put("/api/v1/mailboxes/:mailboxId/folders/:id", async (c: AppContext) => {
 });
 
 app.delete("/api/v1/mailboxes/:mailboxId/folders/:id", handleDeleteFolder);
-
-// -- Attachments ----------------------------------------------------
-
-// Upload a file to R2 staging (upload-first model). Returns an `uploadId` the
-// client carries as a reference into send/reply/forward/draft/bulk. The raw
-// file is the request body; filename + type ride in query params. Behind
-// `requireMailbox`, so the upload is scoped to an authorized mailbox.
-app.post("/api/v1/mailboxes/:mailboxId/attachments", async (c: AppContext) => {
-	const mailboxId = c.req.param("mailboxId")!;
-	const filename = (c.req.query("filename") || "untitled").slice(0, 255);
-	const type = (c.req.query("type") || "application/octet-stream").slice(0, 78);
-
-	if (isBlockedAttachment(filename)) {
-		return c.json(
-			{
-				error: `.${attachmentExtension(filename) || "this"} files can't be emailed.`,
-			},
-			400,
-		);
-	}
-	// Reject oversize before buffering the whole body into memory.
-	const declared = Number(c.req.header("content-length"));
-	if (Number.isFinite(declared) && declared > ATTACHMENT_LIMITS.maxFileBytes) {
-		return c.json(
-			{
-				error: `File is over the ${Math.round(ATTACHMENT_LIMITS.maxFileBytes / (1024 * 1024))} MB per-file limit.`,
-			},
-			413,
-		);
-	}
-
-	const buf = await c.req.arrayBuffer();
-	const sizeError = validateSingleFile({ filename, size: buf.byteLength });
-	if (sizeError) return c.json({ error: sizeError }, 400);
-
-	const uploadId = crypto.randomUUID();
-	const safe = sanitizeFilename(filename);
-	await c.env.BUCKET.put(uploadKey(mailboxId, uploadId), buf, {
-		httpMetadata: { contentType: type },
-		customMetadata: { filename: safe, type, size: String(buf.byteLength) },
-	});
-	return c.json(
-		{ uploadId, filename: safe, mimetype: type, size: buf.byteLength },
-		201,
-	);
-});
 
 export { app };

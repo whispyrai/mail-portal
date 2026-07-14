@@ -160,6 +160,12 @@ function fixture(options: { failPostAuthorization?: boolean } = {}) {
 			},
 		});
 	});
+	app.post("/api/v1/mailboxes/:mailboxId/authorized-identity", (c) =>
+		c.json({ mailboxId: c.var.authorizedMailboxId }),
+	);
+	app.get("/api/v1/mailboxes/:mailboxId/settings", (c) =>
+		c.json({ mailboxId: c.var.authorizedMailboxId }),
+	);
 
 	return {
 		database,
@@ -169,8 +175,40 @@ function fixture(options: { failPostAuthorization?: boolean } = {}) {
 				init,
 				env,
 			),
+		requestPath: (path: string, init?: RequestInit) => app.request(path, init, env),
 	};
 }
+
+test("mailbox middleware canonicalizes one decoded route identity exactly once", async () => {
+	const state = fixture();
+	const canonical = await state.requestPath(
+		"/api/v1/mailboxes/TEAM%40EXAMPLE.COM/authorized-identity",
+		{ method: "POST" },
+	);
+	assert.equal(canonical.status, 200);
+	assert.deepEqual(await canonical.json(), { mailboxId: "team@example.com" });
+
+	const doubleEncoded = await state.requestPath(
+		"/api/v1/mailboxes/team%2540example.com/authorized-identity",
+		{ method: "POST" },
+	);
+	assert.equal(doubleEncoded.status, 400);
+	assert.deepEqual(await doubleEncoded.json(), { error: "Invalid Mailbox ID" });
+	state.database.close();
+});
+
+test("settings bypass keeps the same once-decoded canonical mailbox identity", async () => {
+	const state = fixture();
+	const response = await state.requestPath(
+		"/api/v1/mailboxes/team%252edoe%40example.com/settings",
+	);
+
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), {
+		mailboxId: "team%2edoe@example.com",
+	});
+	state.database.close();
+});
 
 test("mailbox middleware suppresses a GET response when Shared access is revoked in flight", async () => {
 	const state = fixture();

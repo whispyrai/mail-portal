@@ -11,6 +11,11 @@ export type DraftCreateFingerprintInput = {
 	attachments?: unknown[];
 };
 
+export type DraftSaveFingerprintInput = DraftCreateFingerprintInput & {
+	draft_id?: string;
+	draft_version?: number;
+};
+
 export type DraftToolInvocation =
 	| {
 			surface: "mcp";
@@ -33,6 +38,20 @@ async function sha256(value: unknown): Promise<string> {
 		.join("");
 }
 
+export async function draftIdForSaveKey(
+	mailboxId: string,
+	saveKey: string,
+): Promise<string> {
+	const hash = await sha256([
+		"mail-draft-save-id",
+		1,
+		mailboxId.toLowerCase(),
+		saveKey,
+	]);
+	const variant = ((Number.parseInt(hash[16]!, 16) & 0x3) | 0x8).toString(16);
+	return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-${variant}${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+}
+
 export function draftCreateFingerprint(
 	input: DraftCreateFingerprintInput,
 ): Promise<string> {
@@ -40,6 +59,23 @@ export function draftCreateFingerprint(
 		input.to ?? "",
 		input.cc ?? "",
 		input.bcc ?? "",
+		input.subject ?? "",
+		input.body,
+		input.in_reply_to ?? null,
+		input.thread_id ?? null,
+		input.attachments ?? [],
+	]);
+}
+
+export function draftSaveFingerprint(
+	input: DraftSaveFingerprintInput,
+): Promise<string> {
+	return sha256([
+		input.draft_id ?? null,
+		input.draft_version ?? 0,
+		(input.to ?? "").toLowerCase(),
+		(input.cc ?? "").toLowerCase(),
+		(input.bcc ?? "").toLowerCase(),
 		input.subject ?? "",
 		input.body,
 		input.in_reply_to ?? null,

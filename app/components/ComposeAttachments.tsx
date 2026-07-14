@@ -54,9 +54,14 @@ export default function ComposeAttachments({
 				ref={inputRef}
 				type="file"
 				multiple
+				disabled={disabled}
 				className="hidden"
 				aria-label="Choose files to attach"
 				onChange={(e) => {
+					if (disabled) {
+						e.target.value = "";
+						return;
+					}
 					if (e.target.files && e.target.files.length > 0) onAddFiles(e.target.files);
 					// Reset so picking the same file again still fires onChange.
 					e.target.value = "";
@@ -122,6 +127,7 @@ export default function ComposeAttachments({
 									<button
 										type="button"
 										onClick={() => onRetry(a.localId)}
+										aria-label={`Retry ${a.filename}`}
 										disabled={disabled}
 										className="min-h-11 shrink-0 rounded px-2 font-semibold text-kumo-link hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand disabled:cursor-not-allowed disabled:opacity-50"
 									>
@@ -131,11 +137,11 @@ export default function ComposeAttachments({
 								<button
 									type="button"
 									onClick={() => {
-											if (
-												isEmbedded &&
-												!window.confirm(
-													"This inline image is embedded in the message. Removing it will also remove the image from the message body. Remove it?",
-												)
+										if (
+											isEmbedded &&
+											!window.confirm(
+												"This inline image is embedded in the message. Removing it will also remove the image from the message body. Remove it?",
+											)
 										) return;
 										onRemove(a.localId);
 									}}

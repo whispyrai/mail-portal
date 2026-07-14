@@ -122,6 +122,73 @@ test("SES serializes inline Content-ID without adding one to ordinary attachment
 	]);
 });
 
+test("SES sink bounds legacy attachment filename and MIME without changing the extension", async () => {
+	let payload: {
+		Content?: { Simple?: { Attachments?: Array<Record<string, unknown>> } };
+	} | undefined;
+	const boundaryFilename = `${"a".repeat(251)}.pdf`;
+	const longFilename = `${"a".repeat(252)}.pdf`;
+	const longMime = `image/vnd.${"a".repeat(72)}`;
+	const outcome = await sendEmailWithOutcome(
+		env,
+		{
+			...params,
+			attachments: [
+				{
+					content: "AQID",
+					filename: boundaryFilename,
+					type: "application/pdf",
+					disposition: "attachment",
+				},
+				{
+					content: "BAUG",
+					filename: longFilename,
+					type: longMime,
+					disposition: "attachment",
+				},
+			],
+		},
+		{
+			createTransport: () => transport(async (_url, request) => {
+				payload = JSON.parse(String(request.body));
+				return Response.json({ MessageId: "ses-message-1" });
+			}),
+		},
+	);
+	assert.equal(outcome.kind, "accepted");
+	const attachments = payload?.Content?.Simple?.Attachments;
+	assert.equal(attachments?.[0]?.FileName, boundaryFilename);
+	assert.equal(String(attachments?.[1]?.FileName).length, 255);
+	assert.match(String(attachments?.[1]?.FileName), /\.pdf$/);
+	assert.equal(attachments?.[1]?.ContentType, "application/octet-stream");
+});
+
+test("SES sink rejects an overlong inline Content-ID before dispatch", async () => {
+	let transportCreated = false;
+	const outcome = await sendEmailWithOutcome(
+		env,
+		{
+			...params,
+			attachments: [{
+				content: "AQID",
+				filename: "diagram.png",
+				type: "image/png",
+				disposition: "inline",
+				contentId: `${"a".repeat(67)}@example.com`,
+			}],
+		},
+		{
+			createTransport: () => {
+				transportCreated = true;
+				return transport(async () => Response.json({ MessageId: "unexpected" }));
+			},
+		},
+	);
+	assert.equal(outcome.kind, "not_dispatched");
+	assert.equal(transportCreated, false);
+	assert.match(outcome.detail ?? "", /Content-ID.*SES/i);
+});
+
 test("an explicit SES HTTP rejection preserves its status and response detail", async () => {
 	const outcome = await sendEmailWithOutcome(env, params, {
 		createTransport: () =>

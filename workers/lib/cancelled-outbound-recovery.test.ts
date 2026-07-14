@@ -5,6 +5,11 @@ import {
 	recoveredDraftId,
 	sourceDraftMatchesSnapshot,
 } from "./cancelled-outbound-recovery.ts";
+import {
+	R2_OBJECT_KEY_MAX_BYTES,
+	safeAttachmentStorageFilename,
+} from "../../shared/attachment-filename.ts";
+import { attachmentKey, attachmentKeyPrefix } from "./attachments.ts";
 
 const source = [{
 	id: "attachment-1",
@@ -92,6 +97,31 @@ test("failed rollback remains safely resumable through deterministic destination
 	assert.equal(resumed.draftId, recoveredDraftId("snapshot-1"));
 	assert.equal(resumed.attachments.length, 2);
 	assert.equal(bucket.objects.has("attachments/snapshot-1/attachment-2/terms.txt"), true);
+});
+
+test("cancel recovery re-budgets filenames for its longer destination identity", async () => {
+	const snapshotEmailId = "snapshot-1";
+	const attachmentId = "attachment-1";
+	const sourceFilename = safeAttachmentStorageFilename(
+		`${"😀".repeat(400)}.pdf`,
+		attachmentKeyPrefix(snapshotEmailId, attachmentId),
+	);
+	const sourceKey = attachmentKey(snapshotEmailId, attachmentId, sourceFilename);
+	const bucket = new MemoryBucket();
+	bucket.objects.clear();
+	bucket.objects.set(sourceKey, new Uint8Array([1, 2, 3, 4]).buffer);
+
+	const result = await prepareRecoveredDraftAttachments(bucket as never, snapshotEmailId, [{
+		...source[0]!,
+		filename: sourceFilename,
+	}]);
+	const recovered = result.attachments[0]!;
+	const destinationKey = attachmentKey(result.draftId, recovered.id, recovered.filename);
+
+	assert.ok(new TextEncoder().encode(sourceKey).byteLength <= R2_OBJECT_KEY_MAX_BYTES);
+	assert.ok(new TextEncoder().encode(destinationKey).byteLength <= R2_OBJECT_KEY_MAX_BYTES);
+	assert.notEqual(recovered.filename, sourceFilename);
+	assert.equal(bucket.objects.has(destinationKey), true);
 });
 
 const comparableDraft = {

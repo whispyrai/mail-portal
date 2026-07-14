@@ -14,6 +14,7 @@ import {
 export type ConversationIntelligenceRouteContext = {
   Bindings: Env;
   Variables: {
+		authorizedMailboxId: string;
     session?: SessionClaims;
     mailboxStub?: DurableObjectStub<MailboxDO>;
   };
@@ -48,9 +49,7 @@ export function createConversationIntelligenceApp(
         await c.req.json().catch(() => ({})),
       );
       if (!parsed.success) return c.json({ error: "Invalid request" }, 400);
-      const mailboxId = decodeURIComponent(
-        c.req.param("mailboxId")!,
-      ).toLowerCase();
+			const mailboxId = c.var.authorizedMailboxId;
       const run =
         dependencies?.run ??
         (async (input: RunInput) =>

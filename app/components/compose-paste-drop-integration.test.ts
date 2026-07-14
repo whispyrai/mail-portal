@@ -23,6 +23,7 @@ test("same-tick admission and every upload completion use the synchronous attach
 test("editor and outer compose consume file transfers without double bubbling while text stays native", () => {
 	const editor = read("./RichTextEditor.tsx");
 	const compose = read("./ComposeEmail.tsx");
+	const attachments = read("./ComposeAttachments.tsx");
 	assert.match(editor, /handlePaste:[\s\S]*?consumeEditorFiles/);
 	assert.match(editor, /handleDrop:[\s\S]*?consumeEditorFiles/);
 	assert.match(editor, /consumeComposeEditorFileTransfer/);
@@ -31,6 +32,11 @@ test("editor and outer compose consume file transfers without double bubbling wh
 	assert.match(compose, /onDrop=\{handleOuterDrop\}/);
 	assert.match(compose, /Drop files to attach/);
 	assert.match(compose, /RichTextEditor[\s\S]*?onFiles=/);
+	assert.match(compose, /fileTransfersDisabled = isSending \|\| isResolvingClose/);
+	assert.match(compose, /fileTransfersDisabled \? \(\) => \{\} : acceptTransferredFiles/);
+	assert.match(attachments, /type="file"[\s\S]*?disabled=\{disabled\}/);
+	assert.match(attachments, /onChange=\{\(e\) => \{[\s\S]*?if \(disabled\)/);
+	assert.match(editor, /onChange=\{\(event\) => \{[\s\S]*?if \(fileTransfersDisabledRef\.current\)/);
 	assert.doesNotMatch(editor, /data:|blob:/);
 });
 
@@ -38,7 +44,7 @@ test("upload service forwards AbortSignal and new files remain ordinary attachme
 	const api = read("../services/api.ts");
 	const hook = read("../hooks/useAttachments.ts");
 	assert.match(api, /uploadAttachment:[\s\S]*?signal\?: AbortSignal[\s\S]*?signal,/);
-	assert.match(hook, /api\.uploadAttachment\(mailboxId, file, signal\)/);
+	assert.match(hook, /api\.uploadAttachment\(mailboxId, localId, file, signal\)/);
 	assert.match(hook, /addFiles[\s\S]*?admitFiles\(files, \(\) => "attachment"\)/);
 });
 

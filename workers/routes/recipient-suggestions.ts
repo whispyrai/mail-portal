@@ -4,7 +4,6 @@ import {
 	type RecipientSuggestion,
 } from "../../shared/recipient-suggestions.ts";
 import type { MailboxContext } from "../lib/mailbox.ts";
-import { normalizeMailAddress } from "../lib/mail-address.ts";
 
 export type RecipientSuggestionRouteContext = MailboxContext;
 
@@ -19,14 +18,6 @@ export interface RecipientSuggestionOperations {
 
 interface RecipientSuggestionDependencies {
 	operations(context: Context<RecipientSuggestionRouteContext>): RecipientSuggestionOperations;
-}
-
-function mailboxAddress(value: string): string | null {
-	try {
-		return normalizeMailAddress(decodeURIComponent(value));
-	} catch {
-		return null;
-	}
 }
 
 function boundedLimit(value: string | null): number | null {
@@ -60,8 +51,7 @@ export function createRecipientSuggestionRoutes(
 			if (!c.get("session")) return c.json({ error: "Unauthorized" }, 401);
 			const stub = c.var.mailboxStub;
 			if (!stub) return c.json({ error: "Forbidden" }, 403);
-			const mailbox = mailboxAddress(c.req.param("mailboxId") ?? "");
-			if (!mailbox) return c.json({ error: "Mailbox address is invalid" }, 400);
+			const mailbox = c.var.authorizedMailboxId;
 			const query = (c.req.query("q") ?? "").trim().toLowerCase();
 			if (query.length > RECIPIENT_MEMORY_LIMITS.queryChars) {
 				return c.json({ error: "Recipient query is too long" }, 400);

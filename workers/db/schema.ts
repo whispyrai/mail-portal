@@ -69,6 +69,53 @@ export const draftCreateOperations = sqliteTable(
 	],
 );
 
+export const draftSaveOperations = sqliteTable(
+	"draft_save_operations",
+	{
+		save_key: text("save_key").primaryKey(),
+		fingerprint: text("fingerprint").notNull(),
+		draft_id: text("draft_id").notNull(),
+		expected_version: integer("expected_version").notNull(),
+		state: text("state", {
+			enum: ["claimed", "committed", "aborted"],
+		}).notNull(),
+		destination_keys: text("destination_keys").notNull().default("[]"),
+		committed_version: integer("committed_version"),
+		claim_expires_at: integer("claim_expires_at").notNull(),
+		claim_token: text("claim_token"),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_draft_save_operations_revision").on(
+			table.draft_id,
+			table.expected_version,
+			table.state,
+		),
+		index("idx_draft_save_operations_retention")
+			.on(table.updated_at, table.save_key)
+			.where(sql`${table.state} IN ('committed', 'aborted')`),
+	],
+);
+
+export const draftSaveCleanupIntents = sqliteTable(
+	"draft_save_cleanup_intents",
+	{
+		claim_token: text("claim_token").primaryKey(),
+		draft_id: text("draft_id").notNull(),
+		destination_keys: text("destination_keys").notNull(),
+		next_attempt_at: integer("next_attempt_at").notNull(),
+		verify_until: integer("verify_until").notNull(),
+		attempts: integer("attempts").notNull().default(0),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_draft_save_cleanup_due").on(
+			table.next_attempt_at,
+			table.claim_token,
+		),
+	],
+);
+
 export const snoozeReplyWakeQueue = sqliteTable("snooze_reply_wake_queue", {
 	thread_id: text("thread_id").primaryKey(),
 	requested_at: text("requested_at").notNull(),

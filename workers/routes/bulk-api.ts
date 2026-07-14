@@ -8,6 +8,7 @@ import {
 	BULK_LIMITS,
 	BULK_OPERATION_ID_PATTERN,
 } from "../lib/bulk-job-admission.ts";
+import { isCanonicalAttachmentUploadId } from "../lib/attachment-upload-id.ts";
 import type { MailboxContext } from "../lib/mailbox.ts";
 
 type AppContext = Context<MailboxContext>;
@@ -43,7 +44,11 @@ const BulkSendBody = z
 		text: z.string().max(BULK_LIMITS.bodyChars).optional(),
 		recipients: z.array(BulkRecipient).min(1).max(BULK_LIMITS.maxRecipients),
 		attachmentUploadIds: z
-			.array(z.string().uuid())
+			.array(
+				z.string().refine(isCanonicalAttachmentUploadId, {
+					message: "Attachment upload identity must be a canonical UUIDv4.",
+				}),
+			)
 			.max(ATTACHMENT_LIMITS.maxFiles)
 			.optional(),
 	})
@@ -98,7 +103,7 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 
 export async function handleReserveBulkOperation(c: AppContext) {
 	const startedAt = Date.now();
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const operationId = c.req.param("operationId") ?? "";
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);
@@ -301,7 +306,7 @@ export async function handleReserveBulkOperation(c: AppContext) {
 
 export async function handleCancelBulkReservation(c: AppContext) {
 	const startedAt = Date.now();
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const operationId = c.req.param("operationId") ?? "";
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);
@@ -350,7 +355,7 @@ export async function handleCancelBulkReservation(c: AppContext) {
 
 export async function handleCreateBulkJob(c: AppContext) {
 	const startedAt = Date.now();
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const session = c.get("session");
 	if (!session) {
 		logBulkRoute("warn", {
@@ -613,7 +618,7 @@ export async function handleCreateBulkJob(c: AppContext) {
 
 export async function handleRecoverBulkOperation(c: AppContext) {
 	const startedAt = Date.now();
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const operationId = c.req.param("operationId") ?? "";
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);

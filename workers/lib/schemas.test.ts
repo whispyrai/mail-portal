@@ -134,13 +134,13 @@ test("fresh upload references require Content-ID exactly for inline disposition"
 	assert.deepEqual(
 		AttachmentRefSchema.parse({
 			kind: "upload",
-			uploadId: "upload-inline-1",
+			uploadId: "11111111-1111-4111-8111-111111111111",
 			disposition: "inline",
 			contentId: "image-1@mail-portal.local",
 		}),
 		{
 			kind: "upload",
-			uploadId: "upload-inline-1",
+			uploadId: "11111111-1111-4111-8111-111111111111",
 			disposition: "inline",
 			contentId: "image-1@mail-portal.local",
 		},
@@ -148,7 +148,7 @@ test("fresh upload references require Content-ID exactly for inline disposition"
 	assert.equal(
 		AttachmentRefSchema.safeParse({
 			kind: "upload",
-			uploadId: "upload-inline-2",
+				uploadId: "22222222-2222-4222-8222-222222222222",
 			disposition: "inline",
 		}).success,
 		false,
@@ -156,7 +156,7 @@ test("fresh upload references require Content-ID exactly for inline disposition"
 	assert.equal(
 		AttachmentRefSchema.safeParse({
 			kind: "upload",
-			uploadId: "upload-ordinary-1",
+				uploadId: "33333333-3333-4333-8333-333333333333",
 			disposition: "attachment",
 			contentId: "must-not-be-used@mail-portal.local",
 		}).success,
@@ -164,13 +164,41 @@ test("fresh upload references require Content-ID exactly for inline disposition"
 	);
 });
 
-test("Content-ID validation rejects header injection and enforces the 255-byte boundary", () => {
-	const validAtBoundary = `${"a".repeat(243)}@example.com`;
-	assert.equal(new TextEncoder().encode(validAtBoundary).byteLength, 255);
+test("fresh upload references require a canonical UUID upload identity", () => {
 	assert.equal(
 		AttachmentRefSchema.safeParse({
 			kind: "upload",
-			uploadId: "upload-boundary",
+			uploadId: "95f6a780-cb27-4df2-a9da-49347f7c3d22",
+		}).success,
+		true,
+	);
+	assert.equal(
+		AttachmentRefSchema.safeParse({
+			kind: "upload",
+			uploadId: "upload-1",
+		}).success,
+		false,
+	);
+	for (const uploadId of [
+		"95F6A780-CB27-4DF2-A9DA-49347F7C3D22",
+		"95f6a780-cb27-1df2-a9da-49347f7c3d22",
+		"00000000-0000-0000-0000-000000000000",
+	]) {
+		assert.equal(
+			AttachmentRefSchema.safeParse({ kind: "upload", uploadId }).success,
+			false,
+			uploadId,
+		);
+	}
+});
+
+test("outbound Content-ID validation rejects header injection and enforces the SES boundary", () => {
+	const validAtBoundary = `${"a".repeat(66)}@example.com`;
+	assert.equal(validAtBoundary.length, 78);
+	assert.equal(
+		AttachmentRefSchema.safeParse({
+			kind: "upload",
+				uploadId: "44444444-4444-4444-8444-444444444444",
 			disposition: "inline",
 			contentId: validAtBoundary,
 		}).success,
@@ -178,7 +206,7 @@ test("Content-ID validation rejects header injection and enforces the 255-byte b
 	);
 
 	const invalidContentIds = [
-		`${"a".repeat(244)}@example.com`,
+		`${"a".repeat(67)}@example.com`,
 		"image@example.com\r\nBcc: victim@example.com",
 		"image\u0000@example.com",
 		"image @example.com",
@@ -193,7 +221,7 @@ test("Content-ID validation rejects header injection and enforces the 255-byte b
 		assert.equal(
 			AttachmentRefSchema.safeParse({
 				kind: "upload",
-				uploadId: "upload-invalid",
+					uploadId: "55555555-5555-4555-8555-555555555555",
 				disposition: "inline",
 				contentId,
 			}).success,
@@ -219,7 +247,7 @@ test("attachment reference variants reject unknown and mixed discriminant fields
 	for (const input of [
 		{
 			kind: "upload",
-			uploadId: "upload-1",
+				uploadId: "66666666-6666-4666-8666-666666666666",
 			emailId: "draft-1",
 			attachmentId: "stored-1",
 		},
@@ -227,11 +255,11 @@ test("attachment reference variants reject unknown and mixed discriminant fields
 			kind: "existing",
 			emailId: "draft-1",
 			attachmentId: "stored-1",
-			uploadId: "upload-1",
+				uploadId: "77777777-7777-4777-8777-777777777777",
 		},
 		{
 			kind: "upload",
-			uploadId: "upload-1",
+				uploadId: "88888888-8888-4888-8888-888888888888",
 			unexpected: "must not be stripped",
 		},
 	]) {

@@ -2,12 +2,45 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Hono } from "hono";
 import type { MailboxContext } from "../lib/mailbox.ts";
+import { draftIdForSaveKey } from "../lib/draft-create-idempotency.ts";
 import { handleSaveDraft } from "./drafts.ts";
 
-function fixture(result: Record<string, unknown>) {
+function draftSaveClaimStub() {
+	return {
+		async claimDraftSave() {
+			return { status: "claimed" as const, stalePromotions: [] };
+		},
+		async recordDraftSavePromotion() { return true; },
+		async abortDraftSave() {
+			return { status: "aborted" as const, destinationKeys: [] };
+		},
+		async getDraftSaveOutcome() { return { status: "missing" as const }; },
+		async getCommittedDraftAttachmentScope() { return null; },
+		async getDraftCreateReplay() { return { status: "missing" as const }; },
+	};
+}
+
+function fixture(
+	result: Record<string, unknown>,
+	claimResult: Record<string, unknown> = {
+		status: "claimed",
+		stalePromotions: [],
+	},
+) {
 	const writes: Array<Record<string, unknown>> = [];
+	const claims: Array<Record<string, unknown>> = [];
 	const stub = {
+		...draftSaveClaimStub(),
+		async claimDraftSave(input: Record<string, unknown>) {
+			claims.push(input);
+			return claimResult;
+		},
 		async getAttachment() { return null; },
+		async getCommittedDraftAttachmentScope() {
+			return typeof result.attachmentIdentityScope === "string"
+				? result.attachmentIdentityScope
+				: null;
+		},
 		async upsertDraft(input: Record<string, unknown>) {
 			writes.push(input);
 			return result;
@@ -24,6 +57,7 @@ function fixture(result: Record<string, unknown>) {
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -34,13 +68,114 @@ function fixture(result: Record<string, unknown>) {
 		await next();
 	});
 	app.post("/api/v1/mailboxes/:mailboxId/drafts", handleSaveDraft);
-	return { app, writes };
+	return { app, writes, claims };
 }
 
-test("draft overwrite passes the expected version to the atomic upsert", async () => {
-	const { app, writes } = fixture({ status: "saved", draftVersion: 8, replacedAttachments: [] });
+test("an exact first-save retry reuses its claimed Draft identity", async () => {
+	const saveKey = "10101010-1010-4010-8010-101010101010";
+	const { app, claims } = fixture(
+		{ status: "saved", draftVersion: 1, replacedAttachments: [] },
+		{ status: "revision_in_progress" },
+	);
+	const request = () => app.request(
+		"http://mail.example.com/api/v1/mailboxes/team@example.com/drafts",
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ body: "Recover me", draft_save_key: saveKey }),
+		},
+		{ BUCKET: {} } as never,
+	);
+
+	assert.equal((await request()).status, 409);
+	assert.equal((await request()).status, 409);
+	assert.equal(claims.length, 2);
+	const expectedDraftId = await draftIdForSaveKey("team@example.com", saveKey);
+	assert.equal(claims[0]?.draftId, expectedDraftId);
+	assert.equal(claims[1]?.draftId, expectedDraftId);
+	assert.equal(claims[0]?.fingerprint, claims[1]?.fingerprint);
+	assert.match(String(claims[0]?.claimToken), /^[0-9a-f-]{36}$/);
+	assert.notEqual(claims[0]?.claimToken, claims[1]?.claimToken);
+});
+
+test("a delayed committed save replay reports a newer Draft as superseded", async () => {
+	const { app } = fixture(
+		{ status: "saved", draftVersion: 2, replacedAttachments: [] },
+		{ status: "committed", draftId: "draft-1", committedVersion: 1 },
+	);
 	const response = await app.request(
 		"http://mail.example.com/api/v1/mailboxes/team@example.com/drafts",
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				body: "Original revision",
+				draft_id: "draft-1",
+				draft_version: 1,
+				draft_save_key: "20202020-2020-4020-8020-202020202020",
+			}),
+		},
+		{ BUCKET: {} } as never,
+	);
+
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "This draft save was superseded by a newer revision.",
+		code: "draft_save_superseded",
+		draftId: "draft-1",
+		currentVersion: 2,
+	});
+});
+
+test("a competing Draft revision is rejected before attachment storage", async () => {
+	const { app, writes } = fixture(
+		{ status: "saved", draftVersion: 8, replacedAttachments: [] },
+		{ status: "revision_in_progress" },
+	);
+	let storageCalls = 0;
+	const response = await app.request(
+		"http://mail.example.com/api/v1/mailboxes/team@example.com/drafts",
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				body: "Competing edit",
+				draft_id: "draft-1",
+				draft_version: 7,
+				draft_save_key: crypto.randomUUID(),
+				attachments: [{
+					kind: "upload",
+					uploadId: "10101010-1010-4010-8010-101010101010",
+				}],
+			}),
+		},
+		{
+			BUCKET: {
+				async get() { storageCalls++; return null; },
+				async put() { storageCalls++; return null; },
+				async delete() { storageCalls++; },
+			},
+		} as never,
+	);
+
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "This draft revision is already being saved. Retry shortly.",
+		code: "draft_save_in_progress",
+		retryAfterMs: 500,
+	});
+	assert.equal(storageCalls, 0);
+	assert.equal(writes.length, 0);
+});
+
+test("draft overwrite passes the expected version to the atomic upsert", async () => {
+	const { app, writes, claims } = fixture({
+		status: "saved",
+		draftVersion: 8,
+		replacedAttachments: [],
+	});
+	const response = await app.request(
+		"http://mail.example.com/api/v1/mailboxes/%20TEAM%40EXAMPLE.COM%20/drafts",
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -56,7 +191,14 @@ test("draft overwrite passes the expected version to the atomic upsert", async (
 	assert.equal(response.status, 201);
 	assert.equal(writes[0]!.id, "draft-1");
 	assert.equal(writes[0]!.expectedVersion, 7);
-	assert.equal((await response.json() as { draft_version: number }).draft_version, 8);
+	assert.equal(writes[0]!.sender, "team@example.com");
+	const responseBody = await response.json() as {
+		draft_version: number;
+		attachment_save_scope: string;
+	};
+	assert.equal(responseBody.draft_version, 8);
+	assert.equal(responseBody.attachment_save_scope, claims[0]?.claimToken);
+	assert.equal(writes[0]!.saveClaimToken, claims[0]?.claimToken);
 });
 
 test("stale draft overwrite returns conflict and never replaces newer content", async () => {
@@ -79,6 +221,41 @@ test("stale draft overwrite returns conflict and never replaces newer content", 
 	assert.deepEqual(await response.json(), {
 		error: "Draft changed in another session. Reload it before saving.",
 		currentVersion: 9,
+	});
+});
+
+test("a concurrent create replay returns the winning attachment claim scope", async () => {
+	const winningDraft = {
+		id: "winning-draft",
+		folder_id: "draft",
+		draft_version: 1,
+		attachments: [],
+	};
+	const { app } = fixture({
+		status: "creation_replay",
+		draftId: winningDraft.id,
+		draft: winningDraft,
+		attachmentIdentityScope: "winning-claim-token",
+	});
+	const response = await app.request(
+		"http://mail.example.com/api/v1/mailboxes/team@example.com/drafts",
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				body: "Concurrent first save",
+				draft_create_key: "10101010-1010-4010-8010-101010101010",
+				draft_save_key: "20202020-2020-4020-8020-202020202020",
+			}),
+		},
+		{ BUCKET: {} } as never,
+	);
+
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), {
+		...winningDraft,
+		replayed: true,
+		attachment_save_scope: "winning-claim-token",
 	});
 });
 
@@ -109,6 +286,7 @@ test("replaying a committed first save returns its authoritative draft without r
 	let attachmentReads = 0;
 	let emailReads = 0;
 	const stub = {
+		...draftSaveClaimStub(),
 		async getDraftCreateReplay(key: string, fingerprint: string) {
 			assert.equal(key, "create-once-1");
 			assert.ok(fingerprint.length > 0);
@@ -130,6 +308,7 @@ test("replaying a committed first save returns its authoritative draft without r
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -149,14 +328,21 @@ test("replaying a committed first save returns its authoritative draft without r
 			body: JSON.stringify({
 				body: "First attempt already committed",
 				draft_create_key: "create-once-1",
-				attachments: [{ kind: "upload", uploadId: "already-consumed" }],
+				attachments: [{
+					kind: "upload",
+					uploadId: "10101010-1010-4010-8010-101010101010",
+				}],
 			}),
 		},
 		{ BUCKET: { async get() { throw new Error("spent upload must not be read"); } } } as never,
 	);
 
 	assert.equal(response.status, 200);
-	assert.deepEqual(await response.json(), { ...draft, replayed: true });
+	assert.deepEqual(await response.json(), {
+		...draft,
+		replayed: true,
+		attachment_save_scope: "create-once-1",
+	});
 	assert.equal(upserts, 0);
 	assert.equal(attachmentReads, 0);
 	assert.equal(emailReads, 0);
@@ -165,6 +351,7 @@ test("replaying a committed first save returns its authoritative draft without r
 test("a delayed first-save retry cannot claim a newer authoritative draft revision", async () => {
 	let upserts = 0;
 	const stub = {
+		...draftSaveClaimStub(),
 		async getDraftCreateReplay() {
 			return {
 				status: "superseded",
@@ -179,6 +366,7 @@ test("a delayed first-save retry cannot claim a newer authoritative draft revisi
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -216,6 +404,7 @@ test("a delayed first-save retry cannot claim a newer authoritative draft revisi
 test("a removed first Draft closes exact replay without creating a replacement", async () => {
 	let upserts = 0;
 	const stub = {
+		...draftSaveClaimStub(),
 		async getDraftCreateReplay() {
 			return {
 				status: "unavailable",
@@ -231,6 +420,7 @@ test("a removed first Draft closes exact replay without creating a replacement",
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -283,7 +473,8 @@ test("autosaving text reuses a large unchanged draft attachment without copying 
 	let writes = 0;
 	let deletes = 0;
 	let storedAttachments: unknown[] = [];
-	const stub = {
+		const stub = {
+			...draftSaveClaimStub(),
 		async getEmail() {
 			return { ...prior, draft_version: storedAttachments.length ? 8 : 7 };
 		},
@@ -303,6 +494,7 @@ test("autosaving text reuses a large unchanged draft attachment without copying 
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -375,7 +567,8 @@ test("repeated zero-copy draft saves preserve inline CID and erase ordinary lega
 	let reads = 0;
 	let writes = 0;
 	let deletes = 0;
-	const stub = {
+		const stub = {
+			...draftSaveClaimStub(),
 		async getEmail() {
 			return {
 				id: "draft-inline",
@@ -398,6 +591,7 @@ test("repeated zero-copy draft saves preserve inline CID and erase ordinary lega
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -468,12 +662,15 @@ test("repeated zero-copy draft saves preserve inline CID and erase ordinary lega
 });
 
 test("draft API rejects a broken body-to-CID mapping before storage and rolls back only the new copy", async () => {
-	const stagingKey = "uploads/team@example.com/upload-inline";
+	const uploadId = "20202020-2020-4020-8020-202020202020";
+	const stagingKey = `uploads/team@example.com/${uploadId}`;
 	const objects = new Map<string, ArrayBuffer>([
 		[stagingKey, new Uint8Array([1, 2, 3]).buffer],
 	]);
+	const promotionOwners = new Map<string, string>();
 	let upserts = 0;
 	const stub = {
+		...draftSaveClaimStub(),
 		async getAttachment() { return null; },
 		async upsertDraft() {
 			upserts++;
@@ -486,6 +683,7 @@ test("draft API rejects a broken body-to-CID mapping before storage and rolls ba
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -506,7 +704,7 @@ test("draft API rejects a broken body-to-CID mapping before storage and rolls ba
 				body: '<p>Broken</p><img src="cid:missing@mail-portal.local" data-mail-inline-image="v1">',
 				attachments: [{
 					kind: "upload",
-					uploadId: "upload-inline",
+					uploadId,
 					disposition: "inline",
 					contentId: "actual@mail-portal.local",
 				}],
@@ -517,12 +715,34 @@ test("draft API rejects a broken body-to-CID mapping before storage and rolls ba
 				async get(key: string) {
 					const bytes = objects.get(key);
 					return bytes ? {
-						customMetadata: { filename: "chart.png", type: "image/png" },
+						customMetadata: {
+							filename: "chart.png",
+							type: "image/png",
+							...(promotionOwners.has(key)
+								? { promotionOwner: promotionOwners.get(key) }
+								: {}),
+						},
 						httpMetadata: {},
 						async arrayBuffer() { return bytes.slice(0); },
 					} : null;
 				},
-				async put(key: string, bytes: ArrayBuffer) { objects.set(key, bytes.slice(0)); },
+					async put(
+						key: string,
+						bytes: ArrayBuffer,
+						options?: {
+							onlyIf?: { etagDoesNotMatch?: string };
+							customMetadata?: { promotionOwner?: string };
+						},
+					) {
+						if (options?.onlyIf?.etagDoesNotMatch === "*" && objects.has(key)) {
+							return null;
+						}
+						objects.set(key, bytes.slice(0));
+						if (options?.customMetadata?.promotionOwner) {
+							promotionOwners.set(key, options.customMetadata.promotionOwner);
+						}
+						return { etag: "created" };
+					},
 				async delete(keys: string | string[]) {
 					for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
 				},

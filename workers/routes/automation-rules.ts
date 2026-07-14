@@ -242,7 +242,7 @@ function mapAutomationError(c: AppContext, error: unknown) {
 async function sessionAndManagement(c: AppContext, dependencies: AutomationRouteDependencies) {
 	const session = c.get("session");
 	if (!session) return null;
-	const mailboxId = c.req.param("mailboxId")?.toLowerCase();
+	const mailboxId = c.var.authorizedMailboxId;
 	if (!mailboxId) return null;
 	const canManage = await dependencies.canManage(c, session.sub, mailboxId);
 	return { session, mailboxId, canManage };

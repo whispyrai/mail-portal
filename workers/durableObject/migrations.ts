@@ -1642,4 +1642,52 @@ export const mailboxMigrations: Migration[] = [
 			  AND draft_create_fingerprint IS NOT NULL;
 		`),
 	},
+	{
+		name: "30_add_draft_save_operations",
+		sql: txn(`
+			CREATE TABLE draft_save_operations (
+				save_key TEXT PRIMARY KEY,
+				fingerprint TEXT NOT NULL,
+				draft_id TEXT NOT NULL,
+				expected_version INTEGER NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('claimed', 'committed', 'aborted')),
+				destination_keys TEXT NOT NULL DEFAULT '[]',
+				committed_version INTEGER,
+				claim_expires_at INTEGER NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_draft_save_operations_revision
+				ON draft_save_operations(draft_id, expected_version, state);
+		`),
+	},
+	{
+		name: "31_add_draft_save_claim_token",
+		sql: txn(`
+			ALTER TABLE draft_save_operations ADD COLUMN claim_token TEXT;
+		`),
+	},
+	{
+		name: "32_index_draft_save_retention",
+		sql: txn(`
+			CREATE INDEX idx_draft_save_operations_retention
+				ON draft_save_operations(updated_at, save_key)
+				WHERE state IN ('committed', 'aborted');
+		`),
+	},
+	{
+		name: "33_add_draft_save_cleanup_intents",
+		sql: txn(`
+			CREATE TABLE draft_save_cleanup_intents (
+				claim_token TEXT PRIMARY KEY,
+				draft_id TEXT NOT NULL,
+				destination_keys TEXT NOT NULL,
+				next_attempt_at INTEGER NOT NULL,
+				verify_until INTEGER NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_draft_save_cleanup_due
+				ON draft_save_cleanup_intents(next_attempt_at, claim_token);
+		`),
+	},
 ];

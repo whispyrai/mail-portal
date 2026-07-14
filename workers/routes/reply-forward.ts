@@ -71,7 +71,7 @@ function isSourceDraftConflict(error: unknown): boolean {
 }
 
 export async function handleReplyEmail(c: AppContext) {
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const id = c.req.param("id") ?? "";
 	const parsed = SendEmailRequestSchema.safeParse(await c.req.json());
 	if (!parsed.success) {
@@ -140,7 +140,13 @@ export async function handleReplyEmail(c: AppContext) {
 	const actor = actorFromSession(c.get("session"));
 
 	const resolved = await resolveAndPromoteAttachments(
-		c.env.BUCKET, stub, mailboxId, messageId, attachments, actor,
+		c.env.BUCKET,
+		stub,
+		mailboxId,
+		messageId,
+		attachments,
+		actor,
+		{ promotionOwner: messageId },
 	).then(
 		(r) => ({ ok: true as const, ...r }),
 		(e) => ({ ok: false as const, error: (e as Error).message }),
@@ -242,7 +248,7 @@ export async function handleReplyEmail(c: AppContext) {
 }
 
 export async function handleForwardEmail(c: AppContext) {
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const id = c.req.param("id") ?? "";
 	const parsed = SendEmailRequestSchema.safeParse(await c.req.json());
 	if (!parsed.success) {
@@ -310,7 +316,13 @@ export async function handleForwardEmail(c: AppContext) {
 	const actor = actorFromSession(c.get("session"));
 
 	const resolved = await resolveAndPromoteAttachments(
-		c.env.BUCKET, stub, mailboxId, messageId, attachments, actor,
+		c.env.BUCKET,
+		stub,
+		mailboxId,
+		messageId,
+		attachments,
+		actor,
+		{ promotionOwner: messageId },
 	).then(
 		(r) => ({ ok: true as const, ...r }),
 		(e) => ({ ok: false as const, error: (e as Error).message }),

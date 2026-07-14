@@ -57,6 +57,7 @@ import {
 import { removeManagedInlineImageNodes } from "~/lib/compose-inline-images";
 import {
   composeDraftFingerprint,
+  composeDraftSaveKey,
   composeDraftIsDirty,
   composeDraftIsEmpty,
   composeDraftLifecycle,
@@ -518,7 +519,16 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
       const savePromise = (async () => {
         if (!savedAttachmentPolicy.ok) throw new Error(savedAttachmentPolicy.error);
         const identity = draftIdentityRef.current;
-				const draftRequest = {
+        const draftSaveKey = await composeDraftSaveKey({
+          composeKey: draftCreateKeyRef.current,
+          draftId: identity?.id,
+          draftVersion: identity?.version,
+          fingerprint: JSON.stringify([
+            composeDraftFingerprint(savedSnapshot),
+            savedAttachmentPolicy.refs,
+          ]),
+        });
+        const draftRequest = {
           mailboxId: composeMailboxId,
           draft: {
             to: savedSnapshot.to,
@@ -537,19 +547,27 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
             draft_id: identity?.id,
             draft_version: identity?.version,
             draft_create_key: identity ? undefined : draftCreateKeyRef.current,
+            draft_save_key: draftSaveKey,
             attachments: savedAttachmentPolicy.refs,
           },
-				};
-				let saved;
-				try {
-					saved = await saveDraftMutation.mutateAsync(draftRequest);
-				} catch (firstError) {
-					const retryableFirstCreate =
-						!identity &&
-						(!(firstError instanceof ApiError) || firstError.status >= 500);
-					if (!retryableFirstCreate) throw firstError;
-					saved = await saveDraftMutation.mutateAsync(draftRequest);
-				}
+        };
+        let saved;
+        try {
+          saved = await saveDraftMutation.mutateAsync(draftRequest);
+        } catch (firstError) {
+          const saveStillInProgress =
+            firstError instanceof ApiError &&
+            firstError.body.code === "draft_save_in_progress";
+          const retryableSave =
+            !(firstError instanceof ApiError) ||
+            firstError.status >= 500 ||
+            saveStillInProgress;
+          if (!retryableSave) throw firstError;
+          if (saveStillInProgress) {
+            await new Promise((resolve) => window.setTimeout(resolve, 500));
+          }
+          saved = await saveDraftMutation.mutateAsync(draftRequest);
+        }
         const nextIdentity = {
           id: saved.id,
           version: saved.draft_version ?? 1,
@@ -557,17 +575,18 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
         const confirmedAttachments = evaluateStoredDraftAttachments(
           saved.id,
           saved.attachments,
-					saved.body ?? savedSnapshot.body,
+          saved.body ?? savedSnapshot.body,
         );
         if (!confirmedAttachments.ok) {
           throw new Error(confirmedAttachments.error);
         }
         draftIdentityRef.current = nextIdentity;
         setDraftIdentity(nextIdentity);
-        const reconciledAttachments = reconcileSavedDraft(
+        const reconciledAttachments = await reconcileSavedDraft(
           saved.id,
           savedAttachmentSnapshot,
           saved.attachments,
+          saved.attachment_save_scope,
         );
         snapshotRef.current = {
           ...snapshotRef.current,

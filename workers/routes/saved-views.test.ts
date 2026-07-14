@@ -56,6 +56,7 @@ function testApp(input?: {
   const app = new Hono<SavedViewsContext>();
   app.use("*", async (c, next) => {
     if (input?.session !== null) c.set("session", input?.session ?? session);
+		c.set("authorizedMailboxId", "support@example.com");
     await next();
   });
   app.route(

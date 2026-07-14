@@ -10,6 +10,11 @@ import {
 	bulkAdmissionFingerprint,
 	BULK_LIMITS,
 } from "../lib/bulk-job-admission.ts";
+import {
+	R2_OBJECT_KEY_MAX_BYTES,
+	safeAttachmentStorageFilename,
+} from "../../shared/attachment-filename.ts";
+import { attachmentKeyPrefix } from "../lib/attachments.ts";
 
 const execFileAsync = promisify(execFile);
 const ROOT = process.cwd();
@@ -354,15 +359,57 @@ test(
 				[],
 			);
 
+			const invalidUploadMailbox = await seedMailbox(8);
+			const invalidUpload = await submission(
+				invalidUploadMailbox.actorUserId,
+				invalidUploadMailbox.mailboxId,
+				["95F6A780-CB27-4DF2-A9DA-49347F7C3D22"],
+			);
+			await rpc(
+				invalidUploadMailbox.mailboxId,
+				"/reserve",
+				invalidUpload.reservation,
+			);
+			const invalidUploadResult = await rpc<JsonRecord>(
+				invalidUploadMailbox.mailboxId,
+				"/enqueue",
+				invalidUpload.enqueue,
+			);
+			assert.equal(invalidUploadResult.status, "rejected");
+			assert.equal(invalidUploadResult.code, "invalid_bulk_request");
+			assert.equal(
+				invalidUploadResult.error,
+				"Attachment upload identity is invalid.",
+			);
+			assert.deepEqual(
+				await rpc<unknown[]>(invalidUploadMailbox.mailboxId, "/storage/list", {
+					prefix: "bulk:admission:",
+				}),
+				[],
+			);
+			assert.deepEqual(
+				await rpc<unknown[]>(invalidUploadMailbox.mailboxId, "/storage/list", {
+					prefix: "bulk:job:",
+				}),
+				[],
+			);
+
 			const runtimeMailbox = await seedMailbox(4);
 			const uploadId = crypto.randomUUID();
+			const uploadBudgetFilename = safeAttachmentStorageFilename(
+				`${"😀".repeat(400)}.txt`,
+				attachmentKeyPrefix(crypto.randomUUID(), crypto.randomUUID()),
+			);
 			const innerBucket = await runtime.getR2Bucket("INNER", "flaky-r2");
 			await innerBucket.put(
 				`uploads/${runtimeMailbox.mailboxId}/${uploadId}`,
 				new TextEncoder().encode("attachment bytes"),
 				{
 					httpMetadata: { contentType: "text/plain" },
-					customMetadata: { filename: "brief.txt", type: "text/plain" },
+					customMetadata: {
+						filename: uploadBudgetFilename,
+						type: "text/plain",
+					},
 				},
 			);
 			const runtimeSubmission = await submission(
@@ -413,6 +460,14 @@ test(
 			assert.equal(completedJob.failed, 0);
 			const recipientObjects = await innerBucket.list({ prefix: "attachments/" });
 			assert.equal(recipientObjects.objects.length, 1);
+			assert.ok(
+				new TextEncoder().encode(recipientObjects.objects[0]!.key).byteLength <=
+					R2_OBJECT_KEY_MAX_BYTES,
+			);
+			assert.notEqual(
+				recipientObjects.objects[0]!.key.split("/").at(-1),
+				uploadBudgetFilename,
+			);
 
 			const cleanupMailbox = await seedMailbox(5);
 			const cleanupKey = "bulk-runtime/orphan";

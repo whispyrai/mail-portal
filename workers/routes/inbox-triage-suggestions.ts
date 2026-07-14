@@ -17,6 +17,7 @@ import type { Env } from "../types.ts";
 export type InboxTriageSuggestionRouteContext = {
 	Bindings: Env;
 	Variables: {
+		authorizedMailboxId: string;
 		session?: SessionClaims;
 		mailboxStub?: DurableObjectStub<MailboxDO>;
 	};
@@ -114,16 +115,6 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 	}
 }
 
-function normalizedMailboxId(raw: string): string {
-	try {
-		const mailboxId = decodeURIComponent(raw).trim().toLowerCase();
-		if (!mailboxId || mailboxId.length > 320) throw new Error();
-		return mailboxId;
-	} catch {
-		throw new InboxTriageSuggestionBodyError();
-	}
-}
-
 export function createInboxTriageSuggestionRoutes(
 	dependencies: InboxTriageSuggestionRouteDependencies = productionDependencies,
 ) {
@@ -143,7 +134,7 @@ export function createInboxTriageSuggestionRoutes(
 			request = parseInboxTriageSuggestionRequest(
 				await boundedJsonBody(c.req.raw),
 			);
-			mailboxId = normalizedMailboxId(c.req.param("mailboxId")!);
+			mailboxId = c.var.authorizedMailboxId;
 		} catch (error) {
 			if (
 				error instanceof InboxTriageSuggestionBodyError &&

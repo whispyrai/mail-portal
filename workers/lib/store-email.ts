@@ -4,7 +4,12 @@
 
 import type { Email } from "postal-mime";
 import { extractThreadTokens } from "./thread-token.ts";
-import { sanitizeFilename, type StoredAttachment } from "./attachments.ts";
+import {
+	attachmentKey,
+	attachmentKeyPrefix,
+	type StoredAttachment,
+} from "./attachments.ts";
+import { safeAttachmentStorageFilename } from "../../shared/attachment-filename.ts";
 import type { RecipientMemoryOrigin } from "../../shared/recipient-suggestions.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
 import { normalizeObservedSenderName } from "./people/index.ts";
@@ -129,8 +134,11 @@ export async function storeParsedEmail(
 			const attachmentId = options.attachmentIdNamespace
 				? `${messageId}-${options.attachmentIdNamespace}-${attachmentIndex}`
 				: `${messageId}-${attachmentIndex}`;
-			const filename = sanitizeFilename(attachment.filename ?? "untitled");
-			const key = `attachments/${messageId}/${attachmentId}/${filename}`;
+			const filename = safeAttachmentStorageFilename(
+				attachment.filename ?? "untitled",
+				attachmentKeyPrefix(messageId, attachmentId),
+			);
+			const key = attachmentKey(messageId, attachmentId, filename);
 			attachmentKeys.push(key);
 			await dependencies.bucket.put(key, attachment.content);
 			const disposition = attachment.disposition ?? "attachment";

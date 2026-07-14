@@ -7,9 +7,10 @@ import { resolveUnambiguousThreadReference } from "./thread-reference.ts";
 function dependencies() {
 	const created: Array<Record<string, unknown>> = [];
 	const storedAttachments: Array<Array<Record<string, unknown>>> = [];
+	const storedKeys: string[] = [];
 	const value: EmailStorageDependencies = {
 		bucket: {
-			async put() {},
+			async put(key) { storedKeys.push(key); },
 			async delete() {},
 		},
 		mailbox: {
@@ -27,7 +28,7 @@ function dependencies() {
 			async getEmail() { return null; },
 		},
 	};
-	return { value, created, storedAttachments };
+	return { value, created, storedAttachments, storedKeys };
 }
 
 function parsed(overrides: Partial<Email> = {}): Email {
@@ -222,4 +223,26 @@ test("ingest records UTF-8 byte size for string attachment content", async () =>
 		state.storedAttachments[0]?.[0]?.size,
 		new TextEncoder().encode(content).byteLength,
 	);
+});
+
+test("ingest bounds multi-byte attachment storage beneath the exact R2 key limit", async () => {
+	const state = dependencies();
+	await storeParsedEmail(state.value, parsed({
+		attachments: [{
+			filename: `${"📄".repeat(400)}.pdf`,
+			mimeType: "application/pdf",
+			content: new Uint8Array([1]).buffer,
+			disposition: "attachment",
+		}],
+	}), {
+		folder: "inbox",
+		date: "2026-07-11T10:00:00.000Z",
+		messageId: "unicode-storage",
+		recipientMemoryOrigin: "live_inbound",
+	});
+	const stored = state.storedAttachments[0]?.[0];
+	assert.equal(typeof stored?.filename, "string");
+	assert.ok([...(stored?.filename as string)].length <= 255);
+	assert.match(stored?.filename as string, /\.pdf$/);
+	assert.ok(new TextEncoder().encode(state.storedKeys[0] ?? "").byteLength <= 1_024);
 });

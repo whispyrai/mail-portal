@@ -189,7 +189,7 @@ export function createAiDraftRoutes(
 		}
 
 		const session = c.get("session")!;
-		const mailboxId = c.req.param("mailboxId")!;
+			const mailboxId = c.var.authorizedMailboxId;
 		try {
 			return c.json(
 				await operations.draftReply(
@@ -245,7 +245,7 @@ export function createAiDraftRoutes(
 		}
 
 		const session = c.get("session")!;
-		const mailboxId = c.req.param("mailboxId")!;
+			const mailboxId = c.var.authorizedMailboxId;
 		try {
 			return c.json(
 				await operations.draftCompose(

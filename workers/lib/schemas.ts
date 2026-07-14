@@ -11,10 +11,11 @@
  * Zod schemas: used across route handlers to eliminate duplication.
  */
 import { z } from "zod";
+import { isCanonicalAttachmentUploadId } from "./attachment-upload-id.ts";
 import { RECIPIENT_MEMORY_LIMITS } from "../../shared/recipient-suggestions.ts";
 import { ATTACHMENT_LIMITS } from "../../shared/attachments.ts";
 import { decodeBase64Url } from "../../shared/base64url.ts";
-import { isCanonicalContentId } from "../../shared/content-id.ts";
+import { isSesAttachmentContentId } from "./ses-attachment.ts";
 
 // ── TypeScript Interfaces ──────────────────────────────────────────
 
@@ -76,14 +77,16 @@ export const ErrorResponseSchema = z.object({
 const UploadAttachmentRefSchema = z
 	.object({
 		kind: z.literal("upload"),
-		uploadId: z.string().min(1),
+		uploadId: z.string().refine(isCanonicalAttachmentUploadId, {
+			message: "Upload identity must be a canonical UUIDv4",
+		}),
 		disposition: z.enum(["attachment", "inline"]).optional(),
 		contentId: z.string().optional(),
 	})
 	.strict()
 	.superRefine((ref, context) => {
 		if (ref.disposition === "inline") {
-			if (!ref.contentId || !isCanonicalContentId(ref.contentId)) {
+				if (!ref.contentId || !isSesAttachmentContentId(ref.contentId)) {
 				context.addIssue({
 					code: z.ZodIssueCode.custom,
 					path: ["contentId"],
@@ -122,9 +125,10 @@ export const SaveDraftRequestSchema = z
 		subject: z.string().optional(),
 		body: z.string(),
 		in_reply_to: z.string().optional(),
-		thread_id: z.string().optional(),
-		draft_create_key: z.string().min(1).max(128).optional(),
-		draft_id: z.string().optional(),
+			thread_id: z.string().optional(),
+			draft_create_key: z.string().min(1).max(128).optional(),
+			draft_save_key: z.string().uuid().optional(),
+			draft_id: z.string().optional(),
 		draft_version: z.number().int().min(1).optional(),
 		attachments: z
 			.array(AttachmentRefSchema)

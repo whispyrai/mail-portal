@@ -244,16 +244,310 @@ test(
 			}
 			state = await request<State>("/state");
 			assert.equal(state.emails.length, 1);
-			assert.deepEqual(
-				state.operations.map((operation) => [operation.createKey, operation.state]),
+				assert.deepEqual(
+					state.operations.map((operation) => [operation.createKey, operation.state]),
 				[
 					["tool-create-key-1", "active"],
 					["tool-create-key-consume", "consumed"],
 					["tool-create-key-delete", "deleted"],
 					["tool-create-key-discard", "discarded"],
-				],
-			);
-		} finally {
+					],
+				);
+
+				const claimDraft = await request<UpsertResult>("/upsert", {
+					input: input("draft-save-claim", "claim-create", "claim-create-key"),
+					actor,
+				});
+				assert.equal(claimDraft.status, "saved");
+				const claimInput = (saveKey: string, claimToken = `token-${saveKey}`) => ({
+					saveKey,
+					fingerprint: `fingerprint-${saveKey}`,
+					draftId: claimDraft.draftId,
+					expectedVersion: 1,
+					claimToken,
+					claimExpiresAt: Date.now() + 300_000,
+				});
+				const [firstClaim, competingClaim] = await Promise.all([
+					request<{ status: string }>("/claim-save", claimInput("save-1")),
+					request<{ status: string }>("/claim-save", claimInput("save-2")),
+				]);
+				assert.deepEqual(
+					[firstClaim.status, competingClaim.status].sort(),
+					["claimed", "revision_in_progress"],
+				);
+				const winnerKey = firstClaim.status === "claimed" ? "save-1" : "save-2";
+				const winner = claimInput(winnerKey);
+				const recorded = await request<{ recorded: boolean }>(
+					"/record-save-promotion",
+					{
+						saveKey: winner.saveKey,
+						fingerprint: winner.fingerprint,
+						claimToken: winner.claimToken,
+						destinationKeys: ["attachments/draft-save-claim/attachment/file.pdf"],
+					},
+				);
+				assert.equal(recorded.recorded, true);
+				const claimCommit = await request<{ status: string; draftVersion: number }>(
+					"/upsert",
+					{
+						input: {
+							...input(claimDraft.draftId),
+							createKey: undefined,
+							createFingerprint: undefined,
+							expectedVersion: 1,
+							saveKey: winner.saveKey,
+							saveFingerprint: winner.fingerprint,
+							saveClaimToken: winner.claimToken,
+							subject: "Claimed edit",
+						},
+						actor: { kind: "user", id: "user-1" },
+					},
+				);
+				assert.equal(claimCommit.status, "saved");
+				assert.equal(claimCommit.draftVersion, 2);
+				assert.equal(
+					(await request<{ status: string }>("/save-outcome", {
+						saveKey: winner.saveKey,
+						fingerprint: winner.fingerprint,
+					})).status,
+					"committed",
+				);
+
+				for (const terminal of ["discard", "consume", "delete"] as const) {
+					const terminalDraft = await request<UpsertResult>("/upsert", {
+						input: input(
+							`save-terminal-${terminal}`,
+							`save-terminal-create-${terminal}`,
+							`save-terminal-create-key-${terminal}`,
+						),
+						actor,
+					});
+					assert.equal(terminalDraft.status, "saved");
+					const terminalSave = {
+						saveKey: `save-terminal-key-${terminal}`,
+						fingerprint: `save-terminal-fingerprint-${terminal}`,
+						draftId: terminalDraft.draftId,
+						expectedVersion: 1,
+						claimToken: `save-terminal-token-${terminal}`,
+						claimExpiresAt: Date.now() + 300_000,
+					};
+					assert.equal(
+						(await request<{ status: string }>("/claim-save", terminalSave)).status,
+						"claimed",
+					);
+					const committed = await request<{ status: string; draftVersion: number }>(
+						"/upsert",
+						{
+							input: {
+								...input(terminalDraft.draftId),
+								createKey: undefined,
+								createFingerprint: undefined,
+								expectedVersion: 1,
+								saveKey: terminalSave.saveKey,
+								saveFingerprint: terminalSave.fingerprint,
+								saveClaimToken: terminalSave.claimToken,
+							},
+							actor: { kind: "user", id: "user-1" },
+						},
+					);
+					assert.equal(committed.status, "saved");
+					assert.equal(committed.draftVersion, 2);
+					assert.equal(
+						(await request<{ status: string }>(`/${terminal}`, {
+							draftId: terminalDraft.draftId,
+							...(terminal === "delete"
+								? {}
+								: {
+										draftVersion: 2,
+										actor: { kind: "user", id: "user-1" },
+									}),
+						})).status,
+						terminal === "discard"
+							? "discarded"
+							: terminal === "consume"
+								? "consumed"
+								: "deleted",
+					);
+					const terminalReplay = await request<{ status: string; claimToken?: string }>(
+						"/claim-save",
+						{ ...terminalSave, claimToken: `late-${terminal}` },
+					);
+					assert.equal(terminalReplay.status, "committed");
+					assert.equal(terminalReplay.claimToken, terminalSave.claimToken);
+				}
+
+				const expiredSaveKey = "save-expired-generation";
+				const expiredFingerprint = `fingerprint-${expiredSaveKey}`;
+				const oldClaim = {
+					saveKey: expiredSaveKey,
+					fingerprint: expiredFingerprint,
+					draftId: claimDraft.draftId,
+					expectedVersion: 2,
+					claimToken: "claim-old",
+					claimExpiresAt: Date.now() - 1,
+				};
+				assert.equal(
+					(await request<{ status: string }>("/claim-save", oldClaim)).status,
+					"claimed",
+				);
+				const expiredDestinationKey =
+					"attachments/draft-save-claim/expired-generation/file.pdf";
+				assert.equal(
+					(await request<{ recorded: boolean }>("/record-save-promotion", {
+						saveKey: oldClaim.saveKey,
+						fingerprint: oldClaim.fingerprint,
+						claimToken: oldClaim.claimToken,
+						destinationKeys: [expiredDestinationKey],
+					})).recorded,
+					true,
+				);
+				const replacementClaim = {
+					...oldClaim,
+					claimToken: "claim-new",
+					claimExpiresAt: Date.now() + 300_000,
+				};
+				assert.equal(
+					(await request<{ status: string }>("/claim-save", replacementClaim)).status,
+					"claimed",
+				);
+				let cleanupState = await request<State & {
+					cleanupIntents: Array<{ claimToken: string; attempts: number }>;
+				}>("/state");
+				assert.equal(
+					cleanupState.cleanupIntents.some((intent) =>
+						intent.claimToken === oldClaim.claimToken,
+					),
+					true,
+				);
+				await request("/make-cleanup-due", { claimToken: oldClaim.claimToken });
+				await request("/run-alarm");
+				await request("/put-owned-object", {
+					key: expiredDestinationKey,
+					promotionOwner: oldClaim.claimToken,
+				});
+				assert.equal(
+					(await request<{ exists: boolean }>("/object-exists", {
+						key: expiredDestinationKey,
+					})).exists,
+					true,
+				);
+				await request("/make-cleanup-due", { claimToken: oldClaim.claimToken });
+				await request("/run-alarm");
+				assert.equal(
+					(await request<{ exists: boolean }>("/object-exists", {
+						key: expiredDestinationKey,
+					})).exists,
+					false,
+				);
+				cleanupState = await request<State & {
+					cleanupIntents: Array<{ claimToken: string; attempts: number }>;
+				}>("/state");
+				assert.equal(
+					cleanupState.cleanupIntents.find((intent) =>
+						intent.claimToken === oldClaim.claimToken,
+					)?.attempts,
+					2,
+				);
+				const staleCommit = await request<{ status: string }>("/upsert", {
+					input: {
+						...input(claimDraft.draftId),
+						createKey: undefined,
+						createFingerprint: undefined,
+						expectedVersion: 2,
+						saveKey: expiredSaveKey,
+						saveFingerprint: expiredFingerprint,
+						saveClaimToken: "claim-old",
+					},
+					actor: { kind: "user", id: "user-1" },
+				});
+				assert.equal(staleCommit.status, "save_claim_lost");
+
+				const oldUpdatedAt = new Date(Date.now() - 31 * 24 * 60 * 60_000).toISOString();
+				const recentUpdatedAt = new Date(Date.now() - 29 * 24 * 60 * 60_000).toISOString();
+				await request("/seed-save-operations", {
+					count: 101,
+					state: "committed",
+					updatedAt: oldUpdatedAt,
+					prefix: "expired-terminal",
+				});
+				await request("/seed-save-operations", {
+					count: 1,
+					state: "committed",
+					updatedAt: recentUpdatedAt,
+					prefix: "recent-terminal",
+				});
+				await request("/seed-save-operations", {
+					count: 1,
+					state: "claimed",
+					updatedAt: oldUpdatedAt,
+					prefix: "active-claim",
+				});
+				await request("/claim-save", {
+					saveKey: "retention-trigger-1",
+					fingerprint: "retention-trigger-1",
+					draftId: "retention-trigger-draft-1",
+					expectedVersion: 0,
+					claimToken: "retention-token-1",
+					claimExpiresAt: Date.now() + 300_000,
+				});
+				state = await request<State & { saveOperations: Array<{ saveKey: string }> }>("/state");
+				assert.equal(
+					state.saveOperations.filter((operation) =>
+						operation.saveKey.startsWith("expired-terminal-"),
+					).length,
+					1,
+				);
+				assert.equal(
+					state.saveOperations.some((operation) => operation.saveKey === "recent-terminal-0"),
+					true,
+				);
+				assert.equal(
+					state.saveOperations.some((operation) => operation.saveKey === "active-claim-0"),
+					true,
+				);
+
+				const retentionReference = Date.now();
+				const retentionWindow = 30 * 24 * 60 * 60_000;
+				await request("/seed-save-operations", {
+					count: 1,
+					state: "committed",
+					updatedAt: new Date(retentionReference - retentionWindow + 60_000).toISOString(),
+					prefix: "inside-boundary",
+				});
+				await request("/seed-save-operations", {
+					count: 1,
+					state: "committed",
+					updatedAt: new Date(retentionReference - retentionWindow).toISOString(),
+					prefix: "exact-boundary",
+				});
+				await request("/seed-save-operations", {
+					count: 1,
+					state: "committed",
+					updatedAt: new Date(retentionReference - retentionWindow - 60_000).toISOString(),
+					prefix: "outside-boundary",
+				});
+				await request("/claim-save", {
+					saveKey: "retention-trigger-2",
+					fingerprint: "retention-trigger-2",
+					draftId: "retention-trigger-draft-2",
+					expectedVersion: 0,
+					claimToken: "retention-token-2",
+					claimExpiresAt: Date.now() + 300_000,
+				});
+				state = await request<State & { saveOperations: Array<{ saveKey: string }> }>("/state");
+				assert.equal(
+					state.saveOperations.some((operation) => operation.saveKey === "inside-boundary-0"),
+					true,
+				);
+				assert.equal(
+					state.saveOperations.some((operation) => operation.saveKey === "exact-boundary-0"),
+					false,
+				);
+				assert.equal(
+					state.saveOperations.some((operation) => operation.saveKey === "outside-boundary-0"),
+					false,
+				);
+			} finally {
 			await runtime?.dispose();
 			await rm(outputDirectory, { recursive: true, force: true });
 		}

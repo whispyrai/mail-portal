@@ -413,22 +413,29 @@ const api = {
 		`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/emails/${encodedPathPart(emailId)}/attachments/${encodedPathPart(attachmentId)}`,
 		{ responseType: "blob", signal: opts?.signal },
 	),
-	// Upload a file to staging; returns a reference to carry into a send/reply/draft.
-	// Raw-body POST (not the JSON helper) with no artificial timeout, since large
+	// Upload a file to immutable staging under its browser-owned retry identity.
+	// Raw-body PUT (not the JSON helper) with no artificial timeout, since large
 	// files on slow links can exceed the default request timeout.
 	uploadAttachment: async (
 		mailboxId: string,
+		uploadId: string,
 		file: File,
 		signal?: AbortSignal,
-	): Promise<{ uploadId: string; filename: string; mimetype: string; size: number }> => {
+	): Promise<{
+		uploadId: string;
+		filename: string;
+		mimetype: string;
+		size: number;
+		replayed: boolean;
+	}> => {
 		const params = new URLSearchParams({
 			filename: file.name,
 			type: file.type || "application/octet-stream",
 		});
 		const res = await fetch(
-			`/api/v1/mailboxes/${mailboxId}/attachments?${params.toString()}`,
+			`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/attachment-uploads/${encodedPathPart(uploadId)}?${params.toString()}`,
 			{
-				method: "POST",
+				method: "PUT",
 				body: file,
 				signal,
 				headers: { "Content-Type": file.type || "application/octet-stream" },
@@ -438,9 +445,29 @@ const api = {
 			const body = await res.json().catch(() => ({}));
 			throw new ApiError(res.status, body as Record<string, unknown>);
 		}
-		return res.json() as Promise<{ uploadId: string; filename: string; mimetype: string; size: number }>;
+		const body: unknown = await res.json().catch(() => null);
+		if (
+			!body ||
+			typeof body !== "object" ||
+			!("uploadId" in body) || body.uploadId !== uploadId ||
+			!("filename" in body) || typeof body.filename !== "string" || !body.filename ||
+			!("mimetype" in body) || typeof body.mimetype !== "string" || !body.mimetype ||
+			!("size" in body) || body.size !== file.size ||
+			!("replayed" in body) || typeof body.replayed !== "boolean"
+		) {
+			throw new ApiError(502, {
+				error: "The attachment upload response could not be confirmed.",
+			});
+		}
+		return body as {
+			uploadId: string;
+			filename: string;
+			mimetype: string;
+			size: number;
+			replayed: boolean;
+		};
 	},
-	saveDraft: (
+	saveDraft: async (
 		mailboxId: string,
 		draft: {
 			to?: string;
@@ -450,12 +477,33 @@ const api = {
 			body: string;
 			in_reply_to?: string;
 			thread_id?: string;
-				draft_id?: string;
-				draft_version?: number;
-				draft_create_key?: string;
-				attachments?: AttachmentRef[];
-			},
-		) => post<Email & { replayed?: boolean }>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
+			draft_id?: string;
+			draft_version?: number;
+			draft_create_key?: string;
+			draft_save_key?: string;
+			attachments?: AttachmentRef[];
+		},
+		) => {
+			const response = await post<unknown>(
+				`/api/v1/mailboxes/${mailboxId}/drafts`,
+				draft,
+			);
+			if (
+				response === null ||
+				typeof response !== "object" ||
+				!("attachment_save_scope" in response) ||
+				typeof response.attachment_save_scope !== "string" ||
+				!response.attachment_save_scope.trim()
+			) {
+				throw new ApiError(502, {
+					error: "The saved draft attachment identity could not be confirmed.",
+				});
+			}
+			return response as Email & {
+				replayed?: boolean;
+				attachment_save_scope: string;
+			};
+		},
 	replyToEmail: (mailboxId: string, emailId: string, email: unknown) =>
 		post<OutboundEnqueueResponse>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email),
 	forwardEmail: (mailboxId: string, emailId: string, email: unknown) =>

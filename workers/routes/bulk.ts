@@ -55,8 +55,11 @@ function renderBulk(
     .bulk-preview-field dt{color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
     .bulk-preview-field dd{margin:0;min-width:0;overflow-wrap:anywhere}
     .bulk-page label code{white-space:nowrap}
+    #attachList{list-style:none;margin:8px 0 0;padding:0}
     .bulk-attachment{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:13px;margin-top:6px;min-width:0}
     .bulk-attachment-name{min-width:0;max-width:100%;overflow-wrap:anywhere}
+    .bulk-attachment-meta{min-width:0;overflow-wrap:anywhere}
+    .bulk-attachment-error{color:var(--danger);font-weight:500}
     .bulk-attachment button{min-height:44px}
     @media (max-width:640px){
       .bulk-preview-table{display:none}
@@ -89,7 +92,8 @@ function renderBulk(
     <textarea id="body" maxlength="${BULK_LIMITS.bodyChars}" placeholder="Hi {{first_name}},&#10;&#10;I saw {{company}} is growing fast ...&#10;&#10;Worth a quick 20-minute call?"></textarea>
     <label for="attach" style="margin-top:14px">Attachment <span class="muted">(optional; the same file(s) are attached to every recipient)</span></label>
     <input type="file" id="attach" multiple>
-    <div id="attachList" role="status" aria-live="polite" style="margin-top:8px"></div>
+    <ul id="attachList" aria-label="Attachments"></ul>
+    <p id="attachStatus" class="muted" role="status" aria-live="polite" style="margin:8px 0 0"></p>
     <div class="row bulk-actions" style="margin-top:14px">
       <button class="secondary" id="previewBtn" type="button">Preview first email</button>
       <button id="sendBtn" type="button" disabled>Send all</button>
@@ -329,7 +333,24 @@ $('previewBtn').addEventListener('click', () => {
 // ---- Shared attachment(s): uploaded once, attached to every recipient ----
 function fmtSize(b) { if (b < 1024) return b + ' B'; if (b < 1048576) return Math.round(b/1024) + ' KB'; return (b/1048576).toFixed(1) + ' MB'; }
 function attachUploading() { return ATTACH.some(a => a.status === 'uploading'); }
-function attachFailed() { return ATTACH.some(a => a.status === 'error'); }
+function attachFailed() { return ATTACH.some(a => a.status === 'error' || a.status === 'rejected'); }
+function acceptedAttachments(exceptEntry = null) {
+  return ATTACH.filter(a => a !== exceptEntry && a.status !== 'error' && a.status !== 'rejected');
+}
+function attachmentAdmissionError(file, exceptEntry = null) {
+  const accepted = acceptedAttachments(exceptEntry);
+  if (accepted.length >= CFG.limits.maxFiles) return 'You can attach at most ' + CFG.limits.maxFiles + ' files.';
+  if (file.size > CFG.limits.maxFileBytes) return 'This file is over the per-file attachment limit.';
+  const total = accepted.reduce((sum, attachment) => sum + attachment.size, 0) + file.size;
+  if (total > CFG.limits.maxTotalBytes) return 'This file would exceed the total attachment limit.';
+  return '';
+}
+function attachmentRetryAdmissionError(entry) {
+  return attachmentAdmissionError(entry.file, entry);
+}
+function announceAttachment(message) {
+  $('attachStatus').textContent = message;
+}
 function confirmationSummary() {
   const names = ATTACH.filter(a => a.status === 'ready').map(a => a.filename);
   const attachmentSummary = names.length
@@ -340,46 +361,118 @@ function confirmationSummary() {
 function renderAttach() {
   const box = $('attachList'); box.replaceChildren();
   ATTACH.forEach(a => {
-    const row = document.createElement('div');
+    const row = document.createElement('li');
     row.className = 'bulk-attachment';
     const name = document.createElement('span'); name.className = 'bulk-attachment-name'; name.textContent = a.filename; row.appendChild(name);
-    const meta = document.createElement('span'); meta.className = a.status === 'error' ? 'err' : 'muted';
-    meta.textContent = a.status === 'uploading' ? 'uploading…' : a.status === 'error' ? (a.error || 'failed') : fmtSize(a.size);
+    const meta = document.createElement('span');
+    const hasError = a.status === 'error' || a.status === 'rejected';
+    meta.className = 'bulk-attachment-meta ' + (hasError ? 'bulk-attachment-error' : 'muted');
+    meta.textContent = a.status === 'uploading' ? 'uploading…' : hasError ? (a.error || 'failed') : fmtSize(a.size);
     row.appendChild(meta);
-    if (a.status !== 'uploading') {
-      const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'sm secondary'; rm.textContent = 'Remove';
-      rm.setAttribute('aria-label', 'Remove ' + a.filename);
-      rm.disabled = submissionLocked;
-      rm.addEventListener('click', () => { if (submissionLocked) return; ATTACH = ATTACH.filter(x => x !== a); renderAttach(); updateSendAvailability(); });
-      row.appendChild(rm);
+    if (a.status === 'error' && a.file) {
+      const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'sm secondary'; retry.textContent = 'Retry';
+      retry.setAttribute('aria-label', 'Retry ' + a.filename);
+      retry.disabled = submissionLocked;
+      retry.addEventListener('click', () => {
+        if (submissionLocked) return;
+        void uploadAttachmentEntry(a);
+      });
+      row.appendChild(retry);
     }
+    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'sm secondary'; rm.textContent = 'Remove';
+    rm.setAttribute('aria-label', 'Remove ' + a.filename);
+    rm.disabled = submissionLocked;
+    rm.addEventListener('click', () => {
+      if (submissionLocked) return;
+      a.controller?.abort();
+      a.attempt = (a.attempt || 0) + 1;
+      ATTACH = ATTACH.filter(x => x !== a);
+      announceAttachment(a.filename + ' was removed.');
+      renderAttach(); updateSendAvailability();
+    });
+    row.appendChild(rm);
     box.appendChild(row);
   });
 }
-$('attach').addEventListener('change', async (e) => {
-  const files = Array.from(e.target.files || []); e.target.value = '';
-  for (const file of files) {
-    const accepted = ATTACH.filter(a => a.status !== 'error');
-    if (accepted.length >= CFG.limits.maxFiles) {
-      $('status').className = 'err';
-      $('status').textContent = 'You can attach at most ' + CFG.limits.maxFiles + ' files.';
-      $('attach').focus();
-      break;
+function isConfirmedAttachmentUploadResponse(result, entry) {
+  return result !== null
+    && typeof result === 'object'
+    && result.uploadId === entry.localId
+    && typeof result.filename === 'string'
+    && Boolean(result.filename)
+    && typeof result.mimetype === 'string'
+    && Boolean(result.mimetype)
+    && result.size === entry.file.size
+    && typeof result.replayed === 'boolean';
+}
+async function uploadAttachmentEntry(entry) {
+  if (submissionLocked || entry.status === 'uploading') return;
+  if (entry.status === 'error') {
+    const admissionError = attachmentRetryAdmissionError(entry);
+    if (admissionError) {
+      entry.error = admissionError;
+      announceAttachment(entry.filename + ' cannot be retried yet. ' + admissionError);
+      renderAttach(); updateSendAvailability();
+      return;
     }
-    if (file.size > CFG.limits.maxFileBytes) { ATTACH.push({ filename: file.name, size: file.size, status: 'error', error: 'over per-file limit' }); renderAttach(); continue; }
-    const total = accepted.reduce((s, a) => s + a.size, 0) + file.size;
-    if (total > CFG.limits.maxTotalBytes) { ATTACH.push({ filename: file.name, size: file.size, status: 'error', error: 'over total limit' }); renderAttach(); continue; }
-    const entry = { filename: file.name, size: file.size, status: 'uploading' };
-    ATTACH.push(entry); renderAttach();
-    try {
-      const params = new URLSearchParams({ filename: file.name, type: file.type || 'application/octet-stream' });
-      const r = await fetch(CFG.uploadBase + '?' + params.toString(), { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': file.type || 'application/octet-stream' }, body: file });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) { entry.status = 'error'; entry.error = j.error || 'upload failed'; }
-      else { entry.status = 'ready'; entry.uploadId = j.uploadId; entry.filename = j.filename; entry.size = j.size; }
-    } catch (err) { entry.status = 'error'; entry.error = 'upload failed'; }
+  }
+  entry.status = 'uploading';
+  entry.error = '';
+  entry.attempt = (entry.attempt || 0) + 1;
+  const attempt = entry.attempt;
+  const controller = new AbortController();
+  entry.controller = controller;
+  announceAttachment('Uploading ' + entry.filename + '…');
+  renderAttach(); updateSendAvailability();
+  try {
+    const params = new URLSearchParams({ filename: entry.file.name, type: entry.file.type || 'application/octet-stream' });
+    const response = await fetch(CFG.uploadBase + '/' + encodeURIComponent(entry.localId) + '?' + params.toString(), {
+      method: 'PUT', credentials: 'same-origin', signal: controller.signal,
+      headers: { 'Content-Type': entry.file.type || 'application/octet-stream' }, body: entry.file,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!ATTACH.includes(entry) || entry.attempt !== attempt) return;
+    if (!response.ok) {
+      entry.status = 'error';
+      entry.error = result.error || 'upload failed';
+      announceAttachment(entry.filename + ' could not be uploaded. Retry or remove it.');
+    } else if (!isConfirmedAttachmentUploadResponse(result, entry)) {
+      entry.status = 'error';
+      entry.error = 'The attachment upload response could not be confirmed.';
+      announceAttachment(entry.filename + ' could not be confirmed. Retry or remove it.');
+    } else {
+      entry.status = 'ready';
+      entry.uploadId = result.uploadId;
+      entry.filename = result.filename;
+      entry.size = result.size;
+      announceAttachment(entry.filename + ' is ready.');
+    }
+  } catch (error) {
+    if (!ATTACH.includes(entry) || entry.attempt !== attempt || controller.signal.aborted) return;
+    entry.status = 'error';
+    entry.error = 'upload failed';
+    announceAttachment(entry.filename + ' could not be uploaded. Retry or remove it.');
+  } finally {
+    if (entry.attempt === attempt) entry.controller = null;
     renderAttach(); updateSendAvailability();
   }
+}
+$('attach').addEventListener('change', (e) => {
+  const files = Array.from(e.target.files || []); e.target.value = '';
+  const uploads = [];
+  for (const file of files) {
+    const admissionError = attachmentAdmissionError(file);
+    if (admissionError) {
+      ATTACH.push({ localId: crypto.randomUUID(), file, filename: file.name, size: file.size, status: 'rejected', error: admissionError });
+      announceAttachment(file.name + ' was rejected. ' + admissionError);
+      continue;
+    }
+    const entry = { localId: crypto.randomUUID(), file, filename: file.name, size: file.size, status: 'pending' };
+    ATTACH.push(entry);
+    uploads.push(entry);
+  }
+  renderAttach(); updateSendAvailability();
+  uploads.forEach(entry => { void uploadAttachmentEntry(entry); });
 });
 
 function setConfirmationState(message, mode, moveFocus = false) {
@@ -766,7 +859,7 @@ $('sendBtn').addEventListener('click', () => {
   if (!body.trim()) { reportValidation('Body is required.', 'body'); return; }
   if (!ROWS.length) { reportValidation('Upload a valid CSV first.', 'csv'); return; }
   if (attachUploading()) { reportValidation('Wait for the attachment to finish uploading.', 'attach'); return; }
-  if (attachFailed()) { reportValidation('Remove every failed attachment before sending.', 'attach'); return; }
+  if (attachFailed()) { reportValidation('Retry or remove every failed attachment before sending.', 'attach'); return; }
   const attachmentUploadIds = ATTACH.filter(a => a.status === 'ready' && a.uploadId).map(a => a.uploadId);
   const candidateSubmission = {
     operationId: crypto.randomUUID(),
@@ -830,7 +923,7 @@ export function bulkPage(c: Ctx) {
 	if (!session) return c.redirect("/login", 302);
 	const mailbox = session.mailbox;
 	const apiBase = `/api/v1/mailboxes/${encodeURIComponent(mailbox)}/bulk`;
-	const uploadBase = `/api/v1/mailboxes/${encodeURIComponent(mailbox)}/attachments`;
+	const uploadBase = `/api/v1/mailboxes/${encodeURIComponent(mailbox)}/attachment-uploads`;
 	return c.html(
 		renderBulk(resolveBrand(c.env.BRAND), mailbox, apiBase, uploadBase),
 	);

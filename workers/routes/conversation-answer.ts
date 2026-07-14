@@ -19,6 +19,7 @@ const CONVERSATION_ANSWER_REQUEST_BYTES = 2_048;
 export type ConversationAnswerRouteContext = {
 	Bindings: Env;
 	Variables: {
+		authorizedMailboxId: string;
 		session?: SessionClaims;
 		mailboxStub?: DurableObjectStub<MailboxDO>;
 	};
@@ -109,16 +110,6 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 	}
 }
 
-function normalizedMailboxId(raw: string): string {
-	try {
-		const mailboxId = decodeURIComponent(raw).trim().toLowerCase();
-		if (!mailboxId || mailboxId.length > 320) throw new Error();
-		return mailboxId;
-	} catch {
-		throw new ConversationAnswerBodyError();
-	}
-}
-
 export function createConversationAnswerRoutes(
 	dependencies: ConversationAnswerRouteDependencies = productionDependencies,
 ) {
@@ -141,7 +132,7 @@ export function createConversationAnswerRoutes(
 			if (!emailId || emailId.length > 300) {
 				throw new ConversationAnswerBodyError();
 			}
-			mailboxId = normalizedMailboxId(c.req.param("mailboxId")!);
+			mailboxId = c.var.authorizedMailboxId;
 			question = parsed.question;
 		} catch (error) {
 			if (error instanceof ConversationAnswerBodyError && error.tooLarge) {

@@ -44,6 +44,7 @@ function fixture(
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", mailboxId);
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -65,7 +66,7 @@ test("terminal idempotency replay returns an explicit non-enqueue outcome", asyn
 		undoUntil: "2026-07-11T10:00:10.000Z",
 	});
 	const response = await app.request(
-		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails`,
+		"http://mail.wiserchat.ai/api/v1/mailboxes/%20TEAM%40WISERCHAT.AI%20/emails",
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -131,12 +132,14 @@ test("compose API rejects mismatched inline HTML before Outbox mutation and reta
 		disposition: "inline",
 	};
 	const { app, enqueued } = fixture(null, existingAttachment);
-	const stagingKey = `uploads/${mailboxId}/upload-inline`;
+	const uploadId = "50505050-5050-4050-8050-505050505050";
+	const stagingKey = `uploads/${mailboxId}/${uploadId}`;
 	const existingKey = "attachments/draft-existing/existing-inline/legacy.png";
 	const objects = new Map<string, ArrayBuffer>([
 		[stagingKey, new Uint8Array([1, 2, 3]).buffer],
 		[existingKey, new Uint8Array([4, 5]).buffer],
 	]);
+	const promotionOwners = new Map<string, string>();
 	const response = await app.request(
 		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails`,
 		{
@@ -149,7 +152,7 @@ test("compose API rejects mismatched inline HTML before Outbox mutation and reta
 				html: '<img src="cid:missing@mail-portal.local" data-mail-inline-image="v1">',
 				attachments: [{
 					kind: "upload",
-					uploadId: "upload-inline",
+					uploadId,
 					disposition: "inline",
 					contentId: "actual@mail-portal.local",
 				}, {
@@ -165,12 +168,34 @@ test("compose API rejects mismatched inline HTML before Outbox mutation and reta
 				async get(key: string) {
 					const bytes = objects.get(key);
 					return bytes ? {
-						customMetadata: { filename: "chart.png", type: "image/png" },
+						customMetadata: {
+							filename: "chart.png",
+							type: "image/png",
+							...(promotionOwners.has(key)
+								? { promotionOwner: promotionOwners.get(key) }
+								: {}),
+						},
 						httpMetadata: {},
 						async arrayBuffer() { return bytes.slice(0); },
 					} : null;
 				},
-				async put(key: string, bytes: ArrayBuffer) { objects.set(key, bytes.slice(0)); },
+					async put(
+						key: string,
+						bytes: ArrayBuffer,
+						options?: {
+							onlyIf?: { etagDoesNotMatch?: string };
+							customMetadata?: { promotionOwner?: string };
+						},
+					) {
+						if (options?.onlyIf?.etagDoesNotMatch === "*" && objects.has(key)) {
+							return null;
+						}
+						objects.set(key, bytes.slice(0));
+						if (options?.customMetadata?.promotionOwner) {
+							promotionOwners.set(key, options.customMetadata.promotionOwner);
+						}
+						return { etag: "created" };
+					},
 				async delete(keys: string | string[]) {
 					for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
 				},
@@ -200,14 +225,15 @@ test("compose API accepts matching fresh and authoritative existing inline parts
 		disposition: "inline",
 	};
 	const { app, enqueued, enqueuedAttachments } = fixture(null, existingAttachment);
-	const stagingKey = `uploads/${mailboxId}/upload-fresh`;
+	const uploadId = "60606060-6060-4060-8060-606060606060";
+	const stagingKey = `uploads/${mailboxId}/${uploadId}`;
 	const existingKey = "attachments/draft-existing/existing-inline/legacy.png";
 	const objects = new Map<string, ArrayBuffer>([
 		[stagingKey, new Uint8Array([1, 2, 3]).buffer],
 		[existingKey, new Uint8Array([4, 5]).buffer],
 	]);
 	const response = await app.request(
-		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails`,
+		"http://mail.wiserchat.ai/api/v1/mailboxes/%20TEAM%40WISERCHAT.AI%20/emails",
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -221,7 +247,7 @@ test("compose API accepts matching fresh and authoritative existing inline parts
 				].join(""),
 				attachments: [{
 					kind: "upload",
-					uploadId: "upload-fresh",
+					uploadId,
 					disposition: "inline",
 					contentId: "fresh@mail-portal.local",
 				}, {
@@ -245,7 +271,17 @@ test("compose API accepts matching fresh and authoritative existing inline parts
 						async arrayBuffer() { return bytes.slice(0); },
 					};
 				},
-				async put(key: string, bytes: ArrayBuffer) { objects.set(key, bytes.slice(0)); },
+					async put(
+						key: string,
+						bytes: ArrayBuffer,
+						options?: { onlyIf?: { etagDoesNotMatch?: string } },
+					) {
+						if (options?.onlyIf?.etagDoesNotMatch === "*" && objects.has(key)) {
+							return null;
+						}
+						objects.set(key, bytes.slice(0));
+						return { etag: "created" };
+					},
 				async delete(keys: string | string[]) {
 					for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
 				},

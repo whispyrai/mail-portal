@@ -263,19 +263,26 @@ export default function ComposeEmail() {
     setShowCustomSchedule(false);
   };
 
+  const fileTransfersDisabled = isSending || isResolvingClose;
+
   const acceptTransferredFiles = (files: File[]) => {
     fileDragDepthRef.current = 0;
     setIsDraggingFiles(false);
+    if (fileTransfersDisabled) return;
     addFiles(files);
   };
 
   const handleOuterPaste = (event: ReactClipboardEvent<HTMLFormElement>) => {
-    consumeComposeFileTransfer(event, acceptTransferredFiles);
+    consumeComposeFileTransfer(
+      event,
+      fileTransfersDisabled ? () => {} : acceptTransferredFiles,
+    );
   };
 
   const handleOuterDragEnter = (event: ReactDragEvent<HTMLFormElement>) => {
     if (!transferContainsFiles(event.dataTransfer)) return;
     event.preventDefault();
+    if (fileTransfersDisabled) return;
     fileDragDepthRef.current += 1;
     setIsDraggingFiles(true);
   };
@@ -283,7 +290,7 @@ export default function ComposeEmail() {
   const handleOuterDragOver = (event: ReactDragEvent<HTMLFormElement>) => {
     if (!transferContainsFiles(event.dataTransfer)) return;
     event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
+    event.dataTransfer.dropEffect = fileTransfersDisabled ? "none" : "copy";
   };
 
   const handleOuterDragLeave = () => {
@@ -295,7 +302,10 @@ export default function ComposeEmail() {
   const handleOuterDrop = (event: ReactDragEvent<HTMLFormElement>) => {
     fileDragDepthRef.current = 0;
     setIsDraggingFiles(false);
-    consumeComposeFileTransfer(event, acceptTransferredFiles);
+    consumeComposeFileTransfer(
+      event,
+      fileTransfersDisabled ? () => {} : acceptTransferredFiles,
+    );
   };
 
   return (
@@ -557,6 +567,7 @@ export default function ComposeEmail() {
                   onFiles={acceptTransferredFiles}
                   onInlineImages={addInlineImages}
                   inlineImagePreviews={inlineImagePreviews}
+                  fileTransfersDisabled={fileTransfersDisabled}
                 />
               </div>
 
@@ -567,7 +578,7 @@ export default function ComposeEmail() {
                 onAddFiles={addFiles}
                 onRemove={removeAttachment}
                 onRetry={retryAttachment}
-                disabled={isSending}
+                disabled={fileTransfersDisabled}
               />
             </div>
 

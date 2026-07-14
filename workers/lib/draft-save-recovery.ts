@@ -22,10 +22,25 @@ type RecoveryStub = {
 		email_id: string;
 	} | null>;
 	getEmail(id: string): Promise<AuthoritativeDraft | null>;
+	getDraftSaveOutcome(
+		saveKey: string,
+		fingerprint: string,
+	): Promise<{
+		status: "missing" | "key_conflict" | "claimed" | "committed" | "aborted";
+		draftId?: string;
+		committedVersion?: number | null;
+		claimToken?: string | null;
+	}>;
+	abortDraftSave(
+		saveKey: string,
+		fingerprint: string,
+		claimToken: string,
+	): Promise<{ status: "aborted" | "not_claimed"; destinationKeys: string[] }>;
 	queueAttachmentCleanup?: (
 		emailId: string,
 		keys: string[],
 		actor?: ActivityActor,
+		promotionOwner?: string,
 	) => Promise<void>;
 };
 
@@ -34,39 +49,44 @@ export async function reconcileAmbiguousDraftSave(input: {
 	stub: RecoveryStub;
 	draftId: string;
 	expectedCommittedVersion: number;
+	saveKey: string;
+	saveFingerprint: string;
 	promotion: AttachmentPromotion;
 	replacedAttachments: DraftAttachment[];
 	actor: ActivityActor;
 }): Promise<
-	| { status: "committed"; draft: AuthoritativeDraft }
+	| { status: "committed"; draft: AuthoritativeDraft; attachmentIdentityScope: string }
 	| { status: "not_committed" }
 	| { status: "indeterminate" }
 > {
-	let draft: AuthoritativeDraft | null;
+	let outcome: Awaited<ReturnType<RecoveryStub["getDraftSaveOutcome"]>>;
 	try {
-		draft = await input.stub.getEmail(input.draftId);
+		outcome = await input.stub.getDraftSaveOutcome(
+			input.saveKey,
+			input.saveFingerprint,
+		);
 	} catch {
 		return { status: "indeterminate" };
 	}
-	const expectedAttachmentIds = input.promotion.storedMetadata
-		.map((attachment) => attachment.id)
-		.sort();
-	const actualAttachmentIds = draft?.attachments
-		.map((attachment) => attachment.id)
-		.sort() ?? [];
-	const committed = Boolean(
-		draft &&
-			draft.folder_id === "draft" &&
-			draft.draft_version === input.expectedCommittedVersion &&
-			expectedAttachmentIds.length === actualAttachmentIds.length &&
-			expectedAttachmentIds.every((id, index) => id === actualAttachmentIds[index]),
-	);
-	if (!committed || !draft) {
-		if (
-			draft &&
-			expectedAttachmentIds.some((id) => actualAttachmentIds.includes(id))
-		) {
+	if (outcome.status !== "committed") {
+		if (outcome.status === "key_conflict") {
 			return { status: "indeterminate" };
+		}
+		if (outcome.status === "claimed") {
+			if (!input.promotion.promotionOwner) {
+				return { status: "indeterminate" };
+			}
+			let aborted;
+			try {
+				aborted = await input.stub.abortDraftSave(
+					input.saveKey,
+					input.saveFingerprint,
+					input.promotion.promotionOwner,
+				);
+			} catch {
+				return { status: "indeterminate" };
+			}
+			if (aborted.status !== "aborted") return { status: "indeterminate" };
 		}
 		await rollbackAttachmentPromotion(
 			input.bucket,
@@ -76,6 +96,21 @@ export async function reconcileAmbiguousDraftSave(input: {
 			input.actor,
 		);
 		return { status: "not_committed" };
+	}
+	let draft: AuthoritativeDraft | null;
+	try {
+		draft = await input.stub.getEmail(input.draftId);
+	} catch {
+		return { status: "indeterminate" };
+	}
+	if (
+		!draft ||
+		draft.folder_id !== "draft" ||
+		draft.draft_version !== input.expectedCommittedVersion ||
+		outcome.draftId !== input.draftId ||
+		outcome.committedVersion !== input.expectedCommittedVersion
+	) {
+		return { status: "indeterminate" };
 	}
 	await completeAttachmentPromotion(
 		input.bucket,
@@ -91,5 +126,9 @@ export async function reconcileAmbiguousDraftSave(input: {
 		input.replacedAttachments,
 		input.actor,
 	);
-	return { status: "committed", draft };
+	return {
+		status: "committed",
+		draft,
+		attachmentIdentityScope: outcome.claimToken ?? input.saveKey,
+	};
 }

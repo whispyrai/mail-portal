@@ -1,9 +1,11 @@
 import { Hono, type Context } from "hono";
+import { safeAttachmentPresentationFilename } from "../../shared/attachment-filename.ts";
 import { attachmentKey } from "../lib/attachments.ts";
 import {
 	hasLiveMailboxContentAccess,
 	type MailboxContext,
 } from "../lib/mailbox.ts";
+import { safeAttachmentResponseMimeType } from "../lib/mime-type.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -29,13 +31,6 @@ export interface MailboxAttachmentByteRouteDependencies {
 	operations(c: AppContext): MailboxAttachmentByteOperations;
 	bucket(c: AppContext): MailboxAttachmentByteBucket;
 	revalidateAccess(c: AppContext): Promise<boolean>;
-}
-
-export function safeAttachmentResponseMimeType(value: string): string {
-	const normalized = value.trim().toLowerCase();
-	return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(normalized)
-		? normalized
-		: "application/octet-stream";
 }
 
 export function encodeAttachmentFilenameStar(filename: string): string {
@@ -82,10 +77,16 @@ export function createMailboxAttachmentByteRoutes(
 				"Cross-Origin-Resource-Policy": "same-origin",
 				"X-Content-Type-Options": "nosniff",
 			});
-			const sanitized = exactAttachment.filename.replace(/[\x00-\x1f"\\]/g, "_");
+			const presentationFilename = safeAttachmentPresentationFilename(
+				exactAttachment.filename,
+			);
+			const fallbackFilename = presentationFilename.replace(
+				/[^\x20-\x7e]|["\\]/g,
+				"_",
+			);
 			headers.set(
 				"Content-Disposition",
-				`attachment; filename="${sanitized}"; filename*=UTF-8''${encodeAttachmentFilenameStar(exactAttachment.filename)}`,
+				`attachment; filename="${fallbackFilename}"; filename*=UTF-8''${encodeAttachmentFilenameStar(presentationFilename)}`,
 			);
 			return new Response(object.body, { headers });
 		},

@@ -7,6 +7,10 @@ import {
 	authoredBodyReferencesInlineContentId,
 	validateInlineImageMappings,
 } from "./compose-inline-images.ts";
+import {
+	attachmentStorageId,
+	attachmentStorageSourceIdentity,
+} from "../../shared/attachment-filename.ts";
 
 export type ComposeAttachmentStatus =
 	| "uploading"
@@ -180,56 +184,66 @@ export function evaluateStoredDraftAttachments(
 	);
 }
 
-function attachmentSignature(attachment: {
-	filename: string;
-	mimetype: string;
-	size: number;
-	disposition?: string;
-	contentId?: string | null;
-}): string {
-	return JSON.stringify([
-		attachment.filename,
-		attachment.mimetype,
-		attachment.size,
-		attachment.disposition === "inline" ? "inline" : "attachment",
-		attachment.contentId ?? null,
-	]);
-}
-
 /**
  * Replace the upload/existing references represented by one committed save
  * without erasing attachments the user added or removed while it was in flight.
  */
-export function reconcileSavedComposeAttachments(
+export async function reconcileSavedComposeAttachments(
 	current: ComposeAttachmentRecord[],
 	snapshot: ComposeAttachmentRecord[],
 	draftId: string,
 	savedAttachments: Attachment[],
-): ComposeAttachmentRecord[] {
-	const savedBySignature = new Map<string, Attachment[]>();
-	for (const saved of savedAttachments) {
-		const signature = attachmentSignature({
-			filename: saved.filename,
-			mimetype: saved.mimetype,
-			size: saved.size,
-			disposition: saved.disposition,
-			contentId: saved.content_id,
-		});
-		const candidates = savedBySignature.get(signature) ?? [];
-		candidates.push(saved);
-		savedBySignature.set(signature, candidates);
-	}
+	attachmentIdentityScope?: string,
+): Promise<ComposeAttachmentRecord[]> {
+	const apply = await prepareSavedComposeAttachmentReconciliation(
+		snapshot,
+		draftId,
+		savedAttachments,
+		attachmentIdentityScope,
+	);
+	return apply(current);
+}
 
+export async function prepareSavedComposeAttachmentReconciliation(
+	snapshot: ComposeAttachmentRecord[],
+	draftId: string,
+	savedAttachments: Attachment[],
+	attachmentIdentityScope?: string,
+): Promise<(current: ComposeAttachmentRecord[]) => ComposeAttachmentRecord[]> {
 	const savedByLocalId = new Map<string, Attachment>();
+	const savedById = new Map(savedAttachments.map((saved) => [saved.id, saved]));
+	const sourceOccurrences = new Map<string, number>();
 	for (const source of snapshot) {
-		const signature = attachmentSignature(source);
-		const candidates = savedBySignature.get(signature);
-		const saved = candidates?.shift();
+		if (source.existing?.emailId === draftId) {
+			const retained = savedById.get(source.existing.attachmentId);
+			if (retained) savedByLocalId.set(source.localId, retained);
+			continue;
+		}
+		const ref = source.uploadId
+			? { kind: "upload" as const, uploadId: source.uploadId }
+			: source.existing
+				? {
+						kind: "existing" as const,
+						emailId: source.existing.emailId,
+						attachmentId: source.existing.attachmentId,
+				  }
+				: null;
+		if (!ref) continue;
+		const sourceIdentity = attachmentStorageSourceIdentity(ref);
+		const occurrence = sourceOccurrences.get(sourceIdentity) ?? 0;
+		sourceOccurrences.set(sourceIdentity, occurrence + 1);
+		const storedId = await attachmentStorageId(
+			draftId,
+			ref,
+			occurrence,
+			attachmentIdentityScope,
+		);
+		const saved = savedById.get(storedId);
 		if (saved) savedByLocalId.set(source.localId, saved);
 	}
 	const snapshotIds = new Set(snapshot.map((attachment) => attachment.localId));
 
-	return current.map((attachment) => {
+	return (current) => current.map((attachment) => {
 		if (!snapshotIds.has(attachment.localId)) return attachment;
 		const saved = savedByLocalId.get(attachment.localId);
 		if (!saved) {

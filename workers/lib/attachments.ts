@@ -19,6 +19,13 @@ import {
 	contentIdForDisposition,
 	isInlineImageMimeType,
 } from "../../shared/content-id.ts";
+import { isSesAttachmentContentId } from "./ses-attachment.ts";
+import {
+	attachmentStorageId,
+	attachmentStorageKeyPrefix,
+	attachmentStorageSourceIdentity,
+	safeAttachmentStorageFilename,
+} from "../../shared/attachment-filename.ts";
 
 /** Metadata for one stored attachment, shaped for the DO `attachments` table. */
 export type StoredAttachment = {
@@ -82,9 +89,14 @@ export function uploadKey(mailboxId: string, uploadId: string): string {
 	return `uploads/${mailboxId.toLowerCase()}/${uploadId}`;
 }
 
+/** R2 prefix preceding the storage-normalized filename. */
+export function attachmentKeyPrefix(emailId: string, attachmentId: string): string {
+	return attachmentStorageKeyPrefix(emailId, attachmentId);
+}
+
 /** R2 key for an attachment permanently stored against an email. */
 export function attachmentKey(emailId: string, attachmentId: string, filename: string): string {
-	return `attachments/${emailId}/${attachmentId}/${filename}`;
+	return `${attachmentKeyPrefix(emailId, attachmentId)}${filename}`;
 }
 
 /** Strip characters that could escape the R2 key namespace or break headers. */
@@ -106,6 +118,13 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
 	return btoa(binary);
 }
 
+function equalAttachmentBytes(left: ArrayBuffer, right: ArrayBuffer): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	const leftBytes = new Uint8Array(left);
+	const rightBytes = new Uint8Array(right);
+	return leftBytes.every((byte, index) => byte === rightBytes[index]);
+}
+
 /** Minimal DO-stub surface needed to resolve `existing` references. */
 type StubForResolve = {
 	getAttachment: (
@@ -122,10 +141,12 @@ type StubForResolve = {
 		emailId: string,
 		keys: string[],
 		actor?: ActivityActor,
+		promotionOwner?: string,
 	) => Promise<void>;
 };
 
 type ResolvedSource = {
+	attachmentId: string;
 	bytes: ArrayBuffer;
 	filename: string;
 	mimetype: string;
@@ -141,6 +162,17 @@ export type AttachmentPromotion = {
 	stagingKeys: string[];
 	/** Permanent copies to remove if the database enqueue does not commit. */
 	destinationKeys: string[];
+	/** Exclusive owner required before any permanent destination can be removed. */
+	promotionOwner?: string;
+};
+
+type AttachmentPromotionOptions = {
+	/** Additional stable operation identity for destinations shared by one Draft. */
+	identityScope?: string;
+	/** Exclusive owner recorded on permanent objects for ambiguous-write recovery. */
+	promotionOwner?: string;
+	/** Persist the complete destination intent before the first permanent write. */
+	recordDestinationIntent?: (keys: string[]) => Promise<void>;
 };
 
 async function cleanupOrQueue(
@@ -149,13 +181,25 @@ async function cleanupOrQueue(
 	emailId: string,
 	keys: string[],
 	actor: ActivityActor,
+	promotionOwner?: string,
 ) {
 	if (keys.length === 0) return;
 	try {
-		await bucket.delete(keys);
+		if (!promotionOwner) {
+			await bucket.delete(keys);
+			return;
+		}
+		const ownedKeys: string[] = [];
+		for (const key of keys) {
+			const object = await bucket.get(key);
+			if (object?.customMetadata?.promotionOwner === promotionOwner) {
+				ownedKeys.push(key);
+			}
+		}
+		if (ownedKeys.length > 0) await bucket.delete(ownedKeys);
 	} catch (error) {
 		if (!stub.queueAttachmentCleanup) throw error;
-		await stub.queueAttachmentCleanup(emailId, keys, actor);
+		await stub.queueAttachmentCleanup(emailId, keys, actor, promotionOwner);
 	}
 }
 
@@ -178,7 +222,14 @@ export async function rollbackAttachmentPromotion(
 	promotion: AttachmentPromotion,
 	actor: ActivityActor = { kind: "system" },
 ) {
-	await cleanupOrQueue(bucket, stub, emailId, promotion.destinationKeys, actor);
+	await cleanupOrQueue(
+		bucket,
+		stub,
+		emailId,
+		promotion.destinationKeys,
+		actor,
+		promotion.promotionOwner,
+	);
 }
 
 /** Delete replaced permanent objects, with the durable cleanup queue as fallback. */
@@ -217,6 +268,7 @@ export async function resolveAndPromoteAttachments(
 	newEmailId: string,
 	refs: AttachmentRef[] | undefined,
 	actor: ActivityActor = { kind: "system" },
+	options: AttachmentPromotionOptions = {},
 ): Promise<AttachmentPromotion> {
 	if (!refs?.length) {
 		return {
@@ -232,7 +284,17 @@ export async function resolveAndPromoteAttachments(
 
 	// Pass 1: locate each source and pull its bytes + metadata.
 	const sources: ResolvedSource[] = [];
+	const sourceOccurrences = new Map<string, number>();
 	for (const ref of refs) {
+		const sourceIdentity = attachmentStorageSourceIdentity(ref);
+		const occurrence = sourceOccurrences.get(sourceIdentity) ?? 0;
+		sourceOccurrences.set(sourceIdentity, occurrence + 1);
+		const attachmentId = await attachmentStorageId(
+			newEmailId,
+			ref,
+			occurrence,
+			options.identityScope,
+		);
 		if (ref.kind === "upload") {
 			const disposition: "attachment" | "inline" =
 				ref.disposition === "inline" ? "inline" : "attachment";
@@ -250,6 +312,7 @@ export async function resolveAndPromoteAttachments(
 				throw new Error("Fresh inline attachments must use an image MIME type.");
 			}
 			sources.push({
+				attachmentId,
 				bytes: await obj.arrayBuffer(),
 				filename: sanitizeFilename(meta.filename || "untitled"),
 				mimetype,
@@ -271,12 +334,24 @@ export async function resolveAndPromoteAttachments(
 			const obj = await bucket.get(attachmentKey(att.email_id, ref.attachmentId, safe));
 			if (!obj) throw new Error("A referenced attachment file is missing.");
 			sources.push({
+				attachmentId,
 				bytes: await obj.arrayBuffer(),
 				filename: safe,
 				mimetype: att.mimetype || "application/octet-stream",
 				disposition,
 				contentId: contentIdForDisposition(disposition, att.content_id),
 			});
+		}
+	}
+	for (const source of sources) {
+		if (
+			source.disposition === "inline" &&
+			source.contentId &&
+			!isSesAttachmentContentId(source.contentId)
+		) {
+			throw new Error(
+				"An inline attachment has a Content-ID that SES cannot deliver.",
+			);
 		}
 	}
 
@@ -287,22 +362,71 @@ export async function resolveAndPromoteAttachments(
 	if (setError) throw new Error(setError);
 
 	// Pass 2: promote to permanent storage + build the SES + DB payloads.
+	const destinations = sources.map((source) => {
+		const filename = safeAttachmentStorageFilename(
+			source.filename,
+			attachmentKeyPrefix(newEmailId, source.attachmentId),
+		);
+		return {
+			source,
+			filename,
+			key: attachmentKey(newEmailId, source.attachmentId, filename),
+		};
+	});
+	await options.recordDestinationIntent?.(
+		destinations.map((destination) => destination.key),
+	);
+
 	const sesAttachments: SesAttachmentInput[] = [];
 	const storedMetadata: StoredAttachment[] = [];
 	const destinationKeys: string[] = [];
 	try {
-		for (const s of sources) {
-			const attachmentId = crypto.randomUUID();
-			const destinationKey = attachmentKey(
-				newEmailId,
-				attachmentId,
-				s.filename,
-			);
-			await bucket.put(destinationKey, s.bytes);
-			destinationKeys.push(destinationKey);
+		for (const destination of destinations) {
+			const s = destination.source;
+			const attachmentId = s.attachmentId;
+			const filename = destination.filename;
+			const destinationKey = destination.key;
+			let created;
+			try {
+				created = await bucket.put(destinationKey, s.bytes, {
+					onlyIf: { etagDoesNotMatch: "*" },
+					...(options.promotionOwner
+						? { customMetadata: { promotionOwner: options.promotionOwner } }
+						: {}),
+				});
+			} catch (error) {
+				if (!options.promotionOwner) throw error;
+				const existing = await bucket.get(destinationKey);
+				if (
+					!existing ||
+					existing.customMetadata?.promotionOwner !== options.promotionOwner ||
+					!equalAttachmentBytes(await existing.arrayBuffer(), s.bytes)
+				) {
+					throw error;
+				}
+				// The object is exact and carries this operation's durable owner. It is
+				// therefore both usable and safe for this operation to clean on abort.
+				created = existing;
+			}
+			if (created) {
+				destinationKeys.push(destinationKey);
+			} else {
+				const existing = await bucket.get(destinationKey);
+				if (
+					!existing ||
+					(options.promotionOwner &&
+						existing.customMetadata?.promotionOwner !== options.promotionOwner) ||
+					!equalAttachmentBytes(await existing.arrayBuffer(), s.bytes)
+				) {
+					throw new Error(
+						"A permanent attachment identity already contains different bytes.",
+					);
+				}
+				if (options.promotionOwner) destinationKeys.push(destinationKey);
+			}
 			sesAttachments.push({
 				content: arrayBufferToBase64(s.bytes),
-				filename: s.filename,
+				filename,
 				type: s.mimetype,
 				disposition: s.disposition,
 				...(s.disposition === "inline" && s.contentId
@@ -312,7 +436,7 @@ export async function resolveAndPromoteAttachments(
 			storedMetadata.push({
 				id: attachmentId,
 				email_id: newEmailId,
-				filename: s.filename,
+				filename,
 				mimetype: s.mimetype,
 				size: s.bytes.byteLength,
 				content_id: s.contentId,
@@ -320,7 +444,16 @@ export async function resolveAndPromoteAttachments(
 			});
 		}
 	} catch (error) {
-		await cleanupOrQueue(bucket, stub, newEmailId, destinationKeys, actor);
+		await cleanupOrQueue(
+			bucket,
+			stub,
+			newEmailId,
+			options.promotionOwner
+				? destinations.map((destination) => destination.key)
+				: destinationKeys,
+			actor,
+			options.promotionOwner,
+		);
 		throw error;
 	}
 
@@ -331,5 +464,8 @@ export async function resolveAndPromoteAttachments(
 			source.stagingKey ? [source.stagingKey] : [],
 		),
 		destinationKeys,
+		...(options.promotionOwner
+			? { promotionOwner: options.promotionOwner }
+			: {}),
 	};
 }

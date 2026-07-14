@@ -30,6 +30,7 @@ function app(input: {
 	root.use("*", async (c, next) => {
 		if (input.session) c.set("session", input.session);
 		if (input.stub) c.set("mailboxStub", input.stub as never);
+		c.set("authorizedMailboxId", "team@example.com");
 		await next();
 	});
 	root.route(

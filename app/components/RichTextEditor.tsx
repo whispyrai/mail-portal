@@ -41,6 +41,7 @@ interface RichTextEditorProps {
 	onFiles?: (files: File[]) => void;
 	onInlineImages?: (files: File[]) => InlineImageInsertion[];
 	inlineImagePreviews?: Readonly<Record<string, string>>;
+	fileTransfersDisabled?: boolean;
 }
 
 export default function RichTextEditor({
@@ -49,11 +50,14 @@ export default function RichTextEditor({
 	onFiles,
 	onInlineImages,
 	inlineImagePreviews = {},
+	fileTransfersDisabled = false,
 }: RichTextEditorProps) {
 	const onFilesRef = useRef(onFiles);
 	onFilesRef.current = onFiles;
 	const onInlineImagesRef = useRef(onInlineImages);
 	onInlineImagesRef.current = onInlineImages;
+	const fileTransfersDisabledRef = useRef(fileTransfersDisabled);
+	fileTransfersDisabledRef.current = fileTransfersDisabled;
 	const editorRef = useRef<Editor | null>(null);
 	const initialValueRef = useRef(value);
 	const imageInputRef = useRef<HTMLInputElement>(null);
@@ -88,6 +92,7 @@ export default function RichTextEditor({
 		if (!onFilesRef.current && !onInlineImagesRef.current) return false;
 		const result = consumeComposeEditorFileTransfer(event, {
 			addInlineImages: (files) => {
+				if (fileTransfersDisabledRef.current) return [];
 				if (onInlineImagesRef.current) return onInlineImagesRef.current(files);
 				onFilesRef.current?.(files);
 				return [];
@@ -293,6 +298,7 @@ export default function RichTextEditor({
 						icon={<ImageIcon size={16} />}
 						onClick={() => imageInputRef.current?.click()}
 						aria-label="Insert image"
+						disabled={fileTransfersDisabled}
 					/>
 				</Tooltip>
 				<input
@@ -300,9 +306,14 @@ export default function RichTextEditor({
 					type="file"
 					accept="image/*"
 					multiple
+					disabled={fileTransfersDisabled}
 					className="hidden"
 					aria-label="Choose images to insert"
 					onChange={(event) => {
+						if (fileTransfersDisabledRef.current) {
+							event.target.value = "";
+							return;
+						}
 						const files = Array.from(event.target.files ?? []);
 						const position = editor.state.selection.from;
 						const insertions = onInlineImagesRef.current?.(files) ?? [];

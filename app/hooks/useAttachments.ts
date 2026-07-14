@@ -12,7 +12,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import api from "~/services/api";
 import {
 	recoverComposeAttachments,
-	reconcileSavedComposeAttachments,
+	prepareSavedComposeAttachmentReconciliation,
 	type ComposeAttachmentRecord,
 } from "~/lib/compose-attachment-policy";
 import { planComposeAttachmentAdmission } from "~/lib/compose-attachment-admission";
@@ -86,7 +86,7 @@ export function useAttachments(mailboxId: string | undefined) {
 				return;
 			}
 			try {
-				const res = await api.uploadAttachment(mailboxId, file, signal);
+				const res = await api.uploadAttachment(mailboxId, localId, file, signal);
 				if (!attempts.isCurrent(localId, token)) return;
 				commitAttachments((prev) =>
 					prev.map((a) =>
@@ -284,19 +284,19 @@ export function useAttachments(mailboxId: string | undefined) {
 	}, [commitAttachments]);
 
 	const reconcileSavedDraft = useCallback(
-		(
+		async (
 			emailId: string,
 			snapshot: ComposeAttachment[],
 			draftAttachments?: Attachment[],
+			attachmentIdentityScope?: string,
 		) => {
-			const reconciled = reconcileSavedComposeAttachments(
-				attachmentsRef.current,
+			const apply = await prepareSavedComposeAttachmentReconciliation(
 				snapshot,
 				emailId,
 				draftAttachments ?? [],
+				attachmentIdentityScope,
 			);
-			commitAttachments(reconciled);
-			return reconciled;
+			return commitAttachments((current) => apply(current));
 		},
 		[commitAttachments],
 	);

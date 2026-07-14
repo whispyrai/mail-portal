@@ -33,8 +33,11 @@ import {
 import {
 	arrayBufferToBase64,
 	attachmentKey,
+	attachmentKeyPrefix,
 	uploadKey,
 } from "../lib/attachments";
+import { safeAttachmentStorageFilename } from "../../shared/attachment-filename.ts";
+import { isCanonicalAttachmentUploadId } from "../lib/attachment-upload-id.ts";
 import {
 	ATTACHMENT_LIMITS,
 	validateAttachmentSet,
@@ -352,11 +355,16 @@ interface AttachmentData {
 // ── Bulk send (mail merge, F-06) ───────────────────────────────────
 
 const ATTACHMENT_CLEANUP_QUEUE_KEY = "attachment-cleanup:queue";
+const DRAFT_SAVE_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const DRAFT_SAVE_PRUNE_BATCH = 100;
+const DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS = 5 * 60_000;
+const DRAFT_SAVE_CLEANUP_MAX_DELAY_MS = 24 * 60 * 60_000;
 
 type AttachmentCleanupJob = {
 	id: string;
 	emailId: string;
 	keys: string[];
+	promotionOwner?: string;
 	attempts: number;
 	createdAt: number;
 };
@@ -2055,6 +2063,7 @@ export class MailboxDO extends DurableObject<Env> {
 				email.draft_version,
 				occurredAt,
 			);
+			this.#refreshTerminalDraftSaveRetention(id, occurredAt);
 			this.db.delete(schema.emails).where(eq(schema.emails.id, id)).run();
 		});
 
@@ -2105,6 +2114,7 @@ export class MailboxDO extends DurableObject<Env> {
 				expectedVersion,
 				occurredAt,
 			);
+			this.#refreshTerminalDraftSaveRetention(id, occurredAt);
 			this.db
 				.delete(schema.emails)
 				.where(
@@ -2230,6 +2240,19 @@ export class MailboxDO extends DurableObject<Env> {
 			.run();
 	}
 
+	#refreshTerminalDraftSaveRetention(draftId: string, updatedAt: string) {
+		this.db
+			.update(schema.draftSaveOperations)
+			.set({ updated_at: updatedAt })
+			.where(
+				and(
+					eq(schema.draftSaveOperations.draft_id, draftId),
+					inArray(schema.draftSaveOperations.state, ["committed", "aborted"]),
+				),
+			)
+			.run();
+	}
+
 	#getDraftCreateReplay(createKey: string, fingerprint: string) {
 		const record = this.#getDraftCreateRecord(createKey);
 		if (
@@ -2289,6 +2312,331 @@ export class MailboxDO extends DurableObject<Env> {
 		return this.#getDraftCreateReplay(createKey, fingerprint);
 	}
 
+	async claimDraftSave(input: {
+		saveKey: string;
+		fingerprint: string;
+		draftId: string;
+		expectedVersion: number;
+		claimToken: string;
+		claimExpiresAt: number;
+	}) {
+		const claim = this.ctx.storage.transactionSync(() => {
+			const now = Date.now();
+			const retentionCutoff = new Date(
+				now - DRAFT_SAVE_REPLAY_RETENTION_MS,
+			).toISOString();
+			this.ctx.storage.sql.exec(
+				`DELETE FROM draft_save_operations
+				 WHERE save_key IN (
+					SELECT save_key
+					FROM draft_save_operations
+					WHERE state IN ('committed', 'aborted')
+					  AND updated_at <= ?
+					ORDER BY updated_at, save_key
+					LIMIT ?
+				 )`,
+				retentionCutoff,
+				DRAFT_SAVE_PRUNE_BATCH,
+			);
+			const existingOperation = this.db
+				.select()
+				.from(schema.draftSaveOperations)
+				.where(eq(schema.draftSaveOperations.save_key, input.saveKey))
+				.get();
+			if (
+				existingOperation &&
+				(existingOperation.fingerprint !== input.fingerprint ||
+					existingOperation.draft_id !== input.draftId ||
+					existingOperation.expected_version !== input.expectedVersion)
+			) {
+				return { status: "key_conflict" as const };
+			}
+			if (existingOperation?.state === "committed") {
+				return {
+					status: "committed" as const,
+					draftId: existingOperation.draft_id,
+					committedVersion: existingOperation.committed_version,
+					claimToken: existingOperation.claim_token,
+				};
+			}
+			if (
+				existingOperation?.state === "claimed" &&
+				existingOperation.claim_expires_at > now
+			) {
+				return { status: "in_progress" as const };
+			}
+
+			const expiredOperations = this.db
+				.select({
+					saveKey: schema.draftSaveOperations.save_key,
+					destinationKeys: schema.draftSaveOperations.destination_keys,
+					claimToken: schema.draftSaveOperations.claim_token,
+				})
+				.from(schema.draftSaveOperations)
+				.where(
+					and(
+						eq(schema.draftSaveOperations.draft_id, input.draftId),
+						eq(
+							schema.draftSaveOperations.expected_version,
+							input.expectedVersion,
+						),
+						eq(schema.draftSaveOperations.state, "claimed"),
+						lte(schema.draftSaveOperations.claim_expires_at, now),
+					),
+				)
+				.all();
+			const stalePromotions = expiredOperations.flatMap((operation) => {
+				const parsed: unknown = JSON.parse(operation.destinationKeys);
+				const destinationKeys = Array.isArray(parsed)
+					? parsed.filter((key): key is string => typeof key === "string")
+					: [];
+				return destinationKeys.length > 0
+					? [{
+							destinationKeys,
+							promotionOwner: operation.claimToken ?? operation.saveKey,
+						}]
+					: [];
+			});
+			const occurredAt = new Date(now).toISOString();
+			for (const stalePromotion of stalePromotions) {
+				this.db
+					.insert(schema.draftSaveCleanupIntents)
+					.values({
+						claim_token: stalePromotion.promotionOwner,
+						draft_id: input.draftId,
+						destination_keys: JSON.stringify(stalePromotion.destinationKeys),
+						next_attempt_at: now + DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS,
+						verify_until: now + DRAFT_SAVE_REPLAY_RETENTION_MS,
+						attempts: 0,
+						updated_at: occurredAt,
+					})
+					.onConflictDoUpdate({
+						target: schema.draftSaveCleanupIntents.claim_token,
+						set: {
+							destination_keys: JSON.stringify(stalePromotion.destinationKeys),
+							next_attempt_at: now + DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS,
+							verify_until: now + DRAFT_SAVE_REPLAY_RETENTION_MS,
+							updated_at: occurredAt,
+						},
+					})
+					.run();
+			}
+			this.db
+				.update(schema.draftSaveOperations)
+				.set({ state: "aborted", updated_at: new Date(now).toISOString() })
+				.where(
+					and(
+						eq(schema.draftSaveOperations.draft_id, input.draftId),
+						eq(
+							schema.draftSaveOperations.expected_version,
+							input.expectedVersion,
+						),
+						eq(schema.draftSaveOperations.state, "claimed"),
+						lte(schema.draftSaveOperations.claim_expires_at, now),
+					),
+				)
+				.run();
+			const competingOperation = this.db
+				.select({ saveKey: schema.draftSaveOperations.save_key })
+				.from(schema.draftSaveOperations)
+				.where(
+					and(
+						eq(schema.draftSaveOperations.draft_id, input.draftId),
+						eq(
+							schema.draftSaveOperations.expected_version,
+							input.expectedVersion,
+						),
+						eq(schema.draftSaveOperations.state, "claimed"),
+					),
+				)
+				.get();
+			if (competingOperation) {
+				return { status: "revision_in_progress" as const };
+			}
+
+			const draft = this.db
+				.select({
+					folderId: schema.emails.folder_id,
+					draftVersion: schema.emails.draft_version,
+				})
+				.from(schema.emails)
+				.where(eq(schema.emails.id, input.draftId))
+				.get();
+			if (input.expectedVersion === 0) {
+				if (draft) {
+					return {
+						status: "version_conflict" as const,
+						currentVersion: draft.draftVersion,
+					};
+				}
+			} else if (!draft) {
+				return { status: "not_found" as const };
+			} else if (draft.folderId !== Folders.DRAFT) {
+				return { status: "not_draft" as const };
+			} else if (draft.draftVersion !== input.expectedVersion) {
+				return {
+					status: "version_conflict" as const,
+					currentVersion: draft.draftVersion,
+				};
+			}
+
+			this.db
+				.insert(schema.draftSaveOperations)
+				.values({
+					save_key: input.saveKey,
+					fingerprint: input.fingerprint,
+					draft_id: input.draftId,
+					expected_version: input.expectedVersion,
+					state: "claimed",
+					destination_keys: "[]",
+					committed_version: null,
+					claim_expires_at: input.claimExpiresAt,
+					claim_token: input.claimToken,
+					updated_at: occurredAt,
+				})
+				.onConflictDoUpdate({
+					target: schema.draftSaveOperations.save_key,
+					set: {
+						state: "claimed",
+						destination_keys: "[]",
+						committed_version: null,
+						claim_expires_at: input.claimExpiresAt,
+						claim_token: input.claimToken,
+						updated_at: occurredAt,
+					},
+				})
+				.run();
+			return { status: "claimed" as const, stalePromotions };
+		});
+		if (claim.status === "claimed" && claim.stalePromotions.length > 0) {
+			await this.#scheduleAlarmAt(
+				Date.now() + DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS,
+			);
+		}
+		return claim;
+	}
+
+	async recordDraftSavePromotion(
+		saveKey: string,
+		fingerprint: string,
+		claimToken: string,
+		destinationKeys: string[],
+	) {
+		return this.ctx.storage.transactionSync(() => {
+			const serializedDestinationKeys = JSON.stringify(destinationKeys);
+			this.db
+				.update(schema.draftSaveOperations)
+				.set({
+					destination_keys: serializedDestinationKeys,
+					updated_at: new Date().toISOString(),
+				})
+				.where(
+					and(
+						eq(schema.draftSaveOperations.save_key, saveKey),
+						eq(schema.draftSaveOperations.fingerprint, fingerprint),
+						eq(schema.draftSaveOperations.claim_token, claimToken),
+						eq(schema.draftSaveOperations.state, "claimed"),
+					),
+				)
+				.run();
+			const recorded = this.db
+				.select({ destinationKeys: schema.draftSaveOperations.destination_keys })
+				.from(schema.draftSaveOperations)
+				.where(
+					and(
+						eq(schema.draftSaveOperations.save_key, saveKey),
+						eq(schema.draftSaveOperations.fingerprint, fingerprint),
+						eq(schema.draftSaveOperations.claim_token, claimToken),
+						eq(schema.draftSaveOperations.state, "claimed"),
+					),
+				)
+				.get();
+			return recorded?.destinationKeys === serializedDestinationKeys;
+		});
+	}
+
+	async abortDraftSave(saveKey: string, fingerprint: string, claimToken: string) {
+		return this.ctx.storage.transactionSync(() => {
+			const operation = this.db
+				.select({ destinationKeys: schema.draftSaveOperations.destination_keys })
+				.from(schema.draftSaveOperations)
+				.where(
+					and(
+						eq(schema.draftSaveOperations.save_key, saveKey),
+						eq(schema.draftSaveOperations.fingerprint, fingerprint),
+						eq(schema.draftSaveOperations.claim_token, claimToken),
+						eq(schema.draftSaveOperations.state, "claimed"),
+					),
+				)
+				.get();
+			if (!operation) return { status: "not_claimed" as const, destinationKeys: [] };
+			this.db
+				.update(schema.draftSaveOperations)
+				.set({ state: "aborted", updated_at: new Date().toISOString() })
+				.where(
+					and(
+						eq(schema.draftSaveOperations.save_key, saveKey),
+						eq(schema.draftSaveOperations.fingerprint, fingerprint),
+						eq(schema.draftSaveOperations.claim_token, claimToken),
+						eq(schema.draftSaveOperations.state, "claimed"),
+					),
+				)
+				.run();
+			const parsed: unknown = JSON.parse(operation.destinationKeys);
+			return {
+				status: "aborted" as const,
+				promotionOwner: claimToken,
+				destinationKeys: Array.isArray(parsed)
+					? parsed.filter((key): key is string => typeof key === "string")
+					: [],
+			};
+		});
+	}
+
+	async getDraftSaveOutcome(saveKey: string, fingerprint: string) {
+		const operation = this.db
+			.select()
+			.from(schema.draftSaveOperations)
+			.where(eq(schema.draftSaveOperations.save_key, saveKey))
+			.get();
+		if (!operation) return { status: "missing" as const };
+		if (operation.fingerprint !== fingerprint) {
+			return { status: "key_conflict" as const };
+		}
+		return {
+			status: operation.state,
+			draftId: operation.draft_id,
+			committedVersion: operation.committed_version,
+			claimToken: operation.claim_token,
+		};
+	}
+
+	async getCommittedDraftAttachmentScope(
+		draftId: string,
+		committedVersion: number,
+	) {
+		const operation = this.db
+			.select({
+				saveKey: schema.draftSaveOperations.save_key,
+				claimToken: schema.draftSaveOperations.claim_token,
+			})
+			.from(schema.draftSaveOperations)
+			.where(
+				and(
+					eq(schema.draftSaveOperations.draft_id, draftId),
+					eq(schema.draftSaveOperations.state, "committed"),
+					eq(
+						schema.draftSaveOperations.committed_version,
+						committedVersion,
+					),
+				),
+			)
+			.orderBy(desc(schema.draftSaveOperations.updated_at))
+			.limit(1)
+			.get();
+		return operation ? operation.claimToken ?? operation.saveKey : null;
+	}
+
 	/**
 	 * Create or replace a draft in one SQL transaction. Existing drafts require
 	 * an exact expected version so two browser sessions cannot silently replace
@@ -2308,11 +2656,40 @@ export class MailboxDO extends DurableObject<Env> {
 			body: string;
 			in_reply_to: string | null;
 			thread_id: string;
+			saveKey?: string;
+			saveFingerprint?: string;
+			saveClaimToken?: string;
 		},
 		attachments: AttachmentData[],
 		actor: ActivityActor = { kind: "system" },
 	) {
 		return this.ctx.storage.transactionSync(() => {
+			const hasSaveClaim = Boolean(
+				input.saveKey || input.saveFingerprint || input.saveClaimToken,
+			);
+			if (
+				hasSaveClaim &&
+				(!input.saveKey || !input.saveFingerprint || !input.saveClaimToken)
+			) {
+				return { status: "save_claim_lost" as const };
+			}
+			if (input.saveKey && input.saveFingerprint && input.saveClaimToken) {
+				const claim = this.db
+					.select()
+					.from(schema.draftSaveOperations)
+					.where(eq(schema.draftSaveOperations.save_key, input.saveKey))
+					.get();
+				if (
+					!claim ||
+					claim.fingerprint !== input.saveFingerprint ||
+					claim.claim_token !== input.saveClaimToken ||
+					claim.draft_id !== input.id ||
+					claim.expected_version !== (input.expectedVersion ?? 0) ||
+					claim.state !== "claimed"
+				) {
+					return { status: "save_claim_lost" as const };
+				}
+			}
 			if (input.createKey && input.createFingerprint) {
 				const replay = this.#getDraftCreateReplay(
 					input.createKey,
@@ -2445,6 +2822,30 @@ export class MailboxDO extends DurableObject<Env> {
 			if (attachments.length > 0) {
 				this.db.insert(schema.attachments).values(attachments).run();
 			}
+			if (input.saveKey && input.saveFingerprint && input.saveClaimToken) {
+				this.db
+					.update(schema.draftSaveOperations)
+					.set({
+						state: "committed",
+						committed_version: draftVersion,
+						updated_at: occurredAt,
+					})
+					.where(
+						and(
+							eq(schema.draftSaveOperations.save_key, input.saveKey),
+							eq(
+								schema.draftSaveOperations.fingerprint,
+								input.saveFingerprint,
+							),
+							eq(
+								schema.draftSaveOperations.claim_token,
+								input.saveClaimToken,
+							),
+							eq(schema.draftSaveOperations.state, "claimed"),
+						),
+					)
+					.run();
+			}
 			this.#recordActivity(
 				actor,
 				existing ? "draft_updated" : "draft_created",
@@ -2503,6 +2904,7 @@ export class MailboxDO extends DurableObject<Env> {
 				expectedVersion,
 				occurredAt,
 			);
+			this.#refreshTerminalDraftSaveRetention(id, occurredAt);
 			this.db
 				.delete(schema.emails)
 				.where(
@@ -2527,10 +2929,107 @@ export class MailboxDO extends DurableObject<Env> {
 		});
 	}
 
+	#nextDraftSaveCleanupAt() {
+		return this.db
+			.select({ nextAttemptAt: schema.draftSaveCleanupIntents.next_attempt_at })
+			.from(schema.draftSaveCleanupIntents)
+			.orderBy(
+				asc(schema.draftSaveCleanupIntents.next_attempt_at),
+				asc(schema.draftSaveCleanupIntents.claim_token),
+			)
+			.limit(1)
+			.get()?.nextAttemptAt ?? null;
+	}
+
+	async #processDraftSaveCleanup(now: number): Promise<number | null> {
+		const intent = this.db
+			.select()
+			.from(schema.draftSaveCleanupIntents)
+			.where(lte(schema.draftSaveCleanupIntents.next_attempt_at, now))
+			.orderBy(
+				asc(schema.draftSaveCleanupIntents.next_attempt_at),
+				asc(schema.draftSaveCleanupIntents.claim_token),
+			)
+			.limit(1)
+			.get();
+		if (!intent) return this.#nextDraftSaveCleanupAt();
+
+		let succeeded = false;
+		try {
+			const parsed: unknown = JSON.parse(intent.destination_keys);
+			const keys = Array.isArray(parsed)
+				? parsed.filter((key): key is string => typeof key === "string")
+				: [];
+			const ownedKeys: string[] = [];
+			for (const key of keys) {
+				const object = await this.env.BUCKET.get(key);
+				if (object?.customMetadata?.promotionOwner === intent.claim_token) {
+					ownedKeys.push(key);
+				}
+			}
+			if (ownedKeys.length > 0) await this.env.BUCKET.delete(ownedKeys);
+			succeeded = true;
+		} catch (error) {
+			console.error("[draft-save-cleanup] verification failed", {
+				draftId: intent.draft_id,
+				attempts: intent.attempts + 1,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
+		const completedAt = Date.now();
+		this.ctx.storage.transactionSync(() => {
+			const current = this.db
+				.select()
+				.from(schema.draftSaveCleanupIntents)
+				.where(
+					eq(
+						schema.draftSaveCleanupIntents.claim_token,
+						intent.claim_token,
+					),
+				)
+				.get();
+			if (!current) return;
+			if (succeeded && completedAt >= current.verify_until) {
+				this.db
+					.delete(schema.draftSaveCleanupIntents)
+					.where(
+						eq(
+							schema.draftSaveCleanupIntents.claim_token,
+							intent.claim_token,
+						),
+					)
+					.run();
+				return;
+			}
+			const attempts = current.attempts + 1;
+			const delay = Math.min(
+				DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS * 2 ** Math.min(attempts, 8),
+				DRAFT_SAVE_CLEANUP_MAX_DELAY_MS,
+			);
+			this.db
+				.update(schema.draftSaveCleanupIntents)
+				.set({
+					attempts,
+					next_attempt_at: completedAt + delay,
+					updated_at: new Date(completedAt).toISOString(),
+				})
+				.where(
+					eq(
+						schema.draftSaveCleanupIntents.claim_token,
+						intent.claim_token,
+					),
+				)
+				.run();
+		});
+		return this.#nextDraftSaveCleanupAt();
+	}
+
 	async queueAttachmentCleanup(
 		emailId: string,
 		keys: string[],
 		actor: ActivityActor = { kind: "system" },
+		promotionOwner?: string,
 	) {
 		if (keys.length === 0) return;
 		const queue =
@@ -2541,6 +3040,7 @@ export class MailboxDO extends DurableObject<Env> {
 			id: crypto.randomUUID(),
 			emailId,
 			keys,
+			...(promotionOwner ? { promotionOwner } : {}),
 			attempts: 0,
 			createdAt: Date.now(),
 		});
@@ -2561,9 +3061,21 @@ export class MailboxDO extends DurableObject<Env> {
 			)) ?? [];
 		const job = queue[0];
 		if (!job) return false;
+		let succeeded = false;
 		try {
-			await this.env.BUCKET.delete(job.keys);
-			queue.shift();
+			if (job.promotionOwner) {
+				const ownedKeys: string[] = [];
+				for (const key of job.keys) {
+					const object = await this.env.BUCKET.get(key);
+					if (object?.customMetadata?.promotionOwner === job.promotionOwner) {
+						ownedKeys.push(key);
+					}
+				}
+				if (ownedKeys.length > 0) await this.env.BUCKET.delete(ownedKeys);
+			} else {
+				await this.env.BUCKET.delete(job.keys);
+			}
+			succeeded = true;
 			this.#recordActivity(
 				{ kind: "system" },
 				"attachment_cleanup_completed",
@@ -2572,15 +3084,27 @@ export class MailboxDO extends DurableObject<Env> {
 				{ objectCount: job.keys.length, attempts: job.attempts + 1 },
 			);
 		} catch (error) {
-			job.attempts += 1;
 			console.error("[attachment-cleanup] retry failed", {
 				emailId: job.emailId,
-				attempts: job.attempts,
+				attempts: job.attempts + 1,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
-		await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, queue);
-		return queue.length > 0;
+		// R2 I/O yields the input gate. Re-read before finalization so a cleanup
+		// queued during that yield cannot be overwritten by this job's old snapshot.
+		const latestQueue =
+			(await this.ctx.storage.get<AttachmentCleanupJob[]>(
+				ATTACHMENT_CLEANUP_QUEUE_KEY,
+			)) ?? [];
+		const latestJob = latestQueue.find((candidate) => candidate.id === job.id);
+		if (succeeded) {
+			const remaining = latestQueue.filter((candidate) => candidate.id !== job.id);
+			await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, remaining);
+			return remaining.length > 0;
+		}
+		if (latestJob) latestJob.attempts += 1;
+		await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, latestQueue);
+		return latestQueue.length > 0;
 	}
 
 	#activeOutboundDeliveryForEmail(emailId: string) {
@@ -5744,7 +6268,9 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 		if (
 			(input.attachmentUploadIds ?? []).some(
-				(uploadId) => typeof uploadId !== "string" || !uuid.test(uploadId),
+				(uploadId) =>
+					typeof uploadId !== "string" ||
+					!isCanonicalAttachmentUploadId(uploadId),
 			)
 		) {
 			return {
@@ -6204,17 +6730,20 @@ export class MailboxDO extends DurableObject<Env> {
 		const key = this.#bulkRecipientPreparationKey(job.id, job.cursor);
 		const existing = this.ctx.storage.kv.get<BulkRecipientPreparation>(key);
 		if (existing) return existing;
-		const attachments = job.attachments.map(
-			(attachment, index) =>
-				({
-					id: `bulk_attachment_${index}_${crypto.randomUUID()}`,
+		const attachments = job.attachments.map((attachment, index) => {
+			const id = `bulk_attachment_${index}_${crypto.randomUUID()}`;
+			return {
+					id,
 					email_id: messageId,
-					filename: attachment.filename,
+					filename: safeAttachmentStorageFilename(
+						attachment.filename,
+						attachmentKeyPrefix(messageId, id),
+					),
 					mimetype: attachment.type,
 					size: attachment.size,
 					disposition: "attachment",
-				}) satisfies PendingOutboundAttachment,
-		);
+				} satisfies PendingOutboundAttachment;
+		});
 		const keys = attachments.map((attachment) =>
 			attachmentKey(messageId, attachment.id, attachment.filename),
 		);
@@ -6574,6 +7103,12 @@ export class MailboxDO extends DurableObject<Env> {
 		]);
 		if (nextSnoozeAlarm !== null) {
 			await this.#scheduleAlarmAt(Math.max(alarmNow, nextSnoozeAlarm));
+		}
+		const nextDraftSaveCleanupAt = await this.#processDraftSaveCleanup(alarmNow);
+		if (nextDraftSaveCleanupAt !== null) {
+			await this.#scheduleAlarmAt(
+				Math.max(Date.now() + 100, nextDraftSaveCleanupAt),
+			);
 		}
 		const cleanupPending = await this.#processAttachmentCleanup();
 		await this.#processBulkAttachmentCleanup();

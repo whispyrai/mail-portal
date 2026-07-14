@@ -2,14 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	completeAttachmentPromotion,
+	attachmentKeyPrefix,
 	resolveAndPromoteAttachments,
 	rollbackAttachmentPromotion,
 	uploadKey,
 } from "./attachments.ts";
+import {
+	R2_OBJECT_KEY_MAX_BYTES,
+	safeAttachmentStorageFilename,
+} from "../../shared/attachment-filename.ts";
 
 function bucketFixture(options: { failDelete?: boolean } = {}) {
 	const objects = new Map<string, ArrayBuffer>();
-	const metadata = new Map<string, { filename: string; type: string }>();
+	const metadata = new Map<
+		string,
+		{ filename: string; type: string; promotionOwner?: string }
+	>();
 	const deleted: string[][] = [];
 	return {
 		objects,
@@ -30,8 +38,26 @@ function bucketFixture(options: { failDelete?: boolean } = {}) {
 					},
 				};
 			},
-			async put(key: string, bytes: ArrayBuffer) {
+			async put(
+				key: string,
+				bytes: ArrayBuffer,
+				options?: {
+					onlyIf?: { etagDoesNotMatch?: string };
+					customMetadata?: { filename?: string; type?: string; promotionOwner?: string };
+				},
+			) {
+				if (options?.onlyIf?.etagDoesNotMatch === "*" && objects.has(key)) {
+					return null;
+				}
 				objects.set(key, bytes.slice(0));
+				if (options?.customMetadata) {
+					metadata.set(key, {
+						filename: options.customMetadata.filename ?? "proposal.pdf",
+						type: options.customMetadata.type ?? "application/pdf",
+						...options.customMetadata,
+					});
+				}
+				return { etag: "created" };
 			},
 			async delete(keys: string | string[]) {
 				const list = Array.isArray(keys) ? keys : [keys];
@@ -42,6 +68,91 @@ function bucketFixture(options: { failDelete?: boolean } = {}) {
 		} as never,
 	};
 }
+
+test("a conditional put that commits then throws is confirmed by exact owner readback", async () => {
+	const fixture = bucketFixture();
+	const stagingKey = uploadKey("team@example.com", "upload-ambiguous");
+	fixture.objects.set(stagingKey, new Uint8Array([1, 2, 3]).buffer);
+	const normalPut = fixture.bucket.put.bind(fixture.bucket);
+	let threwAfterCommit = false;
+	const bucket = {
+		...fixture.bucket,
+		async put(...args: Parameters<typeof normalPut>) {
+			const result = await normalPut(...args);
+			if (!threwAfterCommit) {
+				threwAfterCommit = true;
+				throw new Error("R2 response lost");
+			}
+			return result;
+		},
+	};
+	const promotion = await resolveAndPromoteAttachments(
+		bucket,
+		{ async getAttachment() { return null; }, async queueAttachmentCleanup() {} },
+		"team@example.com",
+		"draft-ambiguous",
+		[{ kind: "upload", uploadId: "upload-ambiguous" }],
+		actor,
+		{ promotionOwner: "save-ambiguous" },
+	);
+
+	assert.equal(promotion.destinationKeys.length, 1);
+	assert.equal(fixture.objects.has(promotion.destinationKeys[0]!), true);
+});
+
+test("an unconfirmable committed put queues the full owner-scoped destination intent", async () => {
+	const fixture = bucketFixture();
+	const stagingKey = uploadKey("team@example.com", "upload-unconfirmable");
+	fixture.objects.set(stagingKey, new Uint8Array([1, 2, 3]).buffer);
+	const normalGet = fixture.bucket.get.bind(fixture.bucket);
+	const normalPut = fixture.bucket.put.bind(fixture.bucket);
+	let putThrew = false;
+	let intendedKeys: string[] = [];
+	const queued: Array<{ keys: string[]; owner?: string }> = [];
+	const bucket = {
+		...fixture.bucket,
+		async get(key: string) {
+			if (putThrew && key.startsWith("attachments/")) {
+				throw new Error("R2 confirmation read unavailable");
+			}
+			return normalGet(key);
+		},
+		async put(...args: Parameters<typeof normalPut>) {
+			await normalPut(...args);
+			putThrew = true;
+			throw new Error("R2 response lost");
+		},
+	};
+
+	await assert.rejects(
+		resolveAndPromoteAttachments(
+			bucket,
+			{
+				async getAttachment() { return null; },
+				async queueAttachmentCleanup(
+					_emailId: string,
+					keys: string[],
+					_actor: unknown,
+					owner?: string,
+				) {
+					queued.push({ keys, owner });
+				},
+			},
+			"team@example.com",
+			"draft-unconfirmable",
+			[{ kind: "upload", uploadId: "upload-unconfirmable" }],
+			actor,
+			{
+				promotionOwner: "save-unconfirmable",
+				async recordDestinationIntent(keys) { intendedKeys = keys; },
+			},
+		),
+		/R2 confirmation read unavailable/,
+	);
+
+	assert.equal(intendedKeys.length, 1);
+	assert.deepEqual(queued, [{ keys: intendedKeys, owner: "save-unconfirmable" }]);
+});
 
 const actor = { kind: "user" as const, id: "user-1" };
 
@@ -81,6 +192,39 @@ test("staging survives promotion until the durable enqueue succeeds", async () =
 	assert.deepEqual(queued, []);
 });
 
+test("promotion re-budgets a staging filename for the actual destination prefix", async () => {
+	const fixture = bucketFixture();
+	const stagingKey = uploadKey("team@example.com", "upload-long");
+	const sourceFilename = safeAttachmentStorageFilename(
+		`${"😀".repeat(400)}.pdf`,
+		attachmentKeyPrefix(crypto.randomUUID(), crypto.randomUUID()),
+	);
+	fixture.objects.set(stagingKey, new Uint8Array([1, 2, 3]).buffer);
+	fixture.metadata.set(stagingKey, {
+		filename: sourceFilename,
+		type: "application/pdf",
+	});
+
+	const promotion = await resolveAndPromoteAttachments(
+		fixture.bucket,
+		{
+			async getAttachment() { return null; },
+			async queueAttachmentCleanup() {},
+		},
+		"team@example.com",
+		`draft_recovered_${crypto.randomUUID()}`,
+		[{ kind: "upload", uploadId: "upload-long" }],
+		actor,
+	);
+	const destinationKey = promotion.destinationKeys[0]!;
+	const filename = promotion.storedMetadata[0]!.filename;
+
+	assert.ok(new TextEncoder().encode(destinationKey).byteLength <= R2_OBJECT_KEY_MAX_BYTES);
+	assert.notEqual(filename, sourceFilename);
+	assert.equal(destinationKey.endsWith(`/${filename}`), true);
+	assert.equal(promotion.sesAttachments[0]?.filename, filename);
+});
+
 test("failed enqueue removes destination copies but retains staging for retry", async () => {
 	const fixture = bucketFixture();
 	const stagingKey = uploadKey("team@example.com", "upload-1");
@@ -108,6 +252,138 @@ test("failed enqueue removes destination copies but retains staging for retry", 
 
 	assert.equal(fixture.objects.has(stagingKey), true);
 	assert.equal(fixture.objects.has(promotion.destinationKeys[0]!), false);
+});
+
+test("rollback only removes permanent objects owned by the promotion receipt", async () => {
+	const fixture = bucketFixture();
+	const stagingKey = uploadKey("team@example.com", "upload-owned-rollback");
+	fixture.objects.set(stagingKey, new Uint8Array([1, 2, 3]).buffer);
+	const promotion = await resolveAndPromoteAttachments(
+		fixture.bucket,
+		{ async getAttachment() { return null; }, async queueAttachmentCleanup() {} },
+		"team@example.com",
+		"draft-owned-rollback",
+		[{ kind: "upload", uploadId: "upload-owned-rollback" }],
+		actor,
+		{ promotionOwner: "claim-a" },
+	);
+
+	assert.equal(promotion.promotionOwner, "claim-a");
+	const destinationKey = promotion.destinationKeys[0]!;
+	fixture.metadata.set(destinationKey, {
+		filename: promotion.storedMetadata[0]!.filename,
+		type: promotion.storedMetadata[0]!.mimetype,
+		promotionOwner: "claim-b",
+	});
+
+	await rollbackAttachmentPromotion(
+		fixture.bucket,
+		{ async getAttachment() { return null; }, async queueAttachmentCleanup() {} },
+		"draft-owned-rollback",
+		promotion,
+		actor,
+	);
+
+	assert.equal(fixture.objects.has(destinationKey), true);
+});
+
+test("a reclaimed Draft claim cannot be blocked by an expired generation's late write", async () => {
+	const fixture = bucketFixture();
+	fixture.objects.set(
+		uploadKey("team@example.com", "upload-reclaimed"),
+		new Uint8Array([1, 2, 3]).buffer,
+	);
+	const promote = (claimToken: string) => resolveAndPromoteAttachments(
+		fixture.bucket,
+		{ async getAttachment() { return null; }, async queueAttachmentCleanup() {} },
+		"team@example.com",
+		"draft-reclaimed",
+		[{ kind: "upload", uploadId: "upload-reclaimed" }],
+		actor,
+		{ identityScope: claimToken, promotionOwner: claimToken },
+	);
+
+	const oldPlan = await promote("claim-old");
+	await rollbackAttachmentPromotion(
+		fixture.bucket,
+		{ async getAttachment() { return null; }, async queueAttachmentCleanup() {} },
+		"draft-reclaimed",
+		oldPlan,
+		actor,
+	);
+	const lateOldWrite = await promote("claim-old");
+	const replacement = await promote("claim-new");
+
+	assert.notDeepEqual(lateOldWrite.destinationKeys, replacement.destinationKeys);
+	assert.equal(fixture.objects.has(lateOldWrite.destinationKeys[0]!), true);
+	assert.equal(fixture.objects.has(replacement.destinationKeys[0]!), true);
+});
+
+test("lost-response retry cannot roll back the committed attachment winner", async () => {
+	const fixture = bucketFixture();
+	const stagingKey = uploadKey("team@example.com", "upload-retry");
+	fixture.objects.set(stagingKey, new Uint8Array([1, 2, 3]).buffer);
+	const stub = {
+		async getAttachment() { return null; },
+		async queueAttachmentCleanup() {},
+	};
+	const promote = () => resolveAndPromoteAttachments(
+		fixture.bucket,
+		stub,
+		"team@example.com",
+		"draft-1",
+		[{ kind: "upload" as const, uploadId: "upload-retry" }],
+		actor,
+	);
+
+	const committed = await promote();
+	const staleRetry = await promote();
+	assert.equal(committed.destinationKeys.length, 1);
+	assert.equal(staleRetry.destinationKeys.length, 0);
+
+	await rollbackAttachmentPromotion(
+		fixture.bucket,
+		stub,
+		"draft-1",
+		staleRetry,
+		actor,
+	);
+	assert.equal(fixture.objects.has(committed.destinationKeys[0]!), true);
+});
+
+test("concurrent identical promotion loser never owns the winner's cleanup", async () => {
+	const fixture = bucketFixture();
+	fixture.objects.set(
+		uploadKey("team@example.com", "upload-concurrent"),
+		new Uint8Array([4, 5, 6]).buffer,
+	);
+	const stub = {
+		async getAttachment() { return null; },
+		async queueAttachmentCleanup() {},
+	};
+	const promotions = await Promise.all([0, 1].map(() =>
+		resolveAndPromoteAttachments(
+			fixture.bucket,
+			stub,
+			"team@example.com",
+			"draft-1",
+			[{ kind: "upload", uploadId: "upload-concurrent" }],
+			actor,
+		),
+	));
+	const winner = promotions.find((promotion) => promotion.destinationKeys.length === 1)!;
+	const loser = promotions.find((promotion) => promotion.destinationKeys.length === 0)!;
+	assert.ok(winner);
+	assert.ok(loser);
+
+	await rollbackAttachmentPromotion(
+		fixture.bucket,
+		stub,
+		"draft-1",
+		loser,
+		actor,
+	);
+	assert.equal(fixture.objects.has(winner.destinationKeys[0]!), true);
 });
 
 test("failed destination cleanup is durably queued", async () => {
@@ -267,6 +543,71 @@ test("existing inline attachment promotion preserves its authoritative Content-I
 	]);
 	assert.equal(promotion.storedMetadata[0]?.content_id, "signature@example.com");
 	assert.equal(promotion.storedMetadata[0]?.disposition, "inline");
+});
+
+test("existing attachment promotion preserves authoritative MIME until the SES sink", async () => {
+	const fixture = bucketFixture();
+	const longMime = `image/vnd.${"a".repeat(72)}`;
+	fixture.objects.set(
+		"attachments/draft-long/inline-long/diagram.png",
+		new Uint8Array([4, 5, 6]).buffer,
+	);
+	const promotion = await resolveAndPromoteAttachments(
+		fixture.bucket,
+		{
+			async getAttachment() {
+				return {
+					id: "inline-long",
+					email_id: "draft-long",
+					filename: "diagram.png",
+					mimetype: longMime,
+					size: 3,
+					content_id: null,
+					disposition: "attachment",
+				};
+			},
+			async queueAttachmentCleanup() {},
+		},
+		"team@example.com",
+		"outbound-long",
+		[{ kind: "existing", emailId: "draft-long", attachmentId: "inline-long" }],
+		actor,
+	);
+	assert.equal(promotion.storedMetadata[0]?.mimetype, longMime);
+	assert.equal(promotion.sesAttachments[0]?.type, longMime);
+});
+
+test("existing inline attachment promotion rejects Content-ID beyond the SES boundary", async () => {
+	const fixture = bucketFixture();
+	fixture.objects.set(
+		"attachments/draft-long/inline-long/diagram.png",
+		new Uint8Array([4, 5, 6]).buffer,
+	);
+	await assert.rejects(
+		resolveAndPromoteAttachments(
+			fixture.bucket,
+			{
+				async getAttachment() {
+					return {
+						id: "inline-long",
+						email_id: "draft-long",
+						filename: "diagram.png",
+						mimetype: "image/png",
+						size: 3,
+						content_id: `${"a".repeat(67)}@example.com`,
+						disposition: "inline",
+					};
+				},
+				async queueAttachmentCleanup() {},
+			},
+			"team@example.com",
+			"outbound-long",
+			[{ kind: "existing", emailId: "draft-long", attachmentId: "inline-long" }],
+			actor,
+		),
+		/Content-ID.*SES/i,
+	);
+	assert.equal(fixture.objects.size, 1);
 });
 
 test("existing ordinary metadata cannot carry a legacy Content-ID into promotion", async () => {

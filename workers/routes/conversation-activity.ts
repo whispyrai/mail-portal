@@ -16,6 +16,7 @@ import type { Env } from "../types.ts";
 export type ConversationActivityRouteContext = {
 	Bindings: Env;
 	Variables: {
+		authorizedMailboxId: string;
 		session?: SessionClaims;
 		mailboxStub?: DurableObjectStub<MailboxDO>;
 	};
@@ -234,7 +235,7 @@ export function createConversationActivityRoutes(
 			);
 		}
 		const session = c.get("session")!;
-		const mailboxId = c.req.param("mailboxId")!.trim().toLowerCase();
+		const mailboxId = c.var.authorizedMailboxId;
 		const emailId = c.req.param("emailId")!;
 		try {
 			const result = await dependencies.run({

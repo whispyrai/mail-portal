@@ -20,11 +20,13 @@ import { resolveBrand } from "../routes/brand.ts";
 import { mailboxAccess } from "./mailbox-access.ts";
 import { hasExactLiveMailboxAccess } from "./live-mailbox-authorization.ts";
 import { replaceWithPrivateResponse } from "./response-privacy.ts";
+import { normalizeMailAddress } from "./mail-address.ts";
 
 export type MailboxContext = {
 	Bindings: Env;
 	Variables: {
 		mailboxStub: DurableObjectStub<MailboxDO>;
+		authorizedMailboxId: string;
 		session?: SessionClaims;
 	};
 };
@@ -33,15 +35,9 @@ export type MailboxContext = {
 export async function hasLiveMailboxContentAccess(
 	c: Context<MailboxContext>,
 ): Promise<boolean> {
-	const rawId = c.req.param("mailboxId");
+	const mailboxId = c.get("authorizedMailboxId");
 	const session = c.get("session");
-	if (!rawId || !session) return false;
-	let mailboxId: string;
-	try {
-		mailboxId = decodeURIComponent(rawId).toLowerCase();
-	} catch {
-		return false;
-	}
+	if (!mailboxId || !session) return false;
 	return hasExactLiveMailboxAccess(
 		c.env,
 		mailboxId,
@@ -75,13 +71,17 @@ export function bypassMailboxContentAuthorization(method: string, pathname: stri
 }
 
 export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) => {
+	const rawId = c.req.param("mailboxId");
+	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
+	// Hono has already decoded route parameters. Normalize once and preserve this
+	// exact authorized identity for all downstream storage and Durable Object keys.
+	const mailboxId = normalizeMailAddress(rawId);
+	if (!mailboxId) return c.json({ error: "Invalid Mailbox ID" }, 400);
+	c.set("authorizedMailboxId", mailboxId);
 	if (bypassMailboxContentAuthorization(c.req.method, new URL(c.req.url).pathname)) {
 		await next();
 		return;
 	}
-	const rawId = c.req.param("mailboxId");
-	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
-	const mailboxId = decodeURIComponent(rawId);
 
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);

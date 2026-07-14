@@ -396,9 +396,10 @@ export function useSaveDraft() {
 				in_reply_to?: string;
 				thread_id?: string;
 				draft_id?: string;
-				draft_version?: number;
-				draft_create_key?: string;
-				attachments?: AttachmentRef[];
+					draft_version?: number;
+					draft_create_key?: string;
+					draft_save_key?: string;
+					attachments?: AttachmentRef[];
 			};
 		}) => api.saveDraft(mailboxId, draft),
 		onSuccess: (_data, { mailboxId }) => invalidate(mailboxId),

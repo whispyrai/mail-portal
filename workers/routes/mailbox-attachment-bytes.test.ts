@@ -109,6 +109,71 @@ test("attachment byte route falls back from invalid MIME and reports missing obj
 	assert.deepEqual(await missing.json(), { error: "Attachment file not found" });
 });
 
+test("attachment byte route preserves valid long vendor MIME types", async () => {
+	const vendorMime = `image/vnd.${"a".repeat(72)}`;
+	assert.ok(vendorMime.length > 78);
+	const response = await app(
+		{ async exact() { return { ...stored, mimetype: vendorMime }; } },
+		async () => ({ body: "bytes" }),
+	).request(
+		"/api/v1/mailboxes/team%40example.com/emails/mail-1/attachments/attachment-1",
+	);
+	assert.equal(response.status, 200);
+	assert.equal(response.headers.get("content-type"), vendorMime);
+});
+
+test("attachment byte route rejects overlong media-type components", async () => {
+	const overlongMime = `image/${"a".repeat(128)}`;
+	const response = await app(
+		{ async exact() { return { ...stored, mimetype: overlongMime }; } },
+		async () => ({ body: "bytes" }),
+	).request(
+		"/api/v1/mailboxes/team%40example.com/emails/mail-1/attachments/attachment-1",
+	);
+	assert.equal(response.status, 200);
+	assert.equal(response.headers.get("content-type"), "application/octet-stream");
+});
+
+test("attachment byte route bounds the header filename without changing the R2 key", async () => {
+	const originalFilename = `${"a".repeat(300)}.pdf`;
+	const keys: string[] = [];
+	const response = await app(
+		{ async exact() { return { ...stored, filename: originalFilename }; } },
+		async (key) => {
+			keys.push(key);
+			return { body: "bytes" };
+		},
+	).request(
+		"/api/v1/mailboxes/team%40example.com/emails/mail-1/attachments/attachment-1",
+	);
+	assert.equal(response.status, 200);
+	assert.deepEqual(keys, [`attachments/mail-1/attachment-1/${originalFilename}`]);
+	const disposition = response.headers.get("content-disposition") ?? "";
+	assert.ok(disposition.length < 800);
+	assert.match(disposition, /\.pdf"; filename\*=UTF-8''/);
+	assert.equal(disposition.includes(originalFilename), false);
+});
+
+test("attachment byte route keeps Unicode in filename-star with an ASCII fallback", async () => {
+	const filename = "عقد 📄 نهائي.pdf";
+	const keys: string[] = [];
+	const response = await app(
+		{ async exact() { return { ...stored, filename }; } },
+		async (key) => {
+			keys.push(key);
+			return { body: "bytes" };
+		},
+	).request(
+		"/api/v1/mailboxes/team%40example.com/emails/mail-1/attachments/attachment-1",
+	);
+	assert.equal(response.status, 200);
+	assert.deepEqual(keys, [`attachments/mail-1/attachment-1/${filename}`]);
+	assert.equal(
+		response.headers.get("content-disposition"),
+		`attachment; filename="___ __ _____.pdf"; filename*=UTF-8''${encodeAttachmentFilenameStar(filename)}`,
+	);
+});
+
 test("attachment byte route preserves authorized Draft and inline raster-image reads", async () => {
 	const inline = { ...stored, filename: "logo.png", mimetype: "image/png", disposition: "inline" };
 	const response = await app({ async exact() { return inline; } }, async () => ({ body: "png" }))

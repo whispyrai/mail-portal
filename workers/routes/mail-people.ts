@@ -17,7 +17,6 @@ import {
 	hasLiveMailboxContentAccess,
 	type MailboxContext,
 } from "../lib/mailbox.ts";
-import { normalizeMailAddress } from "../lib/mail-address.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -36,18 +35,6 @@ export type MailPeopleRouteDependencies = {
 	revalidateAccess(c: AppContext): Promise<boolean>;
 };
 
-function mailboxAddress(raw: string): string {
-	let decoded: string;
-	try {
-		decoded = decodeURIComponent(raw);
-	} catch {
-		throw new MailPeopleContractError("Mailbox address is invalid");
-	}
-	const address = normalizeMailAddress(decoded);
-	if (!address) throw new MailPeopleContractError("Mailbox address is invalid");
-	return address;
-}
-
 function personId(raw: string): string {
 	let value: string;
 	try {
@@ -62,7 +49,7 @@ export function createMailPeopleRoutes(dependencies: MailPeopleRouteDependencies
 	const routes = new Hono<MailboxContext>();
 	routes.get("/api/v1/mailboxes/:mailboxId/people", async (c) => {
 		try {
-			const mailbox = mailboxAddress(c.req.param("mailboxId") ?? "");
+			const mailbox = c.var.authorizedMailboxId;
 			const query = normalizeMailPeopleListQuery(new URL(c.req.url).searchParams);
 			const read = await dependencies.operations(c).list(mailbox, query).then(
 				(value) => ({ status: "success" as const, value }),
@@ -82,7 +69,7 @@ export function createMailPeopleRoutes(dependencies: MailPeopleRouteDependencies
 
 	routes.get("/api/v1/mailboxes/:mailboxId/people/:personId", async (c) => {
 		try {
-			const mailbox = mailboxAddress(c.req.param("mailboxId") ?? "");
+			const mailbox = c.var.authorizedMailboxId;
 			const id = personId(c.req.param("personId") ?? "");
 			const read = await dependencies.operations(c).detail(mailbox, id).then(
 				(value) => ({ status: "success" as const, value }),
@@ -105,7 +92,7 @@ export function createMailPeopleRoutes(dependencies: MailPeopleRouteDependencies
 
 	routes.get("/api/v1/mailboxes/:mailboxId/people/:personId/timeline", async (c) => {
 		try {
-			const mailbox = mailboxAddress(c.req.param("mailboxId") ?? "");
+			const mailbox = c.var.authorizedMailboxId;
 			const id = personId(c.req.param("personId") ?? "");
 			const query = normalizeMailPersonTimelineQuery(new URL(c.req.url).searchParams, id);
 			const read = await dependencies.operations(c).timeline(mailbox, id, query).then(

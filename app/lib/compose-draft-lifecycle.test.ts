@@ -3,12 +3,50 @@ import test from "node:test";
 import {
 	composeDraftFingerprint,
 	composeDraftLifecycle,
+	composeDraftSaveKey,
 	composeDraftIsEmpty,
 	composeDraftTransition,
 	planComposeClose,
 	shouldCaptureProgrammaticComposeChange,
 	type ComposeDraftLifecycle,
 } from "./compose-draft-lifecycle.ts";
+
+test("Draft save keys survive exact recovery and isolate content revisions", async () => {
+	const baseline = await composeDraftSaveKey({
+		composeKey: "compose-1",
+		draftId: "draft-1",
+		draftVersion: 3,
+		fingerprint: "content-1",
+	});
+	assert.match(baseline, /^[a-f0-9]{8}-[a-f0-9]{4}-5[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+	assert.equal(
+		await composeDraftSaveKey({
+			composeKey: "compose-1",
+			draftId: "draft-1",
+			draftVersion: 3,
+			fingerprint: "content-1",
+		}),
+		baseline,
+	);
+	assert.equal(
+		await composeDraftSaveKey({
+			composeKey: "a-new-browser-runtime",
+			draftId: "draft-1",
+			draftVersion: 3,
+			fingerprint: "content-1",
+		}),
+		baseline,
+	);
+	assert.notEqual(
+		await composeDraftSaveKey({
+			composeKey: "compose-1",
+			draftId: "draft-1",
+			draftVersion: 3,
+			fingerprint: "content-2",
+		}),
+		baseline,
+	);
+});
 
 test("late signature insertion is captured unless it is untouched identity-less scaffold", () => {
 	assert.equal(

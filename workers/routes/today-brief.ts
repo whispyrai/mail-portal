@@ -19,6 +19,7 @@ const requestSchema = z
 export type TodayBriefRouteContext = {
 	Bindings: Env;
 	Variables: {
+		authorizedMailboxId: string;
 		session?: SessionClaims;
 		mailboxStub?: DurableObjectStub<MailboxDO>;
 	};
@@ -97,16 +98,6 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 	}
 }
 
-function normalizedMailboxId(raw: string): string {
-	try {
-		const mailboxId = decodeURIComponent(raw).trim().toLowerCase();
-		if (!mailboxId || mailboxId.length > 320) throw new Error();
-		return mailboxId;
-	} catch {
-		throw new TodayBriefBodyError();
-	}
-}
-
 export function createTodayBriefRoutes(
 	dependencies: TodayBriefRouteDependencies = productionDependencies,
 ) {
@@ -126,7 +117,7 @@ export function createTodayBriefRoutes(
 			const parsed = requestSchema.safeParse(body);
 			if (!parsed.success) throw new TodayBriefBodyError();
 			day = resolveTodayBriefDay(parsed.data.timeZone);
-			mailboxId = normalizedMailboxId(c.req.param("mailboxId")!);
+			mailboxId = c.var.authorizedMailboxId;
 		} catch (error) {
 			if (error instanceof TodayBriefBodyError && error.tooLarge) {
 				return c.json({ error: error.message }, 413);

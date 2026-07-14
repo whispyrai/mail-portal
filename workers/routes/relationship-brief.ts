@@ -11,7 +11,6 @@ import {
 	hasLiveMailboxContentAccess,
 	type MailboxContext,
 } from "../lib/mailbox.ts";
-import { normalizeMailAddress } from "../lib/mail-address.ts";
 import {
 	RelationshipBriefAccessRevokedError,
 	createRelationshipBriefRuntime,
@@ -79,17 +78,6 @@ async function boundedJson(request: Request): Promise<unknown> {
 	}
 }
 
-function mailboxId(raw: string): string {
-	try {
-		const decoded = decodeURIComponent(raw);
-		const normalized = normalizeMailAddress(decoded);
-		if (!normalized) throw new Error();
-		return normalized;
-	} catch {
-		throw new RelationshipBriefRequestError();
-	}
-}
-
 function personId(raw: string): string {
 	try {
 		return validateMailPersonId(decodeURIComponent(raw));
@@ -123,7 +111,7 @@ export function createRelationshipBriefRoutes(
 			let person: string;
 			try {
 				request = parseRelationshipBriefRequest(await boundedJson(c.req.raw));
-				mailbox = mailboxId(c.req.param("mailboxId") ?? "");
+				mailbox = c.var.authorizedMailboxId;
 				person = personId(c.req.param("personId") ?? "");
 			} catch (error) {
 				if (error instanceof RelationshipBriefRequestError && error.tooLarge) {

@@ -21,6 +21,7 @@ function appWithResult(result: unknown) {
 			role: "AGENT",
 			mailbox: "team@example.com",
 		});
+		c.set("authorizedMailboxId", "team@example.com");
 		c.set("mailboxStub", {
 			async cancelBulkReservation(operationId: string, actorUserId: string) {
 				calls.push({ cancelBulkReservation: operationId, actorUserId });
@@ -66,6 +67,7 @@ function appWithResult(result: unknown) {
 }
 
 test("an exact bulk admission replay returns the one authoritative job", async () => {
+	let settingsKey = "";
 	const { app, calls } = appWithResult({
 		status: "accepted",
 		jobId: "job_stable",
@@ -74,7 +76,7 @@ test("an exact bulk admission replay returns the one authoritative job", async (
 		admissionStatus: "queued",
 	});
 	const response = await app.request(
-		"http://mail.example.com/api/v1/mailboxes/team@example.com/bulk",
+		"http://mail.example.com/api/v1/mailboxes/%20TEAM%40EXAMPLE.COM%20/bulk",
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -90,7 +92,8 @@ test("an exact bulk admission replay returns the one authoritative job", async (
 		},
 		{
 			BUCKET: {
-				async get() {
+				async get(key: string) {
+					settingsKey = key;
 					return {
 						async json() {
 							return { fromName: "Team" };
@@ -110,6 +113,8 @@ test("an exact bulk admission replay returns the one authoritative job", async (
 	});
 	assert.equal(calls.length, 1);
 	assert.equal(calls[0]?.operationId, "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147");
+	assert.equal(calls[0]?.fromEmail, "team@example.com");
+	assert.equal(settingsKey, "mailboxes/team@example.com.json");
 });
 
 test("bulk reservation rejects malformed HTML before creating durable state", async () => {
@@ -135,6 +140,46 @@ test("bulk reservation rejects malformed HTML before creating durable state", as
 		code: "invalid_bulk_request",
 	});
 	assert.deepEqual(calls, []);
+});
+
+test("bulk rejects non-canonical attachment upload identities before durable work", async () => {
+	const operationId = "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147";
+	const invalidUploadIds = [
+		"95F6A780-CB27-4DF2-A9DA-49347F7C3D22",
+		"95f6a780-cb27-1df2-a9da-49347f7c3d22",
+	];
+	for (const uploadId of invalidUploadIds) {
+		const { app, calls } = appWithResult({ status: "reserved" });
+		const payload = {
+			operationId,
+			subject: "Hello",
+			text: "Body",
+			recipients: [{ email: "a@example.com" }],
+			attachmentUploadIds: [uploadId],
+		};
+		const reservation = await app.request(
+			`http://mail.example.com/api/v1/mailboxes/team@example.com/bulk/operations/${operationId}/reserve`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(payload),
+			},
+			{ BUCKET: {} } as never,
+		);
+		const admission = await app.request(
+			"http://mail.example.com/api/v1/mailboxes/team@example.com/bulk",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(payload),
+			},
+			{ BUCKET: {} } as never,
+		);
+
+		assert.equal(reservation.status, 400, uploadId);
+		assert.equal(admission.status, 400, uploadId);
+		assert.deepEqual(calls, [], uploadId);
+	}
 });
 
 test("bulk admission rejects CID images introduced by personalization before queueing", async () => {

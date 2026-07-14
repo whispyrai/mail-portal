@@ -13,7 +13,11 @@ import { SaveDraftRequestSchema } from "../lib/schemas.ts";
 import { reconcileAmbiguousDraftSave } from "../lib/draft-save-recovery.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
 import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
-import { draftCreateFingerprint } from "../lib/draft-create-idempotency.ts";
+import {
+	draftCreateFingerprint,
+	draftIdForSaveKey,
+	draftSaveFingerprint,
+} from "../lib/draft-create-idempotency.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -31,13 +35,15 @@ export async function handleSaveDraft(c: AppContext) {
 		in_reply_to,
 		thread_id,
 		draft_create_key,
+		draft_save_key,
 		draft_id,
 		draft_version,
 		attachments,
 	} = parsed.data;
-	const mailboxId = c.req.param("mailboxId") ?? "";
+	const mailboxId = c.var.authorizedMailboxId;
 	const stub = c.var.mailboxStub;
 	const actor = actorFromSession(c.get("session"));
+	const saveKey = draft_save_key ?? draft_create_key ?? crypto.randomUUID();
 	const createFingerprint = draft_create_key
 		? await draftCreateFingerprint(parsed.data)
 		: undefined;
@@ -80,10 +86,106 @@ export async function handleSaveDraft(c: AppContext) {
 			);
 		}
 		if (replay.status === "replay") {
-			return c.json({ ...replay.draft, replayed: true });
+			const attachmentIdentityScope = await stub.getCommittedDraftAttachmentScope(
+				replay.draftId,
+				replay.draft.draft_version,
+			);
+			return c.json({
+				...replay.draft,
+				replayed: true,
+				attachment_save_scope: attachmentIdentityScope ?? saveKey,
+			});
 		}
 	}
-	const id = draft_id ?? crypto.randomUUID();
+	const id = draft_id ?? await draftIdForSaveKey(mailboxId, saveKey);
+	const claimToken = crypto.randomUUID();
+	const saveFingerprint = await draftSaveFingerprint({
+		...parsed.data,
+		draft_id: id,
+		draft_version: draft_version ?? 0,
+	});
+	const claim = await stub.claimDraftSave({
+		saveKey,
+		fingerprint: saveFingerprint,
+		draftId: id,
+		expectedVersion: draft_version ?? 0,
+		claimToken,
+		claimExpiresAt: Date.now() + 5 * 60_000,
+	});
+	if (claim.status === "committed") {
+		const committedDraft = await stub.getEmail(id);
+		if (!committedDraft || committedDraft.folder_id !== Folders.DRAFT) {
+			return c.json(
+				{ error: "The committed draft save is no longer available." },
+				409,
+			);
+		}
+		if (committedDraft.draft_version !== claim.committedVersion) {
+			return c.json(
+				{
+					error: "This draft save was superseded by a newer revision.",
+					code: "draft_save_superseded",
+					draftId: committedDraft.id,
+					currentVersion: committedDraft.draft_version,
+				},
+				409,
+			);
+		}
+		return c.json({
+			...committedDraft,
+			replayed: true,
+			attachment_save_scope: claim.claimToken ?? saveKey,
+		}, 201);
+	}
+	if (claim.status === "key_conflict") {
+		return c.json(
+			{
+				error: "Draft save key was already used for different content.",
+				code: "draft_save_conflict",
+			},
+			409,
+		);
+	}
+	if (claim.status === "in_progress" || claim.status === "revision_in_progress") {
+		return c.json(
+			{
+				error: "This draft revision is already being saved. Retry shortly.",
+				code: "draft_save_in_progress",
+				retryAfterMs: 500,
+			},
+			409,
+		);
+	}
+	if (claim.status === "version_conflict") {
+		return c.json(
+			{
+				error: "Draft changed in another session. Reload it before saving.",
+				currentVersion: claim.currentVersion,
+			},
+			409,
+		);
+	}
+	if (claim.status === "not_found") {
+		return c.json({ error: "Draft not found" }, 404);
+	}
+	if (claim.status === "not_draft") {
+		return c.json({ error: "Only a draft can be overwritten" }, 409);
+	}
+	for (const stalePromotion of claim.stalePromotions) {
+		await rollbackAttachmentPromotion(
+			c.env.BUCKET,
+			stub,
+			id,
+			{
+				sesAttachments: [],
+				storedMetadata: [],
+				stagingKeys: [],
+				destinationKeys: stalePromotion.destinationKeys,
+				promotionOwner: stalePromotion.promotionOwner,
+			},
+			actor,
+		);
+	}
 	const priorDraft = draft_id ? await stub.getEmail(draft_id) : null;
 	const priorAttachments = new Map(
 		(priorDraft?.attachments ?? []).map((attachment) => [attachment.id, attachment]),
@@ -115,8 +217,22 @@ export async function handleSaveDraft(c: AppContext) {
 		id,
 		attachmentsToPromote,
 		actor,
+		{
+			identityScope: claimToken,
+			promotionOwner: claimToken,
+			recordDestinationIntent: async (keys) => {
+				const recorded = await stub.recordDraftSavePromotion(
+					saveKey,
+					saveFingerprint,
+					claimToken,
+					keys,
+				);
+				if (!recorded) throw new Error("Draft save claim was lost before promotion.");
+			},
+		},
 	).catch((error: Error) => error);
 	if (newPromotion instanceof Error) {
+		await stub.abortDraftSave(saveKey, saveFingerprint, claimToken);
 		return c.json({ error: newPromotion.message }, 400);
 	}
 	const promotion = {
@@ -126,6 +242,7 @@ export async function handleSaveDraft(c: AppContext) {
 	const inlineMapping = validateResolvedInlineImages(body, promotion.storedMetadata);
 	if (!inlineMapping.ok) {
 		await rollbackAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor);
+		await stub.abortDraftSave(saveKey, saveFingerprint, claimToken);
 		return c.json(
 			{ error: inlineMapping.error, code: inlineMapping.code },
 			400,
@@ -151,6 +268,9 @@ export async function handleSaveDraft(c: AppContext) {
 				body,
 				in_reply_to: in_reply_to ?? null,
 				thread_id: thread_id ?? in_reply_to ?? id,
+				saveKey,
+				saveFingerprint,
+				saveClaimToken: claimToken,
 			},
 			promotion.storedMetadata,
 			actor,
@@ -161,18 +281,24 @@ export async function handleSaveDraft(c: AppContext) {
 			stub,
 			draftId: id,
 			expectedCommittedVersion: (draft_version ?? 0) + 1,
+			saveKey,
+			saveFingerprint,
 			promotion,
-				replacedAttachments,
+			replacedAttachments,
 			actor,
 		});
 		if (reconciliation.status === "committed") {
-			return c.json(reconciliation.draft, 201);
+			return c.json({
+				...reconciliation.draft,
+				attachment_save_scope: reconciliation.attachmentIdentityScope,
+			}, 201);
 		}
 		throw error;
 	}
 
 	if (result.status !== "saved") {
 		await rollbackAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor);
+		await stub.abortDraftSave(saveKey, saveFingerprint, claimToken);
 		if (result.status === "creation_superseded") {
 			return c.json(
 				{
@@ -185,7 +311,15 @@ export async function handleSaveDraft(c: AppContext) {
 			);
 		}
 		if (result.status === "creation_replay") {
-			return c.json({ ...result.draft, replayed: true });
+			const attachmentIdentityScope = await stub.getCommittedDraftAttachmentScope(
+				result.draftId,
+				result.draft.draft_version,
+			);
+			return c.json({
+				...result.draft,
+				replayed: true,
+				attachment_save_scope: attachmentIdentityScope ?? saveKey,
+			});
 		}
 		if (result.status === "creation_conflict") {
 			return c.json(
@@ -238,5 +372,5 @@ export async function handleSaveDraft(c: AppContext) {
 	if (!saved || saved.folder_id !== Folders.DRAFT) {
 		throw new Error(`Saved draft ${id} could not be read back`);
 	}
-	return c.json(saved, 201);
+	return c.json({ ...saved, attachment_save_scope: claimToken }, 201);
 }

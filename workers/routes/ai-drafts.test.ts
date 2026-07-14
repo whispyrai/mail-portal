@@ -24,6 +24,7 @@ function testApp(
 	const app = new Hono<AiDraftRouteContext>();
 	app.use("*", async (c, next) => {
 		if (activeSession) c.set("session", activeSession);
+		c.set("authorizedMailboxId", "team@example.com");
 		await next();
 	});
 	app.route("/", createAiDraftRoutes(operations));

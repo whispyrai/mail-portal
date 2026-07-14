@@ -54,6 +54,7 @@ function appWith(
 			role: "ADMIN",
 			mailbox: "user@wiserchat.ai",
 		});
+		c.set("authorizedMailboxId", mailboxId);
 		c.set("mailboxStub", stub as never);
 		await next();
 	});
@@ -72,6 +73,28 @@ function access(input: {
 		async canDisclose() { return disclose.length > 1 ? disclose.shift()! : disclose[0]!; },
 	};
 }
+
+test("Automation management uses the middleware-authorized Mailbox identity", async () => {
+	let managedMailbox = "";
+	const app = appWith({
+		async listAutomationRules() {
+			return { rules: [], rulesetGeneration: 0, orderRevision: 0 };
+		},
+	}, {
+		async canManage(_c, _actorUserId, authorizedMailboxId) {
+			managedMailbox = authorizedMailboxId;
+			return true;
+		},
+		async canDisclose() { return true; },
+	});
+	const alias = encodeURIComponent(" TEAM@WISERCHAT.AI ");
+	const response = await app.request(
+		`https://mail.test/api/v1/mailboxes/${alias}/automation-rules`,
+	);
+
+	assert.equal(response.status, 200);
+	assert.equal(managedMailbox, mailboxId);
+});
 
 test("a current Shared member reads strict Automation summaries without mutation authority", async () => {
 	const app = appWith({

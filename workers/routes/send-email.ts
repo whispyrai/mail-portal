@@ -21,7 +21,7 @@ import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
 type AppContext = Context<MailboxContext>;
 
 export async function handleSendEmail(c: AppContext) {
-	const mailboxId = c.req.param("mailboxId")!;
+	const mailboxId = c.var.authorizedMailboxId;
 	const parsed = SendEmailRequestSchema.safeParse(await c.req.json());
 	if (!parsed.success) {
 		return c.json(
@@ -97,6 +97,7 @@ export async function handleSendEmail(c: AppContext) {
 		messageId,
 		attachments,
 		actor,
+		{ promotionOwner: messageId },
 	).then(
 		(result) => ({ ok: true as const, ...result }),
 		(error) => ({ ok: false as const, error: (error as Error).message }),

@@ -21,7 +21,7 @@ import type { Env } from "../types.ts";
 
 export type MailboxSignatureSettingsRouteContext = {
 	Bindings: Env;
-	Variables: { session?: SessionClaims };
+	Variables: { authorizedMailboxId: string; session?: SessionClaims };
 };
 
 type SignatureAccess = { canRead: boolean; canManage: boolean };
@@ -118,15 +118,11 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 	}
 }
 
-function mailboxAddress(raw: string): string {
-	let decoded: string;
-	try {
-		decoded = decodeURIComponent(raw);
-	} catch {
+function mailboxAddress(authorizedMailboxId: string): string {
+	const address = normalizeMailAddress(authorizedMailboxId);
+	if (!address || address !== authorizedMailboxId) {
 		throw new SignatureRouteError("INVALID", "Mailbox address is invalid", 400);
 	}
-	const address = normalizeMailAddress(decoded);
-	if (!address) throw new SignatureRouteError("INVALID", "Mailbox address is invalid", 400);
 	return address;
 }
 
@@ -159,7 +155,7 @@ export function createMailboxSignatureSettingsRoutes(
 	});
 
 	app.get("/api/v1/mailboxes/:mailboxId/settings", async (c) => {
-		const mailbox = mailboxAddress(c.req.param("mailboxId")!);
+		const mailbox = mailboxAddress(c.var.authorizedMailboxId);
 		const access = await dependencies.operations.access(c.env, c.get("session")!.sub, mailbox);
 		if (!access.canRead && !access.canManage) {
 			throw new SignatureRouteError("FORBIDDEN", "Mailbox settings are not available", 403);
@@ -187,7 +183,7 @@ export function createMailboxSignatureSettingsRoutes(
 	});
 
 	app.patch("/api/v1/mailboxes/:mailboxId/settings/signature", async (c) => {
-		const mailbox = mailboxAddress(c.req.param("mailboxId")!);
+		const mailbox = mailboxAddress(c.var.authorizedMailboxId);
 		const access = await dependencies.operations.access(c.env, c.get("session")!.sub, mailbox);
 		if (!access.canManage) {
 			throw new SignatureRouteError("FORBIDDEN", "Signature settings cannot be changed", 403);

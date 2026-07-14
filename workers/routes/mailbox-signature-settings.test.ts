@@ -15,12 +15,21 @@ function app(input: {
 	session?: SessionClaims;
 	access?: { canRead: boolean; canManage: boolean };
 	settings?: Record<string, unknown> | null;
+	authorizedMailboxId?: string;
 }) {
 	let written: Record<string, unknown> | undefined;
+	const mailboxes: string[] = [];
 	const operations: MailboxSignatureSettingsOperations = {
-		async access() { return input.access ?? { canRead: true, canManage: true }; },
-		async read() { return input.settings === undefined ? { signature: { enabled: false, text: "" } } : input.settings; },
-		async updateSignature(_env, _mailbox, signature) {
+		async access(_env, _userId, mailbox) {
+			mailboxes.push(mailbox);
+			return input.access ?? { canRead: true, canManage: true };
+		},
+		async read(_env, mailbox) {
+			mailboxes.push(mailbox);
+			return input.settings === undefined ? { signature: { enabled: false, text: "" } } : input.settings;
+		},
+		async updateSignature(_env, mailbox, signature) {
+			mailboxes.push(mailbox);
 			const current = input.settings === undefined
 				? { signature: { enabled: false, text: "" } }
 				: input.settings;
@@ -30,9 +39,13 @@ function app(input: {
 		},
 	};
 	const root = new Hono<MailboxSignatureSettingsRouteContext>();
-	root.use("*", async (c, next) => { if (input.session) c.set("session", input.session); await next(); });
+	root.use("*", async (c, next) => {
+		if (input.session) c.set("session", input.session);
+		c.set("authorizedMailboxId", input.authorizedMailboxId ?? "team@example.com");
+		await next();
+	});
 	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
-	return { root, written: () => written };
+	return { root, written: () => written, mailboxes };
 }
 
 function request(root: Hono<MailboxSignatureSettingsRouteContext>, path: string, init?: RequestInit) {
@@ -46,6 +59,25 @@ test("signature settings require auth and allow read-only Shared members", async
 	assert.equal(get.status, 200);
 	assert.deepEqual(await get.json(), { signature: { enabled: true, text: "Team" }, canManage: false });
 	assert.equal((await request(member.root, "/settings/signature", { method: "PATCH", body: JSON.stringify({ enabled: true, text: "x" }) })).status, 403);
+});
+
+test("signature settings use the once-decoded authorized mailbox identity", async () => {
+	const target = app({
+		session,
+		authorizedMailboxId: "team%2edoe@example.com",
+	});
+	const response = await target.root.request(
+		"http://mail.test/api/v1/mailboxes/team%252edoe%40example.com/settings",
+		undefined,
+		{} as never,
+	);
+
+	assert.equal(response.status, 200);
+	assert.deepEqual(target.mailboxes, [
+		"team%2edoe@example.com",
+		"team%2edoe@example.com",
+		"team%2edoe@example.com",
+	]);
 });
 
 test("narrow Shared admin management works without mailbox content access", async () => {
@@ -122,6 +154,7 @@ test("settings GET suppresses R2 output when Shared access is revoked in flight"
 	const root = new Hono<MailboxSignatureSettingsRouteContext>();
 	root.use("*", async (c, next) => {
 		c.set("session", session);
+		c.set("authorizedMailboxId", "team@example.com");
 		await next();
 	});
 	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
@@ -155,6 +188,7 @@ test("settings revocation wins over an in-flight R2 failure", async () => {
 	const root = new Hono<MailboxSignatureSettingsRouteContext>();
 	root.use("*", async (c, next) => {
 		c.set("session", session);
+		c.set("authorizedMailboxId", "team@example.com");
 		await next();
 	});
 	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
@@ -176,7 +210,11 @@ test("unexpected settings failures use a stable credential-free response", async
 		async updateSignature() { throw new Error("secret storage detail"); },
 	};
 	const root = new Hono<MailboxSignatureSettingsRouteContext>();
-	root.use("*", async (c, next) => { c.set("session", session); await next(); });
+	root.use("*", async (c, next) => {
+		c.set("session", session);
+		c.set("authorizedMailboxId", "team@example.com");
+		await next();
+	});
 	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
 	const response = await request(root, "/settings");
 	assert.equal(response.status, 500);
@@ -193,7 +231,11 @@ test("signature write conflicts return a stable retryable response", async () =>
 		async updateSignature() { throw new MailboxSettingsConflictError(); },
 	};
 	const root = new Hono<MailboxSignatureSettingsRouteContext>();
-	root.use("*", async (c, next) => { c.set("session", session); await next(); });
+	root.use("*", async (c, next) => {
+		c.set("session", session);
+		c.set("authorizedMailboxId", "team@example.com");
+		await next();
+	});
 	root.route("/", createMailboxSignatureSettingsRoutes({ operations }));
 	const response = await request(root, "/settings/signature", {
 		method: "PATCH",

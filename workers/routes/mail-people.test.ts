@@ -12,6 +12,10 @@ function app(
 	revalidateAccess: () => Promise<boolean> = async () => true,
 ) {
 	const root = new Hono<MailboxContext>();
+	root.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", "team@example.com");
+		await next();
+	});
 	root.route("/", createMailPeopleRoutes({
 		operations: () => operations,
 		revalidateAccess,

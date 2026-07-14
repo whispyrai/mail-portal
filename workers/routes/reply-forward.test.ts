@@ -77,6 +77,7 @@ function testApp(options: {
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
+		c.set("authorizedMailboxId", mailboxId);
 		c.set("mailboxStub", stub as never);
 		c.set("session", {
 			sub: "user-1",
@@ -205,7 +206,7 @@ test("reply and forward reject delayed or distant schedules before enqueue", asy
 	for (const item of cases) {
 		const { app, enqueued } = testApp();
 		const response = await app.request(
-			`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails/original-1/${item.path}`,
+			`http://mail.wiserchat.ai/api/v1/mailboxes/%20TEAM%40WISERCHAT.AI%20/emails/original-1/${item.path}`,
 			{
 				method: "POST",
 				headers: { "content-type": "application/json" },
@@ -368,12 +369,16 @@ test("reply and forward APIs reject duplicate or malformed inline mappings befor
 
 	for (const item of cases) {
 		const { app, enqueued } = testApp();
-		const stagingKey = `uploads/${mailboxId}/upload-${item.path}`;
+		const uploadId = item.path === "reply"
+			? "30303030-3030-4030-8030-303030303030"
+			: "40404040-4040-4040-8040-404040404040";
+		const stagingKey = `uploads/${mailboxId}/${uploadId}`;
 		const objects = new Map<string, ArrayBuffer>([
 			[stagingKey, new Uint8Array([1, 2, 3]).buffer],
 		]);
+		const promotionOwners = new Map<string, string>();
 		const response = await app.request(
-			`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails/original-1/${item.path}`,
+			`http://mail.wiserchat.ai/api/v1/mailboxes/%20TEAM%40WISERCHAT.AI%20/emails/original-1/${item.path}`,
 			{
 				method: "POST",
 				headers: { "content-type": "application/json" },
@@ -384,7 +389,7 @@ test("reply and forward APIs reject duplicate or malformed inline mappings befor
 					html: item.html,
 					attachments: [{
 						kind: "upload",
-						uploadId: `upload-${item.path}`,
+						uploadId,
 						disposition: "inline",
 						contentId: "chart@mail-portal.local",
 					}],
@@ -396,12 +401,34 @@ test("reply and forward APIs reject duplicate or malformed inline mappings befor
 					async get(key: string) {
 						const bytes = objects.get(key);
 						return bytes ? {
-							customMetadata: { filename: "chart.png", type: "image/png" },
+							customMetadata: {
+								filename: "chart.png",
+								type: "image/png",
+								...(promotionOwners.has(key)
+									? { promotionOwner: promotionOwners.get(key) }
+									: {}),
+							},
 							httpMetadata: {},
 							async arrayBuffer() { return bytes.slice(0); },
 						} : null;
 					},
-					async put(key: string, bytes: ArrayBuffer) { objects.set(key, bytes.slice(0)); },
+						async put(
+							key: string,
+							bytes: ArrayBuffer,
+							options?: {
+								onlyIf?: { etagDoesNotMatch?: string };
+								customMetadata?: { promotionOwner?: string };
+							},
+						) {
+							if (options?.onlyIf?.etagDoesNotMatch === "*" && objects.has(key)) {
+								return null;
+							}
+							objects.set(key, bytes.slice(0));
+							if (options?.customMetadata?.promotionOwner) {
+								promotionOwners.set(key, options.customMetadata.promotionOwner);
+							}
+							return { etag: "created" };
+						},
 					async delete(keys: string | string[]) {
 						for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
 					},

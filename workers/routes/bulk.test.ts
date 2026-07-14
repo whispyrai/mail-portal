@@ -62,7 +62,20 @@ test("bulk page keeps one immutable operation across an unconfirmed retry", asyn
 	assert.match(html, /label for="csv"/);
 	assert.match(html, /'Remove ' \+ a\.filename/);
 	assert.match(html, /function attachFailed\(\)/);
-	assert.match(html, /Remove every failed attachment before sending/);
+	assert.match(html, /Retry or remove every failed attachment before sending/);
+	assert.match(html, /<ul id="attachList"[^>]*aria-label="Attachments"/);
+	assert.match(html, /id="attachStatus"[^>]*role="status"[^>]*aria-live="polite"/);
+	assert.doesNotMatch(html, /id="attachList"[^>]*role="status"/);
+	assert.match(html, /localId: crypto\.randomUUID\(\), file/);
+	assert.match(html, /function uploadAttachmentEntry\(entry\)/);
+	assert.match(html, /encodeURIComponent\(entry\.localId\)/);
+	assert.match(html, /method: 'PUT'/);
+	assert.match(html, /'Retry ' \+ a\.filename/);
+	assert.match(html, /uploadAttachmentEntry\(a\)/);
+	assert.match(html, /function attachmentRetryAdmissionError\(entry\)/);
+	assert.match(html, /const admissionError = attachmentRetryAdmissionError\(entry\)/);
+	assert.match(html, /a\.controller\?\.abort\(\)/);
+	assert.doesNotMatch(html, /if \(a\.status !== 'uploading'\)/);
 	assert.match(html, /Attachments \(' \+ names\.length \+ '\): ' \+ names\.join/);
 	assert.match(html, /\$\('sendBtn'\)\.focus\(\)/);
 	assert.match(html, /charCodeAt\(0\) === 0xFEFF/);
@@ -81,5 +94,44 @@ test("bulk page keeps one immutable operation across an unconfirmed retry", asyn
 	assert.doesNotMatch(html, /if \(!confirm\(/);
 	const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
 	assert.ok(script);
+	const validatorSource = script.match(
+		/function isConfirmedAttachmentUploadResponse\(result, entry\) \{[\s\S]*?\n\}/,
+	)?.[0];
+	assert.ok(validatorSource);
+	const validate = new Function(
+		`${validatorSource}; return isConfirmedAttachmentUploadResponse;`,
+	)() as (
+		result: unknown,
+		entry: { localId: string; file: { size: number } },
+	) => boolean;
+	const entry = {
+		localId: "95f6a780-cb27-4df2-a9da-49347f7c3d22",
+		file: { size: 3 },
+	};
+	const valid = {
+		uploadId: entry.localId,
+		filename: "report.pdf",
+		mimetype: "application/pdf",
+		size: 3,
+		replayed: false,
+	};
+	assert.equal(validate(valid, entry), true);
+	for (const malformed of [
+		null,
+		{},
+		{ ...valid, uploadId: "other" },
+		{ ...valid, filename: "" },
+		{ ...valid, filename: 7 },
+		{ ...valid, mimetype: "" },
+		{ ...valid, mimetype: 7 },
+		{ ...valid, size: 4 },
+		{ ...valid, replayed: "false" },
+	]) {
+		assert.equal(validate(malformed, entry), false);
+	}
+	assert.match(
+		html,
+		/else if \(!isConfirmedAttachmentUploadResponse\(result, entry\)\)/,
+	);
 	assert.doesNotThrow(() => new Function(script));
 });

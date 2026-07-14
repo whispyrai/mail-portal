@@ -33,7 +33,7 @@ export interface FollowUpReminderRouteService {
 
 export type FollowUpReminderRouteContext = {
 	Bindings: Env;
-	Variables: { session?: SessionClaims };
+	Variables: { authorizedMailboxId: string; session?: SessionClaims };
 };
 
 export interface FollowUpReminderRouteDependencies {
@@ -61,14 +61,6 @@ const errorStatuses: Record<FollowUpReminderErrorCode, 400 | 403 | 404 | 409> = 
 	STATE_CONFLICT: 409,
 	IDEMPOTENCY_CONFLICT: 409,
 };
-
-function mailboxAddress(raw: string): string {
-	try {
-		return decodeURIComponent(raw).toLowerCase();
-	} catch {
-		throw new FollowUpReminderError("INVALID", "Mailbox address is invalid");
-	}
-}
 
 function listLimit(raw: string | undefined): number {
 	if (raw === undefined) return 100;
@@ -157,7 +149,7 @@ export function createFollowUpReminderRoutes(
 		const session = c.get("session")!;
 		const page = await dependencies.service(c.env).list(
 			session.sub,
-			mailboxAddress(c.req.param("mailboxId")!),
+			c.var.authorizedMailboxId,
 			listLimit(c.req.query("limit")),
 			c.req.query("cursor"),
 		);
@@ -169,7 +161,7 @@ export function createFollowUpReminderRoutes(
 		const input = await boundedJsonBody(c.req.raw);
 		const reminder = await dependencies.service(c.env).create(
 			session.sub,
-			mailboxAddress(c.req.param("mailboxId")!),
+			c.var.authorizedMailboxId,
 			input,
 		);
 		return c.json({ reminder }, 201);
@@ -182,7 +174,7 @@ export function createFollowUpReminderRoutes(
 			const input = await boundedJsonBody(c.req.raw);
 			const reminder = await dependencies.service(c.env).apply(
 				session.sub,
-				mailboxAddress(c.req.param("mailboxId")!),
+				c.var.authorizedMailboxId,
 				c.req.param("reminderId")!,
 				input,
 			);

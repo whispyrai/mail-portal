@@ -103,3 +103,125 @@ test("byte preview is abortable and its URL remains email-scoped", async () => {
 		"/api/v1/mailboxes/box/emails/email%2F1/attachments/file%2F1",
 	);
 });
+
+test("staging upload sends the stable identity and original file through PUT", async () => {
+	const uploadId = "95f6a780-cb27-4df2-a9da-49347f7c3d22";
+	const file = new File([new Uint8Array([1, 2, 3])], "Q3 plan.pdf", {
+		type: "application/pdf",
+	});
+	const controller = new AbortController();
+	let requestedUrl = "";
+	let requestedInit: RequestInit | undefined;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (input, init) => {
+		requestedUrl = String(input);
+		requestedInit = init;
+		return Promise.resolve(new Response(JSON.stringify({
+			uploadId,
+			filename: "Q3 plan.pdf",
+			mimetype: "application/pdf",
+			size: 3,
+			replayed: false,
+		}), {
+			status: 201,
+			headers: { "content-type": "application/json" },
+		}));
+	};
+	try {
+		assert.deepEqual(
+			await api.uploadAttachment("mailbox/1", uploadId, file, controller.signal),
+			{
+				uploadId,
+				filename: "Q3 plan.pdf",
+				mimetype: "application/pdf",
+				size: 3,
+				replayed: false,
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+
+	assert.equal(
+		requestedUrl,
+		`/api/v1/mailboxes/mailbox%2F1/attachment-uploads/${uploadId}?filename=Q3+plan.pdf&type=application%2Fpdf`,
+	);
+	assert.equal(requestedInit?.method, "PUT");
+	assert.equal(requestedInit?.body, file);
+	assert.equal(requestedInit?.signal, controller.signal);
+	assert.equal(new Headers(requestedInit?.headers).get("content-type"), "application/pdf");
+});
+
+test("staging upload rejects a response for a different upload identity", async () => {
+	const requestedUploadId = "95f6a780-cb27-4df2-a9da-49347f7c3d22";
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = () => Promise.resolve(new Response(JSON.stringify({
+		uploadId: "895dbb44-e8ba-45d1-8d75-c88fbc61cb35",
+		filename: "report.pdf",
+		mimetype: "application/pdf",
+		size: 3,
+		replayed: false,
+	}), {
+		status: 201,
+		headers: { "content-type": "application/json" },
+	}));
+	try {
+		await assert.rejects(
+			api.uploadAttachment(
+				"mailbox/1",
+				requestedUploadId,
+				new File([new Uint8Array([1, 2, 3])], "report.pdf"),
+			),
+			/The attachment upload response could not be confirmed/,
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("staging upload rejects malformed success metadata", async () => {
+	const uploadId = "95f6a780-cb27-4df2-a9da-49347f7c3d22";
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = () => Promise.resolve(new Response(JSON.stringify({
+		uploadId,
+		filename: "report.pdf",
+		mimetype: "application/pdf",
+		size: -1,
+		replayed: "no",
+	}), {
+		status: 200,
+		headers: { "content-type": "application/json" },
+	}));
+	try {
+		await assert.rejects(
+			api.uploadAttachment(
+				"mailbox/1",
+				uploadId,
+				new File([new Uint8Array([1, 2, 3])], "report.pdf"),
+			),
+			/The attachment upload response could not be confirmed/,
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("draft save rejects success without an authoritative attachment scope", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = () => Promise.resolve(new Response(JSON.stringify({
+		id: "draft-1",
+		draft_version: 1,
+		attachments: [],
+	}), {
+		status: 201,
+		headers: { "content-type": "application/json" },
+	}));
+	try {
+		await assert.rejects(
+			api.saveDraft("mailbox/1", { body: "Draft" }),
+			/The saved draft attachment identity could not be confirmed/,
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});

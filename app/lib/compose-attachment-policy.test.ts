@@ -4,10 +4,61 @@ import {
 	bodyReferencesInlineAttachment,
 	evaluateComposeAttachments,
 	evaluateStoredDraftAttachments,
+	prepareSavedComposeAttachmentReconciliation,
 	recoverComposeAttachments,
 	reconcileSavedComposeAttachments,
 	type ComposeAttachmentRecord,
 } from "./compose-attachment-policy.ts";
+import {
+	attachmentStorageId,
+	attachmentStorageKeyPrefix,
+	safeAttachmentStorageFilename,
+} from "../../shared/attachment-filename.ts";
+
+test("prepared Draft reconciliation applies to the latest attachment state", async () => {
+	const savedAtStart: ComposeAttachmentRecord = {
+		localId: "saved-at-start",
+		filename: "proposal.pdf",
+		mimetype: "application/pdf",
+		size: 42,
+		status: "ready",
+		disposition: "attachment",
+		uploadId: "upload-saved",
+	};
+	const addedDuringSave: ComposeAttachmentRecord = {
+		...savedAtStart,
+		localId: "added-during-save",
+		filename: "notes.pdf",
+		uploadId: "upload-new",
+	};
+	const storedId = await attachmentStorageId(
+		"draft-1",
+		{ kind: "upload", uploadId: "upload-saved" },
+		0,
+		"save-1",
+	);
+	const apply = await prepareSavedComposeAttachmentReconciliation(
+		[savedAtStart],
+		"draft-1",
+		[{
+			id: storedId,
+			filename: "proposal.pdf",
+			mimetype: "application/pdf",
+			size: 42,
+			disposition: "attachment",
+		}],
+		"save-1",
+	);
+
+	const result = apply([savedAtStart, addedDuringSave]);
+	assert.equal(result.length, 2);
+	assert.deepEqual(result[0]?.existing, {
+		emailId: "draft-1",
+		attachmentId: storedId,
+	});
+	assert.equal(result[1], addedDuringSave);
+	assert.deepEqual(apply([addedDuringSave]), [addedDuringSave]);
+});
 
 test("compose recovery turns only interrupted uploads into explicit retryable errors", () => {
 	const originalFile = new File(["proposal"], "proposal.pdf", {
@@ -81,7 +132,7 @@ test("compose recovery turns only interrupted uploads into explicit retryable er
 	if (!policy.ok) assert.match(policy.error, /interrupted.*Retry/i);
 });
 
-test("a completed save promotes only attachments still present and preserves later additions", () => {
+test("a completed save promotes only attachments still present and preserves later additions", async () => {
 	const current = [
 		{
 			localId: "kept",
@@ -102,7 +153,17 @@ test("a completed save promotes only attachments still present and preserves lat
 			uploadId: "upload-2",
 		},
 	];
-	const result = reconcileSavedComposeAttachments(
+	const keptStoredId = await attachmentStorageId(
+		"draft-1",
+		{ kind: "upload", uploadId: "upload-1" },
+		0,
+	);
+	const removedStoredId = await attachmentStorageId(
+		"draft-1",
+		{ kind: "upload", uploadId: "upload-removed" },
+		0,
+	);
+	const result = await reconcileSavedComposeAttachments(
 		current,
 		[
 			current[0],
@@ -119,14 +180,14 @@ test("a completed save promotes only attachments still present and preserves lat
 		"draft-1",
 		[
 			{
-				id: "stored-1",
+				id: keptStoredId,
 				filename: "proposal.pdf",
 				mimetype: "application/pdf",
 				size: 42,
 				disposition: "attachment",
 			},
 			{
-				id: "stored-removed",
+				id: removedStoredId,
 				filename: "removed.png",
 				mimetype: "image/png",
 				size: 99,
@@ -146,10 +207,170 @@ test("a completed save promotes only attachments still present and preserves lat
 			uploadId: undefined,
 			error: undefined,
 			contentId: undefined,
-			existing: { emailId: "draft-1", attachmentId: "stored-1" },
+			existing: { emailId: "draft-1", attachmentId: keptStoredId },
 		},
 		current[1],
 	]);
+});
+
+test("draft reconciliation accepts a server-normalized destination filename", async () => {
+	const source: ComposeAttachmentRecord = {
+		localId: "long-upload",
+		filename: `${"😀".repeat(240)}.pdf`,
+		mimetype: "application/pdf",
+		size: 42,
+		status: "ready",
+		disposition: "attachment",
+		uploadId: "upload-long",
+	};
+	const storedId = await attachmentStorageId(
+		"draft_recovered_snapshot-1",
+		{ kind: "upload", uploadId: "upload-long" },
+		0,
+		"save-1",
+	);
+	const normalizedFilename = safeAttachmentStorageFilename(
+		source.filename,
+		attachmentStorageKeyPrefix(
+			"draft_recovered_snapshot-1",
+			storedId,
+		),
+	);
+
+	const result = await reconcileSavedComposeAttachments(
+		[source],
+		[source],
+		"draft_recovered_snapshot-1",
+		[{
+			id: storedId,
+			filename: normalizedFilename,
+			mimetype: "application/pdf",
+			size: 42,
+			disposition: "attachment",
+		}],
+		"save-1",
+	);
+
+	assert.equal(result[0]?.status, "ready");
+	assert.equal(result[0]?.filename, normalizedFilename);
+	assert.deepEqual(result[0]?.existing, {
+		emailId: "draft_recovered_snapshot-1",
+		attachmentId: storedId,
+	});
+});
+
+test("draft reconciliation preserves duplicate file identity across reversed storage order", async () => {
+	const kept: ComposeAttachmentRecord = {
+		localId: "kept",
+		filename: "kept.pdf",
+		mimetype: "application/pdf",
+		size: 42,
+		status: "ready",
+		disposition: "attachment",
+		uploadId: "upload-kept",
+	};
+	const removed: ComposeAttachmentRecord = {
+		...kept,
+		localId: "removed",
+		filename: "kept.pdf",
+		uploadId: "upload-removed",
+	};
+	const keptStoredId = await attachmentStorageId(
+		"draft-1",
+		{ kind: "upload", uploadId: "upload-kept" },
+		0,
+	);
+	const removedStoredId = await attachmentStorageId(
+		"draft-1",
+		{ kind: "upload", uploadId: "upload-removed" },
+		0,
+	);
+
+	const result = await reconcileSavedComposeAttachments(
+		[kept],
+		[kept, removed],
+		"draft-1",
+		[{
+			id: removedStoredId,
+			filename: "kept.pdf",
+			mimetype: "application/pdf",
+			size: 42,
+			disposition: "attachment",
+		}, {
+			id: keptStoredId,
+			filename: "kept.pdf",
+			mimetype: "application/pdf",
+			size: 42,
+			disposition: "attachment",
+		}],
+	);
+
+	assert.equal(result.length, 1);
+	assert.equal(result[0]?.filename, "kept.pdf");
+	assert.deepEqual(result[0]?.existing, {
+		emailId: "draft-1",
+		attachmentId: keptStoredId,
+	});
+});
+
+test("draft reconciliation preserves identity when long filenames normalize identically", async () => {
+	const draftId = "draft_recovered_snapshot-1";
+	const kept: ComposeAttachmentRecord = {
+		localId: "kept-long",
+		filename: `${"😀".repeat(400)}-kept.pdf`,
+		mimetype: "application/pdf",
+		size: 42,
+		status: "ready",
+		disposition: "attachment",
+		uploadId: "upload-kept-long",
+	};
+	const removed: ComposeAttachmentRecord = {
+		...kept,
+		localId: "removed-long",
+		filename: `${"😀".repeat(400)}-removed.pdf`,
+		uploadId: "upload-removed-long",
+	};
+	const keptStoredId = await attachmentStorageId(
+		draftId,
+		{ kind: "upload", uploadId: kept.uploadId! },
+		0,
+	);
+	const removedStoredId = await attachmentStorageId(
+		draftId,
+		{ kind: "upload", uploadId: removed.uploadId! },
+		0,
+	);
+	const keptFilename = safeAttachmentStorageFilename(
+		kept.filename,
+		attachmentStorageKeyPrefix(draftId, keptStoredId),
+	);
+	const removedFilename = safeAttachmentStorageFilename(
+		removed.filename,
+		attachmentStorageKeyPrefix(draftId, removedStoredId),
+	);
+	assert.equal(keptFilename, removedFilename);
+
+	const result = await reconcileSavedComposeAttachments(
+		[kept],
+		[kept, removed],
+		draftId,
+		[{
+			id: removedStoredId,
+			filename: removedFilename,
+			mimetype: "application/pdf",
+			size: 42,
+			disposition: "attachment",
+		}, {
+			id: keptStoredId,
+			filename: keptFilename,
+			mimetype: "application/pdf",
+			size: 42,
+			disposition: "attachment",
+		}],
+	);
+
+	assert.equal(result[0]?.filename, keptFilename);
+	assert.equal(result[0]?.existing?.attachmentId, keptStoredId);
 });
 
 test("ready uploads and existing draft files become outgoing references without losing inline disposition", () => {

@@ -12,7 +12,7 @@ export type SavedViewOperations = ReturnType<typeof savedViewService>;
 
 export type SavedViewsContext = {
   Bindings: Env;
-  Variables: { session?: SessionClaims };
+	Variables: { authorizedMailboxId: string; session?: SessionClaims };
 };
 
 export interface SavedViewsDependencies {
@@ -33,10 +33,6 @@ function responseView(row: SavedViewRecord) {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
-}
-
-function mailboxAddress(raw: string): string {
-  return decodeURIComponent(raw).toLowerCase();
 }
 
 export function createSavedViewsApp(
@@ -72,7 +68,7 @@ export function createSavedViewsApp(
     const session = c.get("session")!;
     const views = await dependencies
       .service(c.env)
-      .list(session.sub, mailboxAddress(c.req.param("mailboxId")!));
+			.list(session.sub, c.var.authorizedMailboxId);
     return c.json({ views: views.map(responseView) });
   });
 
@@ -81,7 +77,7 @@ export function createSavedViewsApp(
     const input = await c.req.json().catch(() => null);
     const view = await dependencies
       .service(c.env)
-      .create(session.sub, mailboxAddress(c.req.param("mailboxId")!), input);
+			.create(session.sub, c.var.authorizedMailboxId, input);
     return c.json(responseView(view), 201);
   });
 
@@ -93,7 +89,7 @@ export function createSavedViewsApp(
       .update(
         c.req.param("viewId")!,
         session.sub,
-        mailboxAddress(c.req.param("mailboxId")!),
+				c.var.authorizedMailboxId,
         input,
       );
     return c.json(responseView(view));
@@ -106,7 +102,7 @@ export function createSavedViewsApp(
       .delete(
         c.req.param("viewId")!,
         session.sub,
-        mailboxAddress(c.req.param("mailboxId")!),
+				c.var.authorizedMailboxId,
       );
     return c.body(null, 204);
   });
@@ -120,7 +116,7 @@ export function createSavedViewsApp(
         .use(
           c.req.param("viewId")!,
           session.sub,
-          mailboxAddress(c.req.param("mailboxId")!),
+					c.var.authorizedMailboxId,
         );
       return c.json({
         view: responseView(view),
