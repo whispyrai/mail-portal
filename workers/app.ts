@@ -299,7 +299,19 @@ export default {
     }
   },
   async queue(batch: MessageBatch<unknown>, env: Env) {
-    if (batch.queue === env.INBOUND_DLQ_NAME) {
+    if (
+      batch.queue === env.INBOUND_DLQ_NAME ||
+      batch.queue === env.INBOUND_PARKING_NAME
+    ) {
+      if (batch.queue === env.INBOUND_PARKING_NAME) {
+        console.error("[mail-projection] parking Queue delivery received", {
+          batchSize: batch.messages.length,
+          errorCode: "INBOUND_PARKING_DELIVERY",
+          operation: "parking_queue_consume",
+          queue: batch.queue,
+          status: "recovering",
+        });
+      }
       await processInboundDeadLetterBatch(batch, env);
       return;
     }

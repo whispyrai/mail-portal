@@ -2,17 +2,23 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import PostalMime, { type Email } from "postal-mime";
+import type { Email } from "postal-mime";
 import { Folders } from "../shared/folders.ts";
 import {
   MAX_EMAIL_SIZE,
+  emailExists,
   storeParsedEmail,
   type EmailStorageDependencies,
 } from "./lib/store-email.ts";
 import {
+  isPermanentMimeProjectionError,
+  storeStreamingEmail,
+} from "./lib/streaming-email.ts";
+import {
   isAddressInConfiguredMailDomains,
   normalizeMailAddress,
 } from "./lib/mail-address.ts";
+import { arrayBufferToHex } from "./lib/checksum.ts";
 
 export const INBOUND_RECEIPT_SCHEMA_VERSION: 1 = 1;
 
@@ -22,6 +28,7 @@ export type InboundArchivePointer = {
   rawKey: string;
   mailboxId: string;
   rawSize: number;
+  rawSha256?: string;
   archivedAt: string;
   etag: string;
   version: string;
@@ -46,25 +53,29 @@ type InboundEnvironment = {
   };
 };
 
-type IngressReceiptState = "archived" | "enqueued" | "rejected";
+type IngressReceiptState = "admitted" | "enqueued" | "rejected";
 
 type InboundRuntime = {
   now(): Date;
   randomUUID(): string;
   sleep(delayMs: number): Promise<void>;
-  parse(raw: ArrayBuffer): Promise<Email>;
+  digestSha256(value: ArrayBuffer): Promise<ArrayBuffer>;
+  parse?(raw: ArrayBuffer): Promise<Email>;
 };
 
 const defaultRuntime: InboundRuntime = {
   now: () => new Date(),
   randomUUID: () => crypto.randomUUID(),
   sleep: (delayMs) => scheduler.wait(delayMs),
-  parse: (raw) => PostalMime.parse(raw),
+  digestSha256: (value) => crypto.subtle.digest("SHA-256", value),
 };
 
 const RAW_ARCHIVE_MAX_ATTEMPTS = 10;
 const RAW_ARCHIVE_INITIAL_BACKOFF_MS = 100;
 const RAW_ARCHIVE_MAX_BACKOFF_MS = 2_000;
+const RECEIPT_MAX_ATTEMPTS = 10;
+const RECEIPT_INITIAL_BACKOFF_MS = 50;
+const RECEIPT_MAX_BACKOFF_MS = 1_000;
 
 type DirectMailboxFallbackResult =
   | "stored"
@@ -87,11 +98,45 @@ function durationMs(runtime: InboundRuntime, startedAt: number): number {
   return Math.max(0, runtime.now().getTime() - startedAt);
 }
 
+function rejectMessage(
+  event: InboundEmailEvent,
+  input: {
+    errorCode: string;
+    ingressId: string;
+    mailboxId: string;
+    rawKey: string;
+    reason: string;
+    smtpMessage: string;
+  },
+): void {
+  console.error("[mail-ingress] permanent SMTP rejection requested", {
+    errorCode: input.errorCode,
+    ingressId: input.ingressId,
+    mailboxId: input.mailboxId,
+    operation: "smtp_rejection",
+    rawKey: input.rawKey,
+    reason: input.reason,
+    status: "rejected",
+  });
+  event.setReject(input.smtpMessage);
+}
+
+function replayStream(rawBytes: ArrayBuffer): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(rawBytes));
+      controller.close();
+    },
+  });
+}
+
 async function persistRawWithRetry(
   env: InboundEnvironment,
   rawKey: string,
   rawBytes: ArrayBuffer,
   metadata: Record<string, string>,
+  rawSha256: ArrayBuffer,
+  rawSha256Hex: string,
   ingressId: string,
   mailboxId: string,
   runtime: InboundRuntime,
@@ -103,10 +148,19 @@ async function persistRawWithRetry(
       const archived = await env.RAW_MAIL_BUCKET.put(rawKey, rawBytes, {
         httpMetadata: { contentType: "message/rfc822" },
         customMetadata: metadata,
+        sha256: rawSha256,
       });
       if (archived.size !== rawBytes.byteLength) {
         errorCode = "RAW_ARCHIVE_SIZE_MISMATCH";
         throw new Error("Raw email archive size mismatch");
+      }
+      if (!archived.checksums?.sha256) {
+        errorCode = "RAW_ARCHIVE_CHECKSUM_UNAVAILABLE";
+        throw new Error("Raw email archive checksum unavailable");
+      }
+      if (arrayBufferToHex(archived.checksums.sha256) !== rawSha256Hex) {
+        errorCode = "RAW_ARCHIVE_CHECKSUM_MISMATCH";
+        throw new Error("Raw email archive checksum mismatch");
       }
       console.log("[mail-ingress] raw archive persisted", {
         archivedSize: archived.size,
@@ -170,62 +224,75 @@ async function recordReceiptState(
   onlyIfEtag?: string,
 ): Promise<R2Object | null> {
   const startedAt = runtime.now().getTime();
-  try {
-    const receiptKey = `receipts/${pointer.ingressId}.json`;
-    const receiptBody = JSON.stringify({
-      ...pointer,
-      state,
-      updatedAt,
-    });
-    const receipt = onlyIfEtag
-      ? await env.RAW_MAIL_BUCKET.put(receiptKey, receiptBody, {
-          httpMetadata: { contentType: "application/json" },
-          customMetadata: { state },
-          onlyIf: { etagMatches: onlyIfEtag },
-        })
-      : await env.RAW_MAIL_BUCKET.put(receiptKey, receiptBody, {
-          httpMetadata: { contentType: "application/json" },
-          customMetadata: { state },
-          onlyIf: { etagDoesNotMatch: "*" },
+  for (let attempt = 1; attempt <= RECEIPT_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const receiptKey = `receipts/${pointer.ingressId}.json`;
+      const receiptBody = JSON.stringify({
+        ...pointer,
+        state,
+        updatedAt,
+      });
+      const receipt = onlyIfEtag
+        ? await env.RAW_MAIL_BUCKET.put(receiptKey, receiptBody, {
+            httpMetadata: { contentType: "application/json" },
+            customMetadata: { state },
+            onlyIf: { etagMatches: onlyIfEtag },
+          })
+        : await env.RAW_MAIL_BUCKET.put(receiptKey, receiptBody, {
+            httpMetadata: { contentType: "application/json" },
+            customMetadata: { state },
+            onlyIf: { etagDoesNotMatch: "*" },
+          });
+      if (!receipt) {
+        console.log("[mail-ingress] receipt state superseded", {
+          attempt,
+          durationMs: durationMs(runtime, startedAt),
+          ingressId: pointer.ingressId,
+          mailboxId: pointer.mailboxId,
+          operation: "receipt_write",
+          rawKey: pointer.rawKey,
+          state,
+          status: "superseded",
+          target: "r2",
         });
-    if (!receipt) {
-      console.log("[mail-ingress] receipt state superseded", {
+        return null;
+      }
+      console.log("[mail-ingress] receipt state persisted", {
+        attempt,
         durationMs: durationMs(runtime, startedAt),
         ingressId: pointer.ingressId,
         mailboxId: pointer.mailboxId,
         operation: "receipt_write",
         rawKey: pointer.rawKey,
         state,
-        status: "superseded",
+        status: "succeeded",
         target: "r2",
       });
-      return null;
+      return receipt;
+    } catch (error) {
+      const finalAttempt = attempt === RECEIPT_MAX_ATTEMPTS;
+      console.error("[mail-ingress] receipt write degraded", {
+        attempt,
+        durationMs: durationMs(runtime, startedAt),
+        errorCode: "RECEIPT_WRITE_FAILED",
+        errorMessage: errorMessage(error),
+        ingressId: pointer.ingressId,
+        mailboxId: pointer.mailboxId,
+        maxAttempts: RECEIPT_MAX_ATTEMPTS,
+        operation: "receipt_write",
+        rawKey: pointer.rawKey,
+        state,
+        status: finalAttempt ? "degraded" : "retrying",
+      });
+      if (finalAttempt) return null;
+      const delayMs = Math.min(
+        RECEIPT_INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
+        RECEIPT_MAX_BACKOFF_MS,
+      );
+      await runtime.sleep(delayMs);
     }
-    console.log("[mail-ingress] receipt state persisted", {
-      durationMs: durationMs(runtime, startedAt),
-      ingressId: pointer.ingressId,
-      mailboxId: pointer.mailboxId,
-      operation: "receipt_write",
-      rawKey: pointer.rawKey,
-      state,
-      status: "succeeded",
-      target: "r2",
-    });
-    return receipt;
-  } catch (error) {
-    console.error("[mail-ingress] receipt write degraded", {
-      durationMs: durationMs(runtime, startedAt),
-      errorCode: "RECEIPT_WRITE_FAILED",
-      errorMessage: errorMessage(error),
-      ingressId: pointer.ingressId,
-      mailboxId: pointer.mailboxId,
-      operation: "receipt_write",
-      rawKey: pointer.rawKey,
-      state,
-      status: "degraded",
-    });
-    return null;
   }
+  return null;
 }
 
 function envelopeMailboxId(
@@ -307,29 +374,65 @@ async function storeDirectlyInMailbox(
       });
       return "stored";
     }
-    const existing = await mailbox.getEmail(ingressId);
+    const existing = await emailExists(mailbox, ingressId);
     if (!existing) {
-      const parsed = await runtime.parse(rawBytes);
-      try {
-        await storeParsedEmail({ bucket: env.BUCKET, mailbox }, parsed, {
-          folder: Folders.INBOX,
-          date: receivedAt,
-          messageId: ingressId,
-          read: false,
-        });
-      } catch (error) {
-        const committed = await mailbox.getEmail(ingressId);
-        if (!committed) throw error;
-        console.log(
-          "[mail-ingress] direct mailbox ambiguous commit recovered",
-          {
-            durationMs: durationMs(runtime, startedAt),
-            ingressId,
-            mailboxId,
-            operation: "direct_mailbox_fallback",
-            status: "recovered",
-          },
-        );
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          if (runtime.parse) {
+            const parsed = await runtime.parse(rawBytes);
+            await storeParsedEmail({ bucket: env.BUCKET, mailbox }, parsed, {
+              folder: Folders.INBOX,
+              date: receivedAt,
+              messageId: ingressId,
+              read: false,
+            });
+          } else {
+            await storeStreamingEmail(
+              { bucket: env.BUCKET, mailbox },
+              replayStream(rawBytes),
+              {
+                folder: Folders.INBOX,
+                date: receivedAt,
+                messageId: ingressId,
+                read: false,
+              },
+            );
+          }
+          break;
+        } catch (error) {
+          const committed = await emailExists(mailbox, ingressId);
+          if (committed) {
+            console.log(
+              "[mail-ingress] direct mailbox ambiguous commit recovered",
+              {
+                durationMs: durationMs(runtime, startedAt),
+                ingressId,
+                mailboxId,
+                operation: "direct_mailbox_fallback",
+                status: "recovered",
+              },
+            );
+            break;
+          }
+          if (attempt === 3 || isPermanentMimeProjectionError(error))
+            throw error;
+          const delayMs = 100 * 2 ** (attempt - 1);
+          console.error(
+            "[mail-ingress] direct mailbox fallback retry scheduled",
+            {
+              attempt,
+              delayMs,
+              errorCode: "DIRECT_MAILBOX_FALLBACK_RETRY",
+              errorMessage: errorMessage(error),
+              ingressId,
+              mailboxId,
+              maxAttempts: 3,
+              operation: "direct_mailbox_fallback",
+              status: "retrying",
+            },
+          );
+          await runtime.sleep(delayMs);
+        }
       }
     }
 
@@ -391,15 +494,14 @@ async function forwardEmergencyOrReject(
     });
   }
 
-  console.error("[mail-ingress] permanent SMTP rejection requested", {
-    errorCode: "SMTP_PERMANENT_REJECTION_REQUESTED",
+  rejectMessage(event, {
+    errorCode: "ALL_DURABILITY_PATHS_FAILED",
     ingressId,
     mailboxId,
-    operation: "smtp_rejection",
     rawKey,
-    status: "rejected",
+    reason: "raw_archive_mailbox_and_emergency_failed",
+    smtpMessage: "Message could not be stored; please resend later",
   });
-  event.setReject("Message could not be stored; please resend later");
 }
 
 async function recoverFromRawArchiveFailure(
@@ -421,7 +523,14 @@ async function recoverFromRawArchiveFailure(
       rawKey,
       status: "rejected",
     });
-    event.setReject("Mailbox unavailable");
+    rejectMessage(event, {
+      errorCode: "FALLBACK_RECIPIENT_OR_SIZE_INVALID",
+      ingressId,
+      mailboxId: event.to.trim().toLowerCase(),
+      rawKey,
+      reason: "fallback_admission_invalid",
+      smtpMessage: "Mailbox unavailable",
+    });
     return;
   }
 
@@ -435,7 +544,14 @@ async function recoverFromRawArchiveFailure(
   );
   if (directResult === "stored") return;
   if (directResult === "unprovisioned" || directResult === "unverified") {
-    event.setReject("Mailbox unavailable");
+    rejectMessage(event, {
+      errorCode: "MAILBOX_UNAVAILABLE",
+      ingressId,
+      mailboxId,
+      rawKey,
+      reason: "direct_mailbox_unprovisioned_or_unverified",
+      smtpMessage: "Mailbox unavailable",
+    });
     return;
   }
 
@@ -478,12 +594,26 @@ export async function receiveEmail(
     });
     const mailboxId = envelopeMailboxId(event, env);
     if (!mailboxId) {
-      event.setReject("Mailbox unavailable");
+      rejectMessage(event, {
+        errorCode: "FALLBACK_RECIPIENT_INVALID",
+        ingressId,
+        mailboxId: envelopeRecipient,
+        rawKey,
+        reason: "unreadable_raw_recipient_invalid",
+        smtpMessage: "Mailbox unavailable",
+      });
       return;
     }
     try {
       if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
-        event.setReject("Mailbox unavailable");
+        rejectMessage(event, {
+          errorCode: "MAILBOX_UNAVAILABLE",
+          ingressId,
+          mailboxId,
+          rawKey,
+          reason: "unreadable_raw_mailbox_unprovisioned",
+          smtpMessage: "Mailbox unavailable",
+        });
         return;
       }
     } catch (verificationError) {
@@ -498,7 +628,14 @@ export async function receiveEmail(
           status: "unverified",
         },
       );
-      event.setReject("Mailbox unavailable");
+      rejectMessage(event, {
+        errorCode: "MAILBOX_VERIFICATION_FAILED",
+        ingressId,
+        mailboxId,
+        rawKey,
+        reason: "unreadable_raw_mailbox_unverified",
+        smtpMessage: "Mailbox unavailable",
+      });
       return;
     }
     await forwardEmergencyOrReject(
@@ -512,6 +649,32 @@ export async function receiveEmail(
     return;
   }
 
+  let rawSha256: ArrayBuffer;
+  try {
+    rawSha256 = await runtime.digestSha256(rawBytes);
+  } catch (error) {
+    console.error("[mail-ingress] boundary failed", {
+      durationMs: durationMs(runtime, handlerStartedAt),
+      errorCode: "RAW_ARCHIVE_CHECKSUM_PREPARATION_FAILED",
+      errorMessage: errorMessage(error),
+      ingressId,
+      mailboxId: envelopeRecipient,
+      operation: "raw_archive_checksum",
+      rawKey,
+      status: "failed",
+    });
+    await recoverFromRawArchiveFailure(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
+    );
+    return;
+  }
+  const rawSha256Hex = arrayBufferToHex(rawSha256);
   let archived: R2Object;
   try {
     archived = await persistRawWithRetry(
@@ -524,8 +687,11 @@ export async function receiveEmail(
         ingressId,
         mailboxId: envelopeRecipient,
         rawSize: String(rawBytes.byteLength),
+        rawSha256: rawSha256Hex,
         schemaVersion: String(INBOUND_RECEIPT_SCHEMA_VERSION),
       },
+      rawSha256,
+      rawSha256Hex,
       ingressId,
       envelopeRecipient,
       runtime,
@@ -550,6 +716,7 @@ export async function receiveEmail(
     rawKey,
     mailboxId: mailboxId ?? envelopeRecipient,
     rawSize: rawBytes.byteLength,
+    rawSha256: rawSha256Hex,
     archivedAt,
     etag: archived.etag,
     version: archived.version,
@@ -581,7 +748,14 @@ export async function receiveEmail(
       rawKey,
       status: "rejected",
     });
-    event.setReject("Mailbox unavailable");
+    rejectMessage(event, {
+      errorCode: "RECIPIENT_DOMAIN_INVALID",
+      ingressId,
+      mailboxId: pointer.mailboxId,
+      rawKey,
+      reason: "recipient_domain_invalid",
+      smtpMessage: "Mailbox unavailable",
+    });
     return;
   }
 
@@ -605,7 +779,14 @@ export async function receiveEmail(
       rawKey,
       status: "rejected",
     });
-    event.setReject("Mailbox unavailable");
+    rejectMessage(event, {
+      errorCode: "RECIPIENT_NOT_ALLOWED",
+      ingressId,
+      mailboxId,
+      rawKey,
+      reason: "recipient_not_allowed",
+      smtpMessage: "Mailbox unavailable",
+    });
     return;
   }
 
@@ -632,7 +813,14 @@ export async function receiveEmail(
       rawKey,
       status: "rejected",
     });
-    event.setReject("Message size unavailable");
+    rejectMessage(event, {
+      errorCode: "RAW_SIZE_INVALID",
+      ingressId,
+      mailboxId,
+      rawKey,
+      reason: "raw_size_invalid",
+      smtpMessage: "Message size unavailable",
+    });
     return;
   }
 
@@ -670,7 +858,14 @@ export async function receiveEmail(
       rawKey,
       status: "rejected",
     });
-    event.setReject("Mailbox unavailable");
+    rejectMessage(event, {
+      errorCode: "MAILBOX_UNAVAILABLE",
+      ingressId,
+      mailboxId,
+      rawKey,
+      reason: "mailbox_unprovisioned",
+      smtpMessage: "Mailbox unavailable",
+    });
     return;
   }
   if (mailboxProvisioned) {
@@ -684,13 +879,28 @@ export async function receiveEmail(
     });
   }
 
-  const archivedReceipt = await recordReceiptState(
+  const admittedReceipt = await recordReceiptState(
     env,
     pointer,
-    "archived",
+    "admitted",
     archivedAt,
     runtime,
   );
+  if (!admittedReceipt) {
+    console.error(
+      "[mail-ingress] handoff deferred until admission is durable",
+      {
+        errorCode: "ADMITTED_RECEIPT_UNAVAILABLE",
+        ingressId,
+        mailboxId,
+        operation: "queue_enqueue",
+        rawKey,
+        recoveryAction: "operator_review",
+        status: "preserved",
+      },
+    );
+    return;
+  }
   const enqueueStartedAt = runtime.now().getTime();
   try {
     await env.INBOUND_QUEUE.send(pointer);
@@ -708,26 +918,14 @@ export async function receiveEmail(
     });
     return;
   }
-  if (archivedReceipt) {
-    await recordReceiptState(
-      env,
-      pointer,
-      "enqueued",
-      runtime.now().toISOString(),
-      runtime,
-      archivedReceipt.etag,
-    );
-  } else {
-    console.error("[mail-ingress] receipt state update skipped", {
-      errorCode: "ARCHIVED_RECEIPT_UNAVAILABLE",
-      ingressId,
-      mailboxId,
-      operation: "receipt_write",
-      rawKey,
-      state: "enqueued",
-      status: "degraded",
-    });
-  }
+  await recordReceiptState(
+    env,
+    pointer,
+    "enqueued",
+    runtime.now().toISOString(),
+    runtime,
+    admittedReceipt.etag,
+  );
 
   console.log("[mail-ingress] archive pointer enqueued", {
     durationMs: durationMs(runtime, enqueueStartedAt),

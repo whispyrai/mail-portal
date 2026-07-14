@@ -22,6 +22,8 @@ type RecoveryAuditRuntime = {
   randomUUID(): string;
 };
 
+type RecoveryResult = Awaited<ReturnType<typeof recoverInboundEmail>>;
+
 const defaultRuntime: RecoveryAuditRuntime = {
   now: () => new Date(),
   randomUUID: () => crypto.randomUUID(),
@@ -47,9 +49,10 @@ export async function recoverInboundEmailWithAudit(
   input: {
     auditBucket: RecoveryAuditBucket;
     dependencies: EmailStorageDependencies;
-    parsed: Email;
+    parsed?: Email;
     pointer: InboundArchivePointer;
     operator: RecoveryOperator;
+    recover?: () => Promise<RecoveryResult>;
   },
   runtime: RecoveryAuditRuntime = defaultRuntime,
 ) {
@@ -82,10 +85,15 @@ export async function recoverInboundEmailWithAudit(
 
   let result: Awaited<ReturnType<typeof recoverInboundEmail>>;
   try {
-    result = await recoverInboundEmail(input.dependencies, input.parsed, {
-      ingressId: input.pointer.ingressId,
-      archivedAt: input.pointer.archivedAt,
-    });
+    if (input.recover) {
+      result = await input.recover();
+    } else {
+      if (!input.parsed) throw new Error("Recovery source is unavailable");
+      result = await recoverInboundEmail(input.dependencies, input.parsed, {
+        ingressId: input.pointer.ingressId,
+        archivedAt: input.pointer.archivedAt,
+      });
+    }
   } catch (error) {
     try {
       const failed = await input.auditBucket.put(

@@ -3,11 +3,13 @@ import test from "node:test";
 import type { InboundArchivePointer } from "./inbound-email.ts";
 import { reconcileInboundArchives } from "./inbound-reconciliation.ts";
 
-test("reconciliation reconstructs and enqueues an archived raw message with no receipt", async () => {
+test("reconciliation preserves but never enqueues raw mail without a durable admission decision", async () => {
   const rawKey = "raw/2026/07/13/reconcile-missing-receipt.eml";
   const queued: InboundArchivePointer[] = [];
   let receipt: Record<string, unknown> | undefined;
   let sweepCursor: Record<string, unknown> | undefined;
+  let anomaly: Record<string, unknown> | undefined;
+  let recoveryPointer: Record<string, unknown> | undefined;
   const env = {
     RAW_MAIL_BUCKET: {
       async list(options: {
@@ -33,6 +35,7 @@ test("reconciliation reconstructs and enqueues an archived raw message with no r
             ingressId: "reconcile-missing-receipt",
             mailboxId: "hello@wiserchat.ai",
             rawSize: "321",
+            rawSha256: "a".repeat(64),
             schemaVersion: "1",
           },
         };
@@ -45,6 +48,14 @@ test("reconciliation reconstructs and enqueues an archived raw message with no r
       async put(key: string, value: string) {
         if (key === "system/reconciliation-cursor.json") {
           sweepCursor = JSON.parse(value);
+          return {};
+        }
+        if (key.startsWith("system/reconciliation-anomalies/")) {
+          anomaly = JSON.parse(value);
+          return {};
+        }
+        if (key.startsWith("system/inbound-recovery-pointers/")) {
+          recoveryPointer = JSON.parse(value);
           return {};
         }
         assert.equal(key, "receipts/reconcile-missing-receipt.json");
@@ -78,28 +89,20 @@ test("reconciliation reconstructs and enqueues an archived raw message with no r
 
   assert.deepEqual(result, {
     scanned: 1,
-    reenqueued: 1,
-    skipped: 0,
+    reenqueued: 0,
+    skipped: 1,
     invalid: 0,
     failed: 0,
     projectionMissing: 0,
     terminalized: 0,
     failureLedgered: 0,
   });
-  assert.deepEqual(queued, [
-    {
-      schemaVersion: 1,
-      ingressId: "reconcile-missing-receipt",
-      rawKey,
-      mailboxId: "hello@wiserchat.ai",
-      rawSize: 321,
-      archivedAt: "2026-07-13T09:30:00.000Z",
-      etag: "archive-etag",
-      version: "archive-version",
-    },
-  ]);
-  assert.equal(receipt?.state, "enqueued");
-  assert.equal(receipt?.reconciled, true);
+  assert.deepEqual(queued, []);
+  assert.equal(receipt, undefined);
+  assert.equal(anomaly?.errorCode, "ADMISSION_DECISION_MISSING");
+  assert.equal(anomaly?.status, "pending_operator_review");
+  assert.equal(recoveryPointer?.ingressId, "reconcile-missing-receipt");
+  assert.equal(recoveryPointer?.rawSha256, "a".repeat(64));
   assert.equal(sweepCursor?.cursor, null);
 });
 
@@ -109,6 +112,7 @@ test("reconciliation skips terminal and dead-letter handoffs while repairing sta
     "recent",
     "stale",
     "archived",
+    "admitted",
     "dead-letter-recent",
     "dead-letter-stale",
     "invalid",
@@ -122,6 +126,7 @@ test("reconciliation skips terminal and dead-letter handoffs while repairing sta
     recent: { state: "enqueued", updatedAt: "2026-07-13T09:55:00.000Z" },
     stale: { state: "enqueued", updatedAt: "2026-07-13T09:30:00.000Z" },
     archived: { state: "archived", updatedAt: "2026-07-13T09:59:00.000Z" },
+    admitted: { state: "admitted", updatedAt: "2026-07-13T09:59:00.000Z" },
     "dead-letter-recent": {
       state: "dead_letter_pending",
       updatedAt: "2026-07-13T09:55:00.000Z",
@@ -210,11 +215,11 @@ test("reconciliation skips terminal and dead-letter handoffs while repairing sta
     now: () => new Date("2026-07-13T10:00:00.000Z"),
   });
 
-  assert.deepEqual(queued, ["stale", "archived"]);
+  assert.deepEqual(queued, ["stale", "archived", "admitted"]);
   assert.equal(receiptConditions.stale, "stale-receipt-etag");
   assert.deepEqual(result, {
-    scanned: 7,
-    reenqueued: 2,
+    scanned: 8,
+    reenqueued: 3,
     skipped: 3,
     invalid: 1,
     failed: 0,

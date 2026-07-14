@@ -6,10 +6,12 @@ import {
   INBOUND_RECEIPT_SCHEMA_VERSION,
   type InboundArchivePointer,
 } from "./inbound-email.ts";
+import { isSha256Hex } from "./lib/checksum.ts";
 
 const RAW_PREFIX = "raw/";
 const SWEEP_CURSOR_KEY = "system/reconciliation-cursor.json";
 const FAILURE_LEDGER_PREFIX = "system/reconciliation-failures/";
+const ANOMALY_LEDGER_PREFIX = "system/reconciliation-anomalies/";
 const LIST_PAGE_SIZE = 100;
 const STALE_HANDOFF_MS = 15 * 60 * 1000;
 
@@ -52,6 +54,7 @@ type ReconciliationEnvironment = {
     idFromName(mailboxId: string): unknown;
     get(id: unknown): {
       getEmail(ingressId: string): Promise<unknown | null>;
+      hasEmail?(ingressId: string): Promise<boolean>;
       isEmailDeleted?(ingressId: string): Promise<boolean>;
       getInboundTerminalFailure?(ingressId: string): Promise<{
         queueMessageId: string;
@@ -108,6 +111,29 @@ function failureLedgerKey(rawKey: string): string {
   return `${FAILURE_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`;
 }
 
+async function persistAnomaly(
+  bucket: ReconciliationBucket,
+  rawKey: string,
+  errorCode: string,
+  details: Record<string, unknown>,
+  runtime: ReconciliationRuntime,
+): Promise<void> {
+  await bucket.put(
+    `${ANOMALY_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`,
+    JSON.stringify({
+      ...details,
+      detectedAt: runtime.now().toISOString(),
+      errorCode,
+      rawKey,
+      status: "pending_operator_review",
+    }),
+    {
+      customMetadata: { errorCode, status: "pending_operator_review" },
+      onlyIf: { etagDoesNotMatch: "*" },
+    },
+  );
+}
+
 function isStale(updatedAt: unknown, now: Date): boolean {
   if (typeof updatedAt !== "string") return true;
   const timestamp = Date.parse(updatedAt);
@@ -118,16 +144,19 @@ function isStale(updatedAt: unknown, now: Date): boolean {
 
 async function readSweepCursor(
   bucket: ReconciliationBucket,
-): Promise<string | undefined> {
+): Promise<{ cursor?: string; etag?: string }> {
   const object = await bucket.get(SWEEP_CURSOR_KEY);
-  if (!object) return undefined;
+  if (!object) return {};
   try {
     const value: unknown = JSON.parse(await object.text());
-    return isRecord(value) && typeof value.cursor === "string"
-      ? value.cursor
-      : undefined;
+    return {
+      ...(isRecord(value) && typeof value.cursor === "string"
+        ? { cursor: value.cursor }
+        : {}),
+      ...(object.etag ? { etag: object.etag } : {}),
+    };
   } catch {
-    return undefined;
+    return { ...(object.etag ? { etag: object.etag } : {}) };
   }
 }
 
@@ -136,7 +165,14 @@ function pointerFromArchive(
 ): InboundArchivePointer | null {
   const metadata = archive.customMetadata;
   if (!metadata) return null;
-  const { archivedAt, ingressId, mailboxId, rawSize, schemaVersion } = metadata;
+  const {
+    archivedAt,
+    ingressId,
+    mailboxId,
+    rawSize,
+    rawSha256,
+    schemaVersion,
+  } = metadata;
   const parsedSize = Number(rawSize);
   if (
     schemaVersion !== String(INBOUND_RECEIPT_SCHEMA_VERSION) ||
@@ -147,6 +183,7 @@ function pointerFromArchive(
     !Number.isSafeInteger(parsedSize) ||
     parsedSize <= 0 ||
     parsedSize !== archive.size ||
+    (rawSha256 !== undefined && !isSha256Hex(rawSha256)) ||
     !archive.key.endsWith(`/${ingressId}.eml`) ||
     !archive.etag ||
     !archive.version
@@ -160,6 +197,7 @@ function pointerFromArchive(
     rawKey: archive.key,
     mailboxId,
     rawSize: parsedSize,
+    ...(rawSha256 ? { rawSha256 } : {}),
     archivedAt,
     etag: archive.etag,
     version: archive.version,
@@ -181,7 +219,7 @@ async function readReceipt(
 }
 
 function shouldEnqueue(receipt: Receipt | null, now: Date): boolean {
-  if (!receipt) return true;
+  if (!receipt) return false;
   if (
     receipt.state === "stored" ||
     receipt.state === "deleted" ||
@@ -191,10 +229,10 @@ function shouldEnqueue(receipt: Receipt | null, now: Date): boolean {
   ) {
     return false;
   }
-  if (receipt.state === "archived") return true;
+  if (receipt.state === "archived" || receipt.state === "admitted") return true;
   if (receipt.state === "dead_letter_pending") return false;
   if (receipt.state !== "enqueued" && receipt.state !== "retrying") {
-    return true;
+    return false;
   }
   return isStale(receipt.updatedAt, now);
 }
@@ -210,6 +248,13 @@ async function reconcileArchive(
   const archive = await env.RAW_MAIL_BUCKET.head(rawKey);
   const pointer = archive ? pointerFromArchive(archive) : null;
   if (!pointer) {
+    await persistAnomaly(
+      env.RAW_MAIL_BUCKET,
+      rawKey,
+      "RAW_ARCHIVE_METADATA_INVALID",
+      {},
+      runtime,
+    );
     console.error("[mail-reconciliation] archive metadata invalid", {
       durationMs: durationMs(runtime, startedAt),
       errorCode: "RAW_ARCHIVE_METADATA_INVALID",
@@ -222,10 +267,79 @@ async function reconcileArchive(
 
   const now = runtime.now();
   const receipt = await readReceipt(env.RAW_MAIL_BUCKET, pointer.ingressId);
+  if (!receipt) {
+    await env.RAW_MAIL_BUCKET.put(
+      `system/inbound-recovery-pointers/${pointer.ingressId}.json`,
+      JSON.stringify(pointer),
+      {
+        customMetadata: {
+          ingressId: pointer.ingressId,
+          mailboxId: pointer.mailboxId,
+          status: "pending_operator_review",
+        },
+        onlyIf: { etagDoesNotMatch: "*" },
+      },
+    );
+    await persistAnomaly(
+      env.RAW_MAIL_BUCKET,
+      rawKey,
+      "ADMISSION_DECISION_MISSING",
+      { ingressId: pointer.ingressId, mailboxId: pointer.mailboxId },
+      runtime,
+    );
+    console.error("[mail-reconciliation] admission decision missing", {
+      durationMs: durationMs(runtime, startedAt),
+      errorCode: "ADMISSION_DECISION_MISSING",
+      ingressId: pointer.ingressId,
+      mailboxId: pointer.mailboxId,
+      operation: "archive_reconcile",
+      rawKey,
+      recoveryAction: "operator_review",
+      status: "preserved",
+    });
+    return "skipped";
+  }
+  const knownReceiptStates = new Set([
+    "admitted",
+    "archived",
+    "dead_letter_pending",
+    "dead_lettered",
+    "deleted",
+    "enqueued",
+    "quarantined",
+    "rejected",
+    "retrying",
+    "stored",
+  ]);
+  if (
+    typeof receipt.state !== "string" ||
+    !knownReceiptStates.has(receipt.state)
+  ) {
+    await persistAnomaly(
+      env.RAW_MAIL_BUCKET,
+      rawKey,
+      "RECEIPT_STATE_UNKNOWN",
+      {
+        ingressId: pointer.ingressId,
+        mailboxId: pointer.mailboxId,
+        receiptState: receipt.state,
+      },
+      runtime,
+    );
+    console.error("[mail-reconciliation] receipt state unknown", {
+      errorCode: "RECEIPT_STATE_UNKNOWN",
+      ingressId: pointer.ingressId,
+      mailboxId: pointer.mailboxId,
+      operation: "archive_reconcile",
+      rawKey,
+      status: "pending_operator_review",
+    });
+    return "skipped";
+  }
   const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(pointer.mailboxId));
   const staleHandoff =
-    !receipt ||
     receipt.state === "archived" ||
+    receipt.state === "admitted" ||
     ((receipt.state === "enqueued" ||
       receipt.state === "retrying" ||
       receipt.state === "dead_letter_pending") &&
@@ -320,7 +434,17 @@ async function reconcileArchive(
     return "terminalized";
   }
   if (receipt?.state === "stored") {
-    if (!(await mailbox.getEmail(pointer.ingressId))) {
+    const projectionExists = mailbox.hasEmail
+      ? await mailbox.hasEmail(pointer.ingressId)
+      : Boolean(await mailbox.getEmail(pointer.ingressId));
+    if (!projectionExists) {
+      await persistAnomaly(
+        env.RAW_MAIL_BUCKET,
+        pointer.rawKey,
+        "STORED_PROJECTION_MISSING",
+        { ingressId: pointer.ingressId, mailboxId: pointer.mailboxId },
+        runtime,
+      );
       console.error("[mail-reconciliation] stored projection is missing", {
         durationMs: durationMs(runtime, startedAt),
         errorCode: "STORED_PROJECTION_MISSING",
@@ -395,12 +519,12 @@ export async function reconcileInboundArchives(
     terminalized: 0,
     failureLedgered: 0,
   };
-  const cursor = await readSweepCursor(env.RAW_MAIL_BUCKET);
+  const cursorState = await readSweepCursor(env.RAW_MAIL_BUCKET);
   const listStartedAt = runtime.now().getTime();
   const page = await env.RAW_MAIL_BUCKET.list({
     prefix: RAW_PREFIX,
     limit: LIST_PAGE_SIZE,
-    ...(cursor ? { cursor } : {}),
+    ...(cursorState.cursor ? { cursor: cursorState.cursor } : {}),
   });
   console.log("[mail-reconciliation] archive page listed", {
     count: page.objects.length,
@@ -480,13 +604,25 @@ export async function reconcileInboundArchives(
   }
 
   const cursorWriteStartedAt = runtime.now().getTime();
-  await env.RAW_MAIL_BUCKET.put(
+  const cursorWritten = await env.RAW_MAIL_BUCKET.put(
     SWEEP_CURSOR_KEY,
     JSON.stringify({
       cursor: page.truncated ? page.cursor : null,
       updatedAt: runtime.now().toISOString(),
     }),
+    {
+      onlyIf: cursorState.etag
+        ? { etagMatches: cursorState.etag }
+        : { etagDoesNotMatch: "*" },
+    },
   );
+  if (!cursorWritten) {
+    console.log("[mail-reconciliation] sweep cursor update superseded", {
+      operation: "reconciliation_cursor_write",
+      status: "superseded",
+    });
+    return result;
+  }
   console.log("[mail-reconciliation] sweep cursor persisted", {
     durationMs: durationMs(runtime, cursorWriteStartedAt),
     operation: "reconciliation_cursor_write",

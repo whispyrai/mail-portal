@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 
 import { appendFile, mkdir } from "node:fs/promises";
+import {
+  fetchWithTimeout,
+  recoveryCompletionMessage,
+} from "./recover-inbound-helpers.mjs";
+
+const LOGIN_TIMEOUT_MS = 15_000;
+const RECOVERY_TIMEOUT_MS = 60_000;
 
 const allowedArgs = new Set(["base", "email", "mailbox", "ingress-id"]);
 const args = {};
@@ -97,15 +104,20 @@ await detail("Recovery inputs", {
 });
 
 await progress("Phase 1/2: authenticating as administrator");
-const loginResponse = await fetch(`${base}/login`, {
-  method: "POST",
-  headers: { "content-type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    email: args.email,
-    password: process.env.IMPORT_PASSWORD,
-  }),
-  redirect: "manual",
-});
+const loginResponse = await fetchWithTimeout(
+  fetch,
+  `${base}/login`,
+  {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      email: args.email,
+      password: process.env.IMPORT_PASSWORD,
+    }),
+    redirect: "manual",
+  },
+  LOGIN_TIMEOUT_MS,
+);
 const setCookie = loginResponse.headers.get("set-cookie");
 await detail("Login response", {
   status: loginResponse.status,
@@ -125,10 +137,15 @@ let finalResponse;
 let responseBody = {};
 for (let attempt = 1; attempt <= 3; attempt += 1) {
   try {
-    finalResponse = await fetch(url, {
-      method: "POST",
-      headers: { cookie },
-    });
+    finalResponse = await fetchWithTimeout(
+      fetch,
+      url,
+      {
+        method: "POST",
+        headers: { cookie },
+      },
+      RECOVERY_TIMEOUT_MS,
+    );
     responseBody = await finalResponse
       .clone()
       .json()
@@ -160,9 +177,7 @@ if (!finalResponse?.ok) {
     `Recovery failed with HTTP ${finalResponse?.status ?? "unavailable"}: ${JSON.stringify(responseBody)}`,
   );
 }
-await progress(
-  responseBody.status === "skipped"
-    ? "Recovery complete: the stable ingress ID was already present"
-    : "Recovery complete: the archived message was restored",
-  { status: responseBody.status, ingressId: args["ingress-id"] },
-);
+await progress(recoveryCompletionMessage(responseBody), {
+  status: responseBody.status,
+  ingressId: args["ingress-id"],
+});

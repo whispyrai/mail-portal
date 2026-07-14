@@ -1,7 +1,48 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Email } from "postal-mime";
-import { recoverInboundEmail } from "./recover-inbound.ts";
+import {
+  recoverInboundEmail,
+  recoverStreamingInboundEmail,
+} from "./recover-inbound.ts";
+
+test("recoverStreamingInboundEmail rebuilds from the archive without buffering MIME", async () => {
+  let stored: Record<string, unknown> | undefined;
+  const raw = new TextEncoder().encode(
+    "From: sender@example.com\r\nTo: hello@wiserchat.ai\r\nSubject: Streamed recovery\r\n\r\nRecovered body",
+  );
+
+  const result = await recoverStreamingInboundEmail(
+    {
+      bucket: { async put() {}, async delete() {} },
+      mailbox: {
+        async getEmail() {
+          return stored ?? null;
+        },
+        async findThreadBySubject() {
+          return null;
+        },
+        async createEmail(_folder, email) {
+          stored = email as unknown as Record<string, unknown>;
+        },
+      },
+    },
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(raw);
+        controller.close();
+      },
+    }),
+    {
+      ingressId: "streamed-recovery",
+      archivedAt: "2026-07-13T09:30:00.000Z",
+    },
+  );
+
+  assert.deepEqual(result, { status: "recovered", ambiguousCommit: false });
+  assert.equal(stored?.id, "streamed-recovery");
+  assert.equal(stored?.body, "Recovered body");
+});
 
 test("recoverInboundEmail preserves the ingress identity and received timestamp", async () => {
   let stored: Record<string, unknown> | undefined;

@@ -15,8 +15,10 @@ import {
   AuditedInboundRecoveryError,
   recoverInboundEmailWithAudit,
 } from "../lib/import/audited-inbound-recovery";
+import { recoverStreamingInboundEmail } from "../lib/import/recover-inbound";
 import { mapZohoFolder } from "../lib/import/parse";
 import { MAX_EMAIL_SIZE } from "../lib/store-email";
+import { arrayBufferToHex } from "../lib/checksum";
 import type { InboundArchivePointer } from "../inbound-email";
 import { isInboundArchivePointer } from "../inbound-queue";
 import {
@@ -361,24 +363,74 @@ adminApp.post("/recover-inbound/:mailboxId", async (c) => {
   const receiptObject = await c.env.RAW_MAIL_BUCKET.get(
     `receipts/${query.data.ingressId}.json`,
   );
-  if (!receiptObject)
-    return c.json({ error: "Inbound receipt not found" }, 404);
-  let receipt: unknown;
-  try {
-    receipt = JSON.parse(await receiptObject.text());
-  } catch {
-    return c.json({ error: "Inbound receipt is malformed" }, 409);
+  let receipt: InboundArchivePointer;
+  let receiptRecord: InboundArchivePointer & Record<string, unknown>;
+  if (receiptObject) {
+    let parsedReceipt: unknown;
+    try {
+      parsedReceipt = JSON.parse(await receiptObject.text());
+    } catch {
+      return c.json({ error: "Inbound receipt is malformed" }, 409);
+    }
+    if (
+      !isInboundArchivePointer(parsedReceipt) ||
+      parsedReceipt.mailboxId !== mailboxId
+    ) {
+      return c.json(
+        { error: "Inbound receipt does not match the requested mailbox" },
+        409,
+      );
+    }
+    receipt = parsedReceipt;
+    receiptRecord = parsedReceipt as InboundArchivePointer &
+      Record<string, unknown>;
+    if (typeof receiptRecord.state !== "string") {
+      return c.json({ error: "Inbound receipt has no durable state" }, 409);
+    }
+  } else {
+    const recoveryPointer = await c.env.RAW_MAIL_BUCKET.get(
+      `system/inbound-recovery-pointers/${query.data.ingressId}.json`,
+    );
+    if (!recoveryPointer) {
+      return c.json({ error: "Inbound recovery pointer not found" }, 404);
+    }
+    let parsedPointer: unknown;
+    try {
+      parsedPointer = JSON.parse(await recoveryPointer.text());
+    } catch {
+      return c.json({ error: "Inbound recovery pointer is malformed" }, 409);
+    }
+    if (
+      !isInboundArchivePointer(parsedPointer) ||
+      parsedPointer.mailboxId !== mailboxId
+    ) {
+      return c.json({ error: "Inbound recovery pointer is invalid" }, 409);
+    }
+    const rawKey = parsedPointer.rawKey;
+    const archiveMetadata = await c.env.RAW_MAIL_BUCKET.head(rawKey);
+    const metadata = archiveMetadata?.customMetadata;
+    if (
+      !archiveMetadata ||
+      !metadata ||
+      metadata.schemaVersion !== String(parsedPointer.schemaVersion) ||
+      metadata.ingressId !== query.data.ingressId ||
+      metadata.mailboxId !== mailboxId ||
+      metadata.rawSize !== String(archiveMetadata.size) ||
+      (parsedPointer.rawSha256 !== undefined &&
+        metadata.rawSha256 !== parsedPointer.rawSha256) ||
+      !metadata.archivedAt ||
+      !Number.isFinite(Date.parse(metadata.archivedAt))
+    ) {
+      return c.json({ error: "Archived inbound metadata is invalid" }, 409);
+    }
+    receipt = parsedPointer;
+    receiptRecord = { ...receipt, state: "admitted" };
   }
-  if (!isInboundArchivePointer(receipt) || receipt.mailboxId !== mailboxId) {
+  if (receipt.mailboxId !== mailboxId) {
     return c.json(
       { error: "Inbound receipt does not match the requested mailbox" },
       409,
     );
-  }
-  const receiptRecord = receipt as InboundArchivePointer &
-    Record<string, unknown>;
-  if (typeof receiptRecord.state !== "string") {
-    return c.json({ error: "Inbound receipt has no durable state" }, 409);
   }
 
   const rawObject = await c.env.RAW_MAIL_BUCKET.get(receipt.rawKey);
@@ -388,26 +440,21 @@ adminApp.post("/recover-inbound/:mailboxId", async (c) => {
     rawObject.key !== receipt.rawKey ||
     rawObject.size !== receipt.rawSize ||
     rawObject.etag !== receipt.etag ||
-    rawObject.version !== receipt.version
+    rawObject.version !== receipt.version ||
+    (receipt.rawSha256 !== undefined &&
+      (!rawObject.checksums.sha256 ||
+        arrayBufferToHex(rawObject.checksums.sha256) !== receipt.rawSha256))
   ) {
     return c.json(
       { error: "Archived inbound message failed integrity verification" },
       409,
     );
   }
-  const raw = await rawObject.arrayBuffer();
-  if (raw.byteLength === 0 || raw.byteLength > MAX_EMAIL_SIZE) {
+  if (rawObject.size === 0 || rawObject.size > MAX_EMAIL_SIZE) {
     return c.json(
       { error: "Archived inbound message has an invalid size" },
       409,
     );
-  }
-
-  let parsed: Email;
-  try {
-    parsed = await PostalMime.parse(raw);
-  } catch {
-    return c.json({ error: "invalid RFC822 message" }, 400);
   }
 
   const session = c.get("session");
@@ -419,9 +466,17 @@ adminApp.post("/recover-inbound/:mailboxId", async (c) => {
     auditedRecovery = await recoverInboundEmailWithAudit({
       auditBucket: c.env.RAW_MAIL_BUCKET,
       dependencies: { bucket: c.env.BUCKET, mailbox },
-      parsed,
       pointer: receipt,
       operator: { id: session.sub, email: session.email },
+      recover: () =>
+        recoverStreamingInboundEmail(
+          { bucket: c.env.BUCKET, mailbox },
+          rawObject.body,
+          {
+            ingressId: receipt.ingressId,
+            archivedAt: receipt.archivedAt,
+          },
+        ),
     });
   } catch (error) {
     const stage =
@@ -463,12 +518,17 @@ adminApp.post("/recover-inbound/:mailboxId", async (c) => {
   }
 
   const { auditId, recoveredAt, result } = auditedRecovery;
+  const recoveredState =
+    result.status === "skipped" && result.reason === "deleted"
+      ? "deleted"
+      : "stored";
 
   try {
     const auditedReceipt = await c.env.RAW_MAIL_BUCKET.put(
       `receipts/${query.data.ingressId}.json`,
       JSON.stringify({
         ...receiptRecord,
+        state: recoveredState,
         recovery: {
           auditId,
           recoveredAt,
@@ -478,8 +538,10 @@ adminApp.post("/recover-inbound/:mailboxId", async (c) => {
       }),
       {
         httpMetadata: { contentType: "application/json" },
-        customMetadata: { state: receiptRecord.state },
-        onlyIf: { etagMatches: receiptObject.etag },
+        customMetadata: { state: recoveredState },
+        onlyIf: receiptObject
+          ? { etagMatches: receiptObject.etag }
+          : { etagDoesNotMatch: "*" },
       },
     );
     if (!auditedReceipt) {

@@ -3,8 +3,33 @@
 // platform boundary.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { receiveEmail, type InboundArchivePointer } from "./inbound-email.ts";
+
+type R2PutTestOptions = {
+  customMetadata?: Record<string, string>;
+  onlyIf?: { etagMatches?: string };
+  sha256?: ArrayBuffer | string;
+};
+
+function r2Object(
+  key: string,
+  size: number,
+  options?: R2PutTestOptions,
+  etag = "archive-etag",
+  version = "archive-version",
+) {
+  return {
+    key,
+    size,
+    etag,
+    version,
+    ...(options?.sha256 instanceof ArrayBuffer
+      ? { checksums: { sha256: options.sha256 } }
+      : {}),
+  };
+}
 
 function rawEmail(headers: string, body = "Hello from the Internet.") {
   const bytes = new TextEncoder().encode(`${headers}\r\n\r\n${body}`);
@@ -150,6 +175,9 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
   const body = "Hello from the Internet.";
   const raw = rawEmail(headers, body);
   const expectedRaw = new TextEncoder().encode(`${headers}\r\n\r\n${body}`);
+  const expectedRawSha256 = createHash("sha256")
+    .update(expectedRaw)
+    .digest("hex");
   const archived: Array<{
     key: string;
     bytes: Uint8Array;
@@ -171,30 +199,26 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
     RAW_MAIL_BUCKET: {
       async put(
         key: string,
-        value: ReadableStream | string,
-        options?: { customMetadata?: Record<string, string> },
+        value: ReadableStream | ArrayBuffer | string,
+        options?: R2PutTestOptions,
       ) {
         if (key.startsWith("receipts/")) {
           externalOperations.push("receipt-put");
           assert.equal(typeof value, "string");
           receiptStates.push(JSON.parse(value).state);
-          return {
+          return r2Object(
             key,
-            size: value.length,
-            etag: "receipt-etag",
-            version: "receipt-version",
-          };
+            value.length,
+            options,
+            "receipt-etag",
+            "receipt-version",
+          );
         }
         assert.notEqual(typeof value, "string");
         externalOperations.push("raw-put");
         const bytes = new Uint8Array(await new Response(value).arrayBuffer());
         archived.push({ key, bytes, customMetadata: options?.customMetadata });
-        return {
-          key,
-          size: bytes.byteLength,
-          etag: "archive-etag",
-          version: "archive-version",
-        };
+        return r2Object(key, bytes.byteLength, options);
       },
     },
     INBOUND_QUEUE: {
@@ -237,6 +261,7 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
     ingressId: "ingress-test",
     mailboxId: mailboxAddress,
     rawSize: String(expectedRaw.byteLength),
+    rawSha256: expectedRawSha256,
     schemaVersion: "1",
   });
   assert.deepEqual(queued, [
@@ -247,11 +272,12 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
       mailboxId: mailboxAddress,
       rawKey: archived[0].key,
       rawSize: expectedRaw.byteLength,
+      rawSha256: expectedRawSha256,
       schemaVersion: 1,
       version: "archive-version",
     },
   ]);
-  assert.deepEqual(receiptStates, ["archived", "enqueued"]);
+  assert.deepEqual(receiptStates, ["admitted", "enqueued"]);
   assert.deepEqual(externalOperations, [
     "raw-put",
     "mailbox-head",
@@ -259,6 +285,58 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
     "queue-send",
     "receipt-put",
   ]);
+});
+
+test("inbound delivery never enqueues before the durable admission decision commits", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let queued = false;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        assert.fail(`valid preserved mail must not be rejected: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      BUCKET: {
+        async head() {
+          return {};
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (key.startsWith("receipts/")) {
+            throw new Error("simulated receipt outage");
+          }
+          assert.ok(value instanceof ArrayBuffer);
+          return r2Object(key, value.byteLength, options);
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          queued = true;
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "admission-write-failure",
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(queued, false);
 });
 
 test("inbound delivery never regresses a receipt state advanced by the Queue consumer", async () => {
@@ -278,26 +356,21 @@ test("inbound delivery never regresses a receipt state advanced by the Queue con
     RAW_MAIL_BUCKET: {
       async put(
         key: string,
-        value: ReadableStream | string,
-        options?: { onlyIf?: { etagMatches?: string } },
+        value: ReadableStream | ArrayBuffer | string,
+        options?: R2PutTestOptions,
       ) {
         if (!key.startsWith("receipts/")) {
           assert.notEqual(typeof value, "string");
           const size = new Uint8Array(await new Response(value).arrayBuffer())
             .byteLength;
-          return {
-            key,
-            size,
-            etag: "archive-etag",
-            version: "archive-version",
-          };
+          return r2Object(key, size, options);
         }
 
         assert.equal(typeof value, "string");
         const nextState = JSON.parse(value).state;
-        if (nextState === "archived") {
+        if (nextState === "admitted") {
           receiptState = nextState;
-          receiptEtag = "archived-receipt-etag";
+          receiptEtag = "admitted-receipt-etag";
           return {
             key,
             size: value.length,
@@ -308,7 +381,7 @@ test("inbound delivery never regresses a receipt state advanced by the Queue con
 
         enqueuedCondition = options?.onlyIf?.etagMatches;
         if (enqueuedCondition !== receiptEtag) return null;
-        if (receiptState !== "archived") return null;
+        if (receiptState !== "admitted") return null;
         receiptState = nextState;
         return {
           key,
@@ -343,7 +416,7 @@ test("inbound delivery never regresses a receipt state advanced by the Queue con
     },
   );
 
-  assert.equal(enqueuedCondition, "archived-receipt-etag");
+  assert.equal(enqueuedCondition, "admitted-receipt-etag");
   assert.equal(receiptState, "stored");
 });
 
@@ -352,6 +425,7 @@ test("inbound delivery writes directly to the intended mailbox after raw retries
   let queued = false;
   let archiveAttempts = 0;
   let storedEmail: Record<string, unknown> | undefined;
+  const uploadedAttachments: Uint8Array[] = [];
   const backoffDelays: number[] = [];
   const errors: Array<{ message: string; fields?: Record<string, unknown> }> =
     [];
@@ -360,7 +434,26 @@ test("inbound delivery writes directly to the intended mailbox after raw retries
     errors.push({ message, fields });
   };
   try {
-    const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+    const raw = rawEmail(
+      [
+        "From: sender@example.com",
+        `To: ${mailboxAddress}`,
+        'Content-Type: multipart/mixed; boundary="direct-boundary"',
+      ].join("\r\n"),
+      [
+        "--direct-boundary",
+        "Content-Type: text/plain",
+        "",
+        "Direct fallback body.",
+        "--direct-boundary",
+        'Content-Type: application/octet-stream; name="fallback.txt"',
+        'Content-Disposition: attachment; filename="fallback.txt"',
+        "Content-Transfer-Encoding: base64",
+        "",
+        "RGlyZWN0IGZhbGxiYWNr",
+        "--direct-boundary--",
+      ].join("\r\n"),
+    );
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
@@ -369,7 +462,15 @@ test("inbound delivery writes directly to the intended mailbox after raw retries
         async head() {
           return {};
         },
-        async put() {},
+        async put(_key: string, value: unknown) {
+          assert.ok(
+            value instanceof ReadableStream,
+            "direct fallback attachment must cross R2 as a stream",
+          );
+          const bytes = new Uint8Array(await new Response(value).arrayBuffer());
+          uploadedAttachments.push(bytes);
+          return { size: bytes.byteLength };
+        },
         async delete() {},
       },
       RAW_MAIL_BUCKET: {
@@ -432,6 +533,11 @@ test("inbound delivery writes directly to the intended mailbox after raw retries
     assert.equal(queued, false);
     assert.equal(storedEmail?.id, "archive-failure");
     assert.equal(storedEmail?.date, "2026-07-13T09:30:00.000Z");
+    assert.equal(uploadedAttachments.length, 1);
+    assert.equal(
+      new TextDecoder().decode(uploadedAttachments[0]),
+      "Direct fallback",
+    );
     assert.equal(archiveAttempts, 10);
     assert.deepEqual(
       backoffDelays,
@@ -482,7 +588,17 @@ test("inbound delivery forwards to Gmail when raw archival and direct mailbox st
           async head() {
             return {};
           },
-          async put() {},
+          async put(_key: string, value: unknown) {
+            assert.ok(
+              value instanceof ReadableStream,
+              "direct fallback attachment must cross R2 as a stream",
+            );
+            const bytes = new Uint8Array(
+              await new Response(value).arrayBuffer(),
+            );
+            uploadedAttachments.push(bytes);
+            return { size: bytes.byteLength };
+          },
           async delete() {},
         },
         RAW_MAIL_BUCKET: {
@@ -644,10 +760,263 @@ test("inbound delivery permanently rejects only when all three durable paths fai
     );
     assert.equal(forwardFailure?.fields?.status, "failed");
     const rejectionLog = errors.find(
-      (entry) =>
-        entry.fields?.errorCode === "SMTP_PERMANENT_REJECTION_REQUESTED",
+      (entry) => entry.fields?.errorCode === "ALL_DURABILITY_PATHS_FAILED",
     );
     assert.equal(rejectionLog?.fields?.status, "rejected");
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test("inbound delivery stores in the intended mailbox when checksum preparation fails", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let rawPutAttempted = false;
+  let storedEmail: Record<string, unknown> | undefined;
+  let forwarded = false;
+  const errors: Array<{ fields?: Record<string, unknown> }> = [];
+  const originalConsoleError = console.error;
+  console.error = (_message: string, fields?: Record<string, unknown>) => {
+    errors.push({ fields });
+  };
+  try {
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...raw,
+        setReject(reason: string) {
+          assert.fail(`successful mailbox fallback must not reject: ${reason}`);
+        },
+        async forward() {
+          forwarded = true;
+          return { messageId: "must-not-forward" };
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        BUCKET: {
+          async head() {
+            return {};
+          },
+          async put() {
+            assert.fail(
+              "plain fallback message must not upload derived objects",
+            );
+          },
+          async delete() {},
+        },
+        RAW_MAIL_BUCKET: {
+          async put() {
+            rawPutAttempted = true;
+            assert.fail("R2 must not receive a raw write without a checksum");
+          },
+        },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName(id: string) {
+            return id;
+          },
+          get() {
+            return {
+              async getEmail() {
+                return storedEmail ?? null;
+              },
+              async findThreadBySubject() {
+                return null;
+              },
+              async createEmail(
+                folder: string,
+                email: Record<string, unknown>,
+              ) {
+                assert.equal(folder, "inbox");
+                storedEmail = email;
+              },
+            };
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "digest-failure",
+        async digestSha256() {
+          throw new Error("simulated WebCrypto failure");
+        },
+      },
+    );
+
+    assert.equal(rawPutAttempted, false);
+    assert.equal(forwarded, false);
+    assert.equal(storedEmail?.id, "digest-failure");
+    assert.equal(
+      errors.find(
+        (entry) =>
+          entry.fields?.errorCode === "RAW_ARCHIVE_CHECKSUM_PREPARATION_FAILED",
+      )?.fields?.status,
+      "failed",
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test("inbound delivery retries when R2 omits the requested raw checksum", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let archiveAttempts = 0;
+  let forwarded = false;
+  const errors: Array<{ fields?: Record<string, unknown> }> = [];
+  const originalConsoleError = console.error;
+  console.error = (_message: string, fields?: Record<string, unknown>) => {
+    errors.push({ fields });
+  };
+  try {
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...raw,
+        setReject(reason: string) {
+          assert.fail(
+            `successful emergency forwarding must not reject: ${reason}`,
+          );
+        },
+        async forward() {
+          forwarded = true;
+          return { messageId: "missing-checksum-forward" };
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        BUCKET: {
+          async head() {
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put(key: string, value: ArrayBuffer) {
+            archiveAttempts += 1;
+            return {
+              key,
+              size: value.byteLength,
+              etag: "archive-etag",
+              version: "archive-version",
+            };
+          },
+        },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName(id: string) {
+            return id;
+          },
+          get() {
+            throw new Error("simulated Durable Object outage");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "missing-checksum",
+        sleep: () => Promise.resolve(),
+      },
+    );
+
+    assert.equal(archiveAttempts, 10);
+    assert.equal(forwarded, true);
+    const archiveFailures = errors.filter(
+      (entry) => entry.fields?.operation === "raw_archive",
+    );
+    assert.equal(archiveFailures.length, 10);
+    assert.equal(
+      archiveFailures.at(-1)?.fields?.errorCode,
+      "RAW_ARCHIVE_CHECKSUM_UNAVAILABLE",
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
+test("inbound delivery retries when R2 returns a same-size raw object with the wrong checksum", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let archiveAttempts = 0;
+  let forwarded = false;
+  const errors: Array<{ fields?: Record<string, unknown> }> = [];
+  const originalConsoleError = console.error;
+  console.error = (_message: string, fields?: Record<string, unknown>) => {
+    errors.push({ fields });
+  };
+  try {
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...raw,
+        setReject(reason: string) {
+          assert.fail(
+            `successful emergency forwarding must not reject: ${reason}`,
+          );
+        },
+        async forward() {
+          forwarded = true;
+          return { messageId: "wrong-checksum-forward" };
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        BUCKET: {
+          async head() {
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put(key: string, value: ArrayBuffer) {
+            archiveAttempts += 1;
+            return {
+              key,
+              size: value.byteLength,
+              etag: "archive-etag",
+              version: "archive-version",
+              checksums: { sha256: new ArrayBuffer(32) },
+            };
+          },
+        },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName(id: string) {
+            return id;
+          },
+          get() {
+            throw new Error("simulated Durable Object outage");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "wrong-checksum",
+        sleep: () => Promise.resolve(),
+      },
+    );
+
+    assert.equal(archiveAttempts, 10);
+    assert.equal(forwarded, true);
+    const archiveFailures = errors.filter(
+      (entry) => entry.fields?.operation === "raw_archive",
+    );
+    assert.equal(archiveFailures.length, 10);
+    assert.equal(
+      archiveFailures.at(-1)?.fields?.errorCode,
+      "RAW_ARCHIVE_CHECKSUM_MISMATCH",
+    );
   } finally {
     console.error = originalConsoleError;
   }
@@ -750,7 +1119,26 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
     errors.push({ message, fields });
   };
   try {
-    const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+    const raw = rawEmail(
+      [
+        "From: sender@example.com",
+        `To: ${mailboxAddress}`,
+        'Content-Type: multipart/mixed; boundary="direct-boundary"',
+      ].join("\r\n"),
+      [
+        "--direct-boundary",
+        "Content-Type: text/plain",
+        "",
+        "Direct fallback body.",
+        "--direct-boundary",
+        'Content-Type: application/octet-stream; name="fallback.txt"',
+        'Content-Disposition: attachment; filename="fallback.txt"',
+        "Content-Transfer-Encoding: base64",
+        "",
+        "RGlyZWN0IGZhbGxiYWNr",
+        "--direct-boundary--",
+      ].join("\r\n"),
+    );
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
@@ -760,26 +1148,26 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
         },
       },
       RAW_MAIL_BUCKET: {
-        async put(key: string, value: ReadableStream | string) {
+        async put(
+          key: string,
+          value: ReadableStream | ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
           if (key.startsWith("receipts/")) {
             assert.equal(typeof value, "string");
             receiptStates.push(JSON.parse(value).state);
-            return {
+            return r2Object(
               key,
-              size: value.length,
-              etag: "receipt-etag",
-              version: "receipt-version",
-            };
+              value.length,
+              options,
+              "receipt-etag",
+              "receipt-version",
+            );
           }
           assert.notEqual(typeof value, "string");
           const bytes = new Uint8Array(await new Response(value).arrayBuffer());
           archivedKeys.push(key);
-          return {
-            key,
-            size: bytes.byteLength,
-            etag: "archive-etag",
-            version: "archive-version",
-          };
+          return r2Object(key, bytes.byteLength, options);
         },
       },
       INBOUND_QUEUE: {
@@ -808,7 +1196,7 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
     );
 
     assert.deepEqual(archivedKeys, ["raw/2026/07/13/queue-failure.eml"]);
-    assert.deepEqual(receiptStates, ["archived"]);
+    assert.deepEqual(receiptStates, ["admitted"]);
     assert.deepEqual(errors, [
       {
         message: "[mail-ingress] boundary failed",
@@ -842,13 +1230,12 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
       },
     },
     RAW_MAIL_BUCKET: {
-      async put(key: string, _value: ReadableStream) {
-        return {
-          key,
-          size: message.rawSize,
-          etag: "archive-etag",
-          version: "archive-version",
-        };
+      async put(
+        key: string,
+        _value: ReadableStream,
+        options?: R2PutTestOptions,
+      ) {
+        return r2Object(key, message.rawSize, options);
       },
     },
     INBOUND_QUEUE: {
@@ -908,25 +1295,25 @@ test("inbound delivery still archives and enqueues when the mailbox admission lo
         },
       },
       RAW_MAIL_BUCKET: {
-        async put(key: string, value: ReadableStream | string) {
+        async put(
+          key: string,
+          value: ReadableStream | ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
           if (key.startsWith("receipts/")) {
-            return {
+            return r2Object(
               key,
-              size: String(value).length,
-              etag: "receipt-etag",
-              version: "receipt-version",
-            };
+              String(value).length,
+              options,
+              "receipt-etag",
+              "receipt-version",
+            );
           }
           rawArchived = true;
           assert.notEqual(typeof value, "string");
           const size = new Uint8Array(await new Response(value).arrayBuffer())
             .byteLength;
-          return {
-            key,
-            size,
-            etag: "archive-etag",
-            version: "archive-version",
-          };
+          return r2Object(key, size, options);
         },
       },
       INBOUND_QUEUE: {
@@ -1002,14 +1389,17 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
       },
     },
     RAW_MAIL_BUCKET: {
-      async put(key: string, value: ArrayBuffer | string) {
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
         if (!key.startsWith("receipts/")) rawWasArchived = true;
-        return {
+        return r2Object(
           key,
-          size: typeof value === "string" ? value.length : value.byteLength,
-          etag: "archive-etag",
-          version: "archive-version",
-        };
+          typeof value === "string" ? value.length : value.byteLength,
+          options,
+        );
       },
     },
     INBOUND_QUEUE: { async send() {} },
@@ -1044,14 +1434,17 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
       },
     },
     RAW_MAIL_BUCKET: {
-      async put(key: string, value: ArrayBuffer | string) {
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
         if (!key.startsWith("receipts/")) rawWasArchived = true;
-        return {
+        return r2Object(
           key,
-          size: typeof value === "string" ? value.length : value.byteLength,
-          etag: "archive-etag",
-          version: "archive-version",
-        };
+          typeof value === "string" ? value.length : value.byteLength,
+          options,
+        );
       },
     },
     INBOUND_QUEUE: { async send() {} },
@@ -1088,14 +1481,17 @@ test("inbound delivery archives recipients outside configured mail domains befor
       },
     },
     RAW_MAIL_BUCKET: {
-      async put(key: string, value: ArrayBuffer | string) {
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
         if (!key.startsWith("receipts/")) rawWasArchived = true;
-        return {
+        return r2Object(
           key,
-          size: typeof value === "string" ? value.length : value.byteLength,
-          etag: "archive-etag",
-          version: "archive-version",
-        };
+          typeof value === "string" ? value.length : value.byteLength,
+          options,
+        );
       },
     },
     INBOUND_QUEUE: { async send() {} },
