@@ -58,6 +58,7 @@ type IngressReceiptState = "admitted" | "enqueued" | "rejected";
 type InboundRuntime = {
   now(): Date;
   randomUUID(): string;
+  random(): number;
   sleep(delayMs: number): Promise<void>;
   digestSha256(value: ArrayBuffer): Promise<ArrayBuffer>;
   parse?(raw: ArrayBuffer): Promise<Email>;
@@ -66,6 +67,7 @@ type InboundRuntime = {
 const defaultRuntime: InboundRuntime = {
   now: () => new Date(),
   randomUUID: () => crypto.randomUUID(),
+  random: () => Math.random(),
   sleep: (delayMs) => scheduler.wait(delayMs),
   digestSha256: (value) => crypto.subtle.digest("SHA-256", value),
 };
@@ -96,6 +98,14 @@ function errorMessage(error: unknown): string {
 
 function durationMs(runtime: InboundRuntime, startedAt: number): number {
   return Math.max(0, runtime.now().getTime() - startedAt);
+}
+
+function jitteredBackoff(maxDelayMs: number, runtime: InboundRuntime): number {
+  const sample = runtime.random();
+  const random = Number.isFinite(sample)
+    ? Math.min(1, Math.max(0, sample))
+    : 0.5;
+  return Math.max(1, Math.floor(maxDelayMs * (0.5 + random * 0.5)));
 }
 
 function rejectMessage(
@@ -144,6 +154,16 @@ async function persistRawWithRetry(
   const startedAt = runtime.now().getTime();
   for (let attempt = 1; attempt <= RAW_ARCHIVE_MAX_ATTEMPTS; attempt += 1) {
     let errorCode = "RAW_ARCHIVE_FAILED";
+    console.log("[mail-ingress] raw archive attempt started", {
+      attempt,
+      ingressId,
+      mailboxId,
+      maxAttempts: RAW_ARCHIVE_MAX_ATTEMPTS,
+      operation: "raw_archive",
+      rawKey,
+      status: "started",
+      target: "r2",
+    });
     try {
       const archived = await env.RAW_MAIL_BUCKET.put(rawKey, rawBytes, {
         httpMetadata: { contentType: "message/rfc822" },
@@ -195,10 +215,11 @@ async function persistRawWithRetry(
       );
       if (finalAttempt) throw error;
 
-      const delayMs = Math.min(
+      const maxDelayMs = Math.min(
         RAW_ARCHIVE_INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
         RAW_ARCHIVE_MAX_BACKOFF_MS,
       );
+      const delayMs = jitteredBackoff(maxDelayMs, runtime);
       console.log("[mail-ingress] raw archive retry scheduled", {
         attempt,
         delayMs,
@@ -231,6 +252,17 @@ async function recordReceiptState(
         ...pointer,
         state,
         updatedAt,
+      });
+      console.log("[mail-ingress] receipt write started", {
+        attempt,
+        ingressId: pointer.ingressId,
+        mailboxId: pointer.mailboxId,
+        maxAttempts: RECEIPT_MAX_ATTEMPTS,
+        operation: "receipt_write",
+        rawKey: pointer.rawKey,
+        state,
+        status: "started",
+        target: "r2",
       });
       const receipt = onlyIfEtag
         ? await env.RAW_MAIL_BUCKET.put(receiptKey, receiptBody, {
@@ -332,6 +364,13 @@ async function storeDirectlyInMailbox(
   runtime: InboundRuntime,
 ): Promise<DirectMailboxFallbackResult> {
   const startedAt = runtime.now().getTime();
+  console.log("[mail-ingress] direct mailbox fallback started", {
+    ingressId,
+    mailboxId,
+    operation: "direct_mailbox_fallback",
+    status: "started",
+    target: "durable_object",
+  });
   let marker: unknown | null;
   try {
     marker = await env.BUCKET.head(`mailboxes/${mailboxId}.json`);
@@ -468,6 +507,14 @@ async function forwardEmergencyOrReject(
   runtime: InboundRuntime,
 ): Promise<void> {
   const forwardStartedAt = runtime.now().getTime();
+  console.log("[mail-ingress] emergency forwarding started", {
+    ingressId,
+    mailboxId,
+    operation: "emergency_forward",
+    rawKey,
+    status: "started",
+    target: "verified_destination",
+  });
   try {
     const result = await event.forward(env.EMERGENCY_FORWARD_TO);
     console.log("[mail-ingress] emergency forwarding completed", {
@@ -543,13 +590,13 @@ async function recoverFromRawArchiveFailure(
     runtime,
   );
   if (directResult === "stored") return;
-  if (directResult === "unprovisioned" || directResult === "unverified") {
+  if (directResult === "unprovisioned") {
     rejectMessage(event, {
       errorCode: "MAILBOX_UNAVAILABLE",
       ingressId,
       mailboxId,
       rawKey,
-      reason: "direct_mailbox_unprovisioned_or_unverified",
+      reason: "direct_mailbox_unprovisioned",
       smtpMessage: "Mailbox unavailable",
     });
     return;
@@ -578,9 +625,34 @@ export async function receiveEmail(
   const ingressId = runtime.randomUUID();
   const rawKey = archiveKey(archivedAtDate, ingressId);
   const envelopeRecipient = event.to.trim().toLowerCase();
+  console.log("[mail-ingress] inbound receive started", {
+    declaredRawSize: event.rawSize,
+    ingressId,
+    mailboxId: envelopeRecipient,
+    operation: "inbound_receive",
+    rawKey,
+    status: "started",
+  });
   let rawBytes: ArrayBuffer;
+  const rawReadStartedAt = runtime.now().getTime();
+  console.log("[mail-ingress] raw stream read started", {
+    ingressId,
+    mailboxId: envelopeRecipient,
+    operation: "raw_stream_read",
+    rawKey,
+    status: "started",
+  });
   try {
     rawBytes = await new Response(event.raw).arrayBuffer();
+    console.log("[mail-ingress] raw stream read completed", {
+      durationMs: durationMs(runtime, rawReadStartedAt),
+      ingressId,
+      mailboxId: envelopeRecipient,
+      operation: "raw_stream_read",
+      rawKey,
+      rawSize: rawBytes.byteLength,
+      status: "succeeded",
+    });
   } catch (error) {
     console.error("[mail-ingress] boundary failed", {
       durationMs: durationMs(runtime, handlerStartedAt),
@@ -604,8 +676,30 @@ export async function receiveEmail(
       });
       return;
     }
+    const admissionStartedAt = runtime.now().getTime();
+    console.log("[mail-ingress] emergency forward admission started", {
+      ingressId,
+      mailboxId,
+      operation: "emergency_forward_admission",
+      rawKey,
+      status: "started",
+      target: "r2",
+    });
     try {
-      if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+      const mailboxExists = Boolean(
+        await env.BUCKET.head(`mailboxes/${mailboxId}.json`),
+      );
+      console.log("[mail-ingress] emergency forward admission completed", {
+        durationMs: durationMs(runtime, admissionStartedAt),
+        found: mailboxExists,
+        ingressId,
+        mailboxId,
+        operation: "emergency_forward_admission",
+        rawKey,
+        status: "succeeded",
+        target: "r2",
+      });
+      if (!mailboxExists) {
         rejectMessage(event, {
           errorCode: "MAILBOX_UNAVAILABLE",
           ingressId,
@@ -620,22 +714,25 @@ export async function receiveEmail(
       console.error(
         "[mail-ingress] unreadable message recipient could not be verified",
         {
+          durationMs: durationMs(runtime, admissionStartedAt),
           errorCode: "MAILBOX_VERIFICATION_FAILED",
           errorMessage: errorMessage(verificationError),
           ingressId,
           mailboxId,
           operation: "emergency_forward_admission",
-          status: "unverified",
+          rawKey,
+          status: "failed",
+          target: "r2",
         },
       );
-      rejectMessage(event, {
-        errorCode: "MAILBOX_VERIFICATION_FAILED",
+      await forwardEmergencyOrReject(
+        event,
+        env,
         ingressId,
         mailboxId,
         rawKey,
-        reason: "unreadable_raw_mailbox_unverified",
-        smtpMessage: "Mailbox unavailable",
-      });
+        runtime,
+      );
       return;
     }
     await forwardEmergencyOrReject(
@@ -650,8 +747,24 @@ export async function receiveEmail(
   }
 
   let rawSha256: ArrayBuffer;
+  const checksumStartedAt = runtime.now().getTime();
+  console.log("[mail-ingress] raw archive checksum started", {
+    ingressId,
+    mailboxId: envelopeRecipient,
+    operation: "raw_archive_checksum",
+    rawKey,
+    status: "started",
+  });
   try {
     rawSha256 = await runtime.digestSha256(rawBytes);
+    console.log("[mail-ingress] raw archive checksum completed", {
+      durationMs: durationMs(runtime, checksumStartedAt),
+      ingressId,
+      mailboxId: envelopeRecipient,
+      operation: "raw_archive_checksum",
+      rawKey,
+      status: "succeeded",
+    });
   } catch (error) {
     console.error("[mail-ingress] boundary failed", {
       durationMs: durationMs(runtime, handlerStartedAt),
@@ -826,6 +939,14 @@ export async function receiveEmail(
 
   let mailboxProvisioned: boolean | undefined;
   const admissionStartedAt = runtime.now().getTime();
+  console.log("[mail-ingress] admission check started", {
+    ingressId,
+    mailboxId,
+    operation: "mailbox_admission_check",
+    rawKey,
+    status: "started",
+    target: "r2",
+  });
   try {
     mailboxProvisioned = Boolean(
       await env.BUCKET.head(`mailboxes/${mailboxId}.json`),
@@ -902,6 +1023,14 @@ export async function receiveEmail(
     return;
   }
   const enqueueStartedAt = runtime.now().getTime();
+  console.log("[mail-ingress] Queue enqueue started", {
+    ingressId,
+    mailboxId,
+    operation: "queue_enqueue",
+    rawKey,
+    status: "started",
+    target: "cloudflare_queue",
+  });
   try {
     await env.INBOUND_QUEUE.send(pointer);
   } catch (error) {

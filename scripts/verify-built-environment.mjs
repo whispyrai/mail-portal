@@ -45,6 +45,7 @@ const environments = {
     rawPreviewBucket: "sales-mail-raw-archive-preview",
     inboundQueue: "sales-mail-inbound",
     inboundDlq: "sales-mail-inbound-dlq",
+    inboundParking: "sales-mail-inbound-parking",
     kvId: "cd541026bdf949d9ac63b3b5fdff4969",
     route: "mail.whispyrcrm.com",
     forbidden: [
@@ -69,6 +70,7 @@ const environments = {
     rawPreviewBucket: "wiser-mail-raw-archive-preview",
     inboundQueue: "wiser-mail-inbound",
     inboundDlq: "wiser-mail-inbound-dlq",
+    inboundParking: "wiser-mail-inbound-parking",
     kvId: "c934d803c2f8430d9088f4a5d9f29d55",
     route: "mail.wiserchat.ai",
     forbidden: [
@@ -112,6 +114,11 @@ try {
     config.vars.INBOUND_DLQ_NAME,
     expected.inboundDlq,
     "INBOUND_DLQ_NAME",
+  );
+  await equal(
+    config.vars.INBOUND_PARKING_NAME,
+    expected.inboundParking,
+    "INBOUND_PARKING_NAME",
   );
   await equal(
     [...config.secrets.required].sort(),
@@ -165,12 +172,30 @@ try {
     expected.inboundQueue,
     "inbound Queue",
   );
+  await equal(config.queues.producers.length, 1, "Queue producer count");
+  await equal(config.queues.consumers.length, 3, "Queue consumer count");
   await equal(
     config.queues.consumers[0]?.queue,
     expected.inboundQueue,
     "Queue consumer",
   );
+  await equal(
+    config.queues.consumers[0]?.max_batch_size,
+    1,
+    "Queue batch size",
+  );
+  await equal(
+    config.queues.consumers[0]?.max_concurrency,
+    1,
+    "Queue concurrency",
+  );
+  await equal(
+    config.queues.consumers[0]?.max_batch_timeout,
+    5,
+    "Queue batch timeout",
+  );
   await equal(config.queues.consumers[0]?.max_retries, 10, "Queue max retries");
+  await equal(config.queues.consumers[0]?.retry_delay, 1, "Queue retry delay");
   await equal(
     config.queues.consumers[0]?.dead_letter_queue,
     expected.inboundDlq,
@@ -185,6 +210,58 @@ try {
     config.queues.consumers[1]?.max_retries,
     10,
     "DLQ consumer max retries",
+  );
+  await equal(config.queues.consumers[1]?.max_batch_size, 1, "DLQ batch size");
+  await equal(
+    config.queues.consumers[1]?.max_concurrency,
+    1,
+    "DLQ concurrency",
+  );
+  await equal(
+    config.queues.consumers[1]?.max_batch_timeout,
+    5,
+    "DLQ batch timeout",
+  );
+  await equal(config.queues.consumers[1]?.retry_delay, 60, "DLQ retry delay");
+  await equal(
+    config.queues.consumers[1]?.dead_letter_queue,
+    expected.inboundParking,
+    "DLQ parking edge",
+  );
+  await equal(
+    config.queues.consumers[2]?.queue,
+    expected.inboundParking,
+    "parking consumer",
+  );
+  await equal(
+    config.queues.consumers[2]?.max_batch_size,
+    1,
+    "parking batch size",
+  );
+  await equal(
+    config.queues.consumers[2]?.max_concurrency,
+    1,
+    "parking concurrency",
+  );
+  await equal(
+    config.queues.consumers[2]?.max_batch_timeout,
+    5,
+    "parking batch timeout",
+  );
+  await equal(
+    config.queues.consumers[2]?.max_retries,
+    100,
+    "parking max retries",
+  );
+  await equal(
+    config.queues.consumers[2]?.retry_delay,
+    3600,
+    "parking retry delay",
+  );
+  await equal(
+    config.queues.consumers[2]?.dead_letter_queue,
+    undefined,
+    "parking terminal edge",
   );
   await equal(config.triggers.crons, ["*/5 * * * *"], "reconciliation cron");
   await equal(config.kv_namespaces[0]?.id, expected.kvId, "OAuth KV id");

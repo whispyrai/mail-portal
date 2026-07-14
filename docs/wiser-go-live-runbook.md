@@ -15,6 +15,7 @@ This runbook is for WISER-242, the Wiser deployment of the shared Mail Portal co
 - Isolated raw-mail development preview bucket: `wiser-mail-raw-archive-preview`
 - Inbound Queue: `wiser-mail-inbound`
 - Dead-letter Queue: `wiser-mail-inbound-dlq`
+- Terminal-ledger parking Queue: `wiser-mail-inbound-parking`
 - Archive reconciler: every five minutes
 - OAuth KV namespace: `wiser-mail-portal-oauth` (`c934d803c2f8430d9088f4a5d9f29d55`)
 - AWS region: `eu-west-2`
@@ -26,7 +27,7 @@ Each of these is a separate production mutation and needs explicit approval befo
 
 1. Apply remote D1 migrations to `wiser_mail_portal_users`.
 2. Create or update the dedicated Wiser SES IAM credentials.
-3. Create `wiser-mail-raw-archive`, `wiser-mail-raw-archive-preview`, `wiser-mail-inbound`, and `wiser-mail-inbound-dlq`.
+3. Create `wiser-mail-raw-archive`, `wiser-mail-raw-archive-preview`, `wiser-mail-inbound`, `wiser-mail-inbound-dlq`, and `wiser-mail-inbound-parking`.
 4. Apply the approved raw retention, lifecycle, and Bucket Lock policy.
 5. Deploy `wiser-mail-portal` with the new bindings and consumer.
 6. Write Worker production secrets.
@@ -50,7 +51,7 @@ npm run verify:env:wiser
 npm run deploy:wiser -- --dry-run
 ```
 
-The Wiser build must say it is using `.dev.vars.wiser`, and the deploy dry-run must say it is using the redirected `build/server/wrangler.json`. The binding summary must list only Wiser resources: `wiser-mail-portal`, `wiser_mail_portal_users`, `wiser-mail-portal`, `wiser-mail-raw-archive`, `wiser-mail-inbound`, `wiser-mail-inbound-dlq`, `c934d803c2f8430d9088f4a5d9f29d55`, and `mail.wiserchat.ai`.
+The Wiser build must say it is using `.dev.vars.wiser`, and the deploy dry-run must say it is using the redirected `build/server/wrangler.json`. The binding summary must list only Wiser resources: `wiser-mail-portal`, `wiser_mail_portal_users`, `wiser-mail-portal`, `wiser-mail-raw-archive`, `wiser-mail-inbound`, `wiser-mail-inbound-dlq`, `wiser-mail-inbound-parking`, `c934d803c2f8430d9088f4a5d9f29d55`, and `mail.wiserchat.ai`.
 
 ## Durable Inbound Resources
 
@@ -59,8 +60,9 @@ These commands mutate Cloudflare production state. Run them only after explicit 
 ```bash
 npx wrangler r2 bucket create wiser-mail-raw-archive
 npx wrangler r2 bucket create wiser-mail-raw-archive-preview
-npx wrangler queues create wiser-mail-inbound
-npx wrangler queues create wiser-mail-inbound-dlq
+npx wrangler queues create wiser-mail-inbound --message-retention-period-secs 1209600
+npx wrangler queues create wiser-mail-inbound-dlq --message-retention-period-secs 1209600
+npx wrangler queues create wiser-mail-inbound-parking --message-retention-period-secs 1209600
 ```
 
 Both raw buckets must stay private. The preview bucket isolates remote development from the production archive and must never receive production routing. The exact production retention duration is a separate product decision and must be approved before rollout. After that decision, apply matching lifecycle and lock rules to the production `raw/` prefix. The lifecycle expiry must never be earlier than the lock retention:
@@ -77,9 +79,18 @@ npx wrangler r2 bucket lock list wiser-mail-raw-archive
 npx wrangler r2 bucket lifecycle list wiser-mail-raw-archive
 npx wrangler queues info wiser-mail-inbound
 npx wrangler queues info wiser-mail-inbound-dlq
+npx wrangler queues info wiser-mail-inbound-parking
 ```
 
-Do not deploy until all four resources exist and the lock/lifecycle output matches the approved policy.
+Confirm each Queue reports `message_retention_period` of `1209600` seconds. For a pre-existing Queue with a different value, the separately approved correction is:
+
+```bash
+npx wrangler queues update wiser-mail-inbound --message-retention-period-secs 1209600
+npx wrangler queues update wiser-mail-inbound-dlq --message-retention-period-secs 1209600
+npx wrangler queues update wiser-mail-inbound-parking --message-retention-period-secs 1209600
+```
+
+Do not deploy until all five resources exist, all three Queues report 14-day retention, and the lock/lifecycle output matches the approved policy.
 
 ## Cloudflare Database
 
@@ -246,7 +257,7 @@ During proof and cutover, monitor these conditions:
 - Non-zero backlog in either primary Queue or DLQ must be explained before declaring inbound healthy. Any message in a parking Queue is an immediate incident. Wiser uses `wiser-mail-inbound`, `wiser-mail-inbound-dlq`, and `wiser-mail-inbound-parking`. Whispyr uses `sales-mail-inbound`, `sales-mail-inbound-dlq`, and `sales-mail-inbound-parking`. Parking consumers retry terminal ledger persistence up to the platform maximum 100 times with an hourly delay.
 - Normal-path success is proved by `raw_archive` status `succeeded`, followed by either `queue_enqueue` status `succeeded` or `archive_reconcile` status `reenqueued`, and finally `mailbox_projection` status `succeeded` or `duplicate`. A raw-archive incident is recovered only by a successful direct Mailbox fallback or successful emergency forwarding for the same `ingressId`.
 
-The reconciler walks the raw archive with a conditionally updated continuation cursor so old pages cannot starve and overlapping cron runs cannot move the cursor backward. It automatically re-enqueues `archived` and `admitted` receipts, plus `enqueued` or `retrying` receipts stale for at least fifteen minutes. It never re-enqueues `dead_letter_pending`, `dead_lettered`, `deleted`, `quarantined`, or `rejected` receipts. A stale `dead_letter_pending` receipt is conditionally terminalized as `dead_lettered`. A Mailbox terminal-failure ledger entry also reconstructs `dead_lettered` after an R2 receipt outage. Deletion tombstones become terminal `deleted` receipts before re-enqueue, while a genuinely missing `stored` projection reports `STORED_PROJECTION_MISSING` for operator review. Conditional receipt writes prevent reconciliation from overwriting a state concurrently advanced by another worker. An object-level failure is written to a durable failure ledger before the main cursor advances. If the ledger write also fails, the cursor stays on the page.
+The reconciler walks the raw archive with a conditionally updated continuation cursor so old pages cannot starve and overlapping cron runs cannot move the cursor backward. It automatically re-enqueues `archived` and `admitted` receipts, plus `enqueued` or `retrying` receipts stale for at least fifteen minutes. It never re-enqueues `dead_letter_pending`, `dead_lettered`, `deleted`, `quarantined`, or `rejected` receipts. Before trusting stale dead-letter state, it checks authoritative Mailbox truth in this order: deletion tombstone, existing Message projection, then the independent terminal-failure ledger. Only the terminal ledger can reconstruct `dead_lettered`; a stale `dead_letter_pending` receipt without that evidence remains pending and records `DLQ_TERMINAL_LEDGER_MISSING` for operator review. A genuinely missing `stored` projection reports `STORED_PROJECTION_MISSING`. Conditional receipt writes prevent reconciliation from overwriting a state concurrently advanced by another worker. An object-level failure is written to a durable failure ledger before the main cursor advances. If the ledger write also fails, the cursor stays on the page.
 
 Raw objects without a receipt are never auto-admitted. Reconciliation writes `system/reconciliation-anomalies/<encoded-raw-key>.json` and a server-derived `system/inbound-recovery-pointers/<ingressId>.json`. The recovery pointer contains the immutable R2 identity validated from raw-object metadata and lets an operator use the normal audited recovery command without supplying a raw key. Do not manufacture or edit recovery pointers manually.
 
@@ -313,7 +324,7 @@ Stop and rollback or ask for direction if any of these happen:
 - The UI shows Whispyr branding on `mail.wiserchat.ai`.
 - Imported mail count reconciliation fails without an explained duplicate/skip reason.
 - Any raw archive write fails or the raw object size does not match the Email Worker envelope size.
-- The inbound Queue or DLQ is missing, paused unexpectedly, or has an unexplained backlog.
+- The inbound Queue, DLQ, or parking Queue is missing, paused unexpectedly, has the wrong retention, or has an unexplained backlog.
 - A receipt reports `dead_lettered`, `quarantined`, or `STORED_PROJECTION_MISSING` without an active incident and verified recovery decision.
 - The raw bucket has no approved lifecycle and Bucket Lock policy.
 - Any secret appears in terminal output, files under git, Jira, or documentation.

@@ -8,6 +8,7 @@ import {
 const MAILSPLIT_HEAD_STATE = 0x01;
 const MAILSPLIT_BODY_STATE = 0x02;
 const OUTPUT_CHUNK_BYTES = 64 * 1024;
+const MAX_MIME_BOUNDARY_BYTES = 70;
 
 type ProcessLineCallback = (
   error?: (Error & { code?: string }) | null,
@@ -30,6 +31,20 @@ type BoundaryMatch = {
   closing: boolean;
   normalizedLine: Buffer;
 };
+
+type BoundaryTrieNode = {
+  boundary: BoundaryReference | null;
+  children: Map<number, BoundaryTrieNode>;
+};
+
+type BoundaryReference = {
+  value: Buffer;
+  priority: number;
+};
+
+function boundaryTrieNode(): BoundaryTrieNode {
+  return { boundary: null, children: new Map() };
+}
 
 class PackedPadding {
   #bits = new Uint8Array(0);
@@ -75,51 +90,14 @@ class PackedPadding {
   }
 }
 
-function withoutLineEnding(line: Uint8Array): {
-  content: Uint8Array;
-  lineEnding: Buffer;
-} {
-  if (line.length === 0 || line[line.length - 1] !== 0x0a) {
-    return { content: line, lineEnding: Buffer.alloc(0) };
-  }
-  if (line.length > 1 && line[line.length - 2] === 0x0d) {
-    return {
-      content: line.subarray(0, line.length - 2),
-      lineEnding: Buffer.from("\r\n"),
-    };
-  }
-  return {
-    content: line.subarray(0, line.length - 1),
-    lineEnding: Buffer.from("\n"),
-  };
-}
-
 function boundaryBytes(value: Buffer | false): Buffer | null {
-  return value && value.length > 0 ? value : null;
-}
-
-function matchBoundaryFor(
-  value: Uint8Array,
-  boundary: Buffer,
-): { closing: boolean } | null {
-  const baseLength = boundary.length + 2;
-  if (value.length < baseLength) return null;
-  for (let index = 0; index < baseLength; index += 1) {
-    const expected = index < 2 ? 0x2d : boundary[index - 2];
-    if (value[index] !== expected) return null;
+  if (!value || value.length === 0) return null;
+  if (value.length > MAX_MIME_BOUNDARY_BYTES) {
+    throw Object.assign(new Error("MIME_MULTIPART_BOUNDARY_INVALID"), {
+      code: "MIME_MULTIPART_BOUNDARY_INVALID",
+    });
   }
-
-  let index = baseLength;
-  let closing = false;
-  if (value[index] === 0x2d) {
-    if (value[index + 1] !== 0x2d) return null;
-    closing = true;
-    index += 2;
-  }
-  for (; index < value.length; index += 1) {
-    if (value[index] !== 0x20 && value[index] !== 0x09) return null;
-  }
-  return { closing };
+  return value;
 }
 
 /**
@@ -135,7 +113,9 @@ export class BoundedMimeSplitter extends Splitter {
   #headerLine = Buffer.alloc(0);
   #candidate = Buffer.allocUnsafe(256);
   #candidateLength = 0;
-  #candidateBoundaries: Buffer[] | null = null;
+  #candidateTrieNode: BoundaryTrieNode | null = null;
+  #candidateClosingBoundary: BoundaryReference | null = null;
+  #candidateClosingDashes = 0;
   #candidateBoundary: BoundaryMatch | null = null;
   #candidatePadding = new PackedPadding();
   #candidateCarriageReturn = false;
@@ -146,6 +126,9 @@ export class BoundedMimeSplitter extends Splitter {
   #outputLength = 0;
   #outputNode: MimeNode | null = null;
   #resumeReadable: (() => void) | null = null;
+  #boundaryCacheNode: MimeNode | null = null;
+  #boundaryCache: Buffer[] = [];
+  #boundaryTrie = boundaryTrieNode();
 
   constructor(options: {
     ignoreEmbedded: boolean;
@@ -166,7 +149,9 @@ export class BoundedMimeSplitter extends Splitter {
 
   #resetCandidate(): void {
     this.#candidateLength = 0;
-    this.#candidateBoundaries = null;
+    this.#candidateTrieNode = null;
+    this.#candidateClosingBoundary = null;
+    this.#candidateClosingDashes = 0;
     this.#candidateBoundary = null;
     this.#candidatePadding.clear();
     this.#candidateCarriageReturn = false;
@@ -182,32 +167,43 @@ export class BoundedMimeSplitter extends Splitter {
     this.#candidateLength += 1;
   }
 
-  #boundaryAcceptsByte(
-    boundary: Buffer,
-    position: number,
-    byte: number,
-  ): boolean {
-    if (position < 2) return byte === 0x2d;
-    if (position < boundary.length + 2) return byte === boundary[position - 2];
-    if (position === boundary.length + 2) return byte === 0x2d;
-    if (position === boundary.length + 3)
-      return this.#candidate[position - 1] === 0x2d && byte === 0x2d;
-    return false;
-  }
-
   #couldExtendBoundary(byte: number): boolean {
-    const boundaries = this.#candidateBoundaries ?? this.#boundaries();
-    return boundaries.some((boundary) =>
-      this.#boundaryAcceptsByte(boundary, this.#candidateLength, byte),
+    if (this.#candidateTrieNode?.children.has(byte)) return true;
+    return Boolean(
+      byte === 0x2d &&
+      (this.#candidateClosingDashes === 1 ||
+        (this.#candidateClosingDashes === 0 &&
+          this.#candidateTrieNode?.boundary)),
     );
   }
 
   #advanceBoundaryCandidates(byte: number): boolean {
-    const boundaries = this.#candidateBoundaries ?? this.#boundaries();
-    this.#candidateBoundaries = boundaries.filter((boundary) =>
-      this.#boundaryAcceptsByte(boundary, this.#candidateLength, byte),
-    );
-    return this.#candidateBoundaries.length > 0;
+    if (this.#candidateLength < 2) return byte === 0x2d;
+    if (this.#candidateLength === 2) {
+      this.#candidateTrieNode =
+        this.#currentBoundaryTrie().children.get(byte) ?? null;
+      return Boolean(this.#candidateTrieNode);
+    }
+
+    const nextTrieNode = this.#candidateTrieNode?.children.get(byte) ?? null;
+    let closingBoundary: BoundaryReference | null = null;
+    let closingDashes = 0;
+    if (this.#candidateClosingDashes === 1 && byte === 0x2d) {
+      closingBoundary = this.#candidateClosingBoundary;
+      closingDashes = 2;
+    } else if (
+      this.#candidateClosingDashes === 0 &&
+      this.#candidateTrieNode?.boundary &&
+      byte === 0x2d
+    ) {
+      closingBoundary = this.#candidateTrieNode.boundary;
+      closingDashes = 1;
+    }
+
+    this.#candidateTrieNode = nextTrieNode;
+    this.#candidateClosingBoundary = closingBoundary;
+    this.#candidateClosingDashes = closingDashes;
+    return Boolean(this.#candidateTrieNode || closingBoundary);
   }
 
   override _read(size: number): void {
@@ -279,9 +275,12 @@ export class BoundedMimeSplitter extends Splitter {
   }
 
   #boundaries(): Buffer[] {
+    const currentNode = this.#getInternals().node;
+    if (this.#boundaryCacheNode === currentNode) return this.#boundaryCache;
     const boundaries: Buffer[] = [];
     const seen = new Set<string>();
-    let node: MimeNode | false = this.#getInternals().node;
+    const trie = boundaryTrieNode();
+    let node: MimeNode | false = currentNode;
     while (node) {
       const boundary = boundaryBytes(node._boundary);
       if (boundary) {
@@ -289,34 +288,59 @@ export class BoundedMimeSplitter extends Splitter {
         if (!seen.has(key)) {
           seen.add(key);
           boundaries.push(boundary);
+          let trieNode = trie;
+          for (const byte of boundary) {
+            let child = trieNode.children.get(byte);
+            if (!child) {
+              child = boundaryTrieNode();
+              trieNode.children.set(byte, child);
+            }
+            trieNode = child;
+          }
+          trieNode.boundary = {
+            value: boundary,
+            priority: boundaries.length - 1,
+          };
         }
       }
       node = node.parentNode as MimeNode | false;
     }
-    return boundaries;
+    this.#boundaryCacheNode = currentNode;
+    this.#boundaryCache = boundaries;
+    this.#boundaryTrie = trie;
+    return this.#boundaryCache;
   }
 
-  #matchBoundary(line: Uint8Array): BoundaryMatch | null {
-    const { content } = withoutLineEnding(line);
-    const value =
-      content.length > 0 && content[content.length - 1] === 0x0d
-        ? content.subarray(0, content.length - 1)
-        : content;
-    for (const boundary of this.#boundaries()) {
-      const match = matchBoundaryFor(value, boundary);
-      if (!match) continue;
-      return {
-        boundary,
-        closing: match.closing,
-        normalizedLine: Buffer.concat([
-          Buffer.from("--"),
-          boundary,
-          ...(match.closing ? [Buffer.from("--")] : []),
-          Buffer.from("\r\n"),
-        ]),
-      };
-    }
-    return null;
+  #currentBoundaryTrie(): BoundaryTrieNode {
+    this.#boundaries();
+    return this.#boundaryTrie;
+  }
+
+  #matchedCandidateBoundary(): BoundaryMatch | null {
+    const opening = this.#candidateTrieNode?.boundary ?? null;
+    const closing =
+      this.#candidateClosingDashes === 2
+        ? this.#candidateClosingBoundary
+        : null;
+    const selected =
+      opening && closing
+        ? opening.priority <= closing.priority
+          ? { reference: opening, closing: false }
+          : { reference: closing, closing: true }
+        : opening
+          ? { reference: opening, closing: false }
+          : closing
+            ? { reference: closing, closing: true }
+            : null;
+    if (!selected) return null;
+    return {
+      boundary: selected.reference.value,
+      closing: selected.closing,
+      normalizedLine: this.#normalizedBoundary(
+        selected.reference.value,
+        selected.closing,
+      ),
+    };
   }
 
   #normalizedBoundary(boundary: Buffer, closing: boolean): Buffer {
@@ -355,8 +379,7 @@ export class BoundedMimeSplitter extends Splitter {
 
   async #finishCandidateLine(lineEnding: Buffer): Promise<void> {
     const boundary =
-      this.#candidateBoundary ??
-      this.#matchBoundary(Buffer.concat([this.#candidateView(), lineEnding]));
+      this.#candidateBoundary ?? this.#matchedCandidateBoundary();
     if (boundary) {
       this.#resetCandidate();
       this.#pendingLineBreak = Buffer.alloc(0);
@@ -416,8 +439,15 @@ export class BoundedMimeSplitter extends Splitter {
           continue;
         }
 
+        if (this.#candidateLength === 0 && byte !== 0x2d && byte !== 0x0d) {
+          this.#appendCandidate(byte);
+          offset += 1;
+          await this.#startOrdinaryBodyLine();
+          continue;
+        }
+
         if (byte === 0x20 || byte === 0x09) {
-          const boundary = this.#matchBoundary(this.#candidateView());
+          const boundary = this.#matchedCandidateBoundary();
           if (boundary && !this.#couldExtendBoundary(byte)) {
             this.#candidateBoundary = boundary;
             this.#candidatePadding.push(byte);
@@ -426,7 +456,7 @@ export class BoundedMimeSplitter extends Splitter {
           }
         }
         if (byte === 0x0d) {
-          const boundary = this.#matchBoundary(this.#candidateView());
+          const boundary = this.#matchedCandidateBoundary();
           if (boundary) {
             this.#candidateBoundary = boundary;
             this.#candidateCarriageReturn = true;
@@ -532,8 +562,7 @@ export class BoundedMimeSplitter extends Splitter {
           (this.#candidateLength > 0 || this.#candidateBoundary)
         ) {
           const boundary =
-            this.#candidateBoundary ??
-            this.#matchBoundary(this.#candidateView());
+            this.#candidateBoundary ?? this.#matchedCandidateBoundary();
           if (boundary) {
             this.#resetCandidate();
             this.#pendingLineBreak = Buffer.alloc(0);

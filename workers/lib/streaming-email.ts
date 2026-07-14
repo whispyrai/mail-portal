@@ -24,6 +24,7 @@ import {
 
 const MAX_MIME_HEADER_BYTES = 128 * 1024;
 const MAX_MIME_CHILD_NODES = 512;
+const MAX_MIME_BOUNDARY_BYTES = 70;
 const MAX_INLINE_BODY_BYTES = 512 * 1024;
 const MIN_TEXT_PART_PREVIEW_BYTES = 4 * 1024;
 
@@ -31,6 +32,7 @@ const PERMANENT_MIME_ERROR_CODES = new Set([
   "MIME_HEADER_SIZE_EXCEEDED",
   "MIME_ROOT_HEADER_MISSING",
   "MIME_MULTIPART_BOUNDARY_MISSING",
+  "MIME_MULTIPART_BOUNDARY_INVALID",
   "MIME_CHARSET_UNSUPPORTED",
   "EMAXLEN",
 ]);
@@ -79,6 +81,12 @@ type BodyTypeState = {
 };
 
 type BodyStates = Record<"text/html" | "text/plain", BodyTypeState>;
+
+type MimeNodeMetadata = {
+  contentId: string | null;
+  contentTypeHeader: string;
+  effectiveContentType: string;
+};
 
 function trackSinkPromise(
   sinkPromises: Promise<unknown>[],
@@ -353,6 +361,206 @@ export class IncrementalQuotedPrintableDecoder extends Transform {
   }
 }
 
+const MAX_RFC_FLOWED_LINE_BYTES = 8 * 1024;
+
+type PendingFlowedLine = {
+  lineEnding: Buffer;
+  quoteDepth: number;
+};
+
+/**
+ * Incrementally unfolds RFC 3676 text while bounding retained physical-line
+ * bytes. RFC-conforming lines are at most 998 characters. An overlong,
+ * non-conforming line is preserved as fixed text rather than buffered.
+ */
+export class IncrementalFlowedDecoder extends Transform {
+  readonly #delSp: boolean;
+  #line = Buffer.allocUnsafe(MAX_RFC_FLOWED_LINE_BYTES);
+  #lineLength = 0;
+  #overlongLine = false;
+  #overlongOutput = Buffer.allocUnsafe(64 * 1024);
+  #overlongOutputLength = 0;
+  #pendingCarriageReturn = false;
+  #pendingFlowed: PendingFlowedLine | null = null;
+  #resumeReadable: (() => void) | null = null;
+
+  constructor(delSp: boolean) {
+    super();
+    this.#delSp = delSp;
+  }
+
+  override _read(size: number): void {
+    const resume = this.#resumeReadable;
+    this.#resumeReadable = null;
+    super._read(size);
+    resume?.();
+  }
+
+  async #pushWithBackpressure(chunk: Uint8Array): Promise<void> {
+    if (chunk.byteLength === 0) return;
+    const resumed = new Promise<void>((resolve) => {
+      this.#resumeReadable = resolve;
+    });
+    if (this.push(Buffer.from(chunk))) {
+      this.#resumeReadable = null;
+      return;
+    }
+    await resumed;
+  }
+
+  async #pushQuotePrefix(depth: number): Promise<void> {
+    let remaining = depth;
+    while (remaining > 0) {
+      const length = Math.min(remaining, 64 * 1024);
+      await this.#pushWithBackpressure(Buffer.alloc(length, 0x3e));
+      remaining -= length;
+    }
+  }
+
+  async #startLine(quoteDepth: number, signature: boolean): Promise<void> {
+    const previous = this.#pendingFlowed;
+    this.#pendingFlowed = null;
+    const joinsPrevious =
+      previous && previous.quoteDepth === quoteDepth && !signature;
+    if (previous) {
+      if (!this.#delSp) await this.#pushWithBackpressure(Buffer.from(" "));
+      if (!joinsPrevious) await this.#pushWithBackpressure(previous.lineEnding);
+    }
+    if (!joinsPrevious) await this.#pushQuotePrefix(quoteDepth);
+  }
+
+  #normalizedLine(): {
+    content: Buffer;
+    quoteDepth: number;
+    signature: boolean;
+  } {
+    const line = this.#line.subarray(0, this.#lineLength);
+    let quoteDepth = 0;
+    while (line[quoteDepth] === 0x3e) quoteDepth += 1;
+    let contentOffset = quoteDepth;
+    if (line[contentOffset] === 0x20) contentOffset += 1;
+    const content = line.subarray(contentOffset);
+    const signature =
+      content.length === 3 &&
+      content[0] === 0x2d &&
+      content[1] === 0x2d &&
+      content[2] === 0x20;
+    return { content, quoteDepth, signature };
+  }
+
+  async #flushPendingFlowedAtBodyEnd(): Promise<void> {
+    const pending = this.#pendingFlowed;
+    this.#pendingFlowed = null;
+    if (!pending) return;
+    if (!this.#delSp) await this.#pushWithBackpressure(Buffer.from(" "));
+    await this.#pushWithBackpressure(pending.lineEnding);
+  }
+
+  async #beginOverlongLine(): Promise<void> {
+    await this.#flushPendingFlowedAtBodyEnd();
+    await this.#pushWithBackpressure(this.#line.subarray(0, this.#lineLength));
+    this.#lineLength = 0;
+    this.#overlongLine = true;
+  }
+
+  async #flushOverlongOutput(): Promise<void> {
+    if (this.#overlongOutputLength === 0) return;
+    await this.#pushWithBackpressure(
+      this.#overlongOutput.subarray(0, this.#overlongOutputLength),
+    );
+    this.#overlongOutput = Buffer.allocUnsafe(64 * 1024);
+    this.#overlongOutputLength = 0;
+  }
+
+  async #appendOverlongByte(byte: number): Promise<void> {
+    this.#overlongOutput[this.#overlongOutputLength++] = byte;
+    if (this.#overlongOutputLength === this.#overlongOutput.length)
+      await this.#flushOverlongOutput();
+  }
+
+  async #appendByte(byte: number): Promise<void> {
+    if (this.#overlongLine) {
+      await this.#appendOverlongByte(byte);
+      return;
+    }
+    if (this.#lineLength === this.#line.length) {
+      await this.#beginOverlongLine();
+      await this.#appendOverlongByte(byte);
+      return;
+    }
+    this.#line[this.#lineLength++] = byte;
+  }
+
+  async #finishLine(lineEnding: Buffer): Promise<void> {
+    if (this.#overlongLine) {
+      await this.#flushOverlongOutput();
+      await this.#pushWithBackpressure(lineEnding);
+      this.#overlongLine = false;
+      return;
+    }
+    const { content, quoteDepth, signature } = this.#normalizedLine();
+    await this.#startLine(quoteDepth, signature);
+    const flowed =
+      !signature && content.length > 0 && content[content.length - 1] === 0x20;
+    if (flowed) {
+      await this.#pushWithBackpressure(content.subarray(0, content.length - 1));
+      this.#pendingFlowed = { lineEnding, quoteDepth };
+    } else {
+      await this.#pushWithBackpressure(content);
+      await this.#pushWithBackpressure(lineEnding);
+    }
+    this.#lineLength = 0;
+  }
+
+  _transform(
+    chunk: Buffer | Uint8Array,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    void (async () => {
+      for (const byte of chunk) {
+        if (this.#pendingCarriageReturn) {
+          this.#pendingCarriageReturn = false;
+          if (byte === 0x0a) {
+            await this.#finishLine(Buffer.from("\r\n"));
+            continue;
+          }
+          await this.#appendByte(0x0d);
+        }
+        if (byte === 0x0d) {
+          this.#pendingCarriageReturn = true;
+        } else if (byte === 0x0a) {
+          await this.#finishLine(Buffer.from("\n"));
+        } else {
+          await this.#appendByte(byte);
+        }
+      }
+    })().then(
+      () => callback(),
+      (error) => callback(error as Error),
+    );
+  }
+
+  _flush(callback: (error?: Error | null) => void): void {
+    void (async () => {
+      if (this.#pendingCarriageReturn) {
+        await this.#appendByte(0x0d);
+        this.#pendingCarriageReturn = false;
+      }
+      if (this.#overlongLine) {
+        await this.#flushOverlongOutput();
+        this.#overlongLine = false;
+      } else if (this.#lineLength > 0) {
+        await this.#finishLine(Buffer.alloc(0));
+      }
+      await this.#flushPendingFlowedAtBodyEnd();
+    })().then(
+      () => callback(),
+      (error) => callback(error as Error),
+    );
+  }
+}
+
 class CharsetToUtf8 extends Transform {
   readonly #decoder: TextDecoder;
 
@@ -401,8 +609,32 @@ function attachmentKey(
   return `attachments/${messageId}/${projectionAttemptId}/${attachmentId}/${filename}`;
 }
 
-function isAttachment(node: MimeNode): boolean {
-  const contentType = node.contentType || "application/octet-stream";
+function metadataForNode(node: MimeNode): MimeNodeMetadata {
+  const contentTypeHeader = node.headers
+    ? node.headers.getFirst("content-type")
+    : "";
+  const effectiveContentType =
+    !contentTypeHeader &&
+    node.parentNode &&
+    node.parentNode.multipart === "digest"
+      ? "message/rfc822"
+      : node.contentType || "application/octet-stream";
+  const contentId = node.headers
+    ? truncateUtf8Bytes(node.headers.getFirst("content-id") || "", 512) || null
+    : null;
+  return { contentId, contentTypeHeader, effectiveContentType };
+}
+
+function releaseNonRootHeaderStorage(node: MimeNode): void {
+  if (node.root) return;
+  const mutable = node as MimeNode & { _headersLines: Buffer[] };
+  mutable._headersLines = [];
+  mutable._headerlen = 0;
+  mutable.headers = false;
+}
+
+function isAttachment(node: MimeNode, metadata: MimeNodeMetadata): boolean {
+  const contentType = metadata.effectiveContentType;
   return (
     node.disposition === "attachment" ||
     Boolean(node.filename) ||
@@ -418,12 +650,18 @@ function startAttachment(
   attachmentIndex: number,
   attachments: StoredAttachment[],
   attachmentNodes: Map<string, MimeNode>,
+  metadata: MimeNodeMetadata,
   objectKeys: string[],
   sinkPromises: Promise<unknown>[],
 ): ActiveLeaf {
   const decoder = decoderForNode(node);
   const attachmentId = `${messageId}-${attachmentIndex}`;
-  const filename = sanitizeFilename(node.filename || "untitled");
+  const filename = sanitizeFilename(
+    node.filename ||
+      (metadata.effectiveContentType === "message/rfc822"
+        ? "message.eml"
+        : "untitled"),
+  );
   const storageFilename = boundedAttachmentStorageFilename(filename);
   const key = attachmentKey(
     messageId,
@@ -466,12 +704,9 @@ function startAttachment(
         id: attachmentId,
         email_id: messageId,
         filename,
-        mimetype: node.contentType || "application/octet-stream",
+        mimetype: metadata.effectiveContentType,
         size,
-        content_id: node.headers
-          ? truncateUtf8Bytes(node.headers.getFirst("content-id") || "", 512) ||
-            null
-          : null,
+        content_id: metadata.contentId,
         disposition: node.disposition || "attachment",
         r2_key: key,
       });
@@ -533,6 +768,10 @@ function startTextPart(
   const transcoder = new CharsetToUtf8(node.charset);
   const contentType =
     node.contentType === "text/html" ? "text/html" : "text/plain";
+  const flowedDecoder =
+    contentType === "text/plain" && node.flowed
+      ? new IncrementalFlowedDecoder(node.delSp)
+      : null;
   const bodyState = bodyStates[contentType];
   const previewChunks: Uint8Array[] = [];
   const fullChunks: Uint8Array[] = [];
@@ -618,8 +857,14 @@ function startTextPart(
     },
   });
   decoder.once("error", (error) => transcoder.destroy(error));
-  transcoder.once("error", (error) => collector.destroy(error));
-  decoder.pipe(transcoder).pipe(collector);
+  transcoder.once("error", (error) => {
+    flowedDecoder?.destroy(error);
+    collector.destroy(error);
+  });
+  flowedDecoder?.once("error", (error) => collector.destroy(error));
+  const decodedText = decoder.pipe(transcoder);
+  if (flowedDecoder) decodedText.pipe(flowedDecoder).pipe(collector);
+  else decodedText.pipe(collector);
   return {
     node,
     decoder,
@@ -627,6 +872,7 @@ function startTextPart(
       const failure = error instanceof Error ? error : new Error(String(error));
       decoder.destroy(failure);
       transcoder.destroy(failure);
+      flowedDecoder?.destroy(failure);
       collector.destroy(failure);
       sink?.destroy(failure);
     },
@@ -671,9 +917,13 @@ async function writeLeafChunk(
   await once(activeLeaf.decoder, "drain");
 }
 
-function relatedRoot(node: MimeNode, children: MimeNode[]): MimeNode | null {
+function relatedRoot(
+  node: MimeNode,
+  children: MimeNode[],
+  nodeMetadata: Map<MimeNode, MimeNodeMetadata>,
+): MimeNode | null {
   if (children.length === 0) return null;
-  const contentType = node.headers ? node.headers.getFirst("content-type") : "";
+  const contentType = nodeMetadata.get(node)?.contentTypeHeader ?? "";
   const startMatch = /(?:^|;)\s*start\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(
     contentType,
   );
@@ -683,9 +933,9 @@ function relatedRoot(node: MimeNode, children: MimeNode[]): MimeNode | null {
   if (!start) return children[0];
   return (
     children.find((child) => {
-      const contentId = child.headers
-        ? child.headers.getFirst("content-id").trim().replace(/^<|>$/g, "")
-        : "";
+      const contentId = (nodeMetadata.get(child)?.contentId ?? "")
+        .trim()
+        .replace(/^<|>$/g, "");
       return contentId === start;
     }) ?? children[0]
   );
@@ -694,6 +944,7 @@ function relatedRoot(node: MimeNode, children: MimeNode[]): MimeNode | null {
 function selectBody(
   textParts: TextPart[],
   nodes: MimeNode[],
+  nodeMetadata: Map<MimeNode, MimeNodeMetadata>,
 ): {
   body: Pick<Email, "html" | "text">;
   parts: TextPart[];
@@ -722,7 +973,7 @@ function selectBody(
       return fallback;
     }
     if (node.multipart === "related") {
-      const root = relatedRoot(node, childNodes);
+      const root = relatedRoot(node, childNodes, nodeMetadata);
       return root ? selectNode(root) : [];
     }
     return childNodes.flatMap(selectNode);
@@ -813,6 +1064,7 @@ export async function storeStreamingEmail(
   const sinkPromises: Promise<unknown>[] = [];
   const textParts: TextPart[] = [];
   const nodes: MimeNode[] = [];
+  const nodeMetadata = new Map<MimeNode, MimeNodeMetadata>();
   const projectionAttemptId = crypto.randomUUID();
   const bodyStates: BodyStates = {
     "text/html": {
@@ -852,15 +1104,21 @@ export async function storeStreamingEmail(
         activeLeaf = null;
       }
       if (chunk.type === "node") {
+        const metadata = metadataForNode(chunk);
+        nodeMetadata.set(chunk, metadata);
         nodes.push(chunk);
         if (chunk.root) rootNode = chunk;
         if (chunk.multipart) {
           if (!chunk._boundary) {
             throw permanentMimeError("MIME_MULTIPART_BOUNDARY_MISSING");
           }
+          if (chunk._boundary.byteLength > MAX_MIME_BOUNDARY_BYTES) {
+            throw permanentMimeError("MIME_MULTIPART_BOUNDARY_INVALID");
+          }
+          releaseNonRootHeaderStorage(chunk);
           continue;
         }
-        activeLeaf = isAttachment(chunk)
+        activeLeaf = isAttachment(chunk, metadata)
           ? startAttachment(
               dependencies,
               chunk,
@@ -869,6 +1127,7 @@ export async function storeStreamingEmail(
               attachmentIndex++,
               attachments,
               attachmentNodes,
+              metadata,
               objectKeys,
               sinkPromises,
             )
@@ -883,6 +1142,7 @@ export async function storeStreamingEmail(
               bodyStates,
               sinkPromises,
             );
+        releaseNonRootHeaderStorage(chunk);
         continue;
       }
       if (chunk.type === "body" && activeLeaf) {
@@ -894,7 +1154,7 @@ export async function storeStreamingEmail(
     if (!rootNode) throw permanentMimeError("MIME_ROOT_HEADER_MISSING");
 
     const parsedHeaders = await parseBoundedHeaders(rootNode);
-    const selected = selectBody(textParts, nodes);
+    const selected = selectBody(textParts, nodes, nodeMetadata);
     const selectedParts = selected.parts;
     const selectedAttachments = attachments.filter((attachment) => {
       const node = attachment.r2_key

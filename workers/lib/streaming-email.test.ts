@@ -3,6 +3,7 @@ import test from "node:test";
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import {
+  IncrementalFlowedDecoder,
   IncrementalQuotedPrintableDecoder,
   storeStreamingEmail,
 } from "./streaming-email.ts";
@@ -49,6 +50,23 @@ async function decodeQuotedPrintableChunks(
   const chunks: Buffer[] = [];
   decoder.on("data", (chunk: Buffer) => chunks.push(chunk));
   Readable.from(chunksToDecode).pipe(decoder);
+  await finished(decoder);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function decodeFlowed(
+  source: string,
+  delSp: boolean,
+  chunkSize: number,
+): Promise<string> {
+  const decoder = new IncrementalFlowedDecoder(delSp);
+  const chunks: Buffer[] = [];
+  decoder.on("data", (chunk: Buffer) => chunks.push(chunk));
+  Readable.from(
+    Array.from({ length: Math.ceil(source.length / chunkSize) }, (_, index) =>
+      source.slice(index * chunkSize, (index + 1) * chunkSize),
+    ),
+  ).pipe(decoder);
   await finished(decoder);
   return Buffer.concat(chunks).toString("utf8");
 }
@@ -175,6 +193,58 @@ test("quoted-printable preserves transport padding when no soft break follows", 
       );
     }
   }
+});
+
+test("format=flowed obeys DelSp, stuffing, quoting, and signature boundaries", async () => {
+  const source = [
+    " alpha ",
+    "beta",
+    "> quoted ",
+    "> continuation",
+    ">> deeper ",
+    "-- ",
+    "signature",
+  ].join("\r\n");
+  const withoutDeletedSpaces =
+    "alpha beta\r\n>quoted continuation\r\n>>deeper \r\n-- \r\nsignature";
+  const withDeletedSpaces =
+    "alphabeta\r\n>quotedcontinuation\r\n>>deeper\r\n-- \r\nsignature";
+
+  for (let chunkSize = 1; chunkSize <= 32; chunkSize += 1) {
+    assert.equal(
+      await decodeFlowed(source, false, chunkSize),
+      withoutDeletedSpaces,
+    );
+    assert.equal(
+      await decodeFlowed(source, true, chunkSize),
+      withDeletedSpaces,
+    );
+  }
+});
+
+test("format=flowed preserves a non-conforming overlong line without buffering it", async () => {
+  const source = `${"x".repeat(9 * 1024)} \r\nnext`;
+  assert.equal(await decodeFlowed(source, false, 17), source);
+});
+
+test("streaming projection applies format=flowed after transfer and charset decoding", async () => {
+  const harness = storageHarness();
+  const source = [
+    "From: flowed@example.com",
+    "Content-Type: text/plain; charset=utf-8; format=flowed; delsp=yes",
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    "joined=20",
+    "without-gap",
+  ].join("\r\n");
+
+  await storeStreamingEmail(harness.dependencies, streamBytes(source, 1), {
+    folder: "inbox",
+    date: "2026-07-14T00:00:00.000Z",
+    messageId: "flowed-pipeline",
+  });
+
+  assert.equal(harness.createInput?.email.body, "joinedwithout-gap");
 });
 
 test("duplicate projection removes attempt-scoped attachment objects", async () => {
@@ -487,6 +557,104 @@ test("more than 500,000 short body lines project successfully", async () => {
   assert.equal(new TextDecoder().decode(harness.objects.get(key)), body);
 });
 
+test(
+  "false boundary prefixes stay linear under deeply nested multipart boundaries",
+  { timeout: 15_000 },
+  async () => {
+    const harness = storageHarness();
+    const depth = 480;
+    const body = Array.from(
+      { length: 20_000 },
+      () => "--b\r\n--b \r\n--bX\r\nordinary",
+    ).join("\r\n");
+    const sourceParts = [
+      "From: nested@example.com",
+      "Content-Type: multipart/mixed; boundary=b0",
+      "",
+    ];
+    for (let index = 0; index < depth - 1; index += 1) {
+      sourceParts.push(
+        `--b${index}`,
+        `Content-Type: multipart/mixed; boundary=b${index + 1}`,
+        "",
+      );
+    }
+    sourceParts.push(
+      `--b${depth - 1}`,
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      body,
+    );
+    for (let index = depth - 1; index >= 0; index -= 1)
+      sourceParts.push(`--b${index}--`);
+    sourceParts.push("");
+
+    await storeStreamingEmail(
+      harness.dependencies,
+      streamBytes(sourceParts.join("\r\n"), 8191),
+      {
+        folder: "inbox",
+        date: "2026-07-14T00:00:00.000Z",
+        messageId: "deep-linear-boundaries",
+      },
+    );
+
+    const bodyKey = String(harness.createInput?.bodyObjects[0].r2_key);
+    const projectedBody = new TextDecoder().decode(
+      harness.objects.get(bodyKey),
+    );
+    assert.equal(projectedBody.length, body.length);
+    let mismatch = -1;
+    for (let index = 0; index < body.length; index += 1) {
+      if (projectedBody[index] !== body[index]) {
+        mismatch = index;
+        break;
+      }
+    }
+    assert.equal(
+      mismatch,
+      -1,
+      `body mismatch near ${JSON.stringify(projectedBody.slice(Math.max(0, mismatch - 20), mismatch + 40))}`,
+    );
+  },
+);
+
+test("multipart boundaries longer than RFC 2046 permits are rejected before trie construction", async () => {
+  const boundary = "b".repeat(71);
+  for (const [messageId, body] of [
+    ["oversized-boundary-delimited", `--${boundary}\r\nbody`],
+    ["oversized-boundary-ordinary", "ordinary body"],
+  ] as const) {
+    const harness = storageHarness();
+    await assert.rejects(
+      storeStreamingEmail(
+        harness.dependencies,
+        streamBytes(
+          [
+            "From: a@example.com",
+            `Content-Type: multipart/mixed; boundary=${boundary}`,
+            "",
+            body,
+          ].join("\r\n"),
+          17,
+        ),
+        {
+          folder: "inbox",
+          date: "2026-07-14T00:00:00.000Z",
+          messageId,
+        },
+      ),
+      (error: unknown) =>
+        Boolean(
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          error.code === "MIME_MULTIPART_BOUNDARY_INVALID",
+        ),
+    );
+  }
+});
+
 test("multipart alternative chooses the last supported representation once", async () => {
   const harness = storageHarness();
   const source = [
@@ -685,6 +853,40 @@ test("multipart mixed preserves independent plain and HTML parts in order", asyn
     harness.createInput?.email.body,
     "<pre>plain &lt;safe&gt;</pre><br/>\n<p>html</p>",
   );
+});
+
+test("multipart digest defaults children without Content-Type to message/rfc822", async () => {
+  const harness = storageHarness();
+  const embedded = [
+    "From: nested@example.com",
+    "To: recipient@example.com",
+    "Subject: preserved embedded message",
+    "",
+    "embedded body",
+  ].join("\r\n");
+  const source = [
+    "From: digest@example.com",
+    "Content-Type: multipart/digest; boundary=digest",
+    "",
+    "--digest",
+    "",
+    embedded,
+    "--digest--",
+    "",
+  ].join("\r\n");
+
+  await storeStreamingEmail(harness.dependencies, streamBytes(source, 7), {
+    folder: "inbox",
+    date: "2026-07-14T00:00:00.000Z",
+    messageId: "implicit-digest-message",
+  });
+
+  assert.equal(harness.createInput?.email.body, "");
+  assert.equal(harness.createInput?.attachments.length, 1);
+  assert.equal(harness.createInput?.attachments[0].mimetype, "message/rfc822");
+  assert.equal(harness.createInput?.attachments[0].filename, "message.eml");
+  const key = String(harness.createInput?.attachments[0].r2_key);
+  assert.equal(new TextDecoder().decode(harness.objects.get(key)), embedded);
 });
 
 test("many selected text parts cannot overflow the bounded Mailbox body preview", async () => {

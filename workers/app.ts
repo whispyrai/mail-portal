@@ -328,6 +328,7 @@ export default {
         status:
           result.failed > 0 ||
           result.invalid > 0 ||
+          result.pendingReview > 0 ||
           result.projectionMissing > 0
             ? "degraded"
             : "succeeded",

@@ -83,6 +83,7 @@ export type ReconciliationResult = {
   invalid: number;
   failed: number;
   projectionMissing: number;
+  pendingReview: number;
   terminalized: number;
   failureLedgered: number;
 };
@@ -111,6 +112,10 @@ function failureLedgerKey(rawKey: string): string {
   return `${FAILURE_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`;
 }
 
+function anomalyLedgerKey(rawKey: string): string {
+  return `${ANOMALY_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`;
+}
+
 async function persistAnomaly(
   bucket: ReconciliationBucket,
   rawKey: string,
@@ -119,7 +124,7 @@ async function persistAnomaly(
   runtime: ReconciliationRuntime,
 ): Promise<void> {
   await bucket.put(
-    `${ANOMALY_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`,
+    anomalyLedgerKey(rawKey),
     JSON.stringify({
       ...details,
       detectedAt: runtime.now().toISOString(),
@@ -132,6 +137,43 @@ async function persistAnomaly(
       onlyIf: { etagDoesNotMatch: "*" },
     },
   );
+}
+
+async function resolveAnomaly(
+  bucket: ReconciliationBucket,
+  rawKey: string,
+  resolution: string,
+  runtime: ReconciliationRuntime,
+): Promise<void> {
+  const key = anomalyLedgerKey(rawKey);
+  const object = await bucket.get(key);
+  if (!object) return;
+  const value: unknown = JSON.parse(await object.text());
+  if (!isRecord(value) || value.status !== "pending_operator_review") return;
+  const resolved = await bucket.put(
+    key,
+    JSON.stringify({
+      ...value,
+      resolution,
+      resolvedAt: runtime.now().toISOString(),
+      status: "resolved",
+    }),
+    {
+      customMetadata: {
+        errorCode:
+          typeof value.errorCode === "string" ? value.errorCode : "UNKNOWN",
+        status: "resolved",
+      },
+      ...(object.etag ? { onlyIf: { etagMatches: object.etag } } : {}),
+    },
+  );
+  if (!resolved) {
+    console.log("[mail-reconciliation] anomaly resolution superseded", {
+      operation: "reconciliation_anomaly_resolve",
+      rawKey,
+      status: "superseded",
+    });
+  }
 }
 
 function isStale(updatedAt: unknown, now: Date): boolean {
@@ -242,7 +284,12 @@ async function reconcileArchive(
   env: ReconciliationEnvironment,
   runtime: ReconciliationRuntime,
 ): Promise<
-  "reenqueued" | "skipped" | "invalid" | "projectionMissing" | "terminalized"
+  | "reenqueued"
+  | "skipped"
+  | "invalid"
+  | "projectionMissing"
+  | "pendingReview"
+  | "terminalized"
 > {
   const startedAt = runtime.now().getTime();
   const archive = await env.RAW_MAIL_BUCKET.head(rawKey);
@@ -297,7 +344,7 @@ async function reconcileArchive(
       recoveryAction: "operator_review",
       status: "preserved",
     });
-    return "skipped";
+    return "pendingReview";
   }
   const knownReceiptStates = new Set([
     "admitted",
@@ -334,9 +381,107 @@ async function reconcileArchive(
       rawKey,
       status: "pending_operator_review",
     });
-    return "skipped";
+    return "pendingReview";
   }
   const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(pointer.mailboxId));
+  const receiptNeedsMailboxTruthRepair =
+    receipt.state === "quarantined" ||
+    receipt.state === "rejected" ||
+    receipt.state === "dead_letter_pending" ||
+    receipt.state === "dead_lettered";
+  if (
+    receiptNeedsMailboxTruthRepair &&
+    mailbox.isEmailDeleted &&
+    (await mailbox.isEmailDeleted(pointer.ingressId))
+  ) {
+    const deletedReceipt = await env.RAW_MAIL_BUCKET.put(
+      `receipts/${pointer.ingressId}.json`,
+      JSON.stringify({
+        ...pointer,
+        state: "deleted",
+        updatedAt: now.toISOString(),
+        reconciled: true,
+        errorCode: "MAILBOX_PROJECTION_DELETED",
+      }),
+      {
+        customMetadata: { state: "deleted" },
+        onlyIf: receipt.etag
+          ? { etagMatches: receipt.etag }
+          : { etagDoesNotMatch: "*" },
+      },
+    );
+    if (!deletedReceipt) {
+      console.log("[mail-reconciliation] deletion state superseded", {
+        ingressId: pointer.ingressId,
+        mailboxId: pointer.mailboxId,
+        operation: "deleted_projection_terminalize",
+        status: "superseded",
+      });
+      return "skipped";
+    }
+    console.log("[mail-reconciliation] deleted projection terminalized", {
+      durationMs: durationMs(runtime, startedAt),
+      ingressId: pointer.ingressId,
+      mailboxId: pointer.mailboxId,
+      operation: "deleted_projection_terminalize",
+      rawKey: pointer.rawKey,
+      status: "deleted",
+    });
+    await resolveAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "mailbox_projection_deleted",
+      runtime,
+    );
+    return "terminalized";
+  }
+  if (receiptNeedsMailboxTruthRepair) {
+    const projectionExists = mailbox.hasEmail
+      ? await mailbox.hasEmail(pointer.ingressId)
+      : Boolean(await mailbox.getEmail(pointer.ingressId));
+    if (projectionExists) {
+      const storedReceipt = await env.RAW_MAIL_BUCKET.put(
+        `receipts/${pointer.ingressId}.json`,
+        JSON.stringify({
+          ...pointer,
+          state: "stored",
+          updatedAt: now.toISOString(),
+          reconciled: true,
+          errorCode: "MAILBOX_PROJECTION_RECOVERED",
+        }),
+        {
+          customMetadata: { state: "stored" },
+          onlyIf: receipt.etag
+            ? { etagMatches: receipt.etag }
+            : { etagDoesNotMatch: "*" },
+        },
+      );
+      if (!storedReceipt) {
+        console.log("[mail-reconciliation] stored state superseded", {
+          ingressId: pointer.ingressId,
+          mailboxId: pointer.mailboxId,
+          operation: "stored_projection_recover",
+          status: "superseded",
+        });
+        return "skipped";
+      }
+      console.log("[mail-reconciliation] stored projection recovered", {
+        durationMs: durationMs(runtime, startedAt),
+        ingressId: pointer.ingressId,
+        mailboxId: pointer.mailboxId,
+        operation: "stored_projection_recover",
+        rawKey: pointer.rawKey,
+        status: "stored",
+      });
+      await resolveAnomaly(
+        env.RAW_MAIL_BUCKET,
+        pointer.rawKey,
+        "mailbox_projection_stored",
+        runtime,
+      );
+      return "terminalized";
+    }
+  }
   const staleHandoff =
     receipt.state === "archived" ||
     receipt.state === "admitted" ||
@@ -345,17 +490,12 @@ async function reconcileArchive(
       receipt.state === "dead_letter_pending") &&
       isStale(receipt.updatedAt, now));
   const terminalFailure =
-    staleHandoff && mailbox.getInboundTerminalFailure
+    (staleHandoff || receipt.state === "dead_lettered") &&
+    mailbox.getInboundTerminalFailure
       ? await mailbox.getInboundTerminalFailure(pointer.ingressId)
       : null;
-  if (
-    terminalFailure ||
-    (receipt?.state === "dead_letter_pending" &&
-      isStale(receipt.updatedAt, now))
-  ) {
-    const errorCode = terminalFailure
-      ? "DLQ_TERMINAL_LEDGER_RECOVERED"
-      : "DLQ_TERMINALIZATION_RECOVERED";
+  if (terminalFailure) {
+    const errorCode = "DLQ_TERMINAL_LEDGER_RECOVERED";
     const terminalReceipt = await env.RAW_MAIL_BUCKET.put(
       `receipts/${pointer.ingressId}.json`,
       JSON.stringify({
@@ -391,7 +531,53 @@ async function reconcileArchive(
       rawKey: pointer.rawKey,
       status: "dead_lettered",
     });
+    await resolveAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "terminal_failure_ledger_recovered",
+      runtime,
+    );
     return "terminalized";
+  }
+  if (receipt.state === "dead_lettered") {
+    await resolveAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "terminal_receipt_persisted",
+      runtime,
+    );
+    console.log("[mail-reconciliation] terminal receipt confirmed", {
+      durationMs: durationMs(runtime, startedAt),
+      ingressId: pointer.ingressId,
+      mailboxId: pointer.mailboxId,
+      operation: "dead_letter_terminalize",
+      rawKey: pointer.rawKey,
+      status: "dead_lettered",
+      target: "r2",
+    });
+    return "terminalized";
+  }
+  if (
+    receipt.state === "dead_letter_pending" &&
+    isStale(receipt.updatedAt, now)
+  ) {
+    await persistAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "DLQ_TERMINAL_LEDGER_MISSING",
+      { ingressId: pointer.ingressId, mailboxId: pointer.mailboxId },
+      runtime,
+    );
+    console.error("[mail-reconciliation] terminal ledger missing", {
+      durationMs: durationMs(runtime, startedAt),
+      errorCode: "DLQ_TERMINAL_LEDGER_MISSING",
+      ingressId: pointer.ingressId,
+      mailboxId: pointer.mailboxId,
+      operation: "dead_letter_terminalize",
+      rawKey: pointer.rawKey,
+      status: "pending_operator_review",
+    });
+    return "pendingReview";
   }
   if (
     (receipt?.state === "stored" || shouldEnqueue(receipt, now)) &&
@@ -431,6 +617,12 @@ async function reconcileArchive(
       rawKey: pointer.rawKey,
       status: "deleted",
     });
+    await resolveAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "mailbox_projection_deleted",
+      runtime,
+    );
     return "terminalized";
   }
   if (receipt?.state === "stored") {
@@ -456,6 +648,24 @@ async function reconcileArchive(
       });
       return "projectionMissing";
     }
+    await resolveAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "mailbox_projection_stored",
+      runtime,
+    );
+  }
+  if (
+    receipt?.state === "deleted" &&
+    mailbox.isEmailDeleted &&
+    (await mailbox.isEmailDeleted(pointer.ingressId))
+  ) {
+    await resolveAnomaly(
+      env.RAW_MAIL_BUCKET,
+      pointer.rawKey,
+      "mailbox_projection_deleted",
+      runtime,
+    );
   }
   if (!shouldEnqueue(receipt, now)) {
     console.log("[mail-reconciliation] archive skipped", {
@@ -516,6 +726,7 @@ export async function reconcileInboundArchives(
     invalid: 0,
     failed: 0,
     projectionMissing: 0,
+    pendingReview: 0,
     terminalized: 0,
     failureLedgered: 0,
   };

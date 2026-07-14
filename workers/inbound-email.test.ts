@@ -46,68 +46,89 @@ function rawEmail(headers: string, body = "Hello from the Internet.") {
 
 test("inbound delivery forwards to the emergency destination only after verifying an unreadable message recipient", async () => {
   let forwardedTo: string | undefined;
-  await receiveEmail(
-    {
-      from: "sender@example.com",
-      to: "hello@wiserchat.ai",
-      raw: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.error(new Error("simulated stream failure"));
+  const admissionLogs: Array<Record<string, unknown>> = [];
+  const originalConsoleLog = console.log;
+  console.log = (_message: string, fields?: Record<string, unknown>) => {
+    if (fields?.operation === "emergency_forward_admission")
+      admissionLogs.push(fields);
+  };
+  try {
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: "hello@wiserchat.ai",
+        raw: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error("simulated stream failure"));
+          },
+        }),
+        rawSize: 100,
+        async forward(recipient: string) {
+          forwardedTo = recipient;
+          return { messageId: "stream-failure-forward" };
         },
-      }),
-      rawSize: 100,
-      async forward(recipient: string) {
-        forwardedTo = recipient;
-        return { messageId: "stream-failure-forward" };
-      },
-      setReject(reason: string) {
-        assert.fail(
-          `successful emergency forwarding must not reject: ${reason}`,
-        );
-      },
-    },
-    {
-      DOMAINS: "wiserchat.ai",
-      EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
-      BUCKET: {
-        async head() {
-          return {};
-        },
-        async put() {
-          assert.fail("unreadable raw bytes cannot reach storage");
-        },
-        async delete() {
-          assert.fail("unreadable raw bytes cannot reach storage");
+        setReject(reason: string) {
+          assert.fail(
+            `successful emergency forwarding must not reject: ${reason}`,
+          );
         },
       },
-      RAW_MAIL_BUCKET: {
-        async put() {
-          assert.fail("unreadable raw bytes cannot reach R2");
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        BUCKET: {
+          async head() {
+            return {};
+          },
+          async put() {
+            assert.fail("unreadable raw bytes cannot reach storage");
+          },
+          async delete() {
+            assert.fail("unreadable raw bytes cannot reach storage");
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put() {
+            assert.fail("unreadable raw bytes cannot reach R2");
+          },
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            assert.fail("unreadable raw bytes cannot enqueue");
+          },
+        },
+        MAILBOX: {
+          idFromName() {
+            assert.fail("unreadable raw bytes cannot reach Mailbox");
+          },
+          get() {
+            assert.fail("unreadable raw bytes cannot reach Mailbox");
+          },
         },
       },
-      INBOUND_QUEUE: {
-        async send() {
-          assert.fail("unreadable raw bytes cannot enqueue");
-        },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "stream-failure",
       },
-      MAILBOX: {
-        idFromName() {
-          assert.fail("unreadable raw bytes cannot reach Mailbox");
-        },
-        get() {
-          assert.fail("unreadable raw bytes cannot reach Mailbox");
-        },
-      },
-    },
-    { waitUntil() {} },
-    {
-      now: () => new Date("2026-07-13T09:30:00.000Z"),
-      randomUUID: () => "stream-failure",
-    },
-  );
+    );
+  } finally {
+    console.log = originalConsoleLog;
+  }
 
   assert.equal(forwardedTo, "verified-backup@example.com");
+  assert.deepEqual(
+    admissionLogs.map(({ found, status, target }) => ({
+      ...(typeof found === "boolean" ? { found } : {}),
+      status,
+      target,
+    })),
+    [
+      { status: "started", target: "r2" },
+      { found: true, status: "succeeded", target: "r2" },
+    ],
+  );
 });
 
 test("inbound delivery rejects an unreadable message for an unverified recipient", async () => {
@@ -164,6 +185,73 @@ test("inbound delivery rejects an unreadable message for an unverified recipient
   assert.match(rejection ?? "", /mailbox unavailable/i);
 });
 
+test("unreadable-message admission failures include a measured boundary log", async () => {
+  const errors: Array<Record<string, unknown>> = [];
+  let forwardedTo: string | undefined;
+  const originalConsoleError = console.error;
+  console.error = (_message: string, fields?: Record<string, unknown>) => {
+    if (fields) errors.push(fields);
+  };
+  try {
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: "hello@wiserchat.ai",
+        raw: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error("simulated stream failure"));
+          },
+        }),
+        rawSize: 100,
+        async forward(recipient: string) {
+          forwardedTo = recipient;
+          return { messageId: "verification-outage-forward" };
+        },
+        setReject(reason: string) {
+          assert.fail(`verification outage fallback rejected: ${reason}`);
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        BUCKET: {
+          async head() {
+            throw new Error("simulated mailbox marker outage");
+          },
+          async put() {},
+          async delete() {},
+        },
+        RAW_MAIL_BUCKET: { async put() {} },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName() {
+            return "unused";
+          },
+          get() {
+            throw new Error("unused");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "unreadable-verification-outage",
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(forwardedTo, "verified-backup@example.com");
+  const admissionFailure = errors.find(
+    (fields) => fields.operation === "emergency_forward_admission",
+  );
+  assert.equal(admissionFailure?.status, "failed");
+  assert.equal(admissionFailure?.durationMs, 0);
+  assert.equal(admissionFailure?.target, "r2");
+});
+
 test("inbound delivery archives exact raw MIME and durably enqueues its pointer before projection", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const headers = [
@@ -186,6 +274,7 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
   const receiptStates: string[] = [];
   const queued: unknown[] = [];
   const externalOperations: string[] = [];
+  const startedOperations: string[] = [];
   const env = {
     BRAND: "wiser",
     DOMAINS: "wiserchat.ai",
@@ -242,15 +331,24 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
     },
   };
 
-  await receiveEmail(
-    message,
-    env,
-    { waitUntil() {} },
-    {
-      now: () => new Date("2026-07-13T09:30:00.000Z"),
-      randomUUID: () => "ingress-test",
-    },
-  );
+  const originalConsoleLog = console.log;
+  console.log = (_message: string, fields?: Record<string, unknown>) => {
+    if (fields?.status === "started" && typeof fields.operation === "string")
+      startedOperations.push(fields.operation);
+  };
+  try {
+    await receiveEmail(
+      message,
+      env,
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "ingress-test",
+      },
+    );
+  } finally {
+    console.log = originalConsoleLog;
+  }
 
   assert.equal(archived.length, 1);
   assert.deepEqual(archived[0].bytes, expectedRaw);
@@ -284,6 +382,16 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
     "receipt-put",
     "queue-send",
     "receipt-put",
+  ]);
+  assert.deepEqual(startedOperations, [
+    "inbound_receive",
+    "raw_stream_read",
+    "raw_archive_checksum",
+    "raw_archive",
+    "mailbox_admission_check",
+    "receipt_write",
+    "queue_enqueue",
+    "receipt_write",
   ]);
 });
 
@@ -523,6 +631,7 @@ test("inbound delivery writes directly to the intended mailbox after raw retries
       {
         now: () => new Date("2026-07-13T09:30:00.000Z"),
         randomUUID: () => "archive-failure",
+        random: () => 0,
         sleep(delayMs: number) {
           backoffDelays.push(delayMs);
           return Promise.resolve();
@@ -541,7 +650,7 @@ test("inbound delivery writes directly to the intended mailbox after raw retries
     assert.equal(archiveAttempts, 10);
     assert.deepEqual(
       backoffDelays,
-      [100, 200, 400, 800, 1600, 2000, 2000, 2000, 2000],
+      [50, 100, 200, 400, 800, 1000, 1000, 1000, 1000],
     );
     assert.equal(errors.length, 10);
     assert.equal(errors.at(-1)?.message, "[mail-ingress] boundary failed");
@@ -642,9 +751,9 @@ test("inbound delivery forwards to Gmail when raw archival and direct mailbox st
   }
 });
 
-test("inbound delivery never forwards when a raw outage coincides with an unverifiable mailbox", async () => {
+test("inbound delivery forwards when a raw outage coincides with a transient mailbox verification outage", async () => {
   const raw = rawEmail("From: sender@example.com\r\nTo: typo@wiserchat.ai");
-  let forwarded = false;
+  let forwardedTo: string | undefined;
   let rejection: string | undefined;
   await receiveEmail(
     {
@@ -654,9 +763,9 @@ test("inbound delivery never forwards when a raw outage coincides with an unveri
       setReject(reason: string) {
         rejection = reason;
       },
-      async forward() {
-        forwarded = true;
-        return { messageId: "must-not-forward" };
+      async forward(recipient: string) {
+        forwardedTo = recipient;
+        return { messageId: "verification-outage-forward" };
       },
     },
     {
@@ -693,8 +802,89 @@ test("inbound delivery never forwards when a raw outage coincides with an unveri
     },
   );
 
-  assert.equal(forwarded, false);
-  assert.match(rejection ?? "", /mailbox unavailable/i);
+  assert.equal(forwardedTo, "verified-backup@example.com");
+  assert.equal(rejection, undefined);
+});
+
+test("inbound delivery logs raw and fallback boundaries before starting them", async () => {
+  const logs: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+  const originalConsoleLog = console.log;
+  console.log = (message: string, fields?: Record<string, unknown>) => {
+    logs.push({ message, fields });
+  };
+  try {
+    const raw = rawEmail("From: sender@example.com\r\nTo: hello@wiserchat.ai");
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: "hello@wiserchat.ai",
+        ...raw,
+        setReject(reason: string) {
+          assert.fail(`successful emergency forwarding rejected: ${reason}`);
+        },
+        async forward() {
+          return { messageId: "logged-forward" };
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        BUCKET: {
+          async head() {
+            throw new Error("simulated mailbox marker outage");
+          },
+          async put() {},
+          async delete() {},
+        },
+        RAW_MAIL_BUCKET: {
+          async put() {
+            throw new Error("simulated R2 outage");
+          },
+        },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName() {
+            return "unused";
+          },
+          get() {
+            throw new Error("unused");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => "boundary-start-logs",
+        random: () => 0,
+        sleep: () => Promise.resolve(),
+      },
+    );
+  } finally {
+    console.log = originalConsoleLog;
+  }
+
+  const startedOperations = logs
+    .filter((entry) => entry.fields?.status === "started")
+    .map((entry) => entry.fields?.operation);
+  assert.deepEqual(startedOperations.slice(0, 4), [
+    "inbound_receive",
+    "raw_stream_read",
+    "raw_archive_checksum",
+    "raw_archive",
+  ]);
+  assert.ok(startedOperations.includes("direct_mailbox_fallback"));
+  assert.ok(startedOperations.includes("emergency_forward"));
+  assert.equal(
+    logs
+      .filter(
+        (entry) =>
+          entry.fields?.operation === "raw_archive" &&
+          entry.fields?.status === "started",
+      )
+      .every((entry) => entry.fields?.ingressId === "boundary-start-logs"),
+    true,
+  );
 });
 
 test("inbound delivery permanently rejects only when all three durable paths fail", async () => {
