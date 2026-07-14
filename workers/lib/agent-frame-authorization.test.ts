@@ -283,10 +283,15 @@ test("actor reconciliation quarantines during lookup and restores only the live 
 	});
 	let resolveVersion!: (value: number | null) => void;
 	const version = new Promise<number | null>((resolve) => { resolveVersion = resolve; });
+	const resolvedVersions: Array<number | null> = [];
 	const reconciliation = reconcileAgentActorConnections({
 		connections: [current, stale, pending],
 		userId: "user-1",
 		resolveCurrentSessionVersion: () => version,
+		onSessionVersionResolved: (currentVersion) => {
+			resolvedVersions.push(currentVersion);
+			assert.deepEqual(stale.closed, []);
+		},
 	});
 	assert.equal(current.state.liveAuthorized, false);
 	assert.equal(stale.state.liveAuthorized, false);
@@ -295,6 +300,7 @@ test("actor reconciliation quarantines during lookup and restores only the live 
 	assert.equal(current.state.liveAuthorized, true);
 	assert.equal(pending.state.liveAuthorized, false);
 	assert.deepEqual(stale.closed, [[4403, "Mail access revoked"]]);
+	assert.deepEqual(resolvedVersions, [3]);
 });
 
 test("actor reconciliation lookup failure leaves targeted sockets quarantined", async () => {
@@ -303,15 +309,18 @@ test("actor reconciliation lookup failure leaves targeted sockets quarantined", 
 		actorSessionVersion: 3,
 		liveAuthorized: true,
 	});
+	let unavailable = false;
 	await assert.rejects(() => reconcileAgentActorConnections({
 		connections: [connection],
 		userId: "user-1",
 		resolveCurrentSessionVersion: async () => {
 			throw new Error("private D1 detail");
 		},
+		onAuthorizationUnavailable: () => { unavailable = true; },
 	}));
 	assert.equal(connection.state.liveAuthorized, false);
 	assert.deepEqual(connection.closed, []);
+	assert.equal(unavailable, true);
 });
 
 test("mailbox reconciliation restores only exact current grants", async () => {
@@ -330,11 +339,36 @@ test("mailbox reconciliation restores only exact current grants", async () => {
 		actorSessionVersion: 3,
 		liveAuthorized: false,
 	});
+	let resolvedIds: string[] = [];
 	await reconcileAgentMailboxConnections({
 		connections: [valid, revoked, pending],
 		resolveAuthorizedConnectionIds: async () => new Set(["valid", "pending"]),
+		onAuthorizedConnectionIdsResolved: (ids) => {
+			resolvedIds = [...ids];
+			assert.deepEqual(revoked.closed, []);
+		},
 	});
 	assert.equal(valid.state.liveAuthorized, true);
 	assert.equal(pending.state.liveAuthorized, false);
 	assert.deepEqual(revoked.closed, [[4403, "Mailbox access revoked"]]);
+	assert.deepEqual(resolvedIds, ["valid", "pending"]);
+});
+
+test("mailbox reconciliation lookup failure invokes fail-closed run cancellation", async () => {
+	const connection = reconciledConnection("live", {
+		actorUserId: "user-1",
+		actorSessionVersion: 3,
+		liveAuthorized: true,
+	});
+	let unavailable = false;
+	await assert.rejects(() => reconcileAgentMailboxConnections({
+		connections: [connection],
+		resolveAuthorizedConnectionIds: async () => {
+			throw new Error("private D1 detail");
+		},
+		onAuthorizationUnavailable: () => { unavailable = true; },
+	}));
+	assert.equal(unavailable, true);
+	assert.equal(connection.state.liveAuthorized, false);
+	assert.deepEqual(connection.closed, []);
 });

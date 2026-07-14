@@ -139,6 +139,8 @@ export async function reconcileAgentActorConnections(options: {
 	connections: readonly ReconciledAgentConnection[];
 	userId: string;
 	resolveCurrentSessionVersion(): Promise<number | null>;
+	onSessionVersionResolved?(currentSessionVersion: number | null): void;
+	onAuthorizationUnavailable?(): void;
 }): Promise<void> {
 	const previouslyAuthorized = new Set<string>();
 	for (const connection of options.connections) {
@@ -147,7 +149,14 @@ export async function reconcileAgentActorConnections(options: {
 		}
 		connection.setState({ ...connection.state, liveAuthorized: false });
 	}
-	const currentSessionVersion = await options.resolveCurrentSessionVersion();
+	let currentSessionVersion: number | null;
+	try {
+		currentSessionVersion = await options.resolveCurrentSessionVersion();
+	} catch (error) {
+		options.onAuthorizationUnavailable?.();
+		throw error;
+	}
+	options.onSessionVersionResolved?.(currentSessionVersion);
 	const staleConnectionIds = new Set(
 		agentConnectionIdsToReconcile(
 			options.connections,
@@ -169,6 +178,10 @@ export async function reconcileAgentActorConnections(options: {
 export async function reconcileAgentMailboxConnections(options: {
 	connections: readonly ReconciledAgentConnection[];
 	resolveAuthorizedConnectionIds(): Promise<ReadonlySet<string>>;
+	onAuthorizedConnectionIdsResolved?(
+		authorizedConnectionIds: ReadonlySet<string>,
+	): void;
+	onAuthorizationUnavailable?(): void;
 }): Promise<void> {
 	const previouslyAuthorized = new Set<string>();
 	for (const connection of options.connections) {
@@ -177,7 +190,14 @@ export async function reconcileAgentMailboxConnections(options: {
 		}
 		connection.setState({ ...connection.state, liveAuthorized: false });
 	}
-	const authorizedConnectionIds = await options.resolveAuthorizedConnectionIds();
+	let authorizedConnectionIds: ReadonlySet<string>;
+	try {
+		authorizedConnectionIds = await options.resolveAuthorizedConnectionIds();
+	} catch (error) {
+		options.onAuthorizationUnavailable?.();
+		throw error;
+	}
+	options.onAuthorizedConnectionIdsResolved?.(authorizedConnectionIds);
 	for (const connection of options.connections) {
 		if (!authorizedConnectionIds.has(connection.id)) {
 			connection.close(4403, "Mailbox access revoked");
