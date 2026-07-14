@@ -1441,23 +1441,19 @@ export class MailboxDO extends DurableObject<Env> {
 		{ read, starred }: { read?: boolean; starred?: boolean },
 		actor: ActivityActor = { kind: "system" },
 	) {
-		const data: { read?: number; starred?: number } = {};
-		if (read !== undefined) {
-			data.read = read ? 1 : 0;
-		}
-		if (starred !== undefined) {
-			data.starred = starred ? 1 : 0;
-		}
-
-		if (Object.keys(data).length === 0) {
+		if (read === undefined && starred === undefined) {
 			return this.getEmail(id);
 		}
 
 		const occurredAt = new Date().toISOString();
-		let updated = false;
+		let visible = false;
 		this.ctx.storage.transactionSync(() => {
-			const visible = this.db
-				.select({ id: schema.emails.id })
+			const current = this.db
+				.select({
+					id: schema.emails.id,
+					read: schema.emails.read,
+					starred: schema.emails.starred,
+				})
 				.from(schema.emails)
 				.where(
 					and(
@@ -1466,7 +1462,16 @@ export class MailboxDO extends DurableObject<Env> {
 					),
 				)
 				.get();
-			if (!visible) return;
+			if (!current) return;
+			visible = true;
+			const data: { read?: number; starred?: number } = {};
+			if (read !== undefined && (current.read ?? 0) !== (read ? 1 : 0)) {
+				data.read = read ? 1 : 0;
+			}
+			if (starred !== undefined && (current.starred ?? 0) !== (starred ? 1 : 0)) {
+				data.starred = starred ? 1 : 0;
+			}
+			if (Object.keys(data).length === 0) return;
 			this.db
 				.update(schema.emails)
 				.set(data)
@@ -1477,18 +1482,29 @@ export class MailboxDO extends DurableObject<Env> {
 					),
 				)
 				.run();
-			updated = true;
-			this.#recordActivity(
-				actor,
-				"email_updated",
-				"email",
-				id,
-				{ read, starred },
-				occurredAt,
-			);
+			if (data.read !== undefined) {
+				this.#recordActivity(
+					actor,
+					"email_updated",
+					"email",
+					id,
+					{ read },
+					occurredAt,
+				);
+			}
+			if (data.starred !== undefined) {
+				this.#recordActivity(
+					actor,
+					"email_updated",
+					"email",
+					id,
+					{ starred },
+					occurredAt,
+				);
+			}
 		});
 
-		return updated ? this.getEmail(id) : null;
+		return visible ? this.getEmail(id) : null;
 	}
 
 	async markThreadRead(
@@ -1575,11 +1591,25 @@ export class MailboxDO extends DurableObject<Env> {
 			return { status: "not_found" as const, affectedCount: 0 };
 		}
 		const occurredAt = new Date().toISOString();
+		let affectedCount = 0;
 		this.ctx.storage.transactionSync(() => {
+			const changedIds = this.db
+				.select({ id: schema.emails.id })
+				.from(schema.emails)
+				.where(
+					and(
+						inArray(schema.emails.id, scope.emailIds),
+						sql`COALESCE(${schema.emails.read}, 0) <> ${read ? 1 : 0}`,
+					),
+				)
+				.all()
+				.map((row) => row.id);
+			affectedCount = changedIds.length;
+			if (affectedCount === 0) return;
 			this.db
 				.update(schema.emails)
 				.set({ read: read ? 1 : 0 })
-				.where(inArray(schema.emails.id, scope.emailIds))
+				.where(inArray(schema.emails.id, changedIds))
 				.run();
 			this.#recordActivity(
 				actor,
@@ -1589,12 +1619,12 @@ export class MailboxDO extends DurableObject<Env> {
 				{
 					folderId: scope.folderId,
 					read,
-					affectedCount: scope.emailIds.length,
+					affectedCount,
 				},
 				occurredAt,
 			);
 		});
-		return { status: "updated" as const, affectedCount: scope.emailIds.length };
+		return { status: "updated" as const, affectedCount };
 	}
 
 	async archiveConversation(
@@ -1674,11 +1704,24 @@ export class MailboxDO extends DurableObject<Env> {
 						.get(),
 				),
 			setRead: (emailIds, read) => {
+				const changedIds = this.db
+					.select({ id: schema.emails.id })
+					.from(schema.emails)
+					.where(
+						and(
+							inArray(schema.emails.id, emailIds),
+							sql`COALESCE(${schema.emails.read}, 0) <> ${read ? 1 : 0}`,
+						),
+					)
+					.all()
+					.map((row) => row.id);
+				if (changedIds.length === 0) return 0;
 				this.db
 					.update(schema.emails)
 					.set({ read: read ? 1 : 0 })
-					.where(inArray(schema.emails.id, emailIds))
+					.where(inArray(schema.emails.id, changedIds))
 					.run();
+				return changedIds.length;
 			},
 			move: (emailIds, fromFolderId, toFolderId) => {
 				const occurredAt = new Date().toISOString();
@@ -2944,12 +2987,36 @@ export class MailboxDO extends DurableObject<Env> {
 				});
 				continue;
 			}
+			const existingIds = new Set(
+				this.db
+					.select({ emailId: schema.emailLabels.email_id })
+					.from(schema.emailLabels)
+					.where(
+						and(
+							eq(schema.emailLabels.label_id, input.labelId),
+							inArray(schema.emailLabels.email_id, emailIds),
+						),
+					)
+					.all()
+					.map((row) => row.emailId),
+			);
+			const changedIds = input.action === "apply"
+				? emailIds.filter((emailId) => !existingIds.has(emailId))
+				: emailIds.filter((emailId) => existingIds.has(emailId));
+			if (changedIds.length === 0) {
+				results.push({
+					emailId: target.emailId,
+					status: "updated",
+					affectedCount: 0,
+				});
+				continue;
+			}
 			const active = this.db
 				.select({ id: schema.outboundDeliveries.id })
 				.from(schema.outboundDeliveries)
 				.where(
 					and(
-						inArray(schema.outboundDeliveries.email_id, emailIds),
+						inArray(schema.outboundDeliveries.email_id, changedIds),
 						inArray(schema.outboundDeliveries.status, [
 							"queued",
 							"sending",
@@ -2973,7 +3040,7 @@ export class MailboxDO extends DurableObject<Env> {
 					this.db
 						.insert(schema.emailLabels)
 						.values(
-							emailIds.map((emailId) => ({
+							changedIds.map((emailId) => ({
 								email_id: emailId,
 								label_id: input.labelId,
 								created_at: now,
@@ -2987,7 +3054,7 @@ export class MailboxDO extends DurableObject<Env> {
 						.where(
 							and(
 								eq(schema.emailLabels.label_id, input.labelId),
-								inArray(schema.emailLabels.email_id, emailIds),
+								inArray(schema.emailLabels.email_id, changedIds),
 							),
 						)
 						.run();
@@ -2997,14 +3064,14 @@ export class MailboxDO extends DurableObject<Env> {
 					input.action === "apply" ? "label_applied" : "label_removed",
 					target.conversationId ? "conversation" : "email",
 					target.conversationId ?? target.emailId,
-					{ labelId: input.labelId, affectedCount: emailIds.length },
+					{ labelId: input.labelId, affectedCount: changedIds.length },
 					now,
 				);
 			});
 			results.push({
 				emailId: target.emailId,
 				status: "updated",
-				affectedCount: emailIds.length,
+				affectedCount: changedIds.length,
 			});
 		}
 		return { status: "completed" as const, results };
@@ -3116,6 +3183,9 @@ export class MailboxDO extends DurableObject<Env> {
 			})
 		) {
 			return { status: "snoozed_state_requires_unsnooze" as const };
+		}
+		if (folder.id === email.folder_id && folder.id !== Folders.TRASH) {
+			return true;
 		}
 		const activeDelivery = this.#activeOutboundDeliveryForEmail(id);
 		if (activeDelivery) {

@@ -9,6 +9,7 @@ function repository() {
 	let transactions = 0;
 	const readUpdates: Array<{ ids: string[]; read: boolean }> = [];
 	const moves: Array<{ ids: string[]; from: string; to: string }> = [];
+	const activities: string[] = [];
 	const repo: BatchTriageRepository = {
 		transaction(run) {
 			transactions++;
@@ -29,13 +30,22 @@ function repository() {
 		},
 		setRead(emailIds, read) {
 			readUpdates.push({ ids: emailIds, read });
+			return emailIds.includes("already") ? 0 : emailIds.length;
 		},
 		move(emailIds, fromFolderId, toFolderId) {
 			moves.push({ ids: emailIds, from: fromFolderId, to: toFolderId });
 		},
-		recordActivity() {},
+		recordActivity({ target }) {
+			activities.push(target.emailId);
+		},
 	};
-	return { repo, readUpdates, moves, transactionCount: () => transactions };
+	return {
+		repo,
+		readUpdates,
+		moves,
+		activities,
+		transactionCount: () => transactions,
+	};
 }
 
 test("DO batch helper applies successful targets once and reports stale rows", () => {
@@ -65,6 +75,28 @@ test("DO batch helper applies successful targets once and reports stale rows", (
 			{ emailId: "stale", status: "not_found", affectedCount: 0 },
 		],
 	});
+});
+
+test("already-satisfied batch read remains successful without false activity", () => {
+	const state = repository();
+	const result = executeBatchTriage(
+		state.repo,
+		{
+			action: "mark_read",
+			targets: [{ emailId: "already", folderId: "inbox" }],
+		},
+		{ kind: "user", id: "user-1" },
+	);
+
+	assert.deepEqual(result, {
+		requestedCount: 1,
+		succeededCount: 1,
+		failedCount: 0,
+		results: [
+			{ emailId: "already", status: "updated", affectedCount: 0 },
+		],
+	});
+	assert.deepEqual(state.activities, []);
 });
 
 test("DO batch helper never moves protected or folder-ineligible targets", () => {

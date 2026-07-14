@@ -16,7 +16,7 @@ export interface BatchTriageRepository {
 	transaction<T>(run: () => T): T;
 	resolveTarget(target: BatchTriageTarget): ResolvedBatchTriageTarget | null;
 	hasActiveOutbound(emailIds: string[]): boolean;
-	setRead(emailIds: string[], read: boolean): void;
+	setRead(emailIds: string[], read: boolean): number;
 	move(emailIds: string[], fromFolderId: string, toFolderId: string): void;
 	recordActivity(input: {
 		actor: ActivityActor;
@@ -59,8 +59,12 @@ export function executeBatchTriage(
 				continue;
 			}
 
+			let affectedCount = resolved.emailIds.length;
 			if (command.action === "mark_read" || command.action === "mark_unread") {
-				repository.setRead(resolved.emailIds, command.action === "mark_read");
+				affectedCount = repository.setRead(
+					resolved.emailIds,
+					command.action === "mark_read",
+				);
 			} else {
 				repository.move(
 					resolved.emailIds,
@@ -68,16 +72,18 @@ export function executeBatchTriage(
 					command.action === "archive" ? Folders.ARCHIVE : Folders.TRASH,
 				);
 			}
-			repository.recordActivity({
-				actor,
-				action: `batch_${command.action}`,
-				target,
-				affectedCount: resolved.emailIds.length,
-			});
+			if (affectedCount > 0) {
+				repository.recordActivity({
+					actor,
+					action: `batch_${command.action}`,
+					target,
+					affectedCount,
+				});
+			}
 			results.push({
 				emailId: target.emailId,
 				status: "updated",
-				affectedCount: resolved.emailIds.length,
+				affectedCount,
 			});
 		}
 		const succeededCount = results.filter((result) => result.status === "updated").length;
