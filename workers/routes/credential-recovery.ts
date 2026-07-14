@@ -226,10 +226,10 @@ export function createCredentialRecoveryHandler(
       reconciliationPending = true;
       reconciliationErrorName = safeErrorName(error);
     }
-    const reconciliationStatus = reconciliationPending
+    const reconciliationStatus: "success" | "partial_success" = reconciliationPending
       ? "partial_success"
       : "success";
-    const reconciliationHttpStatus = reconciliationPending ? 202 : 200;
+    const reconciliationHttpStatus: 200 | 202 = reconciliationPending ? 202 : 200;
     const reconciliationReport = {
       actorUserId: consumed.userId,
       durationMs: Math.max(0, Date.now() - reconciliationStartedAt),
