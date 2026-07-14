@@ -8,6 +8,9 @@ type AppContext = Context<MailboxContext>;
 
 const FolderBody = z.object({ folderId: z.string().trim().min(1).max(200) });
 const ReadBody = FolderBody.extend({ read: z.boolean() });
+const MoveBody = FolderBody.extend({
+	representativeEmailId: z.string().trim().min(1).max(300),
+});
 
 function isReadFolder(folderId: string) {
 	return folderId !== Folders.OUTBOX &&
@@ -49,6 +52,9 @@ function mutationResponse(c: AppContext, result: { status: string; affectedCount
 			409,
 		);
 	}
+	if (result.status === "invalid_action") {
+		return c.json({ error: "This conversation move is unavailable in this folder" }, 409);
+	}
 	return c.json(result);
 }
 
@@ -68,28 +74,34 @@ export async function handleSetConversationRead(c: AppContext) {
 }
 
 export async function handleArchiveConversation(c: AppContext) {
-	const parsed = FolderBody.safeParse(await c.req.json());
-	if (!parsed.success) return c.json({ error: "Folder ID required" }, 400);
+	const parsed = MoveBody.safeParse(await c.req.json());
+	if (!parsed.success) {
+		return c.json({ error: "Folder ID and representative Message ID required" }, 400);
+	}
 	if (!isArchiveSource(parsed.data.folderId)) {
 		return c.json({ error: "Archive is unavailable in this folder" }, 409);
 	}
 	const result = await c.var.mailboxStub.archiveConversation(
 		c.req.param("conversationId")!,
 		parsed.data.folderId,
+		parsed.data.representativeEmailId,
 		actorFromSession(c.get("session")),
 	);
 	return mutationResponse(c, result);
 }
 
 export async function handleTrashConversation(c: AppContext) {
-	const parsed = FolderBody.safeParse(await c.req.json());
-	if (!parsed.success) return c.json({ error: "Folder ID required" }, 400);
+	const parsed = MoveBody.safeParse(await c.req.json());
+	if (!parsed.success) {
+		return c.json({ error: "Folder ID and representative Message ID required" }, 400);
+	}
 	if (!isTrashSource(parsed.data.folderId)) {
 		return c.json({ error: "Trash is unavailable in this folder" }, 409);
 	}
 	const result = await c.var.mailboxStub.trashConversation(
 		c.req.param("conversationId")!,
 		parsed.data.folderId,
+		parsed.data.representativeEmailId,
 		actorFromSession(c.get("session")),
 	);
 	return mutationResponse(c, result);

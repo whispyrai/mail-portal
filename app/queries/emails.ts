@@ -290,21 +290,33 @@ export function useSetConversationRead() {
 
 export function useArchiveConversation() {
 	return useConversationMutation(
-		({ mailboxId, conversationId, folderId }: {
+		({ mailboxId, conversationId, folderId, representativeEmailId }: {
 			mailboxId: string;
 			conversationId: string;
 			folderId: string;
-		}) => api.archiveConversation(mailboxId, conversationId, folderId),
+			representativeEmailId: string;
+		}) => api.archiveConversation(
+			mailboxId,
+			conversationId,
+			folderId,
+			representativeEmailId,
+		),
 	);
 }
 
 export function useTrashConversation() {
 	return useConversationMutation(
-		({ mailboxId, conversationId, folderId }: {
+		({ mailboxId, conversationId, folderId, representativeEmailId }: {
 			mailboxId: string;
 			conversationId: string;
 			folderId: string;
-		}) => api.trashConversation(mailboxId, conversationId, folderId),
+			representativeEmailId: string;
+		}) => api.trashConversation(
+			mailboxId,
+			conversationId,
+			folderId,
+			representativeEmailId,
+		),
 	);
 }
 

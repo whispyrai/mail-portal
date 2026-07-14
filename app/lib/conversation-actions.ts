@@ -5,8 +5,18 @@ type ConversationKeyboardCommand = "toggle-unread" | "archive" | "trash";
 
 export type PlannedKeyboardConversationAction =
 	| { kind: "conversation-read"; conversationId: string; folderId: string; read: boolean }
-	| { kind: "conversation-archive"; conversationId: string; folderId: string }
-	| { kind: "conversation-trash"; conversationId: string; folderId: string }
+	| {
+		kind: "conversation-archive";
+		conversationId: string;
+		folderId: string;
+		representativeEmailId: string;
+	}
+	| {
+		kind: "conversation-trash";
+		conversationId: string;
+		folderId: string;
+		representativeEmailId: string;
+	}
 	| { kind: "email-read"; emailId: string; read: boolean }
 	| { kind: "email-archive"; emailId: string }
 	| { kind: "email-trash"; emailId: string };
@@ -40,10 +50,20 @@ export function planKeyboardConversationAction(
 	}
 	if (command === "archive") {
 		return isConversation
-			? { kind: "conversation-archive", conversationId: conversationId!, folderId }
+			? {
+				kind: "conversation-archive",
+				conversationId: conversationId!,
+				folderId,
+				representativeEmailId: email.id,
+			}
 			: { kind: "email-archive", emailId: email.id };
 	}
 	return isConversation
-		? { kind: "conversation-trash", conversationId: conversationId!, folderId }
+		? {
+			kind: "conversation-trash",
+			conversationId: conversationId!,
+			folderId,
+			representativeEmailId: email.id,
+		}
 		: { kind: "email-trash", emailId: email.id };
 }

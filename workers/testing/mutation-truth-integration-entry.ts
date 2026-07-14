@@ -7,22 +7,36 @@ import { MailboxDO } from "../durableObject/index.ts";
 export class MutationTruthMailboxDO extends MailboxDO {
 	async seedMutationTruthForTest() {
 		const actor = { kind: "user" as const, id: "seed-user" };
+		await this.createFolder("custom-retry", "Custom retry");
 		const messages = [
 			{ id: "message-1", read: false, starred: false, threadId: "thread-1" },
 			{ id: "message-2", read: true, starred: false, threadId: "thread-1" },
 			{ id: "message-3", read: false, starred: false, threadId: null },
 			{ id: "message-4", read: false, starred: false, threadId: "thread-null" },
 			{ id: "message-5", read: false, starred: false, threadId: null },
+			{ id: "archive-older", read: false, starred: false, threadId: "thread-archive" },
+			{ id: "archive-anchor", read: false, starred: false, threadId: "thread-archive" },
+			{ id: "trash-older", read: false, starred: false, threadId: "thread-trash" },
+			{ id: "trash-anchor", read: false, starred: false, threadId: "thread-trash" },
+			{ id: "batch-message", read: false, starred: false, threadId: null },
+			{ id: "custom-batch-message", read: false, starred: false, threadId: null },
+			{ id: "batch-trash-older", read: false, starred: false, threadId: "thread-batch-trash" },
+			{ id: "batch-trash-anchor", read: false, starred: false, threadId: "thread-batch-trash" },
 		];
 		for (const [index, message] of messages.entries()) {
 			await this.createEmail(
-				"inbox",
+				message.id.startsWith("trash-")
+					? "sent"
+					: message.id === "custom-batch-message"
+						? "custom-retry"
+						: "inbox",
 				{
 					id: message.id,
 					subject: "Customer question",
 					sender: "customer@example.com",
 					recipient: "team@example.com",
-					date: `2026-07-14T10:0${index}:00.000Z`,
+					date: new Date(Date.parse("2026-07-14T10:00:00.000Z") + index * 60_000)
+						.toISOString(),
 					body: "<p>Hello</p>",
 					read: message.read,
 					starred: message.starred,
@@ -40,6 +54,25 @@ export class MutationTruthMailboxDO extends MailboxDO {
 		);
 		const label = await this.createLabel("Priority", "red", actor);
 		return { labelId: label.id };
+	}
+
+	async seedArchiveReplyForTest() {
+		return this.createEmail(
+			"inbox",
+			{
+				id: "archive-new-reply",
+				subject: "Customer question",
+				sender: "customer@example.com",
+				recipient: "team@example.com",
+				date: "2026-07-14T11:00:00.000Z",
+				body: "<p>New reply</p>",
+				read: false,
+				starred: false,
+				thread_id: "thread-archive",
+			},
+			[],
+			{ kind: "user", id: "seed-user" },
+		);
 	}
 
 	seedActiveOutboundForTest(emailId: string) {
@@ -74,7 +107,9 @@ export class MutationTruthMailboxDO extends MailboxDO {
 			 WHERE action IN (
 			  'email_updated', 'conversation_read_state_changed',
 			  'label_applied', 'label_removed', 'email_moved',
-			  'batch_mark_read', 'batch_mark_unread'
+			  'batch_mark_read', 'batch_mark_unread',
+			  'conversation_archived', 'conversation_trashed',
+			  'batch_archive', 'batch_trash'
 			 )
 			 ORDER BY occurred_at, id`,
 		)];
@@ -88,6 +123,7 @@ export class MutationTruthMailboxDO extends MailboxDO {
 
 type MutationTruthStub = DurableObjectStub<MutationTruthMailboxDO> & {
 	seedMutationTruthForTest(): Promise<{ labelId: string }>;
+	seedArchiveReplyForTest(): Promise<unknown>;
 	seedActiveOutboundForTest(emailId: string): Promise<void>;
 	mutationTruthStateForTest(): Promise<{
 		emails: Array<Record<string, unknown>>;
@@ -110,10 +146,20 @@ export default {
 		if (url.pathname === "/state") {
 			return Response.json(await stub.mutationTruthStateForTest());
 		}
+		if (url.pathname === "/seed-archive-reply") {
+			await stub.seedArchiveReplyForTest();
+			return Response.json({ status: "created" });
+		}
 		if (url.pathname === "/seed-active-outbound") {
 			const body = await request.json() as { emailId: string };
 			await stub.seedActiveOutboundForTest(body.emailId);
 			return Response.json({ status: "created" });
+		}
+		if (url.pathname === "/delete-folder") {
+			const body = await request.json() as { folderId: string; actor: ActivityActor };
+			return Response.json({
+				deleted: await stub.deleteFolder(body.folderId, body.actor),
+			});
 		}
 		if (url.pathname === "/update-email") {
 			const body = await request.json() as {
@@ -136,6 +182,34 @@ export default {
 				body.conversationId,
 				body.folderId,
 				body.read,
+				body.actor,
+			));
+		}
+		if (url.pathname === "/conversation-archive") {
+			const body = await request.json() as {
+				conversationId: string;
+				folderId: string;
+				representativeEmailId: string;
+				actor: ActivityActor;
+			};
+			return Response.json(await stub.archiveConversation(
+				body.conversationId,
+				body.folderId,
+				body.representativeEmailId,
+				body.actor,
+			));
+		}
+		if (url.pathname === "/conversation-trash") {
+			const body = await request.json() as {
+				conversationId: string;
+				folderId: string;
+				representativeEmailId: string;
+				actor: ActivityActor;
+			};
+			return Response.json(await stub.trashConversation(
+				body.conversationId,
+				body.folderId,
+				body.representativeEmailId,
 				body.actor,
 			));
 		}

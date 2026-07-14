@@ -333,19 +333,21 @@ const api = {
 		mailboxId: string,
 		conversationId: string,
 		folderId: string,
+		representativeEmailId: string,
 	) =>
 		post<{ status: "archived"; affectedCount: number }>(
 			`/api/v1/mailboxes/${mailboxId}/conversations/${encodeURIComponent(conversationId)}/archive`,
-			{ folderId },
+			{ folderId, representativeEmailId },
 		),
 	trashConversation: (
 		mailboxId: string,
 		conversationId: string,
 		folderId: string,
+		representativeEmailId: string,
 	) =>
 		post<{ status: "trashed"; affectedCount: number }>(
 			`/api/v1/mailboxes/${mailboxId}/conversations/${encodeURIComponent(conversationId)}/trash`,
-			{ folderId },
+			{ folderId, representativeEmailId },
 		),
 	batchTriage: (mailboxId: string, command: BatchTriageCommand) =>
 		post<BatchTriageResult>(

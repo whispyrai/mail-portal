@@ -116,6 +116,17 @@ test(
 			const state = () => request<State>("/state");
 			let before = await state();
 
+			assert.deepEqual(
+				await request("/conversation-archive", {
+					conversationId: "thread-trash",
+					folderId: "Sent",
+					representativeEmailId: "trash-anchor",
+					actor,
+				}),
+				{ status: "invalid_action", affectedCount: 0 },
+			);
+			assert.deepEqual(await state(), before);
+
 			await request("/update-email", {
 				id: "message-4",
 				changes: { read: false, starred: false },
@@ -278,6 +289,151 @@ test(
 			assert.deepEqual(batch.results, [
 				{ status: "updated", affectedCount: 0, emailId: "message-2" },
 			]);
+			assert.deepEqual(await state(), before);
+
+			const archived = await request<{ status: string; affectedCount: number }>(
+				"/conversation-archive",
+				{
+					conversationId: "thread-archive",
+					folderId: "inbox",
+					representativeEmailId: "archive-anchor",
+					actor,
+				},
+			);
+			assert.deepEqual(archived, { status: "archived", affectedCount: 2 });
+			after = await state();
+			assert.equal(
+				after.emails.find((email) => email.id === "archive-anchor")?.folderId,
+				"archive",
+			);
+			await request("/seed-archive-reply");
+			await request("/seed-active-outbound", { emailId: "archive-anchor" });
+			before = await state();
+
+			const archiveReplay = await request<{ status: string; affectedCount: number }>(
+				"/conversation-archive",
+				{
+					conversationId: "thread-archive",
+					folderId: "inbox",
+					representativeEmailId: "archive-anchor",
+					actor,
+				},
+			);
+			assert.deepEqual(archiveReplay, { status: "archived", affectedCount: 0 });
+			after = await state();
+			assert.equal(
+				after.emails.find((email) => email.id === "archive-new-reply")?.folderId,
+				"inbox",
+			);
+			assert.deepEqual(after, before);
+
+			const trashed = await request<{ status: string; affectedCount: number }>(
+				"/conversation-trash",
+				{
+					conversationId: "thread-trash",
+					folderId: "sent",
+					representativeEmailId: "trash-anchor",
+					actor,
+				},
+			);
+			assert.deepEqual(trashed, { status: "trashed", affectedCount: 2 });
+			before = await state();
+			assert.deepEqual(
+				await request("/conversation-trash", {
+					conversationId: "thread-trash",
+					folderId: "sent",
+					representativeEmailId: "trash-anchor",
+					actor,
+				}),
+				{ status: "trashed", affectedCount: 0 },
+			);
+			assert.deepEqual(await state(), before);
+			assert.deepEqual(
+				await request("/conversation-trash", {
+					conversationId: "thread-trash",
+					folderId: "Trash",
+					representativeEmailId: "trash-anchor",
+					actor,
+				}),
+				{ status: "invalid_action", affectedCount: 0 },
+			);
+			assert.deepEqual(await state(), before);
+
+			const batchArchive = {
+				command: {
+					action: "archive" as const,
+					targets: [{ emailId: "batch-message", folderId: "inbox" }],
+				},
+				actor,
+			};
+			assert.deepEqual(
+				(await request<{ results: Array<{ status: string; affectedCount: number }> }>(
+					"/batch",
+					batchArchive,
+				)).results,
+				[{ emailId: "batch-message", status: "updated", affectedCount: 1 }],
+			);
+			before = await state();
+			assert.deepEqual(
+				(await request<{ results: Array<{ status: string; affectedCount: number }> }>(
+					"/batch",
+					batchArchive,
+				)).results,
+				[{ emailId: "batch-message", status: "updated", affectedCount: 0 }],
+			);
+			assert.deepEqual(await state(), before);
+
+			const batchTrash = {
+				command: {
+					action: "trash" as const,
+					targets: [{
+						emailId: "batch-trash-anchor",
+						folderId: "inbox",
+						conversationId: "thread-batch-trash",
+					}],
+				},
+				actor,
+			};
+			assert.deepEqual(
+				(await request<{ results: Array<{ status: string; affectedCount: number }> }>(
+					"/batch",
+					batchTrash,
+				)).results,
+				[{ emailId: "batch-trash-anchor", status: "updated", affectedCount: 2 }],
+			);
+			before = await state();
+			assert.deepEqual(
+				(await request<{ results: Array<{ status: string; affectedCount: number }> }>(
+					"/batch",
+					batchTrash,
+				)).results,
+				[{ emailId: "batch-trash-anchor", status: "updated", affectedCount: 0 }],
+			);
+			assert.deepEqual(await state(), before);
+
+			const customArchive = {
+				command: {
+					action: "archive" as const,
+					targets: [{ emailId: "custom-batch-message", folderId: "custom-retry" }],
+				},
+				actor,
+			};
+			assert.deepEqual(
+				(await request<{ results: Array<{ status: string; affectedCount: number }> }>(
+					"/batch",
+					customArchive,
+				)).results,
+				[{ emailId: "custom-batch-message", status: "updated", affectedCount: 1 }],
+			);
+			await request("/delete-folder", { folderId: "custom-retry", actor });
+			before = await state();
+			assert.deepEqual(
+				(await request<{ results: Array<{ status: string; affectedCount: number }> }>(
+					"/batch",
+					customArchive,
+				)).results,
+				[{ emailId: "custom-batch-message", status: "updated", affectedCount: 0 }],
+			);
 			assert.deepEqual(await state(), before);
 		} finally {
 			await runtime?.dispose();

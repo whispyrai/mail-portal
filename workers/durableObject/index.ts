@@ -92,7 +92,10 @@ import {
 	executeBatchTriage,
 	type BatchTriageRepository,
 } from "./batch-triage.ts";
-import type { BatchTriageCommand } from "../../shared/batch-triage.ts";
+import {
+	isBatchTriageActionAllowed,
+	type BatchTriageCommand,
+} from "../../shared/batch-triage.ts";
 import { planBulkEnqueueReconciliation } from "../lib/outbound-enqueue-recovery.ts";
 import {
 	bulkCleanupBacklogCount,
@@ -1630,12 +1633,14 @@ export class MailboxDO extends DurableObject<Env> {
 	async archiveConversation(
 		conversationId: string,
 		folderId: string,
+		representativeEmailId: string,
 		actor: ActivityActor = { kind: "system" },
 	) {
 		return this.#moveConversationInFolder(
 			conversationId,
 			folderId,
 			Folders.ARCHIVE,
+			representativeEmailId,
 			actor,
 		);
 	}
@@ -1643,12 +1648,14 @@ export class MailboxDO extends DurableObject<Env> {
 	async trashConversation(
 		conversationId: string,
 		folderId: string,
+		representativeEmailId: string,
 		actor: ActivityActor = { kind: "system" },
 	) {
 		return this.#moveConversationInFolder(
 			conversationId,
 			folderId,
 			Folders.TRASH,
+			representativeEmailId,
 			actor,
 		);
 	}
@@ -1656,6 +1663,7 @@ export class MailboxDO extends DurableObject<Env> {
 	async batchTriage(command: BatchTriageCommand, actor: ActivityActor) {
 		const repository: BatchTriageRepository = {
 			transaction: (run) => this.ctx.storage.transactionSync(run),
+			resolveFolder: (folderId) => this.#visibleFolderId(folderId),
 			resolveTarget: (target) => {
 				const folderId = this.#visibleFolderId(target.folderId);
 				if (!folderId) return null;
@@ -1684,6 +1692,26 @@ export class MailboxDO extends DurableObject<Env> {
 					.get();
 				if (representative?.id !== target.emailId) return null;
 				return { emailIds: scope.emailIds, folderId: scope.folderId };
+			},
+			isTargetStateSatisfied: (target, targetFolderId) => {
+				const folderId = this.#visibleFolderId(targetFolderId);
+				if (!folderId) return false;
+				if (!target.conversationId) {
+					return Boolean(
+						this.db
+							.select({ id: schema.emails.id })
+							.from(schema.emails)
+							.where(
+								and(
+									eq(schema.emails.id, target.emailId),
+									eq(schema.emails.folder_id, folderId),
+								),
+							)
+							.get(),
+					);
+				}
+				const scope = this.#conversationScope(target.conversationId, folderId);
+				return Boolean(scope?.emailIds.includes(target.emailId));
 			},
 			hasActiveOutbound: (emailIds) =>
 				Boolean(
@@ -1879,10 +1907,42 @@ export class MailboxDO extends DurableObject<Env> {
 		conversationId: string,
 		folderId: string,
 		targetFolderId: string,
+		representativeEmailId: string,
 		actor: ActivityActor,
 	) {
-		const scope = this.#conversationScope(conversationId, folderId);
-		if (!scope || scope.emailIds.length === 0) {
+		const sourceFolderId = this.#visibleFolderId(folderId);
+		const policyFolderId = sourceFolderId ?? folderId;
+		const action = targetFolderId === Folders.ARCHIVE ? "archive" : "trash";
+		if (!isBatchTriageActionAllowed(action, policyFolderId)) {
+			return { status: "invalid_action" as const, affectedCount: 0 };
+		}
+		const target = this.db
+			.select({ id: schema.folders.id })
+			.from(schema.folders)
+			.where(eq(schema.folders.id, targetFolderId))
+			.get();
+		if (!target || isInternalFolderId(target.id)) {
+			return { status: "not_found" as const, affectedCount: 0 };
+		}
+		const targetScope = this.#conversationScope(conversationId, target.id);
+		if (targetScope?.emailIds.includes(representativeEmailId)) {
+			return {
+				status: target.id === Folders.TRASH
+					? ("trashed" as const)
+					: ("archived" as const),
+				affectedCount: 0,
+			};
+		}
+		if (!sourceFolderId) {
+			return { status: "not_found" as const, affectedCount: 0 };
+		}
+
+		const scope = this.#conversationScope(conversationId, sourceFolderId);
+		if (
+			!scope ||
+			scope.emailIds.length === 0 ||
+			!scope.emailIds.includes(representativeEmailId)
+		) {
 			return { status: "not_found" as const, affectedCount: 0 };
 		}
 		if (scope.folderId === Folders.SNOOZED) {
@@ -1930,13 +1990,6 @@ export class MailboxDO extends DurableObject<Env> {
 		if (active) {
 			return { status: "outbound_delivery_active" as const, affectedCount: 0 };
 		}
-		const target = this.db
-			.select({ id: schema.folders.id })
-			.from(schema.folders)
-			.where(eq(schema.folders.id, targetFolderId))
-			.get();
-		if (!target) return { status: "not_found" as const, affectedCount: 0 };
-
 		const occurredAt = new Date().toISOString();
 		const isTrash = target.id === Folders.TRASH;
 		this.ctx.storage.transactionSync(() => {

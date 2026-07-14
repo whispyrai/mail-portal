@@ -39,11 +39,13 @@ test("Archive and Trash target the represented conversation, not its latest emai
 		kind: "conversation-archive",
 		conversationId: "thread-1",
 		folderId: "inbox",
+		representativeEmailId: "latest-1",
 	});
 	assert.deepEqual(planKeyboardConversationAction("trash", threadRow, "sent"), {
 		kind: "conversation-trash",
 		conversationId: "thread-1",
 		folderId: "sent",
+		representativeEmailId: "latest-1",
 	});
 });
 

@@ -14,7 +14,12 @@ export type ResolvedBatchTriageTarget = {
 
 export interface BatchTriageRepository {
 	transaction<T>(run: () => T): T;
+	resolveFolder(folderId: string): string | null;
 	resolveTarget(target: BatchTriageTarget): ResolvedBatchTriageTarget | null;
+	isTargetStateSatisfied(
+		target: BatchTriageTarget,
+		targetFolderId: string,
+	): boolean;
 	hasActiveOutbound(emailIds: string[]): boolean;
 	setRead(emailIds: string[], read: boolean): number;
 	move(emailIds: string[], fromFolderId: string, toFolderId: string): void;
@@ -34,12 +39,9 @@ export function executeBatchTriage(
 	return repository.transaction(() => {
 		const results: BatchTriageResult["results"] = [];
 		for (const target of command.targets) {
-			const resolved = repository.resolveTarget(target);
-			if (!resolved || resolved.emailIds.length === 0) {
-				results.push({ emailId: target.emailId, status: "not_found", affectedCount: 0 });
-				continue;
-			}
-			if (!isBatchTriageActionAllowed(command.action, resolved.folderId)) {
+			const sourceFolderId = repository.resolveFolder(target.folderId);
+			const policyFolderId = sourceFolderId ?? target.folderId;
+			if (!isBatchTriageActionAllowed(command.action, policyFolderId)) {
 				results.push({
 					emailId: target.emailId,
 					status: "invalid_action",
@@ -47,8 +49,39 @@ export function executeBatchTriage(
 				});
 				continue;
 			}
+
+			const canonicalTarget = {
+				...target,
+				folderId: sourceFolderId ?? target.folderId,
+			};
+			const targetFolderId = command.action === "archive"
+				? Folders.ARCHIVE
+				: command.action === "trash"
+					? Folders.TRASH
+					: null;
 			if (
-				(command.action === "archive" || command.action === "trash") &&
+				targetFolderId &&
+				repository.isTargetStateSatisfied(canonicalTarget, targetFolderId)
+			) {
+				results.push({
+					emailId: target.emailId,
+					status: "updated",
+					affectedCount: 0,
+				});
+				continue;
+			}
+			if (!sourceFolderId) {
+				results.push({ emailId: target.emailId, status: "not_found", affectedCount: 0 });
+				continue;
+			}
+
+			const resolved = repository.resolveTarget(canonicalTarget);
+			if (!resolved || resolved.emailIds.length === 0) {
+				results.push({ emailId: target.emailId, status: "not_found", affectedCount: 0 });
+				continue;
+			}
+			if (
+				targetFolderId &&
 				repository.hasActiveOutbound(resolved.emailIds)
 			) {
 				results.push({
@@ -69,14 +102,14 @@ export function executeBatchTriage(
 				repository.move(
 					resolved.emailIds,
 					resolved.folderId,
-					command.action === "archive" ? Folders.ARCHIVE : Folders.TRASH,
+					targetFolderId!,
 				);
 			}
 			if (affectedCount > 0) {
 				repository.recordActivity({
 					actor,
 					action: `batch_${command.action}`,
-					target,
+					target: canonicalTarget,
 					affectedCount,
 				});
 			}
