@@ -13,6 +13,10 @@ AWS_SECRET_ACCESS_KEY=your-ses-iam-secret-access-key
 #   openssl rand -base64 48
 JWT_SECRET=your-long-random-jwt-secret
 
+# Verified external destination used only if both raw R2 archival and direct
+# Mailbox persistence fail. Configure the approved address per environment.
+EMERGENCY_FORWARD_TO=replace-with-verified-emergency-destination
+
 # Email allowed to self-provision the first ADMIN account on first login.
 ADMIN_BOOTSTRAP_EMAIL=replace-with-the-brand-admin-address
 

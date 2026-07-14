@@ -16,5 +16,6 @@ snapshot-*.txt
 .agents/
 opencode.jsonc
 skills-lock.json
+script-logs/
 .DS_Store
 worker-configuration.d.ts

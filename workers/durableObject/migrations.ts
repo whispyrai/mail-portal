@@ -3,8 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 export interface Migration {
-	name: string;
-	sql: string;
+  name: string;
+  sql: string;
 }
 
 /**
@@ -15,52 +15,47 @@ export interface Migration {
  * create the same table so the schema is consistent either way.
  */
 export function applyMigrations(
-	sql: SqlStorage,
-	migrations: Migration[],
-	storage?: DurableObjectStorage,
+  sql: SqlStorage,
+  migrations: Migration[],
+  storage?: DurableObjectStorage,
 ): void {
-	sql.exec(`CREATE TABLE IF NOT EXISTS d1_migrations (
+  sql.exec(`CREATE TABLE IF NOT EXISTS d1_migrations (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL UNIQUE,
 		applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 	)`);
 
-	for (const migration of migrations) {
-		const applied = [
-			...sql.exec(
-				`SELECT 1 FROM d1_migrations WHERE name = ?`,
-				migration.name,
-			),
-		];
-		if (applied.length > 0) continue;
+  for (const migration of migrations) {
+    const applied = [
+      ...sql.exec(`SELECT 1 FROM d1_migrations WHERE name = ?`, migration.name),
+    ];
+    if (applied.length > 0) continue;
 
-		// Strip any existing BEGIN/COMMIT wrapper from the migration SQL.
-		// Cloudflare's DO runtime forbids SQL-level transactions -- must use
-		// the JS storage.transactionSync() API instead.
-		let migrationSql = migration.sql.trim();
-		migrationSql = migrationSql.replace(/^\s*BEGIN\s+TRANSACTION\s*;?\s*/i, "");
-		migrationSql = migrationSql.replace(/\s*COMMIT\s*;?\s*$/i, "");
+    // Strip any existing BEGIN/COMMIT wrapper from the migration SQL.
+    // Cloudflare's DO runtime forbids SQL-level transactions -- must use
+    // the JS storage.transactionSync() API instead.
+    let migrationSql = migration.sql.trim();
+    migrationSql = migrationSql.replace(/^\s*BEGIN\s+TRANSACTION\s*;?\s*/i, "");
+    migrationSql = migrationSql.replace(/\s*COMMIT\s*;?\s*$/i, "");
 
-		const escapedName = migration.name.replace(/'/g, "''");
-		const run = () => {
-			sql.exec(migrationSql);
-			sql.exec(
-				`INSERT INTO d1_migrations (name) VALUES ('${escapedName}')`,
-			);
-		};
+    const escapedName = migration.name.replace(/'/g, "''");
+    const run = () => {
+      sql.exec(migrationSql);
+      sql.exec(`INSERT INTO d1_migrations (name) VALUES ('${escapedName}')`);
+    };
 
-		if (storage) {
-			// Preferred: atomic transaction via the DO JS API
-			storage.transactionSync(run);
-		} else {
-			// Fallback: run without explicit transaction (each exec is auto-committed)
-			run();
-		}
-	}
+    if (storage) {
+      // Preferred: atomic transaction via the DO JS API
+      storage.transactionSync(run);
+    } else {
+      // Fallback: run without explicit transaction (each exec is auto-committed)
+      run();
+    }
+  }
 }
 
 interface DurableObjectStorage {
-	transactionSync: <T>(closure: () => T) => T;
+  transactionSync: <T>(closure: () => T) => T;
 }
 
 /**
@@ -75,16 +70,16 @@ interface DurableObjectStorage {
  * uniformly costs nothing and avoids accidental omissions.
  */
 function txn(sql: string): string {
-	const trimmed = sql.trim();
-	// Don't double-wrap if someone already added BEGIN/COMMIT
-	if (/^\s*BEGIN\b/i.test(trimmed)) return trimmed;
-	return `BEGIN TRANSACTION;\n${trimmed}\nCOMMIT;`;
+  const trimmed = sql.trim();
+  // Don't double-wrap if someone already added BEGIN/COMMIT
+  if (/^\s*BEGIN\b/i.test(trimmed)) return trimmed;
+  return `BEGIN TRANSACTION;\n${trimmed}\nCOMMIT;`;
 }
 
 export const mailboxMigrations: Migration[] = [
-	{
-		name: "1_initial_setup",
-		sql: txn(`
+  {
+    name: "1_initial_setup",
+    sql: txn(`
             CREATE TABLE folders (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -122,10 +117,10 @@ export const mailboxMigrations: Migration[] = [
                 FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
             );
         `),
-	},
-	{
-		name: "2_add_email_threading",
-		sql: txn(`
+  },
+  {
+    name: "2_add_email_threading",
+    sql: txn(`
             ALTER TABLE emails ADD COLUMN in_reply_to TEXT;
             ALTER TABLE emails ADD COLUMN email_references TEXT;
             ALTER TABLE emails ADD COLUMN thread_id TEXT;
@@ -133,49 +128,53 @@ export const mailboxMigrations: Migration[] = [
             CREATE INDEX idx_emails_thread_id ON emails(thread_id);
             CREATE INDEX idx_emails_in_reply_to ON emails(in_reply_to);
         `),
-	},
-	{
-		name: "3_add_draft_folder",
-		sql: txn(`INSERT INTO folders (id, name, is_deletable) VALUES ('draft', 'Drafts', 0);`),
-	},
-	{
-		name: "4_add_message_id",
-		sql: txn(`ALTER TABLE emails ADD COLUMN message_id TEXT;`),
-	},
-	{
-		name: "5_add_raw_headers",
-		sql: txn(`ALTER TABLE emails ADD COLUMN raw_headers TEXT;`),
-	},
-	{
-		name: "6_mark_sent_emails_as_read",
-		sql: txn(`UPDATE emails SET read = 1 WHERE folder_id = 'sent' AND read = 0;`),
-	},
-	{
-		name: "7_add_cc_bcc",
-		sql: txn(`
+  },
+  {
+    name: "3_add_draft_folder",
+    sql: txn(
+      `INSERT INTO folders (id, name, is_deletable) VALUES ('draft', 'Drafts', 0);`,
+    ),
+  },
+  {
+    name: "4_add_message_id",
+    sql: txn(`ALTER TABLE emails ADD COLUMN message_id TEXT;`),
+  },
+  {
+    name: "5_add_raw_headers",
+    sql: txn(`ALTER TABLE emails ADD COLUMN raw_headers TEXT;`),
+  },
+  {
+    name: "6_mark_sent_emails_as_read",
+    sql: txn(
+      `UPDATE emails SET read = 1 WHERE folder_id = 'sent' AND read = 0;`,
+    ),
+  },
+  {
+    name: "7_add_cc_bcc",
+    sql: txn(`
             ALTER TABLE emails ADD COLUMN cc TEXT;
             ALTER TABLE emails ADD COLUMN bcc TEXT;
         `),
-	},
-	{
-		// No txn() wrapper: Cloudflare's DO runtime requires state.storage.transactionSync()
-		// instead of SQL-level BEGIN TRANSACTION. These are idempotent CREATE INDEX IF NOT EXISTS
-		// statements so they're safe to run without a transaction.
-		name: "8_add_folder_date_indexes",
-		sql: `
+  },
+  {
+    // No txn() wrapper: Cloudflare's DO runtime requires state.storage.transactionSync()
+    // instead of SQL-level BEGIN TRANSACTION. These are idempotent CREATE INDEX IF NOT EXISTS
+    // statements so they're safe to run without a transaction.
+    name: "8_add_folder_date_indexes",
+    sql: `
             CREATE INDEX IF NOT EXISTS idx_emails_folder_id ON emails(folder_id);
             CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date);
             CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
         `,
-	},
-	{
-		// Web Push per-device subscriptions for this mailbox (WISER-240). One row
-		// per device: `endpoint` is the browser-minted capability URL (unique);
-		// `id` is a stable client-facing handle for the device list + removal.
-		// No txn() wrapper — a single idempotent CREATE ... IF NOT EXISTS (see
-		// migration 8 for why DO runtime forbids SQL-level transactions).
-		name: "9_add_push_subscriptions",
-		sql: `
+  },
+  {
+    // Web Push per-device subscriptions for this mailbox (WISER-240). One row
+    // per device: `endpoint` is the browser-minted capability URL (unique);
+    // `id` is a stable client-facing handle for the device list + removal.
+    // No txn() wrapper — a single idempotent CREATE ... IF NOT EXISTS (see
+    // migration 8 for why DO runtime forbids SQL-level transactions).
+    name: "9_add_push_subscriptions",
+    sql: `
             CREATE TABLE IF NOT EXISTS push_subscriptions (
                 id TEXT PRIMARY KEY,
                 endpoint TEXT NOT NULL UNIQUE,
@@ -187,5 +186,65 @@ export const mailboxMigrations: Migration[] = [
                 last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
         `,
-	},
+  },
+  {
+    // Inbound Queue delivery is at least once. These ledgers keep a user's
+    // explicit deletion authoritative and make notification fanout single-winner.
+    name: "10_add_inbound_delivery_ledgers",
+    sql: `
+            CREATE TABLE IF NOT EXISTS email_deletion_tombstones (
+                id TEXT PRIMARY KEY,
+                deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS inbound_push_claims (
+                id TEXT PRIMARY KEY,
+                claimed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS inbound_terminal_failures (
+                id TEXT PRIMARY KEY,
+                queue_message_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                error_code TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `,
+  },
+  {
+    name: "11_add_external_email_bodies",
+    sql: `
+            CREATE TABLE IF NOT EXISTS email_body_objects (
+                id TEXT PRIMARY KEY,
+                email_id TEXT NOT NULL,
+                part_index INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                charset TEXT NOT NULL,
+                r2_key TEXT NOT NULL,
+                byte_length INTEGER NOT NULL,
+                FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_email_body_objects_email_id
+                ON email_body_objects(email_id, part_index);
+        `,
+  },
+  {
+    name: "12_add_r2_deletion_outbox",
+    sql: `
+			CREATE TABLE IF NOT EXISTS r2_deletion_outbox (
+				r2_key TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+				last_error TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+			CREATE INDEX IF NOT EXISTS idx_r2_deletion_outbox_due
+				ON r2_deletion_outbox(next_attempt_at);
+		`,
+  },
+  {
+    name: "13_add_attachment_object_key",
+    sql: `ALTER TABLE attachments ADD COLUMN r2_key TEXT;`,
+  },
 ];

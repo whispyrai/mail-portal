@@ -11,16 +11,16 @@ Design + decisions live in the second brain: the shared platform in `~/Documents
 
 ## What changed from upstream
 
-| Area | Upstream | This fork |
-|------|----------|-----------|
-| Outbound | Cloudflare Email Sending (`env.EMAIL.send()`) | **AWS SES** (API v2 `SendEmail`, Simple content) via `aws4fetch` |
-| Auth | Cloudflare Access | **Email + password**, hand-rolled (PBKDF2 + JWT cookie via `jose`), roles `AGENT`/`ADMIN` |
-| Authorization | None (any authed user → any mailbox) | **Per-mailbox**: a rep sees only their mailbox; an admin sees all |
-| Users | implicit (Access) | **D1 `users` table** + `/admin/users` console |
-| AI model | Kimi K2.5 | `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, **manual-only** (auto-draft removed) |
-| MCP (`/mcp`) | open to any authed user | **per-user bearer token**; reads admin=all/agent=own, writes own-only |
-| Bulk send | — | **CSV mail merge** with a DO alarm scheduler (`/bulk`) |
-| Apex landing | — | separate static site on Vercel (this Worker serves `mail.` only) |
+| Area          | Upstream                                      | This fork                                                                                 |
+| ------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Outbound      | Cloudflare Email Sending (`env.EMAIL.send()`) | **AWS SES** (API v2 `SendEmail`, Simple content) via `aws4fetch`                          |
+| Auth          | Cloudflare Access                             | **Email + password**, hand-rolled (PBKDF2 + JWT cookie via `jose`), roles `AGENT`/`ADMIN` |
+| Authorization | None (any authed user → any mailbox)          | **Per-mailbox**: a rep sees only their mailbox; an admin sees all                         |
+| Users         | implicit (Access)                             | **D1 `users` table** + `/admin/users` console                                             |
+| AI model      | Kimi K2.5                                     | `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, **manual-only** (auto-draft removed)          |
+| MCP (`/mcp`)  | open to any authed user                       | **per-user bearer token**; reads admin=all/agent=own, writes own-only                     |
+| Bulk send     | —                                             | **CSV mail merge** with a DO alarm scheduler (`/bulk`)                                    |
+| Apex landing  | —                                             | separate static site on Vercel (this Worker serves `mail.` only)                          |
 
 ## Architecture
 
@@ -69,25 +69,49 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, �
    ```bash
    npx wrangler d1 create sales_portal_users
    ```
+
    Copy the returned `database_id` into `wrangler.jsonc` (`d1_databases[0].database_id`), then apply the schema:
+
    ```bash
    npx wrangler d1 migrations apply sales_portal_users --remote
    ```
 
-2. **R2 bucket**
+2. **R2 buckets and inbound queues**
 
    ```bash
    npx wrangler r2 bucket create sales-mail-portal
+   npx wrangler r2 bucket create sales-mail-raw-archive
+   npx wrangler r2 bucket create sales-mail-raw-archive-preview
+   npx wrangler queues create sales-mail-inbound --message-retention-period-secs 1209600
+   npx wrangler queues create sales-mail-inbound-dlq --message-retention-period-secs 1209600
+   npx wrangler queues create sales-mail-inbound-parking --message-retention-period-secs 1209600
+   ```
+
+   `sales-mail-raw-archive` is the private authoritative copy of every accepted raw inbound message. The separate preview bucket prevents remote development from writing to the production archive. All three Queues must use the paid-plan maximum 14-day retention. Apply an explicitly approved Bucket Lock and lifecycle policy to the production `raw/` prefix before routing live mail.
+
+   For existing Queues, inspect and correct retention before deployment:
+
+   ```bash
+   npx wrangler queues info sales-mail-inbound
+   npx wrangler queues info sales-mail-inbound-dlq
+   npx wrangler queues info sales-mail-inbound-parking
+   npx wrangler queues update sales-mail-inbound --message-retention-period-secs 1209600
+   npx wrangler queues update sales-mail-inbound-dlq --message-retention-period-secs 1209600
+   npx wrangler queues update sales-mail-inbound-parking --message-retention-period-secs 1209600
    ```
 
 3. **Secrets**
 
    ```bash
-   npx wrangler secret put AWS_ACCESS_KEY_ID       # SES IAM user (ses:SendEmail)
-   npx wrangler secret put AWS_SECRET_ACCESS_KEY
-   npx wrangler secret put JWT_SECRET              # openssl rand -base64 48
-   npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL   # e.g. hesham@whispyrcrm.com
+   npx wrangler secret put AWS_ACCESS_KEY_ID --env whispyr       # SES IAM user (ses:SendEmail)
+   npx wrangler secret put AWS_SECRET_ACCESS_KEY --env whispyr
+   npx wrangler secret put JWT_SECRET --env whispyr              # openssl rand -base64 48
+   npx wrangler secret put EMERGENCY_FORWARD_TO --env whispyr    # verified external fallback destination
+   npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL --env whispyr   # e.g. hesham@whispyrcrm.com
+   npx wrangler secret put VAPID_PUBLIC_KEY --env whispyr
+   npx wrangler secret put VAPID_PRIVATE_KEY --env whispyr
    ```
+
    `AWS_REGION` and `DOMAINS` are plain vars already set in `wrangler.jsonc`.
 
 4. **Deploy** — provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `env.whispyr`). `CLOUDFLARE_ENV=whispyr` is baked in by the script, so the build resolves the `env.whispyr` block and the deploy lands on the `sales-mail-portal` Worker:
