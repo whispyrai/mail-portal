@@ -75,6 +75,61 @@ export class MutationTruthMailboxDO extends MailboxDO {
 		);
 	}
 
+	async seedLabelFilteredBatchForTest() {
+		const actor = { kind: "user" as const, id: "seed-user" };
+		const label = await this.createLabel("Label-filtered batch", "blue", actor);
+		const fixtures = [
+			{ action: "mark-read", read: false },
+			{ action: "mark-unread", read: true },
+			{ action: "archive", read: false },
+			{ action: "trash", read: false },
+		];
+		for (const [index, fixture] of fixtures.entries()) {
+			for (const [offset, suffix] of ["anchor", "newer"].entries()) {
+				await this.createEmail(
+					"inbox",
+					{
+						id: `label-${fixture.action}-${suffix}`,
+						subject: `Label-filtered ${fixture.action}`,
+						sender: "customer@example.com",
+						recipient: "team@example.com",
+						date: new Date(
+							Date.parse("2026-07-14T12:00:00.000Z") +
+								(index * 2 + offset) * 60_000,
+						).toISOString(),
+						body: "<p>Label-filtered batch</p>",
+						read: fixture.read,
+						starred: false,
+						thread_id: `thread-label-${fixture.action}`,
+					},
+					[],
+					actor,
+				);
+			}
+		}
+		await this.mutateLabels(
+			{
+				labelId: label.id,
+				action: "apply",
+				targets: fixtures.map((fixture) => ({
+					emailId: `label-${fixture.action}-anchor`,
+					folderId: "inbox",
+				})),
+			},
+			actor,
+		);
+		const rows = await this.getThreadedEmails({
+			folder: "inbox",
+			label_id: label.id,
+			limit: 100,
+		});
+		return rows.map((row) => ({
+			id: row.id,
+			conversationId: row.conversation_id,
+			threadCount: row.thread_count,
+		}));
+	}
+
 	seedActiveOutboundForTest(emailId: string) {
 		const now = "2026-07-14T10:10:00.000Z";
 		this.ctx.storage.sql.exec(
@@ -124,6 +179,11 @@ export class MutationTruthMailboxDO extends MailboxDO {
 type MutationTruthStub = DurableObjectStub<MutationTruthMailboxDO> & {
 	seedMutationTruthForTest(): Promise<{ labelId: string }>;
 	seedArchiveReplyForTest(): Promise<unknown>;
+	seedLabelFilteredBatchForTest(): Promise<Array<{
+		id: string;
+		conversationId: string;
+		threadCount: number;
+	}>>;
 	seedActiveOutboundForTest(emailId: string): Promise<void>;
 	mutationTruthStateForTest(): Promise<{
 		emails: Array<Record<string, unknown>>;
@@ -149,6 +209,9 @@ export default {
 		if (url.pathname === "/seed-archive-reply") {
 			await stub.seedArchiveReplyForTest();
 			return Response.json({ status: "created" });
+		}
+		if (url.pathname === "/seed-label-filtered-batch") {
+			return Response.json(await stub.seedLabelFilteredBatchForTest());
 		}
 		if (url.pathname === "/seed-active-outbound") {
 			const body = await request.json() as { emailId: string };

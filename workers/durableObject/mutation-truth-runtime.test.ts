@@ -435,6 +435,61 @@ test(
 				[{ emailId: "custom-batch-message", status: "updated", affectedCount: 0 }],
 			);
 			assert.deepEqual(await state(), before);
+
+			const labelFilteredRows = await request<Array<{
+				id: string;
+				conversationId: string;
+				threadCount: number;
+			}>>("/seed-label-filtered-batch");
+			assert.deepEqual(labelFilteredRows, [
+				{
+					id: "label-trash-anchor",
+					conversationId: "thread-label-trash",
+					threadCount: 2,
+				},
+				{
+					id: "label-archive-anchor",
+					conversationId: "thread-label-archive",
+					threadCount: 2,
+				},
+				{
+					id: "label-mark-unread-anchor",
+					conversationId: "thread-label-mark-unread",
+					threadCount: 2,
+				},
+				{
+					id: "label-mark-read-anchor",
+					conversationId: "thread-label-mark-read",
+					threadCount: 2,
+				},
+			]);
+			for (const [action, expectedEmailId] of [
+				["mark_read", "label-mark-read-anchor"],
+				["mark_unread", "label-mark-unread-anchor"],
+				["archive", "label-archive-anchor"],
+				["trash", "label-trash-anchor"],
+			] as const) {
+				const target = labelFilteredRows.find((row) => row.id === expectedEmailId);
+				assert.ok(target);
+				const result = await request<{
+					results: Array<{ emailId: string; status: string; affectedCount: number }>;
+				}>("/batch", {
+					command: {
+						action,
+						targets: [{
+							emailId: target.id,
+							folderId: "inbox",
+							conversationId: target.conversationId,
+						}],
+					},
+					actor,
+				});
+				assert.deepEqual(result.results, [{
+					emailId: expectedEmailId,
+					status: "updated",
+					affectedCount: 2,
+				}]);
+			}
 		} finally {
 			await runtime?.dispose();
 			await rm(outputDirectory, { recursive: true, force: true });

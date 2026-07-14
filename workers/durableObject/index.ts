@@ -1683,14 +1683,6 @@ export class MailboxDO extends DurableObject<Env> {
 
 				const scope = this.#conversationScope(target.conversationId, folderId);
 				if (!scope || !scope.emailIds.includes(target.emailId)) return null;
-				const representative = this.db
-					.select({ id: schema.emails.id })
-					.from(schema.emails)
-					.where(inArray(schema.emails.id, scope.emailIds))
-					.orderBy(desc(schema.emails.date), desc(schema.emails.id))
-					.limit(1)
-					.get();
-				if (representative?.id !== target.emailId) return null;
 				return { emailIds: scope.emailIds, folderId: scope.folderId };
 			},
 			isTargetStateSatisfied: (target, targetFolderId) => {
