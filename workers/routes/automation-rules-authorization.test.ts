@@ -123,6 +123,7 @@ function fixture() {
 				email: `${userId}@example.com`,
 				role: userId.startsWith("admin") ? "ADMIN" : "AGENT",
 				mailbox: `${userId}@example.com`,
+				sessionVersion: 1,
 			};
 		},
 		revokeDuringRead() { revokeRead = true; },

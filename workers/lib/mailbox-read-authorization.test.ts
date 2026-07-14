@@ -101,6 +101,7 @@ function fixture(options: { failPostAuthorization?: boolean } = {}) {
 		email: "member@example.com",
 		role: "AGENT",
 		mailbox: "member@example.com",
+		sessionVersion: 1,
 	};
 	let routeWorkStarted = false;
 	const env = {

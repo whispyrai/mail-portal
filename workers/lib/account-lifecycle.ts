@@ -12,6 +12,7 @@ export function createAccountLifecycle(deps: {
   store: AccountLifecycleStore;
   generateReplacementPassword: () => Promise<{ hash: string; salt: string }>;
   purgePush: (userId: string, mailboxId: string) => Promise<void>;
+  disconnectAgent: (userId: string, mailboxId: string) => Promise<void>;
   now?: () => number;
 }) {
   return {
@@ -23,13 +24,29 @@ export function createAccountLifecycle(deps: {
         passwordSalt: replacement.salt,
         at: (deps.now ?? Date.now)(),
       });
-      const cleanup = await Promise.allSettled(
-        result.mailboxIds.map((mailboxId) => deps.purgePush(userId, mailboxId)),
+      const [agentCleanup, pushCleanup] = await Promise.all([
+        Promise.allSettled(
+          result.mailboxIds.map((mailboxId) =>
+            deps.disconnectAgent(userId, mailboxId),
+          ),
+        ),
+        Promise.allSettled(
+          result.mailboxIds.map((mailboxId) => deps.purgePush(userId, mailboxId)),
+        ),
+      ]);
+      const agentFailures = agentCleanup.filter(
+        (outcome) => outcome.status === "rejected",
       );
+      if (agentFailures.length > 0) {
+        throw new AggregateError(
+          agentFailures.map((outcome) => outcome.reason),
+          "Live Agent connections could not be revoked",
+        );
+      }
       return {
         ...result,
         pushCleanupFailedMailboxIds: result.mailboxIds.filter(
-          (_mailboxId, index) => cleanup[index]?.status === "rejected",
+          (_mailboxId, index) => pushCleanup[index]?.status === "rejected",
         ),
       };
     },

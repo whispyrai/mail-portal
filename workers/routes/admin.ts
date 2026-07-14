@@ -50,6 +50,7 @@ import {
 import { accountLifecycle } from "../lib/account-lifecycle-runtime.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
 import { createAdminReadDisclosureGuard } from "./admin-read-disclosure-guard.ts";
+import { requireAgentConnectionReconciliation } from "../lib/agent-connection-revocation-outbox.ts";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
@@ -456,6 +457,10 @@ adminApp.post("/users/:id/revoke", async (c) => {
     c.env.JWT_SECRET,
   );
   await revokeUserCredentials(c.env, user.id, hash, salt);
+  await requireAgentConnectionReconciliation(c.env, {
+    userId: user.id,
+    scope: "ACTOR",
+  });
   return c.redirect(
     `/admin/users?ok=${encodeURIComponent(`Revoked sessions and credentials for ${user.email}. The owner can recover from the sign-in page.`)}`,
     302,

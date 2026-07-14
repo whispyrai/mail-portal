@@ -5,7 +5,7 @@ This runbook is for WISER-242, the Wiser deployment of the shared Mail Portal co
 ## Production Shape
 
 - App domain: `mail.wiserchat.ai`
-- Inbound mail domains during proof: `test.wiserchat.ai`, then `wiserchat.ai` after MX cutover approval
+- Inbound mail domain: `wiserchat.ai`. The locked direct-cutover plan does not use a temporary test domain.
 - Launch mailboxes: `hesham@wiserchat.ai` (ADMIN/personal), `hello@wiserchat.ai`, `contact@wiserchat.ai`
 - Unknown recipients: permanent SMTP reject via the Worker email handler
 - Cloudflare Worker: `wiser-mail-portal`
@@ -27,7 +27,7 @@ Each of these is a separate production mutation and needs explicit approval befo
 6. Import Zoho exports into production mailboxes.
 7. Change apex `wiserchat.ai` MX away from Zoho.
 8. Disable or delete Zoho mailboxes/routing after final reconciliation.
-9. Commit and push the implementation.
+9. Push a deployment branch, create or merge a PR, or change the deployed branch.
 
 ## Local Preflight
 
@@ -44,23 +44,48 @@ npm run verify:env:wiser
 npm run deploy:wiser -- --dry-run
 ```
 
-The Wiser build must say it is using `.dev.vars.wiser`, and the deploy dry-run must say it is using the redirected `build/server/wrangler.json`. The binding summary must list only Wiser resources: `wiser-mail-portal`, `wiser_mail_portal_users`, `wiser-mail-portal`, `c934d803c2f8430d9088f4a5d9f29d55`, and `mail.wiserchat.ai`.
+The Wiser build must say it is using `.dev.vars.wiser`, and the deploy dry-run must say it is using the redirected `build/server/wrangler.json`. The binding summary must list only Wiser resources: `wiser-mail-portal`, `wiser_mail_portal_users`, `wiser-mail-portal`, `c934d803c2f8430d9088f4a5d9f29d55`, and `mail.wiserchat.ai`. Its `DOMAINS` value must be exactly `wiserchat.ai`, and its scheduled triggers must be exactly `* * * * *` plus `17 * * * *`.
 
 ## Cloudflare Database
 
-Approved remote command:
+After explicit approval for the Wiser production database, run:
 
 ```bash
 npx wrangler d1 migrations apply DB --env wiser --remote
 ```
 
+Apply every migration through `0010_create_agent_connection_revocations.sql`
+before deploying the Worker version or Cron Trigger configuration in this
+checkpoint. The ordering is mandatory because user, membership, and mailbox
+lifecycle writes enqueue Agent connection reconciliation through migration 0010
+triggers.
+
 Validate with a read-only query:
 
 ```bash
-npx wrangler d1 execute DB --env wiser --remote --command "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT type, name FROM sqlite_master WHERE name IN ('agent_connection_revocations', 'users_enqueue_agent_connection_reconciliation', 'mailbox_memberships_enqueue_agent_connection_reconciliation', 'mailboxes_enqueue_agent_connection_reconciliation') ORDER BY type, name"
 ```
 
-Expected tables include `users`. Quiz tables may exist because the migration directory is shared, but Wiser keeps the quiz feature disabled with `FEATURES=[]`.
+The result must contain the `agent_connection_revocations` table and all three
+named triggers. Quiz tables may exist because the migration directory is shared,
+but Wiser keeps the quiz feature disabled with `FEATURES=[]`.
+
+## Scheduled Maintenance
+
+The deployment artifact must contain exactly two schedules:
+
+- `* * * * *` drains durable Agent connection-reconciliation work. Work that
+  fails during the invocation or remains immediately due fails that Cron turn,
+  while the D1 outbox retains future-backoff items for later retries. Monitor the
+  outbox separately because deferred work does not make every interim turn fail.
+- `17 * * * *` deletes expired AI response-cache rows in bounded batches. A
+  remaining backlog fails the invocation instead of being hidden.
+
+After an approved deploy, inspect Cron Trigger invocation logs without exposing
+mail content or credentials. Verify both schedules invoke the Worker and that
+`agent_connection_revocations` reaches zero after an approved disposable
+revocation drill. Do not modify a real user's credentials solely to create this
+probe.
 
 ## AWS SES
 
@@ -73,13 +98,15 @@ Production secrets required by `env.wiser`:
 ```text
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
+SES_EVENT_WEBHOOK_SECRET
 JWT_SECRET
 ADMIN_BOOTSTRAP_EMAIL
+ACCOUNT_RECOVERY_DIRECTORY
 VAPID_PUBLIC_KEY
 VAPID_PRIVATE_KEY
 ```
 
-Use `ADMIN_BOOTSTRAP_EMAIL=hesham@wiserchat.ai`. Generate `JWT_SECRET` with at least 48 random base64 bytes. Generate one VAPID keypair for Wiser push.
+Use `ADMIN_BOOTSTRAP_EMAIL=hesham@wiserchat.ai`. Generate `JWT_SECRET` with at least 48 random base64 bytes. Generate a separate high-entropy `SES_EVENT_WEBHOOK_SECRET`. Store the approved JSON mapping from portal addresses to external recovery addresses in `ACCOUNT_RECOVERY_DIRECTORY`. Generate one VAPID keypair for Wiser push.
 
 ## First Deploy And Secrets
 
@@ -93,15 +120,17 @@ npm run deploy:wiser -- --secrets-file "$SECRETS_FILE"
 rm "$SECRETS_FILE"
 ```
 
-The temporary file must use dotenv syntax and contain only the six secret names above. Do not commit it, paste it into tickets, or store it in the repo. `.secrets*` is ignored as an extra local guard, but `/tmp` is preferred.
+The temporary file must use dotenv syntax and contain only the eight secret names above. Do not commit it, paste it into tickets, or store it in the repo. `.secrets*` is ignored as an extra local guard, but `/tmp` is preferred.
 
 For secret rotation after the Worker exists, use:
 
 ```bash
 npx wrangler secret put AWS_ACCESS_KEY_ID --env wiser
 npx wrangler secret put AWS_SECRET_ACCESS_KEY --env wiser
+npx wrangler secret put SES_EVENT_WEBHOOK_SECRET --env wiser
 npx wrangler secret put JWT_SECRET --env wiser
 npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL --env wiser
+npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY --env wiser
 npx wrangler secret put VAPID_PUBLIC_KEY --env wiser
 npx wrangler secret put VAPID_PRIVATE_KEY --env wiser
 ```
@@ -131,17 +160,18 @@ The manifest must use Wiser icons and Wiser theme values. The login page must re
 
 Do not enable catch-all routing to production until these mailboxes exist. The inbound handler rejects unprovisioned recipients.
 
-## Email Routing Proof
+## Production Email Routing Validation
 
-Before apex cutover, use `test.wiserchat.ai` only:
+The apex cutover is active. Validate only the production addresses after explicit
+approval for the external test messages:
 
-1. Add Cloudflare Email Routing for `test.wiserchat.ai`.
-2. Create a catch-all routing rule that delivers to `wiser-mail-portal`.
-3. Send test messages to the three launch recipients at `test.wiserchat.ai` only if matching mailboxes are intentionally created for that proof, or use an approved temporary test mailbox.
-4. Send to an unknown test recipient and confirm permanent SMTP reject.
-5. Send a Bcc-only message and confirm routing uses the SMTP envelope recipient, not the visible `To` header.
+1. Confirm the active apex catch-all delivers to `wiser-mail-portal`.
+2. Send to each approved launch mailbox and confirm exact mailbox isolation.
+3. Send to an unknown apex recipient and confirm permanent SMTP rejection.
+4. Send a Bcc-only message and confirm routing uses the SMTP envelope recipient,
+   not the visible `To` header.
 
-If the proof needs `hello@test.wiserchat.ai` or similar, create those as temporary mailboxes and delete them before apex go-live, or use one dedicated approved test mailbox. Do not silently create production `wiserchat.ai` mailboxes from inbound mail.
+Do not create or operate `test.wiserchat.ai` mailboxes or Email Routing records.
 
 ## Outbound Proof
 
@@ -183,7 +213,8 @@ Repeat for `contact@wiserchat.ai` and any approved `hesham@wiserchat.ai` history
 
 ## Apex MX Cutover
 
-Only after staging proof, outbound proof, import reconciliation, and user approval:
+For a future cutover replay or rollback recovery, only after outbound proof,
+import reconciliation, and user approval:
 
 1. Record current Zoho MX/TXT records and TTLs.
 2. Lower relevant TTLs if needed and wait for propagation.
@@ -212,10 +243,9 @@ After an agreed observation window:
 
 1. Run a final Zoho delta export and import.
 2. Reconcile message counts and spot-check important threads.
-3. Remove temporary `test.wiserchat.ai` Email Routing and any temporary test mailboxes.
-4. Consider a follow-up config change to remove `test.wiserchat.ai` from `DOMAINS` after proof is no longer needed.
-5. Decommission Zoho routing/mailboxes only after explicit approval.
-6. Write the final launch note in `~/Documents/hesham-os/wiserchat/logs/notes/`.
+3. Confirm `DOMAINS` remains exactly `wiserchat.ai` and that no temporary test-domain routing exists.
+4. Decommission Zoho routing/mailboxes only after explicit approval.
+5. Write the final launch note in `~/Documents/hesham-os/wiserchat/logs/notes/`.
 
 ## Stop Conditions
 
@@ -223,7 +253,7 @@ Stop and rollback or ask for direction if any of these happen:
 
 - Wiser build or dry-run references a Whispyr resource.
 - Unknown recipients are accepted instead of rejected.
-- A test route receives live apex mail before cutover approval.
+- Any route other than the approved apex catch-all receives live Wiser mail.
 - SES headers fail DKIM or SPF for Wiser.
 - The UI shows Whispyr branding on `mail.wiserchat.ai`.
 - Imported mail count reconciliation fails without an explained duplicate/skip reason.

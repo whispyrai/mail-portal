@@ -25,7 +25,15 @@ export function mcpCredentialVersionMatches(
 	identity: Pick<McpIdentity, "sessionVersion">,
 	user: Pick<LiveMcpUser, "session_version">,
 ): boolean {
-	return (identity.sessionVersion ?? 1) === user.session_version;
+	return mcpCredentialSessionVersion(identity) === user.session_version;
+}
+
+export function mcpCredentialSessionVersion(
+	identity: Pick<McpIdentity, "sessionVersion">,
+): number {
+	// OAuth grants created before credential generations were persisted are
+	// explicitly generation one. New grants always carry their exact generation.
+	return identity.sessionVersion ?? 1;
 }
 
 export async function quizAuthorizationFailure(

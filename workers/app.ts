@@ -36,12 +36,15 @@ import {
   readCookie,
   shouldRenewSession,
   cookieDomainFor,
-  sessionMatchesUserVersion,
   SESSION_COOKIE_NAME,
   type SessionClaims,
 } from "./lib/auth";
-import { getUserById } from "./lib/users";
-import { mailboxAccess } from "./lib/mailbox-access";
+import {
+  agentMailboxFromPath,
+  isAcceptedAgentWebSocket,
+  resolveLiveSessionUser,
+} from "./lib/live-session.ts";
+import { hasExactLiveMailboxAccess } from "./lib/live-mailbox-authorization.ts";
 import { handleSesEvent } from "./routes/ses-events";
 import {
   credentialRecoveryPage,
@@ -52,9 +55,11 @@ import {
 import { mutationOriginDecision } from "./lib/request-security";
 import {
   isSensitiveAuthenticationPath,
+  replaceWithPrivateResponse,
   setPrivateNoStore,
   withPrivateNoStore,
 } from "./lib/response-privacy";
+import { runScheduledMaintenance } from "./lib/scheduled-maintenance.ts";
 import type { Env } from "./types";
 
 export { MailboxDO } from "./durableObject";
@@ -163,16 +168,10 @@ app.use("*", async (c, next) => {
   const claims = token ? await verifySession(token, c.env.JWT_SECRET) : null;
   if (!claims) return respondUnauthorized();
 
-  // Safety belt: confirm the user still exists and is active (enables
-  // force-logout by deactivating the user). One cheap D1 read per request.
-  const user = await getUserById(c.env, claims.sub);
-  if (
-    !user ||
-    user.is_active !== 1 ||
-    !sessionMatchesUserVersion(claims, user)
-  ) {
-    return respondUnauthorized();
-  }
+  // Confirm the user is active and on this credential generation before work.
+  // A second check below prevents in-flight revocation from disclosing output.
+  const user = await resolveLiveSessionUser(c.env, claims);
+  if (!user) return respondUnauthorized();
 
   const liveClaims: SessionClaims & { exp: number } = {
     ...claims,
@@ -205,9 +204,64 @@ app.use("*", async (c, next) => {
     );
   }
   await next();
-  if (!path.startsWith("/agents/")) {
+  if (
+    isAcceptedAgentWebSocket(
+      path,
+      c.req.header("upgrade"),
+      c.res.status,
+    )
+  ) return;
+  if (c.req.method !== "GET" && c.req.method !== "HEAD") {
     setPrivateNoStore(c);
+    return;
   }
+  try {
+    const currentUser = await resolveLiveSessionUser(c.env, liveClaims);
+    if (!currentUser) {
+      replaceWithPrivateResponse(
+        c,
+        path.startsWith("/api/")
+          ? c.json({ error: "Unauthorized" }, 401)
+          : c.text("Unauthorized", 401),
+      );
+      return;
+    }
+    if (path.startsWith("/agents/")) {
+      const agentMailbox = agentMailboxFromPath(path);
+      if (
+        !agentMailbox ||
+        !(await hasExactLiveMailboxAccess(
+          c.env,
+          agentMailbox,
+          liveClaims.sub,
+          liveClaims.sessionVersion,
+        ))
+      ) {
+        replaceWithPrivateResponse(
+          c,
+          c.json({ error: "Forbidden" }, 403),
+        );
+        return;
+      }
+    }
+  } catch (error) {
+    console.error("[auth] live session check failed", {
+      operation: "session_authorization_check",
+      phase: "after_response",
+      method: c.req.method,
+      path,
+      actorUserId: liveClaims.sub,
+      errorName: error instanceof Error ? error.name : "UnknownError",
+    });
+    replaceWithPrivateResponse(
+      c,
+      path.startsWith("/api/")
+        ? c.json({ error: "Authorization unavailable" }, 500)
+        : c.text("Internal Server Error", 500),
+    );
+    return;
+  }
+  setPrivateNoStore(c);
 });
 
 // ── Bulk send (mail merge) page, with API authorization per mailbox ──
@@ -226,14 +280,15 @@ app.route("/", apiApp);
 app.all("/agents/*", async (c) => {
   const session = c.get("session");
   // Agent instances are named by mailbox address: /agents/<class>/<name>/...
-  const segs = new URL(c.req.url).pathname.split("/").filter(Boolean);
-  const agentName = segs[2] ? decodeURIComponent(segs[2]) : "";
+  const agentName = agentMailboxFromPath(new URL(c.req.url).pathname) ?? "";
   if (
     !session ||
     !agentName ||
-    !(await mailboxAccess(c.env).canAccessMailbox(
+    !(await hasExactLiveMailboxAccess(
+      c.env,
+      agentName,
       session.sub,
-      agentName.toLowerCase(),
+      session.sessionVersion,
     ))
   ) {
     return c.json({ error: "Forbidden" }, 403);
@@ -241,10 +296,33 @@ app.all("/agents/*", async (c) => {
   const headers = new Headers(c.req.raw.headers);
   headers.set("X-Mail-Actor-User-Id", session.sub);
   headers.set("X-Mail-Actor-Email", session.email);
-  const response = await routeAgentRequest(
-    new Request(c.req.raw, { headers }),
-    c.env,
-  );
+  headers.set("X-Mail-Actor-Session-Version", String(session.sessionVersion ?? 1));
+  const agentRequest = new Request(c.req.raw, { headers });
+  const response = await routeAgentRequest(agentRequest, c.env, {
+    // Per Cloudflare Agents' connection lifecycle, this runs immediately before
+    // the Durable Object accepts the WebSocket. The DO also guards every frame.
+    onBeforeConnect: async () => {
+      try {
+        const currentUser = await resolveLiveSessionUser(c.env, session);
+        if (
+          !currentUser ||
+          !(await hasExactLiveMailboxAccess(
+            c.env,
+            agentName,
+            session.sub,
+            session.sessionVersion,
+          ))
+        ) {
+          return Response.json({ error: "Forbidden" }, { status: 403 });
+        }
+      } catch {
+        return Response.json(
+          { error: "Authorization unavailable" },
+          { status: 500 },
+        );
+      }
+    },
+  });
   if (response) return response;
   return c.text("Agent not found", 404);
 });
@@ -339,6 +417,11 @@ async function fetchWithBranding(
 
 export default {
   fetch: fetchWithBranding,
+  async scheduled(controller: ScheduledController, env: Env) {
+    // Per Cloudflare Workers Cron Triggers docs, every configured schedule invokes
+    // this handler and controller.cron identifies the exact maintenance lane.
+    await runScheduledMaintenance(env, controller);
+  },
   async email(event: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
     try {
       await receiveEmail(event, env, ctx);

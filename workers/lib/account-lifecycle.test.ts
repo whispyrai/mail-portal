@@ -14,6 +14,7 @@ test("deactivate permanently revokes passwords, cookies, OAuth/MCP, and recovery
     openRecoveryTokens: 2,
   };
   const purged: string[] = [];
+  const disconnected: string[] = [];
   const lifecycle = createAccountLifecycle({
     generateReplacementPassword: async () => ({
       hash: "unknown-random-hash",
@@ -35,6 +36,9 @@ test("deactivate permanently revokes passwords, cookies, OAuth/MCP, and recovery
     },
     async purgePush(_userId, mailboxId) {
       purged.push(mailboxId);
+    },
+    async disconnectAgent(_userId, mailboxId) {
+      disconnected.push(mailboxId);
     },
   });
 
@@ -60,6 +64,7 @@ test("deactivate permanently revokes passwords, cookies, OAuth/MCP, and recovery
     false,
   );
   assert.deepEqual(purged.sort(), ["member@wiserchat.ai", "team@wiserchat.ai"]);
+  assert.deepEqual(disconnected.sort(), ["member@wiserchat.ai", "team@wiserchat.ai"]);
 });
 
 test("push cleanup failure cannot roll back durable account revocation", async () => {
@@ -76,9 +81,34 @@ test("push cleanup failure cannot roll back durable account revocation", async (
     async purgePush() {
       throw new Error("DO unavailable");
     },
+    async disconnectAgent() {},
   });
 
   const result = await lifecycle.deactivate("usr_member");
   assert.equal(deactivated, true);
   assert.deepEqual(result.pushCleanupFailedMailboxIds, ["team@wiserchat.ai"]);
+});
+
+test("Agent disconnect failure is never reported as successful deactivation", async () => {
+  let deactivated = false;
+  const lifecycle = createAccountLifecycle({
+    generateReplacementPassword: async () => ({ hash: "hash", salt: "salt" }),
+    store: {
+      async deactivate() {
+        deactivated = true;
+        return { mailboxIds: ["team@wiserchat.ai"] };
+      },
+      async activate() {},
+    },
+    async purgePush() {},
+    async disconnectAgent() {
+      throw new Error("Agent RPC unavailable");
+    },
+  });
+
+  await assert.rejects(
+    () => lifecycle.deactivate("usr_member"),
+    /Live Agent connections could not be revoked/,
+  );
+  assert.equal(deactivated, true);
 });

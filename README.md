@@ -76,9 +76,13 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler d1 migrations apply sales_portal_users --remote
    ```
 
-   Apply all migrations through `0007_create_saved_views.sql` before deploying
-   code that exposes personal Saved Views. The application fails closed if the
-   required D1 table is unavailable.
+   Apply all migrations through
+   `0010_create_agent_connection_revocations.sql` before deploying the current
+   Worker. Migration 0010 creates the durable Agent connection-reconciliation
+   outbox and lifecycle triggers required by live access revocation. Apply the
+   migration before enabling the current minutely reconciliation and hourly AI
+   cache-retention schedules. The application fails closed when required D1
+   authorization or reconciliation state is unavailable.
 
 2. **R2 bucket**
 
@@ -91,9 +95,12 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    ```bash
    npx wrangler secret put AWS_ACCESS_KEY_ID       # SES IAM user (ses:SendEmail)
    npx wrangler secret put AWS_SECRET_ACCESS_KEY
+   npx wrangler secret put SES_EVENT_WEBHOOK_SECRET
    npx wrangler secret put JWT_SECRET              # openssl rand -base64 48
    npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL   # e.g. hesham@whispyrcrm.com
    npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY
+   npx wrangler secret put VAPID_PUBLIC_KEY
+   npx wrangler secret put VAPID_PRIVATE_KEY
    ```
 
    `ACCOUNT_RECOVERY_DIRECTORY` is a platform-operator managed JSON object that

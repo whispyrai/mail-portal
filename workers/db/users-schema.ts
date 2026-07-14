@@ -136,6 +136,51 @@ export const mailboxMemberships = sqliteTable(
   ],
 );
 
+export const AGENT_CONNECTION_REVOCATION_SCOPES = ["ACTOR", "MAILBOX"] as const;
+
+export const agentConnectionRevocations = sqliteTable(
+  "agent_connection_revocations",
+  {
+    id: text("id").primaryKey(),
+    scope: text("scope", {
+      enum: AGENT_CONNECTION_REVOCATION_SCOPES,
+    }).notNull(),
+    mailbox_id: text("mailbox_id").notNull(),
+    user_id: text("user_id"),
+    attempt_count: integer("attempt_count").notNull().default(0),
+    next_attempt_at: integer("next_attempt_at").notNull(),
+    lease_token: text("lease_token"),
+    lease_expires_at: integer("lease_expires_at"),
+    last_error_code: text("last_error_code"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => [
+    check(
+      "agent_connection_revocations_scope_check",
+      sql`${table.scope} IN ('ACTOR', 'MAILBOX')`,
+    ),
+    check(
+      "agent_connection_revocations_attempt_count_check",
+      sql`${table.attempt_count} >= 0`,
+    ),
+    check(
+      "agent_connection_revocations_scope_user_check",
+      sql`(${table.scope} = 'ACTOR' AND ${table.user_id} IS NOT NULL) OR (${table.scope} = 'MAILBOX' AND ${table.user_id} IS NULL)`,
+    ),
+    check(
+      "agent_connection_revocations_lease_check",
+      sql`(${table.lease_token} IS NULL AND ${table.lease_expires_at} IS NULL) OR (${table.lease_token} IS NOT NULL AND ${table.lease_expires_at} IS NOT NULL)`,
+    ),
+    index("idx_agent_connection_revocations_due").on(
+      table.next_attempt_at,
+      table.lease_expires_at,
+      table.created_at,
+      table.id,
+    ),
+  ],
+);
+
 export type MailboxRow = typeof mailboxes.$inferSelect;
 
 export const savedViews = sqliteTable(

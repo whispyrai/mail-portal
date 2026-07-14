@@ -67,6 +67,7 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
     "0003_create_mailbox_access.sql",
     "0005_auth_security.sql",
     "0006_credential_recovery.sql",
+    "0010_create_agent_connection_revocations.sql",
   ]) {
     db.exec(
       readFileSync(
@@ -116,6 +117,7 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
   ).run();
 
   const purged: string[] = [];
+  const disconnected: string[] = [];
   const env = {
     DB: d1(db),
     JWT_SECRET: "test-secret",
@@ -132,7 +134,9 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
       },
     },
   } as unknown as Env;
-  const lifecycle = accountLifecycle(env);
+  const lifecycle = accountLifecycle(env, async (mailboxId, userId) => {
+    disconnected.push(`${mailboxId}:${userId}`);
+  });
   await lifecycle.deactivate("usr_member");
   await lifecycle.activate("usr_member");
 
@@ -175,6 +179,16 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
     "member@wiserchat.ai:usr_member",
     "team@wiserchat.ai:usr_member",
   ]);
+  assert.deepEqual(disconnected.sort(), [
+    "member@wiserchat.ai:usr_member",
+    "team@wiserchat.ai:usr_member",
+  ]);
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM agent_connection_revocations",
+    ).get()!.count,
+    3,
+  );
   assert.equal(
     db
       .prepare(

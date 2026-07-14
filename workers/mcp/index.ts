@@ -6,7 +6,10 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveBrand, type BrandConfig } from "../routes/brand";
-import { mailboxAccess } from "../lib/mailbox-access";
+import {
+	hasExactLiveMailboxAccess,
+	listExactLiveMailboxes,
+} from "../lib/live-mailbox-authorization.ts";
 import {
 	toolListEmails,
 	toolGetEmail,
@@ -36,6 +39,13 @@ import {
 import type { UserRole } from "../db/users-schema";
 import { getUserById } from "../lib/users";
 import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+	runLiveAuthorizedMutation,
+	runLiveAuthorizedRead,
+} from "../lib/live-authorized-read.ts";
+import {
+	mcpCredentialSessionVersion,
 	mcpCredentialVersionMatches,
 	quizAuthorizationFailure,
 	type QuizAccessMode,
@@ -163,20 +173,84 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			return null;
 		};
 
-		/** Authorize before checking storage so inaccessible metadata stays private. */
-		const verifyMailbox = async (mailboxId: string) => {
-			const identityFailure = await verifyLiveIdentity();
-			if (identityFailure) return identityFailure;
-			const userId = this.props?.userId;
-			if (!userId) return mcpError("Unauthenticated MCP session.");
-			if (!(await mailboxAccess(env).canAccessMailbox(userId, mailboxId))) {
-				return mcpError("Forbidden: you do not have access to this mailbox.");
+		const hasLiveMailboxAccess = async (mailboxId: string) => {
+			const props = this.props;
+			return Boolean(
+				props?.userId &&
+					(await hasExactLiveMailboxAccess(
+						env,
+						mailboxId,
+						props.userId,
+						mcpCredentialSessionVersion(props),
+					)),
+			);
+		};
+
+		const liveReadFailure = (error: unknown) => {
+			if (error instanceof LiveReadAuthorizationError) {
+				return mcpError(
+					"This MCP connection or mailbox access changed during the read. Reconnect or choose an accessible mailbox.",
+				);
 			}
-			const obj = await env.BUCKET.head(`mailboxes/${mailboxId}.json`);
-			if (!obj) {
-				return mcpError(`Mailbox "${mailboxId}" not found. Use list_mailboxes to see available mailboxes.`);
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return mcpError("Mail authorization is temporarily unavailable.");
 			}
 			return null;
+		};
+
+		const runMailboxRead = async <T>(mailboxId: string, read: () => Promise<T>) => {
+			try {
+				const result = await runLiveAuthorizedRead(
+					() => hasLiveMailboxAccess(mailboxId),
+					async () => {
+						const object = await env.BUCKET.head(`mailboxes/${mailboxId}.json`);
+						return object
+							? { status: "found" as const, value: await read() }
+							: { status: "missing" as const };
+					},
+				);
+				return result.status === "found"
+					? { status: "success" as const, value: result.value }
+					: {
+						status: "denied" as const,
+						response: mcpError(`Mailbox "${mailboxId}" not found. Use list_mailboxes to see available mailboxes.`),
+					};
+			} catch (error) {
+				const response = liveReadFailure(error);
+				if (response) {
+					return {
+						status: "denied" as const,
+						response,
+					};
+				}
+				throw error;
+			}
+		};
+		const runMailboxMutation = async <T>(
+			mailboxId: string,
+			mutate: () => Promise<T>,
+		) => {
+			try {
+				const result = await runLiveAuthorizedMutation(
+					() => hasLiveMailboxAccess(mailboxId),
+					async () => {
+						const object = await env.BUCKET.head(`mailboxes/${mailboxId}.json`);
+						return object
+							? { status: "found" as const, value: await mutate() }
+							: { status: "missing" as const };
+					},
+				);
+				return result.status === "found"
+					? { status: "success" as const, value: result.value }
+					: {
+						status: "denied" as const,
+						response: mcpError(`Mailbox "${mailboxId}" not found. Use list_mailboxes to see available mailboxes.`),
+					};
+			} catch (error) {
+				const response = liveReadFailure(error);
+				if (response) return { status: "denied" as const, response };
+				throw error;
+			}
 		};
 
 		// ── list_mailboxes ─────────────────────────────────────────
@@ -187,12 +261,39 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async () => {
 				const userId = this.props?.userId;
 				if (!userId) return mcpError("Unauthenticated MCP session.");
-				const identityFailure = await verifyLiveIdentity();
-				if (identityFailure) return identityFailure;
 				if (!this.props?.scopes?.includes("email.read")) {
 					return mcpError("Forbidden: this connection lacks email.read.");
 				}
-				const visible = await mailboxAccess(env).listAccessibleMailboxes(userId);
+				let listedMailboxIds: string[] | undefined;
+				let visible;
+				try {
+					visible = await runLiveAuthorizedRead(
+						async () => {
+							if (await verifyLiveIdentity()) return false;
+							if (!listedMailboxIds) return true;
+							const current = await listExactLiveMailboxes(
+								env,
+								userId,
+								mcpCredentialSessionVersion(this.props ?? {}),
+							);
+							const currentIds = new Set(current.map((mailbox) => mailbox.id));
+							return listedMailboxIds.every((mailboxId) => currentIds.has(mailboxId));
+						},
+						async () => {
+							const rows = await listExactLiveMailboxes(
+								env,
+								userId,
+								mcpCredentialSessionVersion(this.props ?? {}),
+							);
+							listedMailboxIds = rows.map((mailbox) => mailbox.id);
+							return rows;
+						},
+					);
+				} catch (error) {
+					const response = liveReadFailure(error);
+					if (response) return response;
+					throw error;
+				}
 				return mcpText(
 					visible.map((mailbox) => ({
 						id: mailbox.address,
@@ -225,10 +326,13 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, folder, limit, page }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "read");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolListEmails(env, scoped.mailboxId, { folder, limit, page });
-				return mcpText(result);
+				const result = await runMailboxRead(
+					scoped.mailboxId,
+					() => toolListEmails(env, scoped.mailboxId, { folder, limit, page }),
+				);
+				return result.status === "success"
+					? mcpText(result.value)
+					: result.response;
 			},
 		);
 
@@ -243,16 +347,18 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, emailId }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "read");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolGetEmail(env, scoped.mailboxId, emailId);
-				if ("error" in result) {
+				const read = await runMailboxRead(
+					scoped.mailboxId,
+					() => toolGetEmail(env, scoped.mailboxId, emailId),
+				);
+				if (read.status !== "success") return read.response;
+				if ("error" in read.value) {
 					return {
 						content: [{ type: "text" as const, text: "Email not found" }],
 						isError: true,
 					};
 				}
-				return mcpText(result);
+				return mcpText(read.value);
 			},
 		);
 
@@ -269,10 +375,13 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, threadId }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "read");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolGetThread(env, scoped.mailboxId, threadId);
-				return mcpText(result);
+				const result = await runMailboxRead(
+					scoped.mailboxId,
+					() => toolGetThread(env, scoped.mailboxId, threadId),
+				);
+				return result.status === "success"
+					? mcpText(result.value)
+					: result.response;
 			},
 		);
 
@@ -291,10 +400,13 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, query, folder }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "read");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolSearchEmails(env, scoped.mailboxId, { query, folder });
-				return mcpText(result);
+				const result = await runMailboxRead(
+					scoped.mailboxId,
+					() => toolSearchEmails(env, scoped.mailboxId, { query, folder }),
+				);
+				return result.status === "success"
+					? mcpText(result.value)
+					: result.response;
 			},
 		);
 
@@ -316,17 +428,20 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolDraftReply(env, scoped.mailboxId, {
-					originalEmailId,
-					to,
-					subject,
-					body: bodyHtml,
-					isPlainText: false,
-					runVerifyDraft: true,
-				}, { kind: "mcp", id: this.props?.userId });
-				return mcpResult(result);
+				const result = await runMailboxMutation(
+					scoped.mailboxId,
+					() => toolDraftReply(env, scoped.mailboxId, {
+						originalEmailId,
+						to,
+						subject,
+						body: bodyHtml,
+						isPlainText: false,
+						runVerifyDraft: true,
+					}, { kind: "mcp", id: this.props?.userId }),
+				);
+				return result.status === "success"
+					? mcpResult(result.value)
+					: result.response;
 			},
 		);
 
@@ -354,24 +469,26 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, to, subject, bodyHtml, in_reply_to, thread_id }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolDraftEmail(env, scoped.mailboxId, {
-					to: to || "",
-					subject,
-					body: bodyHtml,
-					isPlainText: false,
-					runVerifyDraft: true,
-					in_reply_to,
-					thread_id,
-				}, { kind: "mcp", id: this.props?.userId });
-				if ("error" in result) {
-					return mcpResult(result);
+				const read = await runMailboxMutation(
+					scoped.mailboxId,
+					() => toolDraftEmail(env, scoped.mailboxId, {
+						to: to || "",
+						subject,
+						body: bodyHtml,
+						isPlainText: false,
+						runVerifyDraft: true,
+						in_reply_to,
+						thread_id,
+					}, { kind: "mcp", id: this.props?.userId }),
+				);
+				if (read.status !== "success") return read.response;
+				if ("error" in read.value) {
+					return mcpResult(read.value);
 				}
 				return mcpText({
 					status: "draft_created",
-					draftId: result.draftId,
-					threadId: result.threadId,
+					draftId: read.value.draftId,
+					threadId: read.value.threadId,
 					message: "Draft created in Drafts folder.",
 				});
 			},
@@ -399,25 +516,27 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			async ({ mailboxId, draftId, draftVersion, to, subject, bodyHtml }) => {
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
-				const denied = await verifyMailbox(scoped.mailboxId);
-				if (denied) return denied;
-				const result = await toolUpdateDraft(env, scoped.mailboxId, {
-					draftId,
-					draftVersion,
-					to,
-					subject,
-					bodyHtml,
-				}, { kind: "mcp", id: this.props?.userId });
-				if ("error" in result) {
-					if (result.error === "Draft not found") {
+				const read = await runMailboxMutation(
+					scoped.mailboxId,
+					() => toolUpdateDraft(env, scoped.mailboxId, {
+						draftId,
+						draftVersion,
+						to,
+						subject,
+						bodyHtml,
+					}, { kind: "mcp", id: this.props?.userId }),
+				);
+				if (read.status !== "success") return read.response;
+				if ("error" in read.value) {
+					if (read.value.error === "Draft not found") {
 						return {
 							content: [{ type: "text" as const, text: "Draft not found" }],
 							isError: true,
 						};
 					}
-					return mcpResult(result);
+					return mcpResult(read.value);
 				}
-				return mcpText(result);
+				return mcpText(read.value);
 			},
 		);
 
@@ -435,6 +554,38 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			return failure ? mcpError(failure) : null;
 		};
 
+		const runQuizRead = async <T>(read: () => Promise<T>) => {
+			try {
+				return {
+					status: "success" as const,
+					value: await runLiveAuthorizedRead(
+						async () => !(await quizAuthorizationFailure(
+							this.props,
+							"read",
+							(userId) => getUserById(env, userId),
+						)),
+						read,
+					),
+				};
+			} catch (error) {
+				if (error instanceof LiveReadAuthorizationError) {
+					return {
+						status: "denied" as const,
+						response: mcpError(
+							"Quiz access changed during the read. Reconnect before reading team results.",
+						),
+					};
+				}
+				if (error instanceof LiveReadAuthorizationUnavailableError) {
+					return {
+						status: "denied" as const,
+						response: mcpError("Quiz authorization is temporarily unavailable."),
+					};
+				}
+				throw error;
+			}
+		};
+
 		/** Resolve a quiz by its id or its key ('real-estate-market' | 'whispyr-system'). */
 		const resolveQuiz = async (ref: string) =>
 			(await getQuizById(env, ref)) ?? (await getQuizByKey(env, ref));
@@ -445,20 +596,22 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: list every quiz with its status and attempt counts (submitted / graded). Start here to find a quiz's id/key.",
 			{},
 			async () => {
-				const denied = await requireQuizAdmin("read");
-				if (denied) return denied;
-				const quizzes = await listQuizzes(env);
-				const out = await Promise.all(
-					quizzes.map(async (q) => ({
-						id: q.id,
-						key: q.key,
-						title_en: q.title_en,
-						title_ar: q.title_ar,
-						status: q.status,
-						...(await attemptCounts(env, q.id)),
-					})),
-				);
-				return mcpText(out);
+				const read = await runQuizRead(async () => {
+					const quizzes = await listQuizzes(env);
+					return Promise.all(
+						quizzes.map(async (q) => ({
+							id: q.id,
+							key: q.key,
+							title_en: q.title_en,
+							title_ar: q.title_ar,
+							status: q.status,
+							...(await attemptCounts(env, q.id)),
+						})),
+					);
+				});
+				return read.status === "success"
+					? mcpText(read.value)
+					: read.response;
 			},
 		);
 
@@ -468,11 +621,24 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: the results table for one quiz — every rep with their MCQ / short / total scores, status, and attemptId (pass attemptId to quiz_attempt for the full breakdown).",
 			{ quiz: z.string().describe("Quiz id or key (real-estate-market | whispyr-system)") },
 			async ({ quiz }) => {
-				const denied = await requireQuizAdmin("read");
-				if (denied) return denied;
-				const q = await resolveQuiz(quiz);
-				if (!q) return mcpError(`Quiz "${quiz}" not found. Use quiz_overview to list quizzes.`);
-				return mcpText({ quiz: { id: q.id, key: q.key, status: q.status }, results: await listResults(env, q.id) });
+				const read = await runQuizRead(async () => {
+					const q = await resolveQuiz(quiz);
+					return q
+						? { status: "found" as const, quiz: q, results: await listResults(env, q.id) }
+						: { status: "missing" as const };
+				});
+				if (read.status !== "success") return read.response;
+				if (read.value.status === "missing") {
+					return mcpError(`Quiz "${quiz}" not found. Use quiz_overview to list quizzes.`);
+				}
+				return mcpText({
+					quiz: {
+						id: read.value.quiz.id,
+						key: read.value.quiz.key,
+						status: read.value.quiz.status,
+					},
+					results: read.value.results,
+				});
 			},
 		);
 
@@ -482,14 +648,23 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: one rep's full attempt — every question with its correct answer, the rep's selected/typed answer, the awarded points, auto-correctness, and any note. This is how you read the answers to grade them.",
 			{ attemptId: z.string().describe("The attempt id (from quiz_results)") },
 			async ({ attemptId }) => {
-				const denied = await requireQuizAdmin("read");
-				if (denied) return denied;
-				const attempt = await getAttemptById(env, attemptId);
-				if (!attempt) return mcpError(`Attempt "${attemptId}" not found.`);
-				const questions = await listQuestions(env, attempt.quiz_id);
-				const answers = await getAnswers(env, attempt.id);
+				const read = await runQuizRead(async () => {
+					const attempt = await getAttemptById(env, attemptId);
+					if (!attempt) return { status: "missing" as const };
+					const [questions, answers, results] = await Promise.all([
+						listQuestions(env, attempt.quiz_id),
+						getAnswers(env, attempt.id),
+						listResults(env, attempt.quiz_id),
+					]);
+					return { status: "found" as const, attempt, questions, answers, results };
+				});
+				if (read.status !== "success") return read.response;
+				if (read.value.status === "missing") {
+					return mcpError(`Attempt "${attemptId}" not found.`);
+				}
+				const { attempt, questions, answers, results } = read.value;
 				const ansByQ = new Map(answers.map((a) => [a.question_id, a]));
-				const rep = (await listResults(env, attempt.quiz_id)).find((r) => r.attemptId === attempt.id);
+				const rep = results.find((r) => r.attemptId === attempt.id);
 
 				const detail = questions.map((q) => {
 					const a = ansByQ.get(q.id);
@@ -542,10 +717,21 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 			"ADMIN: one question with every rep's answer to it, for grading the same question across the whole team. Each submission includes its answerId (pass to quiz_grade_answer).",
 			{ questionId: z.string().describe("The question id (from quiz_attempt)") },
 			async ({ questionId }) => {
-				const denied = await requireQuizAdmin("read");
-				if (denied) return denied;
-				const q = await getQuestion(env, questionId);
-				if (!q) return mcpError(`Question "${questionId}" not found.`);
+				const read = await runQuizRead(async () => {
+					const question = await getQuestion(env, questionId);
+					return question
+						? {
+							status: "found" as const,
+							question,
+							submissions: await listQuestionSubmissions(env, question.id),
+						}
+						: { status: "missing" as const };
+				});
+				if (read.status !== "success") return read.response;
+				if (read.value.status === "missing") {
+					return mcpError(`Question "${questionId}" not found.`);
+				}
+				const q = read.value.question;
 				return mcpText({
 					question: {
 						id: q.id,
@@ -560,7 +746,7 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 						rubric_en: q.rubric_en,
 						rubric_ar: q.rubric_ar,
 					},
-					submissions: await listQuestionSubmissions(env, q.id),
+					submissions: read.value.submissions,
 				});
 			},
 		);

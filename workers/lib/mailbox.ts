@@ -18,6 +18,7 @@ import type { SessionClaims } from "./auth";
 import { systemPromptFor } from "./prompts.ts";
 import { resolveBrand } from "../routes/brand.ts";
 import { mailboxAccess } from "./mailbox-access.ts";
+import { hasExactLiveMailboxAccess } from "./live-mailbox-authorization.ts";
 import { replaceWithPrivateResponse } from "./response-privacy.ts";
 
 export type MailboxContext = {
@@ -41,7 +42,12 @@ export async function hasLiveMailboxContentAccess(
 	} catch {
 		return false;
 	}
-	return mailboxAccess(c.env).canAccessMailbox(session.sub, mailboxId);
+	return hasExactLiveMailboxAccess(
+		c.env,
+		mailboxId,
+		session.sub,
+		session.sessionVersion,
+	);
 }
 
 function isReadMethod(method: string): boolean {

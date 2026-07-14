@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	DEFAULT_MCP_SCOPES,
 	MCP_SCOPES,
+	mcpCredentialSessionVersion,
 	mcpCredentialVersionMatches,
 	quizAuthorizationFailure,
 } from "./mcp-authorization.ts";
@@ -36,6 +37,11 @@ test("MCP credentials are revoked when the user's credential generation changes"
 		mcpCredentialVersionMatches({}, { session_version: 1 }),
 		true,
 	);
+});
+
+test("legacy MCP grants bind to credential generation one", () => {
+	assert.equal(mcpCredentialSessionVersion({}), 1);
+	assert.equal(mcpCredentialSessionVersion({ sessionVersion: 4 }), 4);
 });
 
 test("quiz reads require quiz.read even for a live administrator", async () => {

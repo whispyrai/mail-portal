@@ -59,6 +59,7 @@ function testApp(input?: {
 	session?: SessionClaims | null;
 	access?: SharedMailboxManagementAccess;
 	mailboxExists?: boolean;
+	revokeMemberSideEffects?: (mailboxId: string, userId: string) => Promise<void>;
 }) {
 	const app = new Hono<SharedMailboxAdminContext>();
 	app.use("*", async (c, next) => {
@@ -72,6 +73,10 @@ function testApp(input?: {
 		createSharedMailboxAdminApp({
 			access: () => input?.access ?? managementAccess(),
 			mailboxMetadataExists: async () => input?.mailboxExists ?? true,
+			revokeMemberSideEffects: input?.revokeMemberSideEffects
+				? async (_env, mailboxId, userId) =>
+					input.revokeMemberSideEffects!(mailboxId, userId)
+				: undefined,
 		}),
 	);
 	return app;
@@ -429,19 +434,26 @@ test("Adding an inactive user returns conflict", async () => {
 
 test("An administrator can remove a Shared Mailbox member", async () => {
 	let removed: string | undefined;
+	let disconnected: string | undefined;
 	const access = managementAccess({
 		async removeSharedMailboxMember(_adminUserId, _mailboxId, userId) {
 			removed = userId;
 		},
 	});
 	const response = await jsonRequest(
-		testApp({ access }),
+		testApp({
+			access,
+			revokeMemberSideEffects: async (mailboxId, userId) => {
+				disconnected = `${mailboxId}:${userId}`;
+			},
+		}),
 		"/api/v1/admin/shared-mailboxes/support%40wiserchat.ai/members/usr_member",
 		{ method: "DELETE" },
 	);
 
 	assert.equal(response.status, 204);
 	assert.equal(removed, "usr_member");
+	assert.equal(disconnected, "support@wiserchat.ai:usr_member");
 	assert.equal(await response.text(), "");
 });
 

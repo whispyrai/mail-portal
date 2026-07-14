@@ -94,6 +94,8 @@ import {
 	mergeGeneralMailboxSettings,
 	updateMailboxSettings,
 } from "./lib/mailbox-settings-store";
+import { requireAgentConnectionReconciliation } from "./lib/agent-connection-revocation-outbox.ts";
+import { listStableLiveMailboxes } from "./lib/live-mailbox-authorization.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -180,8 +182,10 @@ app.get("/api/v1/config", async (c) => {
 		.filter(Boolean);
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);
-	const accessible = await mailboxAccess(c.env).listAccessibleMailboxes(
+	const accessible = await listStableLiveMailboxes(
+		c.env,
 		session.sub,
+		session.sessionVersion,
 	);
 	const allowed = new Set(
 		((c.env.EMAIL_ADDRESSES ?? []) as string[]).map((address) =>
@@ -248,8 +252,10 @@ app.route("/", mailboxChangeFeedRoutes);
 app.get("/api/v1/mailboxes", async (c: AppContext) => {
 	const session = c.get("session");
 	if (!session) return c.json({ error: "Unauthorized" }, 401);
-	const visible = await mailboxAccess(c.env).listAccessibleMailboxes(
+	const visible = await listStableLiveMailboxes(
+		c.env,
 		session.sub,
+		session.sessionVersion,
 	);
 	return c.json(
 		visible.map((mailbox) => ({
@@ -361,6 +367,10 @@ app.delete("/api/v1/mailboxes/:mailboxId", async (c: AppContext) => {
 	if (!(await c.env.BUCKET.head(key)))
 		return c.json({ error: "Not found" }, 404);
 	await mailboxAccess(c.env).deactivateMailbox(session.sub, mailboxId);
+	await requireAgentConnectionReconciliation(c.env, {
+		mailboxId,
+		scope: "MAILBOX",
+	});
 	return c.body(null, 204);
 });
 

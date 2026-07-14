@@ -85,6 +85,7 @@ function fixture() {
 				email: `${userId}@example.com`,
 				role: userId === "admin" ? "ADMIN" : "AGENT",
 				mailbox: `${userId}@example.com`,
+				sessionVersion: 1,
 			};
 		},
 		revoke() { revoke = true; },

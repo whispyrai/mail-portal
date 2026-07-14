@@ -28,7 +28,7 @@ const environments = {
 	wiser: {
 		name: "wiser-mail-portal",
 		brand: "wiser",
-		domains: "wiserchat.ai,test.wiserchat.ai",
+		domains: "wiserchat.ai",
 		features: [],
 		databaseName: "wiser_mail_portal_users",
 		databaseId: "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
@@ -60,6 +60,11 @@ assert.equal(config.d1_databases[0]?.database_id, expected.databaseId, "D1 id");
 assert.equal(config.r2_buckets[0]?.bucket_name, expected.bucket, "R2 bucket");
 assert.equal(config.r2_buckets[0]?.preview_bucket_name, expected.bucket, "R2 preview bucket");
 assert.equal(config.kv_namespaces[0]?.id, expected.kvId, "OAuth KV id");
+assert.deepEqual(
+	config.triggers?.crons,
+	["* * * * *", "17 * * * *"],
+	"scheduled maintenance crons",
+);
 
 const serialized = JSON.stringify(config);
 for (const forbidden of expected.forbidden) {

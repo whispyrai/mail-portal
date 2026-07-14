@@ -14,6 +14,9 @@
 	"observability": {
 		"enabled": true
 	},
+	"triggers": {
+		"crons": ["* * * * *", "17 * * * *"]
+	},
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
@@ -130,15 +133,14 @@
 		},
 		// Wiser Team Mail Portal — isolated runtime for WISER-242. Bindings,
 		// Durable Object namespaces, data, and secrets are distinct from Whispyr.
-		// During the pre-cutover proof, Email Routing is enabled only on
-		// test.wiserchat.ai; the apex joins DOMAINS now so the same tested Worker
-		// can receive it immediately after the separately approved MX cutover.
+		// The locked direct-cutover plan uses only the live wiserchat.ai mail domain.
+		// No temporary test mail domain is authorized or required.
 		"wiser": {
 			"name": "wiser-mail-portal",
 			"vars": {
 				"BRAND": "wiser",
 				"FEATURES": [],
-				"DOMAINS": "wiserchat.ai,test.wiserchat.ai",
+				"DOMAINS": "wiserchat.ai",
 				"EMAIL_ADDRESSES": [],
 				"AWS_REGION": "eu-west-2",
 				"SES_CONFIGURATION_SET": "mail-portal-events",

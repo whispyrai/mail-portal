@@ -1,8 +1,16 @@
 import type { Env } from "../types.ts";
 import { generateMcpToken, hashPassword } from "./auth.ts";
 import { createAccountLifecycle } from "./account-lifecycle.ts";
+import { requireAgentConnectionReconciliation } from "./agent-connection-revocation-outbox.ts";
 
-export function accountLifecycle(env: Env) {
+export function accountLifecycle(
+  env: Env,
+  reconcileAgent: (
+    mailboxId: string,
+    userId: string,
+  ) => Promise<void> = (mailboxId, userId) =>
+    requireAgentConnectionReconciliation(env, { mailboxId, userId }),
+) {
   return createAccountLifecycle({
     generateReplacementPassword: () =>
       hashPassword(generateMcpToken(), env.JWT_SECRET),
@@ -67,6 +75,9 @@ export function accountLifecycle(env: Env) {
     async purgePush(userId, mailboxId) {
       const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
       await stub.removePushSubscriptionsForUser(userId);
+    },
+    async disconnectAgent(userId, mailboxId) {
+      await reconcileAgent(mailboxId, userId);
     },
   });
 }

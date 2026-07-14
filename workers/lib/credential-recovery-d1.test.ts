@@ -60,6 +60,7 @@ test("D1 atomically confirms first ownership and distinguishes later recovery", 
     "0003_create_mailbox_access.sql",
     "0005_auth_security.sql",
     "0006_credential_recovery.sql",
+    "0010_create_agent_connection_revocations.sql",
   ]) {
     db.exec(
       readFileSync(
@@ -78,6 +79,11 @@ test("D1 atomically confirms first ownership and distinguishes later recovery", 
 			  mailbox_address, recovery_email, ownership_confirmed_at, created_at, updated_at)
 			 VALUES (?, ?, 'old-hash', 'old-salt', 1, ?, 1, ?, 'owner@personal.example', ?, 100, 100)`,
     ).run(id, email, id === "usr_admin" ? "ADMIN" : "AGENT", email, claimed);
+    db.prepare(
+      `INSERT INTO mailboxes
+         (id, address, type, owner_user_id, is_active, created_at, updated_at)
+       VALUES (?, ?, 'PERSONAL', ?, 1, 100, 100)`,
+    ).run(email, email, id);
   }
   const env = { DB: d1(db) } as unknown as Env;
   let now = 1_000;
@@ -120,6 +126,27 @@ test("D1 atomically confirms first ownership and distinguishes later recovery", 
       .get()!.ownership_confirmed_at,
     1_100,
   );
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM agent_connection_revocations WHERE user_id = 'usr_member'",
+    ).get()!.count,
+    1,
+  );
+  assert.equal(
+    await workflow.consume({
+      token,
+      passwordHash: "must-not-apply",
+      passwordSalt: "must-not-apply",
+      mcpTokenHash: null,
+    }),
+    null,
+  );
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM agent_connection_revocations WHERE user_id = 'usr_member'",
+    ).get()!.count,
+    1,
+  );
 
   now = 2_000;
   token = "recovery-token";
@@ -155,6 +182,12 @@ test("D1 atomically confirms first ownership and distinguishes later recovery", 
       "recovery_issued",
       "credentials_recovered",
     ],
+  );
+  assert.equal(
+    db.prepare(
+      "SELECT COUNT(*) AS count FROM agent_connection_revocations WHERE user_id = 'usr_member'",
+    ).get()!.count,
+    2,
   );
   assert.throws(
     () =>

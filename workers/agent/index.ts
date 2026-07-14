@@ -3,7 +3,12 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
-import { getCurrentAgent } from "agents";
+import {
+	getCurrentAgent,
+	type AgentContext,
+	type Connection,
+	type WSMessage,
+} from "agents";
 import { streamText, convertToModelMessages, stepCountIs } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
@@ -22,7 +27,25 @@ import {
 import { Folders, FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
 import type { ActivityActor } from "../lib/activity";
-import { mailboxAccess } from "../lib/mailbox-access";
+import {
+	runLiveAuthorizedMutation,
+	runLiveAuthorizedRead,
+} from "../lib/live-authorized-read.ts";
+import {
+	agentActorTag,
+	hasLiveAgentMailboxAccess,
+	parseBoundSessionVersion,
+	quarantineAgentOutput,
+	reconcileAgentActorConnections,
+	reconcileAgentMailboxConnections,
+	runAuthorizedAgentAdmission,
+	runAuthorizedAgentFrame,
+	unauthorizedAgentConnectionIds,
+} from "../lib/agent-frame-authorization.ts";
+import {
+	currentAgentActorSessionVersion,
+	isAgentMailboxActive,
+} from "../lib/live-mailbox-authorization.ts";
 import {
 	calculateAiUsageCostMicros,
 	resolveAiCostControlConfig,
@@ -35,6 +58,23 @@ import {
 } from "../lib/ai-input-bounds.ts";
 
 const ESTIMATED_CHAT_COST_MICROS = 25_000;
+
+async function runAgentReconciliationExclusively(
+	context: Pick<AgentContext, "blockConcurrencyWhile">,
+	operation: () => Promise<void>,
+): Promise<void> {
+	let failed = false;
+	let failure: unknown;
+	await context.blockConcurrencyWhile(async () => {
+		try {
+			await operation();
+		} catch (error) {
+			failed = true;
+			failure = error;
+		}
+	});
+	if (failed) throw failure;
+}
 
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
@@ -53,21 +93,22 @@ function defineTool(def: {
 type AgentConnectionState = {
 	actorUserId?: string;
 	actorEmail?: string;
+	actorSessionVersion?: number;
+	liveAuthorized?: boolean;
 };
 
 function createEmailTools(
 	env: Env,
 	mailboxId: string,
 	actor: ActivityActor,
+	actorSessionVersion: number | undefined,
 ) {
-	const authorize = async () => {
-		if (
-			!actor.id ||
-			!(await mailboxAccess(env).canAccessMailbox(actor.id, mailboxId))
-		) {
-			throw new Error("Your access to this mailbox is no longer active.");
-		}
-	};
+	const hasAccess = () => hasLiveAgentMailboxAccess(
+		env,
+		mailboxId,
+		actor.id,
+		actorSessionVersion,
+	);
 	return {
 		list_emails: defineTool({
 			description:
@@ -92,9 +133,11 @@ function createEmailTools(
 					.describe("Page number for pagination"),
 			}),
 			execute: async ({ folder, limit, page }): Promise<unknown> => {
-				await authorize();
 				return boundAiToolResult(
-					await toolListEmails(env, mailboxId, { folder, limit, page }),
+					await runLiveAuthorizedRead(
+						hasAccess,
+						() => toolListEmails(env, mailboxId, { folder, limit, page }),
+					),
 				);
 			},
 		}),
@@ -106,8 +149,10 @@ function createEmailTools(
 				emailId: z.string().max(200).describe("The email ID to retrieve"),
 			}),
 			execute: async ({ emailId }): Promise<unknown> => {
-				await authorize();
-				return boundAiToolResult(await toolGetEmail(env, mailboxId, emailId));
+				return boundAiToolResult(await runLiveAuthorizedRead(
+					hasAccess,
+					() => toolGetEmail(env, mailboxId, emailId),
+				));
 			},
 		}),
 
@@ -122,8 +167,10 @@ function createEmailTools(
 					),
 			}),
 			execute: async ({ threadId }): Promise<unknown> => {
-				await authorize();
-				return boundAiToolResult(await toolGetThread(env, mailboxId, threadId));
+				return boundAiToolResult(await runLiveAuthorizedRead(
+					hasAccess,
+					() => toolGetThread(env, mailboxId, threadId),
+				));
 			},
 		}),
 
@@ -142,9 +189,11 @@ function createEmailTools(
 					.describe("Optional folder to restrict search to"),
 			}),
 			execute: async ({ query, folder }): Promise<unknown> => {
-				await authorize();
 				return boundAiToolResult(
-					await toolSearchEmails(env, mailboxId, { query, folder }),
+					await runLiveAuthorizedRead(
+						hasAccess,
+						() => toolSearchEmails(env, mailboxId, { query, folder }),
+					),
 				);
 			},
 		}),
@@ -164,13 +213,15 @@ function createEmailTools(
 					),
 			}),
 			execute: async ({ to, subject, body }): Promise<unknown> => {
-				await authorize();
 				return boundAiToolResult(
-					await toolDraftEmail(
-						env,
-						mailboxId,
-						{ to, subject, body, isPlainText: true },
-						actor,
+					await runLiveAuthorizedMutation(
+						hasAccess,
+						() => toolDraftEmail(
+							env,
+							mailboxId,
+							{ to, subject, body, isPlainText: true },
+							actor,
+						),
 					),
 				);
 			},
@@ -194,20 +245,22 @@ function createEmailTools(
 					),
 			}),
 			execute: async ({ originalEmailId, to, subject, body }): Promise<unknown> => {
-				await authorize();
 				return boundAiToolResult(
-					await toolDraftReply(
-						env,
-						mailboxId,
-						{
-							originalEmailId,
-							to,
-							subject,
-							body,
-							isPlainText: true,
-							runVerifyDraft: true,
-						},
-						actor,
+					await runLiveAuthorizedMutation(
+						hasAccess,
+						() => toolDraftReply(
+							env,
+							mailboxId,
+							{
+								originalEmailId,
+								to,
+								subject,
+								body,
+								isPlainText: true,
+								runVerifyDraft: true,
+							},
+							actor,
+						),
 					),
 				);
 			},
@@ -219,12 +272,163 @@ function createEmailTools(
 // SEND_EMAIL binding shape and the AIChatAgent constraint.  The actual env
 // is fully typed inside the tools via the closure.
 export class EmailAgent extends AIChatAgent<any> {
-	async onConnect(connection: any, context: { request: Request }) {
-		connection.setState({
-			actorUserId: context.request.headers.get("X-Mail-Actor-User-Id") ?? undefined,
-			actorEmail: context.request.headers.get("X-Mail-Actor-Email") ?? undefined,
-		} satisfies AgentConnectionState);
-		await super.onConnect(connection, context as never);
+	constructor(ctx: AgentContext, env: any) {
+		super(ctx, env);
+		const handleConnect = this.onConnect.bind(this);
+		const handleMessage = this.onMessage.bind(this);
+		this.onConnect = async (connection: Connection, context: { request: Request }) => {
+			const state: AgentConnectionState = {
+				actorUserId: context.request.headers.get("X-Mail-Actor-User-Id") ?? undefined,
+				actorEmail: context.request.headers.get("X-Mail-Actor-Email") ?? undefined,
+				actorSessionVersion: parseBoundSessionVersion(
+					context.request.headers.get("X-Mail-Actor-Session-Version"),
+				),
+				liveAuthorized: false,
+			};
+			connection.setState(state);
+			const output = quarantineAgentOutput(connection);
+			await runAuthorizedAgentAdmission({
+				authorize: () => hasLiveAgentMailboxAccess(
+					this.env as Env,
+					this.name,
+					state.actorUserId,
+					state.actorSessionVersion,
+				),
+				markAuthorized: () => connection.setState({ ...state, liveAuthorized: true }),
+				markUnauthorized: () => connection.setState({ ...state, liveAuthorized: false }),
+				releaseQuarantinedOutput: output.release,
+				discardQuarantinedOutput: output.discard,
+				reportUnexpectedError: (error) => {
+					console.error("[email-agent] admission failed", {
+						mailboxId: this.name,
+						userId: state.actorUserId ?? "unknown",
+						errorName: error instanceof Error ? error.name : "UnknownError",
+					});
+				},
+				close: (code, reason) => connection.close(code, reason),
+				delegate: async () => {
+					await handleConnect(connection, context as never);
+				},
+			});
+		};
+		// Cloudflare Agents WebSocket docs guarantee connection.state survives
+		// hibernation. Wrap AIChatAgent's installed outer handler so stale sockets
+		// are rejected before it persists chat frames or replays resumable chunks.
+		this.onMessage = async (connection: Connection, message: WSMessage) => {
+			const state = connection.state as AgentConnectionState | null;
+			await runAuthorizedAgentFrame({
+				authorize: () => hasLiveAgentMailboxAccess(
+					this.env as Env,
+					this.name,
+					state?.actorUserId,
+					state?.actorSessionVersion,
+				),
+				markAuthorized: () => connection.setState({
+					...state,
+					liveAuthorized: true,
+				}),
+				markUnauthorized: () => connection.setState({
+					...state,
+					liveAuthorized: false,
+				}),
+				close: (code, reason) => connection.close(code, reason),
+				delegate: async () => {
+					await handleMessage(connection, message);
+				},
+			});
+		};
+	}
+
+	getConnectionTags(
+		_connection: Connection,
+		context: { request: Request },
+	): string[] {
+		const actorUserId = context.request.headers.get("X-Mail-Actor-User-Id");
+		return actorUserId ? [agentActorTag(actorUserId)] : [];
+	}
+
+	broadcast(
+		message: string | ArrayBuffer | ArrayBufferView,
+		without?: string[],
+	): void {
+		super.broadcast(
+			message,
+			unauthorizedAgentConnectionIds(
+				this.getConnections<AgentConnectionState>(),
+				without,
+			),
+		);
+	}
+
+	async reconcileActor(
+		userId: string,
+	): Promise<void> {
+		// Cloudflare documents that external I/O normally permits Durable Object
+		// event interleaving. This rare security reconciliation intentionally blocks
+		// admission until the current D1 grant has been read and stale sockets closed.
+		// https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile
+		await runAgentReconciliationExclusively(this.ctx, async () => {
+			const connections = new Map<string, Connection<AgentConnectionState>>();
+			for (const connection of this.getConnections<AgentConnectionState>(agentActorTag(userId))) {
+				connections.set(connection.id, connection);
+			}
+			// Pre-deployment hibernated sockets have no actor tag, so retain a state scan.
+			for (const connection of this.getConnections<AgentConnectionState>()) {
+				if (connection.state?.actorUserId === userId) {
+					connections.set(connection.id, connection);
+				}
+			}
+			await reconcileAgentActorConnections({
+				connections: [...connections.values()],
+				userId,
+				resolveCurrentSessionVersion: () => currentAgentActorSessionVersion(
+					this.env as Env,
+					this.name,
+					userId,
+				),
+			});
+		});
+	}
+
+	async reconcileMailbox(): Promise<void> {
+		await runAgentReconciliationExclusively(this.ctx, async () => {
+			const connections = [
+				...this.getConnections<AgentConnectionState>(),
+			];
+			await reconcileAgentMailboxConnections({
+				connections,
+				resolveAuthorizedConnectionIds: async () => {
+					if (!(await isAgentMailboxActive(this.env as Env, this.name))) {
+						return new Set<string>();
+					}
+					const currentVersions = new Map<string, number | null>();
+					for (const connection of connections) {
+						const actorUserId = connection.state?.actorUserId;
+						if (!actorUserId || currentVersions.has(actorUserId)) continue;
+						currentVersions.set(
+							actorUserId,
+							await currentAgentActorSessionVersion(
+								this.env as Env,
+								this.name,
+								actorUserId,
+							),
+						);
+					}
+					return new Set(
+						connections
+							.filter((connection) => {
+								const actorUserId = connection.state?.actorUserId;
+								return Boolean(
+									actorUserId &&
+									connection.state?.actorSessionVersion ===
+										currentVersions.get(actorUserId),
+								);
+							})
+							.map((connection) => connection.id),
+					);
+				},
+			});
+		});
 	}
 
 	async onChatMessage(onFinish: any) {
@@ -233,13 +437,15 @@ export class EmailAgent extends AIChatAgent<any> {
 		const state = getCurrentAgent().connection?.state as
 			| AgentConnectionState
 			| undefined;
-		if (
-			!state?.actorUserId ||
-			!(await mailboxAccess(env).canAccessMailbox(
-				state.actorUserId,
-				mailboxId,
-			))
-		) {
+		const actorUserId = state?.actorUserId;
+		const actorSessionVersion = state?.actorSessionVersion;
+		const hasAccess = () => hasLiveAgentMailboxAccess(
+			env,
+			mailboxId,
+			actorUserId,
+			actorSessionVersion,
+		);
+		if (!actorUserId || !(await hasAccess())) {
 			return Response.json(
 				{ error: "Your access to this mailbox is no longer active." },
 				{ status: 403 },
@@ -247,13 +453,20 @@ export class EmailAgent extends AIChatAgent<any> {
 		}
 		const tools = createEmailTools(env, mailboxId, {
 			kind: "agent",
-			id: state.actorUserId,
-		});
+			id: actorUserId,
+		}, actorSessionVersion);
+		const [systemPrompt, mailboxContext] = await runLiveAuthorizedRead(
+			hasAccess,
+			() => Promise.all([
+				getMailboxSystemPrompt(env, mailboxId),
+				buildMailboxContext(env, mailboxId),
+			]),
+		);
 		const config = resolveAiCostControlConfig(env);
 		const controller = createAiCostController(env, config);
 		const decision = await controller.beginUsage({
 			feature: "assistant_chat",
-			actorUserId: state.actorUserId,
+			actorUserId,
 			mailboxId,
 			requestedTier: "cheap",
 			estimatedCostMicros: ESTIMATED_CHAT_COST_MICROS,
@@ -269,13 +482,6 @@ export class EmailAgent extends AIChatAgent<any> {
 			);
 		}
 		const workersai = createWorkersAI({ binding: env.AI });
-
-		// Ground the assistant: per-mailbox brand prompt + a live snapshot of the
-		// inbox, so even small models answer from real data instead of guessing.
-		const [systemPrompt, mailboxContext] = await Promise.all([
-			getMailboxSystemPrompt(env, mailboxId),
-			buildMailboxContext(env, mailboxId),
-		]);
 
 		const convertedMessages = boundModelMessages(
 			await convertToModelMessages(this.messages),

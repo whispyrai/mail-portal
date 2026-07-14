@@ -9,6 +9,7 @@ import {
 	type SharedMailboxManagementAccess,
 } from "../lib/mailbox-access.ts";
 import { normalizeMailAddress } from "../lib/mail-address.ts";
+import { requireAgentConnectionReconciliation } from "../lib/agent-connection-revocation-outbox.ts";
 import type { Env } from "../types.ts";
 
 export type SharedMailboxAdminContext = {
@@ -73,7 +74,25 @@ const productionDependencies: SharedMailboxAdminDependencies = {
 	},
 	async revokeMemberSideEffects(env, mailboxId, userId) {
 		const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
-		await stub.removePushSubscriptionsForUser(userId);
+		const [agentResult, pushResult] = await Promise.allSettled([
+			requireAgentConnectionReconciliation(env, {
+				mailboxId,
+				userId,
+				scope: "ACTOR",
+			}),
+			stub.removePushSubscriptionsForUser(userId),
+		]);
+		if (pushResult.status === "rejected") {
+			console.error("[shared-mailbox] push cleanup failed after revocation", {
+				mailboxId,
+				userId,
+				errorName:
+					pushResult.reason instanceof Error
+						? pushResult.reason.name
+						: "UnknownError",
+			});
+		}
+		if (agentResult.status === "rejected") throw agentResult.reason;
 	},
 };
 
@@ -173,14 +192,7 @@ export function createSharedMailboxAdminApp(
 				userId,
 			);
 		await dependencies
-			.revokeMemberSideEffects?.(c.env, mailboxId, userId)
-			.catch((error) =>
-				console.error("[shared-mailbox] membership side-effect cleanup failed", {
-					mailboxId,
-					userId,
-					error: error instanceof Error ? error.message : String(error),
-				}),
-			);
+			.revokeMemberSideEffects?.(c.env, mailboxId, userId);
 		return c.body(null, 204);
 	});
 
