@@ -107,13 +107,15 @@ test("replaying a committed first save returns its authoritative draft without r
 	};
 	let upserts = 0;
 	let attachmentReads = 0;
+	let emailReads = 0;
 	const stub = {
 		async getDraftCreateReplay(key: string, fingerprint: string) {
 			assert.equal(key, "create-once-1");
 			assert.ok(fingerprint.length > 0);
-			return { status: "replay", draftId: draft.id };
+			return { status: "replay", draftId: draft.id, draft };
 		},
 		async getEmail(id: string) {
+			emailReads++;
 			assert.equal(id, draft.id);
 			return draft;
 		},
@@ -157,6 +159,7 @@ test("replaying a committed first save returns its authoritative draft without r
 	assert.deepEqual(await response.json(), { ...draft, replayed: true });
 	assert.equal(upserts, 0);
 	assert.equal(attachmentReads, 0);
+	assert.equal(emailReads, 0);
 });
 
 test("a delayed first-save retry cannot claim a newer authoritative draft revision", async () => {
@@ -206,6 +209,58 @@ test("a delayed first-save retry cannot claim a newer authoritative draft revisi
 		code: "draft_create_superseded",
 		draftId: "draft-created-on-first-attempt",
 		currentVersion: 2,
+	});
+	assert.equal(upserts, 0);
+});
+
+test("a removed first Draft closes exact replay without creating a replacement", async () => {
+	let upserts = 0;
+	const stub = {
+		async getDraftCreateReplay() {
+			return {
+				status: "unavailable",
+				draftId: "discarded-draft",
+				currentVersion: 1,
+				reason: "discarded",
+			};
+		},
+		async upsertDraft() {
+			upserts++;
+			throw new Error("must not recreate a removed Draft");
+		},
+	};
+	const app = new Hono<MailboxContext>();
+	app.use("*", async (c, next) => {
+		c.set("mailboxStub", stub as never);
+		c.set("session", {
+			sub: "user-1",
+			email: "person@example.com",
+			role: "AGENT",
+			mailbox: "team@example.com",
+		});
+		await next();
+	});
+	app.post("/api/v1/mailboxes/:mailboxId/drafts", handleSaveDraft);
+
+	const response = await app.request(
+		"http://mail.example.com/api/v1/mailboxes/team@example.com/drafts",
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				body: "Already removed",
+				draft_create_key: "create-once-removed",
+			}),
+		},
+		{ BUCKET: {} } as never,
+	);
+
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "The original draft is no longer available for replay.",
+		code: "draft_create_replay_unavailable",
+		draftId: "discarded-draft",
+		currentVersion: 1,
 	});
 	assert.equal(upserts, 0);
 });

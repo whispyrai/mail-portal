@@ -52,6 +52,23 @@ export const emails = sqliteTable("emails", {
 	draft_create_fingerprint: text("draft_create_fingerprint"),
 });
 
+export const draftCreateOperations = sqliteTable(
+	"draft_create_operations",
+	{
+		create_key: text("create_key").primaryKey(),
+		fingerprint: text("fingerprint").notNull(),
+		draft_id: text("draft_id").notNull(),
+		draft_version: integer("draft_version").notNull(),
+		state: text("state", {
+			enum: ["active", "discarded", "consumed", "deleted", "unavailable"],
+		}).notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_draft_create_operations_draft_id").on(table.draft_id),
+	],
+);
+
 export const snoozeReplyWakeQueue = sqliteTable("snooze_reply_wake_queue", {
 	thread_id: text("thread_id").primaryKey(),
 	requested_at: text("requested_at").notNull(),

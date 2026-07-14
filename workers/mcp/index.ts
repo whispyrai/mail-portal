@@ -425,9 +425,10 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 					.string()
 					.describe("The HTML body of the reply"),
 			},
-			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
+			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }, extra) => {
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
+				const actor = { kind: "mcp" as const, id: this.props?.userId };
 				const result = await runMailboxMutation(
 					scoped.mailboxId,
 					() => toolDraftReply(env, scoped.mailboxId, {
@@ -437,7 +438,12 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 						body: bodyHtml,
 						isPlainText: false,
 						runVerifyDraft: true,
-					}, { kind: "mcp", id: this.props?.userId }),
+					}, actor, {
+						surface: "mcp",
+						toolName: "draft_reply",
+						sessionId: extra.sessionId ?? this.getSessionId(),
+						requestId: extra.requestId,
+					}),
 				);
 				return result.status === "success"
 					? mcpResult(result.value)
@@ -466,9 +472,10 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 					.optional()
 					.describe("Thread ID to attach this draft to (optional)"),
 			},
-			async ({ mailboxId, to, subject, bodyHtml, in_reply_to, thread_id }) => {
+			async ({ mailboxId, to, subject, bodyHtml, in_reply_to, thread_id }, extra) => {
 				const scoped = this.#resolveMailbox(mailboxId, "write");
 				if ("error" in scoped) return mcpError(scoped.error);
+				const actor = { kind: "mcp" as const, id: this.props?.userId };
 				const read = await runMailboxMutation(
 					scoped.mailboxId,
 					() => toolDraftEmail(env, scoped.mailboxId, {
@@ -479,7 +486,12 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 						runVerifyDraft: true,
 						in_reply_to,
 						thread_id,
-					}, { kind: "mcp", id: this.props?.userId }),
+					}, actor, {
+						surface: "mcp",
+						toolName: "create_draft",
+						sessionId: extra.sessionId ?? this.getSessionId(),
+						requestId: extra.requestId,
+					}),
 				);
 				if (read.status !== "success") return read.response;
 				if ("error" in read.value) {
@@ -489,7 +501,8 @@ export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 					status: "draft_created",
 					draftId: read.value.draftId,
 					threadId: read.value.threadId,
-					message: "Draft created in Drafts folder.",
+					replayed: read.value.replayed,
+					message: read.value.message,
 				});
 			},
 		);

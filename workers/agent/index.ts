@@ -9,7 +9,12 @@ import {
 	type Connection,
 	type WSMessage,
 } from "agents";
-import { streamText, convertToModelMessages, stepCountIs } from "ai";
+import {
+	streamText,
+	convertToModelMessages,
+	stepCountIs,
+	type ToolExecutionOptions,
+} from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 import {
@@ -110,6 +115,7 @@ function createEmailTools(
 	env: Env,
 	mailboxId: string,
 	actor: ActivityActor,
+	requestId: string,
 	actorSessionVersion: number | undefined,
 	runSignal: AbortSignal,
 ) {
@@ -226,7 +232,10 @@ function createEmailTools(
 						"The plain text body of the email. No HTML — just write normally.",
 					),
 			}),
-			execute: async ({ to, subject, body }): Promise<unknown> => {
+			execute: async (
+				{ to, subject, body },
+				{ toolCallId }: ToolExecutionOptions,
+			): Promise<unknown> => {
 				throwIfAgentRunAborted(runSignal);
 				return boundAiToolResult(
 					await runLiveAuthorizedMutation(
@@ -236,6 +245,12 @@ function createEmailTools(
 							mailboxId,
 							{ to, subject, body, isPlainText: true },
 							actor,
+							{
+								surface: "agent",
+								toolName: "draft_email",
+								requestId,
+								toolCallId,
+							},
 						),
 					),
 				);
@@ -259,7 +274,10 @@ function createEmailTools(
 						"The plain text body of the reply. No HTML — just write normally.",
 					),
 			}),
-			execute: async ({ originalEmailId, to, subject, body }): Promise<unknown> => {
+			execute: async (
+				{ originalEmailId, to, subject, body },
+				{ toolCallId }: ToolExecutionOptions,
+			): Promise<unknown> => {
 				throwIfAgentRunAborted(runSignal);
 				return boundAiToolResult(
 					await runLiveAuthorizedMutation(
@@ -276,6 +294,12 @@ function createEmailTools(
 								runVerifyDraft: true,
 							},
 							actor,
+							{
+								surface: "agent",
+								toolName: "draft_reply",
+								requestId,
+								toolCallId,
+							},
 						),
 					),
 				);
@@ -483,8 +507,9 @@ export class EmailAgent extends AIChatAgent<any> {
 			);
 		}
 
+		const requestId = options?.requestId ?? crypto.randomUUID();
 		const activeRun = this.#activeRuns.begin({
-			requestId: options?.requestId ?? crypto.randomUUID(),
+			requestId,
 			connectionId: connection.id,
 			actorUserId,
 			actorSessionVersion,
@@ -517,6 +542,7 @@ export class EmailAgent extends AIChatAgent<any> {
 				env,
 				mailboxId,
 				{ kind: "agent", id: actorUserId },
+				requestId,
 				actorSessionVersion,
 				activeRun.signal,
 			);

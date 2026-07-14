@@ -1933,6 +1933,7 @@ export class MailboxDO extends DurableObject<Env> {
 				folder_id: schema.emails.folder_id,
 				snooze_source_folder_id: schema.emails.snooze_source_folder_id,
 				snoozed_until: schema.emails.snoozed_until,
+				draft_version: schema.emails.draft_version,
 			})
 			.from(schema.emails)
 			.where(eq(schema.emails.id, id))
@@ -1958,7 +1959,16 @@ export class MailboxDO extends DurableObject<Env> {
 			.where(eq(schema.attachments.email_id, id))
 			.all();
 
-		this.db.delete(schema.emails).where(eq(schema.emails.id, id)).run();
+		const occurredAt = new Date().toISOString();
+		this.ctx.storage.transactionSync(() => {
+			this.#markDraftCreateOperation(
+				id,
+				"deleted",
+				email.draft_version,
+				occurredAt,
+			);
+			this.db.delete(schema.emails).where(eq(schema.emails.id, id)).run();
+		});
 
 		return emailAttachments;
 	}
@@ -2001,6 +2011,12 @@ export class MailboxDO extends DurableObject<Env> {
 		const occurredAt = new Date().toISOString();
 
 		this.ctx.storage.transactionSync(() => {
+			this.#markDraftCreateOperation(
+				id,
+				"discarded",
+				expectedVersion,
+				occurredAt,
+			);
 			this.db
 				.delete(schema.emails)
 				.where(
@@ -2067,6 +2083,12 @@ export class MailboxDO extends DurableObject<Env> {
 					),
 				)
 				.run();
+			this.#markDraftCreateOperation(
+				id,
+				"active",
+				draft.draft_version + 1,
+				occurredAt,
+			);
 			this.#recordActivity(actor, "draft_updated", "email", id, {}, occurredAt);
 		});
 		return {
@@ -2080,31 +2102,103 @@ export class MailboxDO extends DurableObject<Env> {
 		id: string;
 		fingerprint: string;
 		draftVersion: number;
+		state: "active" | "discarded" | "consumed" | "deleted" | "unavailable";
 	} | null {
 		const row = this.db
 			.select({
-				id: schema.emails.id,
-				fingerprint: schema.emails.draft_create_fingerprint,
-				draft_version: schema.emails.draft_version,
+				id: schema.draftCreateOperations.draft_id,
+				fingerprint: schema.draftCreateOperations.fingerprint,
+				draft_version: schema.draftCreateOperations.draft_version,
+				state: schema.draftCreateOperations.state,
 			})
-			.from(schema.emails)
-			.where(eq(schema.emails.draft_create_key, createKey))
+			.from(schema.draftCreateOperations)
+			.where(eq(schema.draftCreateOperations.create_key, createKey))
 			.limit(1)
 			.get();
-		return row?.fingerprint
+		return row
 			? {
 					id: row.id,
 					fingerprint: row.fingerprint,
 					draftVersion: row.draft_version,
+					state: row.state,
 				}
 			: null;
 	}
 
+	#markDraftCreateOperation(
+		draftId: string,
+		state: "active" | "discarded" | "consumed" | "deleted" | "unavailable",
+		draftVersion: number,
+		updatedAt: string,
+	) {
+		this.db
+			.update(schema.draftCreateOperations)
+			.set({
+				state,
+				draft_version: draftVersion,
+				updated_at: updatedAt,
+			})
+			.where(eq(schema.draftCreateOperations.draft_id, draftId))
+			.run();
+	}
+
+	#getDraftCreateReplay(createKey: string, fingerprint: string) {
+		const record = this.#getDraftCreateRecord(createKey);
+		if (
+			record &&
+			record.fingerprint === fingerprint &&
+			record.state !== "active"
+		) {
+			return {
+				status: "unavailable" as const,
+				draftId: record.id,
+				currentVersion: record.draftVersion,
+				reason: record.state,
+			};
+		}
+		const replay = classifyDraftCreateReplay(record, fingerprint);
+		if (replay.status !== "replay") return replay;
+		if (!record) return { status: "missing" as const };
+		const draft = this.db
+			.select()
+			.from(schema.emails)
+			.where(eq(schema.emails.id, replay.draftId))
+			.get();
+		if (!draft || draft.folder_id !== Folders.DRAFT) {
+			return {
+				status: "unavailable" as const,
+				draftId: replay.draftId,
+				currentVersion: draft?.draft_version ?? record.draftVersion,
+				reason: "unavailable" as const,
+			};
+		}
+		if (draft.draft_version !== 1) {
+			return {
+				status: "superseded" as const,
+				draftId: replay.draftId,
+				currentVersion: draft.draft_version,
+			};
+		}
+		const emailAttachments = this.db
+			.select()
+			.from(schema.attachments)
+			.where(eq(schema.attachments.email_id, replay.draftId))
+			.all();
+		return {
+			status: "replay" as const,
+			draftId: replay.draftId,
+			draft: {
+				...draft,
+				read: !!draft.read,
+				starred: !!draft.starred,
+				attachments: emailAttachments,
+				labels: this.#labelsForEmailIds([replay.draftId]).get(replay.draftId) ?? [],
+			},
+		};
+	}
+
 	async getDraftCreateReplay(createKey: string, fingerprint: string) {
-		return classifyDraftCreateReplay(
-			this.#getDraftCreateRecord(createKey),
-			fingerprint,
-		);
+		return this.#getDraftCreateReplay(createKey, fingerprint);
 	}
 
 	/**
@@ -2132,14 +2226,15 @@ export class MailboxDO extends DurableObject<Env> {
 	) {
 		return this.ctx.storage.transactionSync(() => {
 			if (input.createKey && input.createFingerprint) {
-				const replay = classifyDraftCreateReplay(
-					this.#getDraftCreateRecord(input.createKey),
+				const replay = this.#getDraftCreateReplay(
+					input.createKey,
 					input.createFingerprint,
 				);
 				if (replay.status === "replay") {
 					return {
 						status: "creation_replay" as const,
 						draftId: replay.draftId,
+						draft: replay.draft,
 					};
 				}
 				if (replay.status === "conflict") {
@@ -2147,6 +2242,9 @@ export class MailboxDO extends DurableObject<Env> {
 				}
 				if (replay.status === "superseded") {
 					return { ...replay, status: "creation_superseded" as const };
+				}
+				if (replay.status === "unavailable") {
+					return { ...replay, status: "creation_unavailable" as const };
 				}
 			}
 			const existing = this.db
@@ -2214,6 +2312,12 @@ export class MailboxDO extends DurableObject<Env> {
 					.delete(schema.attachments)
 					.where(eq(schema.attachments.email_id, input.id))
 					.run();
+				this.#markDraftCreateOperation(
+					input.id,
+					"active",
+					draftVersion,
+					occurredAt,
+				);
 			} else {
 				this.db
 					.insert(schema.emails)
@@ -2236,6 +2340,19 @@ export class MailboxDO extends DurableObject<Env> {
 						draft_version: draftVersion,
 					})
 					.run();
+				if (input.createKey && input.createFingerprint) {
+					this.db
+						.insert(schema.draftCreateOperations)
+						.values({
+							create_key: input.createKey,
+							fingerprint: input.createFingerprint,
+							draft_id: input.id,
+							draft_version: 1,
+							state: "active",
+							updated_at: occurredAt,
+						})
+						.run();
+				}
 			}
 			if (attachments.length > 0) {
 				this.db.insert(schema.attachments).values(attachments).run();
@@ -2292,6 +2409,12 @@ export class MailboxDO extends DurableObject<Env> {
 				.where(eq(schema.attachments.email_id, id))
 				.all();
 			const occurredAt = new Date().toISOString();
+			this.#markDraftCreateOperation(
+				id,
+				"consumed",
+				expectedVersion,
+				occurredAt,
+			);
 			this.db
 				.delete(schema.emails)
 				.where(

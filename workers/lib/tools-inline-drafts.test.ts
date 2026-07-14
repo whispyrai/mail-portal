@@ -5,7 +5,8 @@ import { toolDraftEmail, toolDraftReply } from "./tools.ts";
 test("MCP draft creation cannot persist CID HTML without attachment support", async () => {
 	let creates = 0;
 	const stub = {
-		async createEmail() { creates++; },
+		async getDraftCreateReplay() { return { status: "missing" }; },
+		async upsertDraft() { creates++; return { status: "saved", draftId: "draft-1" }; },
 		async getEmail() { return null; },
 	};
 	const env = {
@@ -21,6 +22,12 @@ test("MCP draft creation cannot persist CID HTML without attachment support", as
 		"team@example.com",
 		{ to: "person@example.com", subject: "CID", body },
 		{ kind: "mcp", id: "user-1" },
+		{
+			surface: "mcp",
+			toolName: "create_draft",
+			sessionId: "session-1",
+			requestId: 1,
+		},
 	);
 	const reply = await toolDraftReply(
 		env,
@@ -32,6 +39,12 @@ test("MCP draft creation cannot persist CID HTML without attachment support", as
 			body,
 		},
 		{ kind: "agent", id: "user-2" },
+		{
+			surface: "agent",
+			toolName: "draft_reply",
+			requestId: "request-1",
+			toolCallId: "call-1",
+		},
 	);
 
 	assert.deepEqual(compose, {

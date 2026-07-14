@@ -13,34 +13,9 @@ import { SaveDraftRequestSchema } from "../lib/schemas.ts";
 import { reconcileAmbiguousDraftSave } from "../lib/draft-save-recovery.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
 import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
+import { draftCreateFingerprint } from "../lib/draft-create-idempotency.ts";
 
 type AppContext = Context<MailboxContext>;
-
-async function draftCreateFingerprint(input: {
-	to?: string;
-	cc?: string;
-	bcc?: string;
-	subject?: string;
-	body: string;
-	in_reply_to?: string;
-	thread_id?: string;
-	attachments?: unknown[];
-}): Promise<string> {
-	const bytes = new TextEncoder().encode(JSON.stringify([
-		input.to ?? "",
-		input.cc ?? "",
-		input.bcc ?? "",
-		input.subject ?? "",
-		input.body,
-		input.in_reply_to ?? null,
-		input.thread_id ?? null,
-		input.attachments ?? [],
-	]));
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return [...new Uint8Array(digest)]
-		.map((byte) => byte.toString(16).padStart(2, "0"))
-		.join("");
-}
 
 export async function handleSaveDraft(c: AppContext) {
 	const parsed = SaveDraftRequestSchema.safeParse(await c.req.json());
@@ -93,12 +68,19 @@ export async function handleSaveDraft(c: AppContext) {
 				409,
 			);
 		}
+		if (replay.status === "unavailable") {
+			return c.json(
+				{
+					error: "The original draft is no longer available for replay.",
+					code: "draft_create_replay_unavailable",
+					draftId: replay.draftId,
+					currentVersion: replay.currentVersion,
+				},
+				409,
+			);
+		}
 		if (replay.status === "replay") {
-			const saved = await stub.getEmail(replay.draftId);
-			if (!saved || saved.folder_id !== Folders.DRAFT) {
-				return c.json({ error: "Draft replay is unavailable" }, 409);
-			}
-			return c.json({ ...saved, replayed: true });
+			return c.json({ ...replay.draft, replayed: true });
 		}
 	}
 	const id = draft_id ?? crypto.randomUUID();
@@ -203,17 +185,24 @@ export async function handleSaveDraft(c: AppContext) {
 			);
 		}
 		if (result.status === "creation_replay") {
-			const saved = await stub.getEmail(result.draftId);
-			if (!saved || saved.folder_id !== Folders.DRAFT) {
-				return c.json({ error: "Draft replay is unavailable" }, 409);
-			}
-			return c.json({ ...saved, replayed: true });
+			return c.json({ ...result.draft, replayed: true });
 		}
 		if (result.status === "creation_conflict") {
 			return c.json(
 				{
 					error: "Draft create key was already used for different content.",
 					code: "draft_create_conflict",
+					draftId: result.draftId,
+					currentVersion: result.currentVersion,
+				},
+				409,
+			);
+		}
+		if (result.status === "creation_unavailable") {
+			return c.json(
+				{
+					error: "The original draft is no longer available for replay.",
+					code: "draft_create_replay_unavailable",
 					draftId: result.draftId,
 					currentVersion: result.currentVersion,
 				},

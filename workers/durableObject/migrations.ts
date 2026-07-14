@@ -1612,4 +1612,34 @@ export const mailboxMigrations: Migration[] = [
 			END;
 		`),
 	},
+	{
+		name: "29_retain_draft_create_operations",
+		sql: txn(`
+			CREATE TABLE draft_create_operations (
+				create_key TEXT PRIMARY KEY,
+				fingerprint TEXT NOT NULL,
+				draft_id TEXT NOT NULL,
+				draft_version INTEGER NOT NULL,
+				state TEXT NOT NULL CHECK(state IN (
+					'active', 'discarded', 'consumed', 'deleted', 'unavailable'
+				)),
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_draft_create_operations_draft_id
+				ON draft_create_operations(draft_id);
+			INSERT INTO draft_create_operations(
+				create_key, fingerprint, draft_id, draft_version, state, updated_at
+			)
+			SELECT
+				draft_create_key,
+				draft_create_fingerprint,
+				id,
+				draft_version,
+				CASE WHEN folder_id = 'draft' THEN 'active' ELSE 'unavailable' END,
+				COALESCE(date, datetime('now'))
+			FROM emails
+			WHERE draft_create_key IS NOT NULL
+			  AND draft_create_fingerprint IS NOT NULL;
+		`),
+	},
 ];

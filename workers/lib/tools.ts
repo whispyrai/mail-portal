@@ -36,6 +36,11 @@ import type {
 	OutboundDeliverySource,
 } from "./outbound-delivery-contract.ts";
 import { validateResolvedInlineImages } from "./inline-image-authority.ts";
+import {
+	draftCreateFingerprint,
+	draftToolCreateKey,
+	type DraftToolInvocation,
+} from "./draft-create-idempotency.ts";
 
 // ── Type casts for DO methods not on the base stub type ────────────
 type MailboxSearchStub = {
@@ -113,6 +118,170 @@ function replayedOutboundResult(
 		replayed: true,
 		message: `This send action already exists with status ${delivery.status}.`,
 	};
+}
+
+type ToolDraftCreateError = {
+	error: string;
+	code?: "draft_create_conflict" | "draft_create_superseded" | "draft_create_replay_unavailable";
+	draftId?: string;
+	currentVersion?: number;
+};
+
+type ToolDraftCreateResult =
+	| {
+			draftId: string;
+			threadId: string;
+			body: string;
+			replayed: boolean;
+		}
+	| ToolDraftCreateError;
+
+function readToolDraftReplay(
+	draft: { id: string; thread_id: string | null; body: string | null },
+): ToolDraftCreateResult {
+	return {
+		draftId: draft.id,
+		threadId: draft.thread_id || draft.id,
+		body: draft.body ?? "",
+		replayed: true,
+	};
+}
+
+async function prepareToolDraftCreation(
+	stub: ReturnType<typeof getMailboxStub>,
+	mailboxId: string,
+	input: {
+		subject: string;
+		recipient: string;
+		body: string;
+		inReplyTo: string | null;
+		threadId?: string;
+	},
+	actor: ActivityActor,
+	invocation: DraftToolInvocation,
+): Promise<
+	| { createKey: string; createFingerprint: string }
+	| { result: ToolDraftCreateResult }
+> {
+	const [createKey, createFingerprint] = await Promise.all([
+		draftToolCreateKey({ mailboxId, actor, invocation }),
+		draftCreateFingerprint({
+			to: input.recipient,
+			subject: input.subject,
+			body: input.body,
+			in_reply_to: input.inReplyTo ?? undefined,
+			thread_id: input.threadId,
+			attachments: [],
+		}),
+	]);
+	const replay = await stub.getDraftCreateReplay(createKey, createFingerprint);
+	if (replay.status === "missing") return { createKey, createFingerprint };
+	if (replay.status === "replay") {
+		return { result: readToolDraftReplay(replay.draft) };
+	}
+	if (replay.status === "conflict") {
+		return {
+			result: {
+				error: "This Draft invocation was already used for different content.",
+				code: "draft_create_conflict",
+				draftId: replay.draftId,
+				currentVersion: replay.currentVersion,
+			},
+		};
+	}
+	if (replay.status === "unavailable") {
+		return {
+			result: {
+				error: "The original Draft is no longer available for replay.",
+				code: "draft_create_replay_unavailable",
+				draftId: replay.draftId,
+				currentVersion: replay.currentVersion,
+			},
+		};
+	}
+	return {
+		result: {
+			error: "The original Draft was changed after this invocation created it.",
+			code: "draft_create_superseded",
+			draftId: replay.draftId,
+			currentVersion: replay.currentVersion,
+		},
+	};
+}
+
+async function persistToolDraft(
+	stub: ReturnType<typeof getMailboxStub>,
+	mailboxId: string,
+	input: {
+		subject: string;
+		recipient: string;
+		body: string;
+		inReplyTo: string | null;
+		threadId?: string;
+	},
+	identity: { createKey: string; createFingerprint: string },
+	actor: ActivityActor,
+): Promise<ToolDraftCreateResult> {
+	const draftId = crypto.randomUUID();
+	const threadId = input.threadId ?? draftId;
+
+	// Per Cloudflare's SQLite Durable Object storage docs (api/sqlite-storage-api),
+	// transactionSync is one synchronous transaction. The Mailbox RPC, not this
+	// Worker preflight, elects the only concurrent retry winner.
+	const result = await stub.upsertDraft(
+		{
+			id: draftId,
+			createKey: identity.createKey,
+			createFingerprint: identity.createFingerprint,
+			subject: input.subject,
+			sender: mailboxId.toLowerCase(),
+			recipient: input.recipient.toLowerCase(),
+			cc: null,
+			bcc: null,
+			body: input.body,
+			in_reply_to: input.inReplyTo,
+			thread_id: threadId,
+		},
+		[],
+		actor,
+	);
+
+	if (result.status === "saved") {
+		return {
+			draftId: result.draftId,
+			threadId,
+			body: input.body,
+			replayed: false,
+		};
+	}
+	if (result.status === "creation_replay") {
+		return readToolDraftReplay(result.draft);
+	}
+	if (result.status === "creation_conflict") {
+		return {
+			error: "This Draft invocation was already used for different content.",
+			code: "draft_create_conflict",
+			draftId: result.draftId,
+			currentVersion: result.currentVersion,
+		};
+	}
+	if (result.status === "creation_superseded") {
+		return {
+			error: "The original Draft was changed after this invocation created it.",
+			code: "draft_create_superseded",
+			draftId: result.draftId,
+			currentVersion: result.currentVersion,
+		};
+	}
+	if (result.status === "creation_unavailable") {
+		return {
+			error: "The original Draft is no longer available for replay.",
+			code: "draft_create_replay_unavailable",
+			draftId: result.draftId,
+			currentVersion: result.currentVersion,
+		};
+	}
+	return { error: "Draft creation could not be completed safely." };
 }
 
 // ── list_mailboxes ─────────────────────────────────────────────────
@@ -199,10 +368,17 @@ export async function toolDraftReply(
 		isPlainText?: boolean;
 		runVerifyDraft?: boolean;
 	},
-	actor: ActivityActor = { kind: "system" },
+	actor: ActivityActor,
+	invocation: DraftToolInvocation,
 ): Promise<
-	| { status: "draft_saved"; draftId: string; message: string; draft: Record<string, string> }
-	| { error: string }
+	| {
+			status: "draft_saved";
+			draftId: string;
+			replayed: boolean;
+			message: string;
+			draft: Record<string, string>;
+		}
+	| ToolDraftCreateError
 > {
 	const stub = getMailboxStub(env, mailboxId);
 
@@ -222,49 +398,62 @@ export async function toolDraftReply(
 	}
 	const inlineMapping = validateResolvedInlineImages(processedBody, []);
 	if (!inlineMapping.ok) return { error: inlineMapping.error };
-
-	const draftId = crypto.randomUUID();
-
-	// Get the original email for thread_id and quoted text
-	const original = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
-	const threadId = original?.thread_id || params.originalEmailId;
-
-	// Append quoted original message
-	const quotedBlock = original
-		? buildQuotedReplyBlock({
-				date: original.date,
-				sender: original.sender || params.to,
-				body: original.body ?? undefined,
-			})
-		: "";
-	const bodyHtml = processedBody + quotedBlock;
-
-	await stub.createEmail(
-		Folders.DRAFT,
+	const prepared = await prepareToolDraftCreation(
+		stub,
+		mailboxId,
 		{
-			id: draftId,
 			subject: params.subject,
-			sender: mailboxId.toLowerCase(),
-			recipient: params.to.toLowerCase(),
-			date: new Date().toISOString(),
-			body: bodyHtml,
-			in_reply_to: params.originalEmailId,
-			email_references: null,
-			thread_id: threadId,
+			recipient: params.to,
+			body: processedBody,
+			inReplyTo: params.originalEmailId,
 		},
-		[],
 		actor,
+		invocation,
 	);
+	let persisted: ToolDraftCreateResult;
+
+	if ("result" in prepared) {
+		persisted = prepared.result;
+	} else {
+		// Get the original email for thread_id and quoted text only after an exact
+		// replay has been ruled out from durable state.
+		const original = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
+		const threadId = original?.thread_id || params.originalEmailId;
+		const quotedBlock = original
+			? buildQuotedReplyBlock({
+					date: original.date,
+					sender: original.sender || params.to,
+					body: original.body ?? undefined,
+				})
+			: "";
+		persisted = await persistToolDraft(
+			stub,
+			mailboxId,
+			{
+				subject: params.subject,
+				recipient: params.to,
+				body: processedBody + quotedBlock,
+				inReplyTo: params.originalEmailId,
+				threadId,
+			},
+			prepared,
+			actor,
+		);
+	}
+	if ("error" in persisted) return persisted;
 
 	return {
 		status: "draft_saved",
-		draftId,
-		message: "Draft saved to Drafts folder. Review it and confirm to send.",
+		draftId: persisted.draftId,
+		replayed: persisted.replayed,
+		message: persisted.replayed
+			? "The existing Draft was recovered from this exact invocation. Review it and confirm to send."
+			: "Draft saved to Drafts folder. Review it and confirm to send.",
 		draft: {
 			originalEmailId: params.originalEmailId,
 			to: params.to,
 			subject: params.subject,
-			body: params.isPlainText ? params.body.trim() : bodyHtml,
+			body: params.isPlainText ? params.body.trim() : persisted.body,
 		},
 	};
 }
@@ -285,10 +474,18 @@ export async function toolDraftEmail(
 		/** Optional thread_id for create_draft style */
 		thread_id?: string;
 	},
-	actor: ActivityActor = { kind: "system" },
+	actor: ActivityActor,
+	invocation: DraftToolInvocation,
 ): Promise<
-	| { status: string; draftId: string; threadId?: string; message: string; draft?: Record<string, string> }
-	| { error: string }
+	| {
+			status: "draft_saved";
+			draftId: string;
+			threadId: string;
+			replayed: boolean;
+			message: string;
+			draft: Record<string, string>;
+		}
+	| ToolDraftCreateError
 > {
 	const stub = getMailboxStub(env, mailboxId);
 
@@ -306,41 +503,53 @@ export async function toolDraftEmail(
 	}
 	const inlineMapping = validateResolvedInlineImages(processedBody, []);
 	if (!inlineMapping.ok) return { error: inlineMapping.error };
-
-	const draftId = crypto.randomUUID();
-
-	// Resolve thread ID
-	let resolvedThreadId = params.thread_id;
-	if (!resolvedThreadId && params.in_reply_to) {
-		const original = (await stub.getEmail(params.in_reply_to)) as EmailFull | null;
-		resolvedThreadId = original?.thread_id || params.in_reply_to;
-	}
-	if (!resolvedThreadId) {
-		resolvedThreadId = draftId;
-	}
-
-	await stub.createEmail(
-		Folders.DRAFT,
+	const prepared = await prepareToolDraftCreation(
+		stub,
+		mailboxId,
 		{
-			id: draftId,
 			subject: params.subject,
-			sender: mailboxId.toLowerCase(),
-			recipient: (params.to || "").toLowerCase(),
-			date: new Date().toISOString(),
+			recipient: params.to || "",
 			body: processedBody,
-			in_reply_to: params.in_reply_to || null,
-			email_references: null,
-			thread_id: resolvedThreadId,
+			inReplyTo: params.in_reply_to || null,
+			threadId: params.thread_id,
 		},
-		[],
 		actor,
+		invocation,
 	);
+	let persisted: ToolDraftCreateResult;
+
+	if ("result" in prepared) {
+		persisted = prepared.result;
+	} else {
+		let resolvedThreadId = params.thread_id;
+		if (!resolvedThreadId && params.in_reply_to) {
+			const original = (await stub.getEmail(params.in_reply_to)) as EmailFull | null;
+			resolvedThreadId = original?.thread_id || params.in_reply_to;
+		}
+		persisted = await persistToolDraft(
+			stub,
+			mailboxId,
+			{
+				subject: params.subject,
+				recipient: params.to || "",
+				body: processedBody,
+				inReplyTo: params.in_reply_to || null,
+				threadId: resolvedThreadId,
+			},
+			prepared,
+			actor,
+		);
+	}
+	if ("error" in persisted) return persisted;
 
 	return {
 		status: "draft_saved",
-		draftId,
-		threadId: resolvedThreadId,
-		message: "Draft saved to Drafts folder. Review it and confirm to send.",
+		draftId: persisted.draftId,
+		threadId: persisted.threadId,
+		replayed: persisted.replayed,
+		message: persisted.replayed
+			? "The existing Draft was recovered from this exact invocation. Review it and confirm to send."
+			: "Draft saved to Drafts folder. Review it and confirm to send.",
 		draft: {
 			to: params.to,
 			subject: params.subject,
