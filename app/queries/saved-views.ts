@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import api from "~/services/api";
 import { savedViewsApi } from "~/services/saved-views";
+import { SavedViewApiError } from "~/services/saved-views";
 import type { Email } from "~/types";
 import type { SavedViewDefinition } from "../../shared/saved-views.ts";
 
@@ -53,11 +54,22 @@ export function useCreateSavedView() {
     mutationFn: ({
       mailboxId,
       definition,
+      operationId,
     }: {
       mailboxId: string;
       definition: SavedViewDefinition;
-    }) => savedViewsApi.create(mailboxId, definition),
+      operationId: string;
+    }) => savedViewsApi.create(mailboxId, definition, operationId),
     onSuccess: (_view, { mailboxId }) => invalidate(mailboxId),
+    onError: (error, { mailboxId }) => {
+      if (
+        error instanceof SavedViewApiError &&
+        ["creation_superseded", "creation_unavailable"].includes(
+          error.code ?? "",
+        )
+      )
+        invalidate(mailboxId);
+    },
   });
 }
 

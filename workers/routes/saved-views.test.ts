@@ -149,6 +149,10 @@ test("create, replace, and delete are owner and mailbox scoped", async () => {
     filters: { folder: "inbox", isRead: false },
     sort: { column: "date", direction: "DESC" },
   });
+  const createBody = JSON.stringify({
+    ...JSON.parse(body),
+    operationId: "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147",
+  });
   assert.equal(
     (
       await request(
@@ -157,7 +161,7 @@ test("create, replace, and delete are owner and mailbox scoped", async () => {
         {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body,
+          body: createBody,
         },
       )
     ).status,
@@ -194,6 +198,55 @@ test("create, replace, and delete are owner and mailbox scoped", async () => {
     "update:view_1:usr_1:support@example.com",
     "delete:view_1:usr_1:support@example.com",
   ]);
+});
+
+test("saved view create exposes replay and lifecycle recovery states", async () => {
+  const body = JSON.stringify({
+    name: "Urgent unread",
+    filters: { isRead: false },
+    sort: { column: "date", direction: "DESC" },
+    operationId: "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147",
+  });
+  const replay = await request(
+    testApp({
+      operations: operations({
+        async create() {
+          return { ...view, replayed: true };
+        },
+      }),
+    }),
+    "/api/v1/mailboxes/support%40example.com/saved-views",
+    { method: "POST", headers: { "content-type": "application/json" }, body },
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(((await replay.json()) as { replayed: boolean }).replayed, true);
+
+  for (const [errorCode, code] of [
+    ["CREATION_SUPERSEDED", "creation_superseded"],
+    ["CREATION_UNAVAILABLE", "creation_unavailable"],
+  ] as const) {
+    const response = await request(
+      testApp({
+        operations: operations({
+          async create() {
+            throw new SavedViewError(errorCode, "Lifecycle truth", {
+              resourceId: "view_1",
+              currentRevision: 123,
+            });
+          },
+        }),
+      }),
+      "/api/v1/mailboxes/support%40example.com/saved-views",
+      { method: "POST", headers: { "content-type": "application/json" }, body },
+    );
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: "Lifecycle truth",
+      code,
+      resourceId: "view_1",
+      currentRevision: 123,
+    });
+  }
 });
 
 test("saved view errors map to stable API responses", async () => {

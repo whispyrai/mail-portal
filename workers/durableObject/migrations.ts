@@ -1706,4 +1706,22 @@ export const mailboxMigrations: Migration[] = [
 				ON draft_update_operations(draft_id, result_version);
 		`),
 	},
+  {
+    name: "35_add_resource_create_operations",
+    sql: txn(`
+				CREATE TABLE resource_create_operations (
+					operation_key TEXT PRIMARY KEY CHECK(length(operation_key) = 64),
+					resource_kind TEXT NOT NULL CHECK(resource_kind IN ('folder', 'label')),
+					fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+				resource_id TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('active', 'superseded', 'unavailable')),
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX idx_resource_create_operations_resource
+				ON resource_create_operations(resource_kind, resource_id);
+				CREATE INDEX idx_resource_create_operations_retention
+					ON resource_create_operations(updated_at, operation_key)
+					WHERE state IN ('superseded', 'unavailable');
+		`),
+  },
 ];

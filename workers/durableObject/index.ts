@@ -143,6 +143,7 @@ import {
 	validateLabelMutationTargets,
 	type LabelMutationTarget,
 } from "../lib/labels.ts";
+import { resourceCreateReplayCutoff } from "../lib/resource-create-idempotency.ts";
 import {
 	earliestMailboxAlarm,
 	normalizeSnoozeRequest,
@@ -3546,6 +3547,175 @@ export class MailboxDO extends DurableObject<Env> {
 		};
 	}
 
+  async createMailboxResourceIdempotently(input: {
+    kind: "folder" | "label";
+    operationKey: string;
+    fingerprint: string;
+    resourceId: string;
+    name: string;
+    color?: string;
+    actor: ActivityActor;
+  }) {
+    const now = new Date().toISOString();
+    const cutoff = resourceCreateReplayCutoff(Date.now());
+    return this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `DELETE FROM resource_create_operations
+				 WHERE operation_key IN (
+					 SELECT operation_key FROM resource_create_operations
+					 WHERE state IN ('superseded', 'unavailable') AND updated_at < ?1
+					 ORDER BY CASE WHEN operation_key = ?2 THEN 0 ELSE 1 END,
+					          updated_at, operation_key
+					 LIMIT 100
+				 )`,
+        cutoff,
+        input.operationKey,
+      );
+      const operation = this.db
+        .select()
+        .from(schema.resourceCreateOperations)
+        .where(
+          eq(schema.resourceCreateOperations.operation_key, input.operationKey),
+        )
+        .get();
+      if (operation) {
+        if (operation.fingerprint !== input.fingerprint) {
+          return { status: "idempotency_conflict" as const };
+        }
+        if (operation.state !== "active") {
+          return {
+            status:
+              operation.state === "superseded"
+                ? ("creation_superseded" as const)
+                : ("creation_unavailable" as const),
+            resourceId: operation.resource_id,
+            currentRevision: operation.updated_at,
+          };
+        }
+        const resource =
+          input.kind === "folder"
+            ? this.db
+                .select({
+                  id: schema.folders.id,
+                  name: schema.folders.name,
+                  unreadCount:
+                    sql<number>`COALESCE(SUM(CASE WHEN ${schema.emails.read} = 0 THEN 1 ELSE 0 END), 0)`.mapWith(
+                      Number,
+                    ),
+                })
+                .from(schema.folders)
+                .leftJoin(
+                  schema.emails,
+                  eq(schema.emails.folder_id, schema.folders.id),
+                )
+                .where(eq(schema.folders.id, operation.resource_id))
+                .groupBy(schema.folders.id, schema.folders.name)
+                .get()
+            : this.db
+                .select({
+                  id: schema.labels.id,
+                  name: schema.labels.name,
+                  color: schema.labels.color,
+                  createdAt: schema.labels.created_at,
+                  updatedAt: schema.labels.updated_at,
+                })
+                .from(schema.labels)
+                .where(eq(schema.labels.id, operation.resource_id))
+                .get();
+        if (!resource) {
+          this.db
+            .update(schema.resourceCreateOperations)
+            .set({ state: "unavailable", updated_at: now })
+            .where(
+              eq(
+                schema.resourceCreateOperations.operation_key,
+                input.operationKey,
+              ),
+            )
+            .run();
+          return {
+            status: "creation_unavailable" as const,
+            resourceId: operation.resource_id,
+            currentRevision: now,
+          };
+        }
+        return {
+          status: "replayed" as const,
+          resource,
+        };
+      }
+
+      try {
+        let resource;
+        if (input.kind === "folder") {
+          resource = this.db
+            .insert(schema.folders)
+            .values({ id: input.resourceId, name: input.name, is_deletable: 1 })
+            .returning({ id: schema.folders.id, name: schema.folders.name })
+            .get();
+          this.#recordActivity(
+            input.actor,
+            "folder_created",
+            "folder",
+            resource.id,
+            { name: resource.name },
+            now,
+          );
+          resource = { ...resource, unreadCount: 0 };
+        } else {
+          const definition = validateLabelDefinition(
+            input.name,
+            input.color ?? "",
+          );
+          const row = {
+            id: input.resourceId,
+            name: definition.name,
+            normalized_name: definition.normalizedName,
+            color: definition.color,
+            created_at: now,
+            updated_at: now,
+          };
+          this.db.insert(schema.labels).values(row).run();
+          this.#recordActivity(
+            input.actor,
+            "label_created",
+            "label",
+            row.id,
+            { name: row.name, color: row.color },
+            now,
+          );
+          resource = {
+            id: row.id,
+            name: row.name,
+            color: row.color,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+          };
+        }
+        this.db
+          .insert(schema.resourceCreateOperations)
+          .values({
+            operation_key: input.operationKey,
+            resource_kind: input.kind,
+            fingerprint: input.fingerprint,
+            resource_id: input.resourceId,
+            state: "active",
+            updated_at: now,
+          })
+          .run();
+        return { status: "created" as const, resource };
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.includes("UNIQUE constraint failed")
+        ) {
+          return { status: "name_conflict" as const };
+        }
+        throw error;
+      }
+    });
+  }
+
 	async updateLabel(
 		id: string,
 		name: string,
@@ -3554,6 +3724,24 @@ export class MailboxDO extends DurableObject<Env> {
 	) {
 		const definition = validateLabelDefinition(name, color);
 		const now = new Date().toISOString();
+    const current = this.db
+      .select({
+        id: schema.labels.id,
+        name: schema.labels.name,
+        color: schema.labels.color,
+        createdAt: schema.labels.created_at,
+        updatedAt: schema.labels.updated_at,
+      })
+      .from(schema.labels)
+      .where(eq(schema.labels.id, id))
+      .get();
+    if (!current) return null;
+    if (
+      current.name === definition.name &&
+      current.color === definition.color
+    ) {
+      return current;
+    }
 		let updated: { id: string } | undefined;
 		this.ctx.storage.transactionSync(() => {
 			updated = this.db
@@ -3568,6 +3756,17 @@ export class MailboxDO extends DurableObject<Env> {
 				.returning({ id: schema.labels.id })
 				.get();
 			if (updated) {
+        this.db
+          .update(schema.resourceCreateOperations)
+          .set({ state: "superseded", updated_at: now })
+          .where(
+            and(
+              eq(schema.resourceCreateOperations.resource_kind, "label"),
+              eq(schema.resourceCreateOperations.resource_id, id),
+              eq(schema.resourceCreateOperations.state, "active"),
+            ),
+          )
+          .run();
 				this.#recordActivity(
 					actor,
 					"label_updated",
@@ -3594,6 +3793,20 @@ export class MailboxDO extends DurableObject<Env> {
 				.returning({ id: schema.labels.id })
 				.get();
 			if (deleted) {
+        this.db
+          .update(schema.resourceCreateOperations)
+          .set({ state: "unavailable", updated_at: now })
+          .where(
+            and(
+              eq(schema.resourceCreateOperations.resource_kind, "label"),
+              eq(schema.resourceCreateOperations.resource_id, id),
+              inArray(schema.resourceCreateOperations.state, [
+                "active",
+                "superseded",
+              ]),
+            ),
+          )
+          .run();
 				this.#recordActivity(actor, "label_deleted", "label", id, {}, now);
 			}
 		});
@@ -3764,12 +3977,34 @@ export class MailboxDO extends DurableObject<Env> {
 
 	async updateFolder(id: string, name: string) {
 		if (isInternalFolderId(id)) return null;
-		const result = this.db
-			.update(schema.folders)
-			.set({ name })
+    const current = this.db
+      .select({ id: schema.folders.id, name: schema.folders.name })
+      .from(schema.folders)
 			.where(eq(schema.folders.id, id))
-			.returning({ id: schema.folders.id, name: schema.folders.name })
 			.get();
+    if (!current || current.name === name) return current ?? null;
+    let result: { id: string; name: string } | undefined;
+    this.ctx.storage.transactionSync(() => {
+      result = this.db
+        .update(schema.folders)
+        .set({ name })
+        .where(eq(schema.folders.id, id))
+        .returning({ id: schema.folders.id, name: schema.folders.name })
+        .get();
+      if (result) {
+        this.db
+          .update(schema.resourceCreateOperations)
+          .set({ state: "superseded", updated_at: new Date().toISOString() })
+          .where(
+            and(
+              eq(schema.resourceCreateOperations.resource_kind, "folder"),
+              eq(schema.resourceCreateOperations.resource_id, id),
+              eq(schema.resourceCreateOperations.state, "active"),
+            ),
+          )
+          .run();
+      }
+    });
 		return result;
 	}
 
@@ -3801,6 +4036,20 @@ export class MailboxDO extends DurableObject<Env> {
 				.returning({ id: schema.folders.id })
 				.get();
 			if (deleted) {
+        this.db
+          .update(schema.resourceCreateOperations)
+          .set({ state: "unavailable", updated_at: occurredAt })
+          .where(
+            and(
+              eq(schema.resourceCreateOperations.resource_kind, "folder"),
+              eq(schema.resourceCreateOperations.resource_id, id),
+              inArray(schema.resourceCreateOperations.state, [
+                "active",
+                "superseded",
+              ]),
+            ),
+          )
+          .run();
 				this.#recordActivity(
 					actor,
 					"folder_deleted",

@@ -25,6 +25,7 @@ function record(overrides: Partial<SavedViewRecord> = {}): SavedViewRecord {
 
 function memoryStore(seed: SavedViewRecord[] = []) {
   const rows = new Map(seed.map((row) => [row.id, row]));
+  const operations = new Map<string, { fingerprint: string; viewId: string }>();
   const calls: string[] = [];
   const store: SavedViewStore = {
     async list(ownerUserId, mailboxAddress) {
@@ -43,14 +44,52 @@ function memoryStore(seed: SavedViewRecord[] = []) {
         ? row
         : undefined;
     },
-    async create(row) {
-      calls.push("create");
+    async createOrReplay({ row, operationKey, fingerprint }) {
+      calls.push("createOrReplay");
+      const operation = operations.get(operationKey);
+      if (operation) {
+        if (operation.fingerprint !== fingerprint) {
+          return { status: "idempotency_conflict" };
+        }
+        const existing = rows.get(operation.viewId);
+        return existing
+          ? { status: "replayed", view: existing }
+          : {
+              status: "creation_unavailable",
+              resourceId: operation.viewId,
+              currentRevision: row.updatedAt,
+            };
+      }
+      if (
+        [...rows.values()].some(
+          (existing) =>
+            existing.ownerUserId === row.ownerUserId &&
+            existing.mailboxAddress === row.mailboxAddress &&
+            existing.name.toLowerCase() === row.name.toLowerCase(),
+        )
+      ) {
+        return { status: "name_conflict" };
+      }
+      operations.set(operationKey, { fingerprint, viewId: row.id });
       rows.set(row.id, row);
-      return row;
+      return { status: "created", view: row };
     },
-    async update(row) {
+    async update(input) {
       calls.push("update");
-      rows.set(row.id, row);
+      const current = rows.get(input.id);
+      if (
+        !current ||
+        current.ownerUserId !== input.ownerUserId ||
+        current.mailboxAddress !== input.mailboxAddress
+      ) {
+        throw new SavedViewError("NOT_FOUND", "Saved view was not found");
+      }
+      const row = {
+        ...current,
+        ...input.definition,
+        updatedAt: input.updatedAt,
+      };
+      rows.set(input.id, row);
       return row;
     },
     async delete(id, ownerUserId, mailboxAddress) {
@@ -180,11 +219,16 @@ test("every operation rechecks live mailbox access and revocation never deletes 
     (await service.use("view_1", "usr_1", "support@example.com")).id,
     "view_1",
   );
-  await service.create("usr_1", "support@example.com", {
-    name: "Starred",
-    filters: { isStarred: true },
-    sort: { column: "date", direction: "DESC" },
-  });
+  await service.create(
+    "usr_1",
+    "support@example.com",
+    {
+      name: "Starred",
+      filters: { isStarred: true },
+      sort: { column: "date", direction: "DESC" },
+    },
+    "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147",
+  );
   await service.update("view_1", "usr_1", "support@example.com", {
     name: "Unread",
     filters: { isRead: false },
@@ -228,4 +272,28 @@ test("saved views are private to their owner even inside a shared mailbox", asyn
     (error: unknown) =>
       error instanceof SavedViewError && error.code === "NOT_FOUND",
   );
+});
+
+test("saved view creation requires a caller-owned UUID operation identity", async () => {
+  const memory = memoryStore();
+  const service = createSavedViewService({
+    store: memory.store,
+    canAccessMailbox: async () => true,
+  });
+  await assert.rejects(
+    () =>
+      service.create(
+        "usr_1",
+        "support@example.com",
+        {
+          name: "Urgent",
+          filters: { isRead: false },
+          sort: { column: "date", direction: "DESC" },
+        },
+        "not-a-uuid",
+      ),
+    (error: unknown) =>
+      error instanceof SavedViewError && error.code === "INVALID",
+  );
+  assert.equal(memory.calls.includes("createOrReplay"), false);
 });

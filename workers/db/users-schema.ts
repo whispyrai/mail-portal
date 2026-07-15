@@ -214,6 +214,45 @@ export const savedViews = sqliteTable(
   ],
 );
 
+export const savedViewCreateOperations = sqliteTable(
+  "saved_view_create_operations",
+  {
+    operation_key: text("operation_key").notNull().primaryKey(),
+    fingerprint: text("fingerprint").notNull(),
+    owner_user_id: text("owner_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    mailbox_address: text("mailbox_address").notNull(),
+    view_id: text("view_id").notNull(),
+    state: text("state", {
+      enum: ["active", "superseded", "unavailable"],
+    }).notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => [
+    check(
+      "saved_view_create_operations_key_length_check",
+      sql`length(${table.operation_key}) = 64`,
+    ),
+    check(
+      "saved_view_create_operations_fingerprint_length_check",
+      sql`length(${table.fingerprint}) = 64`,
+    ),
+    check(
+      "saved_view_create_operations_state_check",
+      sql`${table.state} IN ('active', 'superseded', 'unavailable')`,
+    ),
+    index("idx_saved_view_create_operations_resource").on(
+      table.owner_user_id,
+      table.mailbox_address,
+      table.view_id,
+    ),
+    index("idx_saved_view_create_operations_retention")
+      .on(table.updated_at, table.operation_key)
+      .where(sql`${table.state} IN ('superseded', 'unavailable')`),
+  ],
+);
+
 export const AI_USAGE_STATES = [
   "reserved",
   "completed",

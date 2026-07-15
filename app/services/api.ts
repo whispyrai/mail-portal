@@ -175,10 +175,21 @@ const api = {
 
 	listLabels: (mailboxId: string) =>
 		get<{ labels: Label[] }>(`/api/v1/mailboxes/${mailboxId}/labels`),
-	createLabel: (mailboxId: string, input: { name: string; color: LabelColor }) =>
-		post<{ label: Label }>(`/api/v1/mailboxes/${mailboxId}/labels`, input),
-	updateLabel: (mailboxId: string, labelId: string, input: { name: string; color: LabelColor }) =>
-		put<{ label: Label }>(`/api/v1/mailboxes/${mailboxId}/labels/${labelId}`, input),
+  createLabel: (
+    mailboxId: string,
+    input: { name: string; color: LabelColor; operationId: string },
+  ) =>
+    post<{ label: Label; replayed: boolean }>(
+      `/api/v1/mailboxes/${mailboxId}/labels`,
+      input,
+    ),
+  updateLabel: (
+    mailboxId: string,
+    labelId: string,
+    input: { name: string; color: LabelColor },
+  ) =>
+    put<{ label: Label }>(
+      `/api/v1/mailboxes/${mailboxId}/labels/${labelId}`, input),
 	deleteLabel: (mailboxId: string, labelId: string) =>
 		del<void>(`/api/v1/mailboxes/${mailboxId}/labels/${labelId}`),
 	mutateLabels: (
@@ -525,10 +536,16 @@ const api = {
 	// Folders
 	listFolders: (mailboxId: string) =>
 		get<Folder[]>(`/api/v1/mailboxes/${mailboxId}/folders`),
-	createFolder: (mailboxId: string, name: string) =>
-		post<Folder>(`/api/v1/mailboxes/${mailboxId}/folders`, { name }),
-	updateFolder: (mailboxId: string, id: string, name: string) =>
-		put<Folder>(`/api/v1/mailboxes/${mailboxId}/folders/${id}`, { name }),
+  createFolder: (mailboxId: string, name: string, operationId: string) =>
+    post<Folder & { replayed: boolean }>(
+      `/api/v1/mailboxes/${mailboxId}/folders`,
+      {
+        name,
+        operationId,
+      },
+    ),
+  updateFolder: (mailboxId: string, id: string, name: string) =>
+    put<Folder>(`/api/v1/mailboxes/${mailboxId}/folders/${id}`, { name }),
 	deleteFolder: (mailboxId: string, id: string) =>
 		del<void>(`/api/v1/mailboxes/${mailboxId}/folders/${id}`),
 

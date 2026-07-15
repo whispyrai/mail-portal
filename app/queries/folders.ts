@@ -25,12 +25,26 @@ export function useCreateFolder() {
 		mutationFn: ({
 			mailboxId,
 			name,
-		}: { mailboxId: string; name: string }) =>
-			api.createFolder(mailboxId, name),
+      operationId,
+    }: { mailboxId: string; name: string;
+      operationId: string;
+    }) =>
+			api.createFolder(mailboxId, name, operationId),
 		onSuccess: (_data, { mailboxId }) => {
 			qc.invalidateQueries({ queryKey: queryKeys.folders.list(mailboxId) });
 		},
-	});
+    onError: (error, { mailboxId }) => {
+      if (
+        error instanceof Error &&
+        "body" in error &&
+        ["creation_superseded", "creation_unavailable"].includes(
+          String((error as { body?: { code?: unknown } }).body?.code),
+        )
+      ) {
+        qc.invalidateQueries({ queryKey: queryKeys.folders.list(mailboxId) });
+}
+    },
+  });
 }
 
 export function useUpdateFolder() {

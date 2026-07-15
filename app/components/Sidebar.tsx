@@ -28,7 +28,7 @@ import {
 	TrashIcon,
 	TrayIcon,
 } from "@phosphor-icons/react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { NavLink, useNavigate, useParams, useSearchParams } from "react-router";
 import { Folders, SYSTEM_FOLDER_IDS } from "shared/folders";
 import ManageLabelsDialog from "~/components/labels/ManageLabelsDialog";
@@ -37,6 +37,11 @@ import { useCreateFolder, useFolders } from "~/queries/folders";
 import { useLabels } from "~/queries/labels";
 import { useMailbox } from "~/queries/mailboxes";
 import { useUIStore } from "~/hooks/useUIStore";
+import {
+  canonicalCollapsedCreateName,
+  CreateOperationIdentity,
+} from "~/lib/create-operation-identity";
+import { ApiError } from "~/services/api";
 
 const FOLDER_ICONS: Record<string, React.ReactNode> = {
 	[Folders.INBOX]: <TrayIcon size={18} weight="regular" />,
@@ -112,6 +117,8 @@ export default function Sidebar() {
 	const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
 	const [isManageLabelsOpen, setIsManageLabelsOpen] = useState(false);
 	const [newFolderName, setNewFolderName] = useState("");
+  const [createFolderError, setCreateFolderError] = useState("");
+  const createFolderIdentity = useRef(new CreateOperationIdentity());
 	const selectedLabelId = searchParams.get("label_id");
 
 	const customFolders = useMemo(
@@ -129,24 +136,40 @@ export default function Sidebar() {
 
 	const handleCreateFolder = (e: React.FormEvent) => {
 		e.preventDefault();
-		const folderName = newFolderName.trim();
+    const folderName = canonicalCollapsedCreateName(newFolderName);
 		if (!folderName || !mailboxId) return;
+    setCreateFolderError("");
+    const operationId = createFolderIdentity.current.operationIdFor([
+      mailboxId.toLowerCase(),
+      "folder",
+      folderName,
+    ]);
 		createFolderMutation.mutate(
-			{ mailboxId, name: folderName },
+      { mailboxId, name: folderName, operationId },
 			{
-				onSuccess: () => {
-					toastManager.add({ title: `Created ${folderName}` });
+        onSuccess: (result) => {
+          toastManager.add({
+            title: `${result.replayed ? "Recovered" : "Created"} ${folderName}`,
+          });
+          createFolderIdentity.current.invalidate();
 					setNewFolderName("");
+          setCreateFolderError("");
 					setIsCreateFolderOpen(false);
 				},
 				onError: (error) => {
-					toastManager.add({
-						title:
-							error instanceof Error && error.message
-								? error.message
-								: "Could not create folder",
-						variant: "error",
-					});
+          const code =
+            error instanceof ApiError ? String(error.body.code ?? "") : "";
+          const message =
+            code === "creation_superseded"
+              ? "This folder was created and later renamed. It was not overwritten. Change the name to create another folder."
+              : code === "creation_unavailable"
+                ? "This folder was created and later deleted. It was not recreated. Change the name to create another folder."
+                : code === "create_idempotency_conflict"
+                  ? "This recovery no longer matches the original folder. Change the name to start a new create."
+                  : error instanceof ApiError
+                    ? error.message
+                    : "We couldn’t confirm whether the folder was created. Retry with the same name to recover it safely.";
+          setCreateFolderError(message);
 				},
 			},
 		);
@@ -372,10 +395,25 @@ export default function Sidebar() {
 							label="Folder name"
 							placeholder="e.g. Projects"
 							value={newFolderName}
-							onChange={(e) => setNewFolderName(e.target.value)}
+              onChange={(e) => {
+                const nextName = e.target.value;
+                const intentChanged =
+                  createFolderIdentity.current.invalidateIfIntentChanged([
+                    mailboxId?.toLowerCase(),
+                    "folder",
+                    canonicalCollapsedCreateName(nextName),
+                  ]);
+                if (intentChanged) setCreateFolderError("");
+                setNewFolderName(nextName);
+              }}
 							disabled={createFolderMutation.isPending}
 							required
 						/>
+            {createFolderError && (
+              <p role="alert" className="text-sm text-kumo-danger">
+                {createFolderError}
+              </p>
+            )}
 						<div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
 							<Dialog.Close
 								render={(props) => (

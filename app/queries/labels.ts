@@ -23,10 +23,24 @@ export function useLabels(mailboxId?: string) {
 export function useCreateLabel() {
 	const invalidate = useInvalidateLabels();
 	return useMutation({
-		mutationFn: ({ mailboxId, name, color }: { mailboxId: string; name: string; color: LabelColor }) =>
-			api.createLabel(mailboxId, { name, color }),
+		mutationFn: ({ mailboxId, name, color,
+      operationId,
+    }: { mailboxId: string; name: string; color: LabelColor;
+      operationId: string;
+    }) =>
+			api.createLabel(mailboxId, { name, color, operationId }),
 		onSuccess: (_result, { mailboxId }) => invalidate(mailboxId),
-	});
+    onError: (error, { mailboxId }) => {
+      if (
+        error instanceof Error &&
+        "body" in error &&
+        ["creation_superseded", "creation_unavailable"].includes(
+          String((error as { body?: { code?: unknown } }).body?.code),
+        )
+      )
+        invalidate(mailboxId);
+},
+  });
 }
 
 export function useUpdateLabel() {

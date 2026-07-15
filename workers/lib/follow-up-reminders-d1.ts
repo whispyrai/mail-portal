@@ -10,6 +10,7 @@ import {
 	type FollowUpReminderStore,
 	type ReminderStoreOperation,
 } from "./follow-up-reminders.ts";
+import { LIVE_MAILBOX_ACCESS_SQL } from "./live-mailbox-access-sql.ts";
 
 interface ReminderRow {
 	id: string;
@@ -35,26 +36,6 @@ interface OperationRow {
 const REMINDER_COLUMNS = `id, owner_user_id, mailbox_address, conversation_key,
 	baseline_message_id, baseline_message_date, remind_at, state,
 	resolution_reason, version, created_at, updated_at, resolved_at`;
-
-const LIVE_ACCESS_SQL = `EXISTS (
-	SELECT 1
-	FROM users AS owner
-	JOIN mailboxes AS mailbox ON mailbox.id = ?
-	WHERE owner.id = ?
-	  AND owner.is_active = 1
-	  AND mailbox.is_active = 1
-	  AND (
-	    (mailbox.type = 'PERSONAL' AND mailbox.owner_user_id = owner.id)
-	    OR (
-	      mailbox.type = 'SHARED'
-	      AND EXISTS (
-	        SELECT 1 FROM mailbox_memberships AS membership
-	        WHERE membership.mailbox_id = mailbox.id
-	          AND membership.user_id = owner.id
-	      )
-	    )
-	  )
-)`;
 
 function fromRow(row: ReminderRow): FollowUpReminder {
 	return {
@@ -126,23 +107,25 @@ export function followUpReminderD1Store(
 			`SELECT ${REMINDER_COLUMNS}
 			 FROM follow_up_reminders
 			 WHERE id = ? AND owner_user_id = ? AND mailbox_address = ?`,
-		)
-			.bind(id, ownerUserId, mailboxAddress)
-			.first<ReminderRow>();
-		return row ? fromRow(row) : undefined;
-	}
+    )
+      .bind(id, ownerUserId, mailboxAddress)
+      .first<ReminderRow>();
+    return row ? fromRow(row) : undefined;
+  }
 
-	async function hasLiveAccess(ownerUserId: string, mailboxAddress: string) {
-		const row = await env.DB.prepare(`SELECT ${LIVE_ACCESS_SQL} AS allowed`)
-			.bind(mailboxAddress, ownerUserId)
-			.first<{ allowed: number }>();
-		return row?.allowed === 1;
-	}
+  async function hasLiveAccess(ownerUserId: string, mailboxAddress: string) {
+    const row = await env.DB.prepare(
+      `SELECT ${LIVE_MAILBOX_ACCESS_SQL} AS allowed`,
+    )
+      .bind(mailboxAddress, ownerUserId)
+      .first<{ allowed: number }>();
+    return row?.allowed === 1;
+  }
 
-	return {
-		async list({ ownerUserId, mailboxAddress, limit, cursor }) {
-			const result = await env.DB.prepare(
-				`SELECT ${REMINDER_COLUMNS}
+  return {
+    async list({ ownerUserId, mailboxAddress, limit, cursor }) {
+      const result = await env.DB.prepare(
+        `SELECT ${REMINDER_COLUMNS}
 				 FROM follow_up_reminders
 				 WHERE owner_user_id = ? AND mailbox_address = ? AND state = 'active'
 				   AND (? IS NULL OR remind_at > ? OR (remind_at = ? AND id > ?))
@@ -206,7 +189,7 @@ export function followUpReminderD1Store(
 					  resolution_reason, create_idempotency_key, create_fingerprint,
 					  create_result_json, version, created_at, updated_at, resolved_at)
 					 SELECT ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?, ?, ?, ?, NULL
-					 WHERE ${LIVE_ACCESS_SQL}`,
+					 WHERE ${LIVE_MAILBOX_ACCESS_SQL}`,
 				)
 					.bind(
 						row.id,
@@ -290,7 +273,7 @@ export function followUpReminderD1Store(
 						     version = version + 1, updated_at = ?, resolved_at = ?
 						 WHERE id = ? AND owner_user_id = ? AND mailbox_address = ?
 						   AND state = 'active' AND version = ?
-						   AND ${LIVE_ACCESS_SQL}`,
+						   AND ${LIVE_MAILBOX_ACCESS_SQL}`,
 					)
 						.bind(
 							remindAt,

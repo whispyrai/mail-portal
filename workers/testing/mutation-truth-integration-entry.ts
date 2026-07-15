@@ -5,6 +5,99 @@ import type { Env } from "../types.ts";
 import { MailboxDO } from "../durableObject/index.ts";
 
 export class MutationTruthMailboxDO extends MailboxDO {
+  async createResourceForTest(
+    input: Parameters<MailboxDO["createMailboxResourceIdempotently"]>[0],
+  ) {
+    return this.createMailboxResourceIdempotently(input);
+  }
+
+  resourceCreateStateForTest() {
+    return {
+      folders: [
+        ...this.ctx.storage.sql.exec(
+          `SELECT folder.id, folder.name,
+				        COALESCE(SUM(CASE WHEN email.read = 0 THEN 1 ELSE 0 END), 0) AS unreadCount
+				 FROM folders AS folder
+				 LEFT JOIN emails AS email ON email.folder_id = folder.id
+				 WHERE folder.id LIKE 'replay-%'
+				 GROUP BY folder.id, folder.name ORDER BY folder.id`,
+        ),
+      ],
+      labels: [
+        ...this.ctx.storage.sql.exec(
+          `SELECT id, name, color FROM labels WHERE id LIKE 'replay-%' ORDER BY id`,
+        ),
+      ],
+      operations: [
+        ...this.ctx.storage.sql.exec(
+          `SELECT operation_key AS operationKey, resource_kind AS resourceKind,
+					        fingerprint, resource_id AS resourceId, state, updated_at AS updatedAt
+					 FROM resource_create_operations ORDER BY operation_key`,
+        ),
+      ],
+      activities: [
+        ...this.ctx.storage.sql.exec(
+          `SELECT action, entity_id AS entityId FROM activity_events
+				 WHERE entity_id LIKE 'replay-%' ORDER BY action, entity_id`,
+        ),
+      ],
+      changes: [
+        ...this.ctx.storage.sql.exec(
+          `SELECT sequence, resource, entity_id AS entityId, operation FROM mailbox_changes
+				 WHERE entity_id LIKE 'replay-%' ORDER BY sequence`,
+        ),
+      ],
+    };
+  }
+
+  async seedResourceFolderEmailForTest(input: {
+    folderId: string;
+    emailId: string;
+    read: boolean;
+  }) {
+    await this.createEmail(
+      input.folderId,
+      {
+        id: input.emailId,
+        subject: "Replay count fixture",
+        sender: "customer@example.com",
+        recipient: "team@example.com",
+        date: "2026-07-15T00:00:00.000Z",
+        body: "<p>Replay count fixture</p>",
+        read: input.read,
+        starred: false,
+        thread_id: null,
+      },
+      [],
+      { kind: "system" },
+    );
+    return { status: "created" as const };
+  }
+
+  seedResourceCreateOperationsForTest(
+    rows: Array<{
+      operationKey: string;
+      resourceKind: "folder" | "label";
+      fingerprint: string;
+      resourceId: string;
+      state: "active" | "superseded" | "unavailable";
+      updatedAt: string;
+    }>,
+  ) {
+    for (const row of rows) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO resource_create_operations
+				 (operation_key, resource_kind, fingerprint, resource_id, state, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?)`,
+        row.operationKey,
+        row.resourceKind,
+        row.fingerprint,
+        row.resourceId,
+        row.state,
+        row.updatedAt,
+      );
+    }
+  }
 	async seedMutationTruthForTest() {
 		const actor = { kind: "user" as const, id: "seed-user" };
 		await this.createFolder("custom-retry", "Custom retry");
@@ -177,6 +270,25 @@ export class MutationTruthMailboxDO extends MailboxDO {
 }
 
 type MutationTruthStub = DurableObjectStub<MutationTruthMailboxDO> & {
+  createResourceForTest(
+    input: Parameters<MailboxDO["createMailboxResourceIdempotently"]>[0],
+  ): Promise<unknown>;
+  resourceCreateStateForTest(): Promise<Record<string, unknown[]>>;
+  seedResourceFolderEmailForTest(input: {
+    folderId: string;
+    emailId: string;
+    read: boolean;
+  }): Promise<unknown>;
+  seedResourceCreateOperationsForTest(
+    rows: Array<{
+      operationKey: string;
+      resourceKind: "folder" | "label";
+      fingerprint: string;
+      resourceId: string;
+      state: "active" | "superseded" | "unavailable";
+      updatedAt: string;
+    }>,
+  ): Promise<void>;
 	seedMutationTruthForTest(): Promise<{ labelId: string }>;
 	seedArchiveReplyForTest(): Promise<unknown>;
 	seedLabelFilteredBatchForTest(): Promise<Array<{
@@ -206,6 +318,66 @@ export default {
 		if (url.pathname === "/state") {
 			return Response.json(await stub.mutationTruthStateForTest());
 		}
+    if (url.pathname === "/resource-create") {
+      return Response.json(
+        await stub.createResourceForTest(
+          (await request.json()) as Parameters<
+            MailboxDO["createMailboxResourceIdempotently"]
+          >[0],
+        ),
+      );
+    }
+    if (url.pathname === "/resource-create-state") {
+      return Response.json(await stub.resourceCreateStateForTest());
+    }
+    if (url.pathname === "/resource-create-email") {
+      return Response.json(
+        await stub.seedResourceFolderEmailForTest(
+          (await request.json()) as {
+            folderId: string;
+            emailId: string;
+            read: boolean;
+          },
+        ),
+      );
+    }
+    if (url.pathname === "/resource-create-operation-seed") {
+      await stub.seedResourceCreateOperationsForTest(
+        (await request.json()) as Array<{
+          operationKey: string;
+          resourceKind: "folder" | "label";
+          fingerprint: string;
+          resourceId: string;
+          state: "active" | "superseded" | "unavailable";
+          updatedAt: string;
+        }>,
+      );
+      return Response.json({ status: "seeded" });
+    }
+    if (url.pathname === "/update-folder") {
+      const body = (await request.json()) as { id: string; name: string };
+      return Response.json(await stub.updateFolder(body.id, body.name));
+    }
+    if (url.pathname === "/update-label") {
+      const body = (await request.json()) as {
+        id: string;
+        name: string;
+        color: string;
+        actor: ActivityActor;
+      };
+      return Response.json(
+        await stub.updateLabel(body.id, body.name, body.color, body.actor),
+      );
+    }
+    if (url.pathname === "/delete-label") {
+      const body = (await request.json()) as {
+        id: string;
+        actor: ActivityActor;
+      };
+      return Response.json({
+        deleted: await stub.deleteLabel(body.id, body.actor),
+      });
+    }
 		if (url.pathname === "/seed-archive-reply") {
 			await stub.seedArchiveReplyForTest();
 			return Response.json({ status: "created" });

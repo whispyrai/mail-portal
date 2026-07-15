@@ -14,7 +14,7 @@ import {
 	handleMoveEmail,
 	handleRestoreEmail,
 } from "./routes/email-lifecycle";
-import { handleDeleteFolder } from "./routes/folders";
+import { handleCreateFolder, handleDeleteFolder } from "./routes/folders";
 import { handleSaveDraft } from "./routes/drafts";
 import { sharedMailboxAdminApp } from "./routes/shared-mailbox-admin";
 import { savedViewsApp } from "./routes/saved-views";
@@ -110,18 +110,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // -- Helpers --------------------------------------------------------
-
-function slugify(text: string) {
-	// can return "" for non-alphanumeric input
-	return text
-		.toString()
-		.toLowerCase()
-		.replace(/\s+/g, "-")
-		.replace(/[^\w-]+/g, "")
-		.replace(/--+/g, "-")
-		.replace(/^-+/, "")
-		.replace(/-+$/, "");
-}
 
 function intQuery(c: AppContext, key: string): number | undefined {
 	const v = c.req.query(key);
@@ -555,19 +543,7 @@ app.get("/api/v1/mailboxes/:mailboxId/folders", async (c: AppContext) =>
 	c.json(await c.var.mailboxStub.getFolders()),
 );
 
-app.post("/api/v1/mailboxes/:mailboxId/folders", async (c: AppContext) => {
-	const { name } = (await c.req.json()) as { name: string };
-	const slug = slugify(name);
-	if (!slug)
-		return c.json(
-			{ error: "Folder name must contain alphanumeric characters" },
-			400,
-		);
-	const f = await c.var.mailboxStub.createFolder(slug, name);
-	return f
-		? c.json(f, 201)
-		: c.json({ error: "Folder with this name already exists" }, 409);
-});
+app.post("/api/v1/mailboxes/:mailboxId/folders", handleCreateFolder);
 
 app.put("/api/v1/mailboxes/:mailboxId/folders/:id", async (c: AppContext) => {
 	const { name } = (await c.req.json()) as { name: string };

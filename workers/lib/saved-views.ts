@@ -6,6 +6,10 @@ import {
   type SavedViewFilters,
   type SavedViewSort,
 } from "../../shared/saved-views.ts";
+import {
+  resourceCreateFingerprint,
+  resourceCreateOperationKey,
+} from "./resource-create-idempotency.ts";
 
 export { savedViewSearchParams } from "../../shared/saved-views.ts";
 
@@ -13,15 +17,26 @@ export type SavedViewErrorCode =
   | "INVALID"
   | "FORBIDDEN"
   | "NOT_FOUND"
-  | "CONFLICT";
+  | "CONFLICT"
+  | "CREATE_IDEMPOTENCY_CONFLICT"
+  | "CREATION_SUPERSEDED"
+  | "CREATION_UNAVAILABLE";
 
 export class SavedViewError extends Error {
   readonly code: SavedViewErrorCode;
+  readonly resourceId?: string;
+  readonly currentRevision?: number;
 
-  constructor(code: SavedViewErrorCode, message: string) {
+  constructor(
+    code: SavedViewErrorCode,
+    message: string,
+    details: { resourceId?: string; currentRevision?: number } = {},
+  ) {
     super(message);
     this.name = "SavedViewError";
     this.code = code;
+    this.resourceId = details.resourceId;
+    this.currentRevision = details.currentRevision;
   }
 }
 
@@ -108,8 +123,26 @@ export interface SavedViewStore {
     ownerUserId: string,
     mailboxAddress: string,
   ): Promise<SavedViewRecord | undefined>;
-  create(row: SavedViewRecord): Promise<SavedViewRecord>;
-  update(row: SavedViewRecord): Promise<SavedViewRecord>;
+  createOrReplay(input: {
+    row: SavedViewRecord;
+    operationKey: string;
+    fingerprint: string;
+  }): Promise<
+    | { status: "created" | "replayed"; view: SavedViewRecord }
+    | { status: "idempotency_conflict" | "forbidden" | "name_conflict" }
+    | {
+        status: "creation_superseded" | "creation_unavailable";
+        resourceId: string;
+        currentRevision: number;
+      }
+  >;
+  update(input: {
+    id: string;
+    ownerUserId: string;
+    mailboxAddress: string;
+    definition: SavedViewDefinition;
+    updatedAt: number;
+  }): Promise<SavedViewRecord>;
   delete(
     id: string,
     ownerUserId: string,
@@ -159,19 +192,80 @@ export function createSavedViewService(
       return owned(viewId, userId, mailbox);
     },
 
-    async create(userId: string, mailboxAddress: string, input: unknown) {
+    async create(
+      userId: string,
+      mailboxAddress: string,
+      input: unknown,
+      operationId: string,
+    ) {
       const mailbox = mailboxAddress.toLowerCase();
       await requireAccess(userId, mailbox);
       const definition = parseSavedViewDefinition(input);
+      if (!z.string().uuid().safeParse(operationId).success) {
+        throw new SavedViewError(
+          "INVALID",
+          "Saved view operation ID is invalid",
+        );
+      }
       const timestamp = now();
-      return dependencies.store.create({
+      const row = {
         id: id(),
         ownerUserId: userId,
         mailboxAddress: mailbox,
         ...definition,
         createdAt: timestamp,
         updatedAt: timestamp,
+      };
+      const [operationKey, fingerprint] = await Promise.all([
+        resourceCreateOperationKey({
+          kind: "saved_view",
+          mailboxId: mailbox,
+          actor: { kind: "user", id: userId },
+          operationId,
+        }),
+        resourceCreateFingerprint({
+          kind: "saved_view",
+          payload: [definition.name, definition.filters, definition.sort],
+        }),
+      ]);
+      const result = await dependencies.store.createOrReplay({
+        row,
+        operationKey,
+        fingerprint,
       });
+      if (result.status === "created" || result.status === "replayed") {
+        return { ...result.view, replayed: result.status === "replayed" };
+      }
+      if (result.status === "forbidden") {
+        throw new SavedViewError("FORBIDDEN", "Mailbox access is required");
+      }
+      if (result.status === "name_conflict") {
+        throw new SavedViewError(
+          "CONFLICT",
+          "A saved view with this name already exists",
+        );
+      }
+      if (result.status === "idempotency_conflict") {
+        throw new SavedViewError(
+          "CREATE_IDEMPOTENCY_CONFLICT",
+          "This create retry no longer matches the original saved view",
+        );
+      }
+      if (!("resourceId" in result)) {
+        throw new Error("Saved view create returned an unknown outcome");
+      }
+      throw new SavedViewError(
+        result.status === "creation_superseded"
+          ? "CREATION_SUPERSEDED"
+          : "CREATION_UNAVAILABLE",
+        result.status === "creation_superseded"
+          ? "The saved view was created and later changed"
+          : "The saved view was created and later deleted",
+        {
+          resourceId: result.resourceId,
+          currentRevision: result.currentRevision,
+        },
+      );
     },
 
     async update(
@@ -182,11 +276,12 @@ export function createSavedViewService(
     ) {
       const mailbox = mailboxAddress.toLowerCase();
       await requireAccess(userId, mailbox);
-      const current = await owned(viewId, userId, mailbox);
       const definition = parseSavedViewDefinition(input);
       return dependencies.store.update({
-        ...current,
-        ...definition,
+        id: viewId,
+        ownerUserId: userId,
+        mailboxAddress: mailbox,
+        definition,
         updatedAt: now(),
       });
     },

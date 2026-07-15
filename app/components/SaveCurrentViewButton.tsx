@@ -1,8 +1,10 @@
 import { Button, Dialog, Input, useKumoToastManager } from "@cloudflare/kumo";
 import { BookmarkSimpleIcon } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useCreateSavedView } from "~/queries/saved-views";
 import type { SavedViewDefinition } from "../../shared/saved-views.ts";
+import { CreateOperationIdentity } from "~/lib/create-operation-identity";
+import { SavedViewApiError } from "~/services/saved-views";
 
 export default function SaveCurrentViewButton({
   mailboxId,
@@ -18,6 +20,18 @@ export default function SaveCurrentViewButton({
   const [error, setError] = useState("");
   const create = useCreateSavedView();
   const toast = useKumoToastManager();
+  const identity = useRef(new CreateOperationIdentity());
+  const definitionIdentity = JSON.stringify(definition);
+  const createContext = JSON.stringify([mailboxId.toLowerCase(), definition]);
+  const previousCreateContext = useRef(createContext);
+
+  useEffect(() => {
+    if (previousCreateContext.current === createContext) return;
+    previousCreateContext.current = createContext;
+    identity.current.invalidate();
+    setError("");
+    if (!open) setName(defaultName);
+  }, [createContext, defaultName, definitionIdentity, open]);
 
   const save = (event: React.FormEvent) => {
     event.preventDefault();
@@ -27,22 +41,47 @@ export default function SaveCurrentViewButton({
       return;
     }
     setError("");
+    const operationId = identity.current.operationIdFor([
+      mailboxId.toLowerCase(),
+      "saved-view",
+      trimmedName,
+      definition,
+    ]);
     create.mutate(
       {
         mailboxId,
         definition: { ...definition, name: trimmedName },
+        operationId,
       },
       {
-        onSuccess: () => {
+        onSuccess: (result) => {
+          identity.current.invalidate();
+          setName(defaultName);
+          setError("");
           setOpen(false);
-          toast.add({ title: "Saved view created" });
+          toast.add({
+            title: result.replayed
+              ? "Saved view recovered"
+              : "Saved view created",
+          });
         },
-        onError: (mutationError) =>
+        onError: (mutationError) => {
+          const code =
+            mutationError instanceof SavedViewApiError
+              ? mutationError.code
+              : "";
           setError(
-            mutationError instanceof Error
-              ? mutationError.message
-              : "Could not save this view.",
-          ),
+            code === "creation_superseded"
+              ? "This view was created and later changed. It was not overwritten. Change the name or filters to save another view."
+              : code === "creation_unavailable"
+                ? "This view was created and later deleted. It was not recreated. Change the name or filters to save another view."
+                : code === "create_idempotency_conflict"
+                  ? "This recovery no longer matches the original view. Change the name or filters to start a new save."
+                  : mutationError instanceof SavedViewApiError
+                    ? mutationError.message
+                    : "We couldn’t confirm whether the view was saved. Retry with the same name to recover it safely.",
+          );
+        },
       },
     );
   };
@@ -51,11 +90,12 @@ export default function SaveCurrentViewButton({
     <Dialog.Root
       open={open}
       onOpenChange={(next) => {
-        setOpen(next);
-        if (next) {
+        if (create.isPending) return;
+        if (next && !identity.current.hasActiveOperation()) {
           setName(defaultName);
           setError("");
         }
+        setOpen(next);
       }}
     >
       <Dialog.Trigger
@@ -81,7 +121,18 @@ export default function SaveCurrentViewButton({
           <Input
             label="View name"
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => {
+              const nextName = event.target.value;
+              const intentChanged = identity.current.invalidateIfIntentChanged([
+                mailboxId.toLowerCase(),
+                "saved-view",
+                nextName.trim(),
+                definition,
+              ]);
+              if (intentChanged) setError("");
+              setName(nextName);
+            }}
+            disabled={create.isPending}
             maxLength={80}
             autoFocus
             required
@@ -94,12 +145,22 @@ export default function SaveCurrentViewButton({
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <Dialog.Close
               render={(props) => (
-                <Button {...props} variant="secondary">
+                <Button
+                  {...props}
+                  variant="secondary"
+                  disabled={create.isPending}
+                  className="min-h-11 w-full sm:w-auto"
+                >
                   Cancel
                 </Button>
               )}
             />
-            <Button type="submit" disabled={create.isPending || !name.trim()}>
+            <Button
+              type="submit"
+              loading={create.isPending}
+              disabled={create.isPending || !name.trim()}
+              className="min-h-11 w-full sm:w-auto"
+            >
               {create.isPending ? "Saving…" : "Save view"}
             </Button>
           </div>

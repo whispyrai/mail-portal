@@ -34,6 +34,8 @@
 		"test": "node --experimental-strip-types --test --test-concurrency=4 'workers/**/*.test.ts' 'app/**/*.test.ts'",
 		"pretest:playwright:folder-create": "npm run test:playwright:install",
 		"test:playwright:folder-create": "node scripts/verify-folder-create-playwright.mjs",
+		"pretest:playwright:create-replay": "npm run test:playwright:install",
+		"test:playwright:create-replay": "node scripts/verify-folder-create-playwright.mjs",
 		"pretest:playwright:attachment-retry": "npm run test:playwright:install",
 		"test:playwright:attachment-retry": "node scripts/verify-attachment-retry-playwright.mjs",
 		"test:playwright:install": "playwright install chromium",

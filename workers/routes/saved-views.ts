@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { z } from "zod";
 import type { SessionClaims } from "../lib/auth.ts";
 import {
   SavedViewError,
@@ -50,7 +51,25 @@ export function createSavedViewsApp(
             : error.code === "NOT_FOUND"
               ? 404
               : 409;
-      return c.json({ error: error.message }, status);
+      const code =
+        error.code === "CREATE_IDEMPOTENCY_CONFLICT"
+          ? "create_idempotency_conflict"
+          : error.code === "CREATION_SUPERSEDED"
+            ? "creation_superseded"
+            : error.code === "CREATION_UNAVAILABLE"
+              ? "creation_unavailable"
+              : undefined;
+      return c.json(
+        {
+          error: error.message,
+          ...(code ? { code } : {}),
+          ...(error.resourceId ? { resourceId: error.resourceId } : {}),
+          ...(error.currentRevision != null
+            ? { currentRevision: error.currentRevision }
+            : {}),
+        },
+        status,
+      );
     }
     throw error;
   });
@@ -75,10 +94,21 @@ export function createSavedViewsApp(
   app.post("/api/v1/mailboxes/:mailboxId/saved-views", async (c) => {
     const session = c.get("session")!;
     const input = await c.req.json().catch(() => null);
+    const parsed = z
+      .object({ operationId: z.string().uuid() })
+      .passthrough()
+      .safeParse(input);
+    if (!parsed.success) {
+      throw new SavedViewError("INVALID", "Saved view operation ID is invalid");
+    }
+    const { operationId, ...definition } = parsed.data;
     const view = await dependencies
       .service(c.env)
-			.create(session.sub, c.var.authorizedMailboxId, input);
-    return c.json(responseView(view), 201);
+      .create(session.sub, c.var.authorizedMailboxId, definition, operationId);
+    return c.json(
+      { ...responseView(view), replayed: Boolean(view.replayed) },
+      view.replayed ? 200 : 201,
+    );
   });
 
   app.put("/api/v1/mailboxes/:mailboxId/saved-views/:viewId", async (c) => {

@@ -20,6 +20,47 @@ export const folders = sqliteTable("folders", {
 	is_deletable: integer("is_deletable").notNull().default(1),
 });
 
+export const resourceCreateOperations = sqliteTable(
+  "resource_create_operations",
+  {
+    operation_key: text("operation_key").primaryKey(),
+    resource_kind: text("resource_kind", {
+      enum: ["folder", "label"],
+    }).notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    resource_id: text("resource_id").notNull(),
+    state: text("state", {
+      enum: ["active", "superseded", "unavailable"],
+    }).notNull(),
+    updated_at: text("updated_at").notNull(),
+  },
+  (table) => [
+    check(
+      "resource_create_operations_key_length_check",
+      sql`length(${table.operation_key}) = 64`,
+    ),
+    check(
+      "resource_create_operations_fingerprint_length_check",
+      sql`length(${table.fingerprint}) = 64`,
+    ),
+    check(
+      "resource_create_operations_kind_check",
+      sql`${table.resource_kind} IN ('folder', 'label')`,
+    ),
+    check(
+      "resource_create_operations_state_check",
+      sql`${table.state} IN ('active', 'superseded', 'unavailable')`,
+    ),
+    index("idx_resource_create_operations_resource").on(
+      table.resource_kind,
+      table.resource_id,
+    ),
+    index("idx_resource_create_operations_retention")
+      .on(table.updated_at, table.operation_key)
+      .where(sql`${table.state} IN ('superseded', 'unavailable')`),
+  ],
+);
+
 export const emails = sqliteTable("emails", {
 	id: text("id").primaryKey(),
 	folder_id: text("folder_id")

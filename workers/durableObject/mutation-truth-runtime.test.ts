@@ -96,9 +96,13 @@ test(
 			});
 
 			const mailboxId = "team@example.com";
-			const request = async <T>(path: string, body?: unknown): Promise<T> => {
+      const request = async <T>(
+        path: string,
+        body?: unknown,
+        targetMailboxId = mailboxId,
+      ): Promise<T> => {
 				const response = await runtime!.dispatchFetch(
-					`http://mutation.test${path}?mailbox=${encodeURIComponent(mailboxId)}`,
+          `http://mutation.test${path}?mailbox=${encodeURIComponent(targetMailboxId)}`,
 					body === undefined
 						? undefined
 						: {
@@ -112,6 +116,537 @@ test(
 				return JSON.parse(text) as T;
 			};
 			const actor = { kind: "user", id: "user-1" };
+      const folderCreate = {
+        kind: "folder",
+        operationKey: "a".repeat(64),
+        fingerprint: "b".repeat(64),
+        resourceId: "replay-folder",
+        name: "Replay folder",
+        actor,
+      };
+      const labelCreate = {
+        kind: "label",
+        operationKey: "c".repeat(64),
+        fingerprint: "d".repeat(64),
+        resourceId: "replay-label",
+        name: "Replay label",
+        color: "red",
+        actor,
+      };
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", folderCreate))
+          .status,
+        "created",
+      );
+      await request("/resource-create-email", {
+        folderId: folderCreate.resourceId,
+        emailId: "folder-replay-unread-fixture",
+        read: false,
+      });
+      const beforeUnreadReplay = await request("/resource-create-state");
+      assert.deepEqual(
+        await request<{ status: string; resource: { unreadCount: number } }>(
+          "/resource-create",
+          folderCreate,
+        ),
+        {
+          status: "replayed",
+          resource: {
+            id: "replay-folder",
+            name: "Replay folder",
+            unreadCount: 1,
+          },
+        },
+      );
+      assert.deepEqual(
+        await request("/resource-create-state"),
+        beforeUnreadReplay,
+      );
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", labelCreate))
+          .status,
+        "created",
+      );
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", labelCreate))
+          .status,
+        "replayed",
+      );
+      let createState = await request<{
+        folders: Array<{ id: string; name: string; unreadCount: number }>;
+        labels: Array<{ id: string; name: string; color: string }>;
+        operations: Array<{ operationKey: string; state: string }>;
+        activities: Array<{ action: string; entityId: string }>;
+        changes: Array<{
+          resource: string;
+          entityId: string;
+          operation: string;
+        }>;
+      }>("/resource-create-state");
+      assert.equal(createState.folders.length, 1);
+      assert.equal(createState.labels.length, 1);
+      assert.deepEqual(
+        createState.operations.map((operation) => operation.state),
+        ["active", "active"],
+      );
+      assert.equal(
+        createState.activities.filter(
+          (event) => event.action === "folder_created",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.activities.filter(
+          (event) => event.action === "label_created",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.changes.filter(
+          (change) =>
+            change.resource === "folder" &&
+            change.entityId === "replay-folder" &&
+            change.operation === "created",
+        ).length,
+        1,
+      );
+
+      const concurrentLabel = {
+        ...labelCreate,
+        operationKey: "3".repeat(64),
+        fingerprint: "4".repeat(64),
+        resourceId: "replay-concurrent-label",
+        name: "Concurrent label",
+        color: "purple",
+      };
+      const concurrentLabelResults = await Promise.all([
+        request<{ status: string }>("/resource-create", concurrentLabel),
+        request<{ status: string }>("/resource-create", concurrentLabel),
+      ]);
+      assert.deepEqual(
+        concurrentLabelResults.map((result) => result.status).sort(),
+        ["created", "replayed"],
+      );
+      createState = await request("/resource-create-state");
+      assert.equal(
+        createState.labels.filter(
+          (label) => label.id === "replay-concurrent-label",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.activities.filter(
+          (event) =>
+            event.action === "label_created" &&
+            event.entityId === "replay-concurrent-label",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.changes.filter(
+          (change) =>
+            change.resource === "label" &&
+            change.entityId === "replay-concurrent-label" &&
+            change.operation === "created",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.changes.filter(
+          (change) =>
+            change.resource === "label" &&
+            change.entityId === "replay-label" &&
+            change.operation === "created",
+        ).length,
+        1,
+      );
+
+      const concurrentFolder = {
+        ...folderCreate,
+        operationKey: "e".repeat(64),
+        fingerprint: "f".repeat(64),
+        resourceId: "replay-concurrent-folder",
+        name: "Concurrent folder",
+      };
+      const concurrentResults = await Promise.all([
+        request<{ status: string }>("/resource-create", concurrentFolder),
+        request<{ status: string }>("/resource-create", concurrentFolder),
+      ]);
+      assert.deepEqual(
+        concurrentResults.map((result) => result.status).sort(),
+        ["created", "replayed"],
+      );
+      createState = await request("/resource-create-state");
+      assert.equal(
+        createState.folders.filter(
+          (folder) => folder.id === "replay-concurrent-folder",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.activities.filter(
+          (event) =>
+            event.action === "folder_created" &&
+            event.entityId === "replay-concurrent-folder",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.changes.filter(
+          (change) =>
+            change.resource === "folder" &&
+            change.entityId === "replay-concurrent-folder" &&
+            change.operation === "created",
+        ).length,
+        1,
+      );
+
+      const beforeConflict = structuredClone(createState);
+      assert.equal(
+        (
+          await request<{ status: string }>("/resource-create", {
+            ...concurrentFolder,
+            fingerprint: "0".repeat(64),
+            name: "Changed intent",
+          })
+        ).status,
+        "idempotency_conflict",
+      );
+      assert.deepEqual(await request("/resource-create-state"), beforeConflict);
+      assert.equal(
+        (
+          await request<{ status: string }>("/resource-create", {
+            ...concurrentFolder,
+            operationKey: "1".repeat(64),
+            fingerprint: "2".repeat(64),
+            resourceId: "replay-losing-folder",
+          })
+        ).status,
+        "name_conflict",
+      );
+      assert.deepEqual(await request("/resource-create-state"), beforeConflict);
+      assert.equal(
+        (
+          await request<{ status: string }>("/resource-create", {
+            ...concurrentLabel,
+            fingerprint: "5".repeat(64),
+            color: "orange",
+          })
+        ).status,
+        "idempotency_conflict",
+      );
+      assert.deepEqual(await request("/resource-create-state"), beforeConflict);
+      assert.equal(
+        (
+          await request<{ status: string }>("/resource-create", {
+            ...concurrentLabel,
+            operationKey: "6".repeat(64),
+            fingerprint: "7".repeat(64),
+            resourceId: "replay-losing-label",
+          })
+        ).status,
+        "name_conflict",
+      );
+      assert.deepEqual(await request("/resource-create-state"), beforeConflict);
+
+      assert.equal(
+        (
+          await request<{ status: string }>(
+            "/resource-create",
+            concurrentFolder,
+            "other@example.com",
+          )
+        ).status,
+        "created",
+      );
+      assert.equal(
+        (
+          await request<{ status: string }>(
+            "/resource-create",
+            concurrentLabel,
+            "other@example.com",
+          )
+        ).status,
+        "created",
+      );
+      const isolatedState = await request<{
+        folders: Array<{ id: string }>;
+        labels: Array<{ id: string }>;
+        operations: Array<{ operationKey: string }>;
+        activities: Array<{ action: string; entityId: string }>;
+        changes: Array<{
+          resource: string;
+          entityId: string;
+          operation: string;
+        }>;
+      }>("/resource-create-state", undefined, "other@example.com");
+      assert.deepEqual(
+        isolatedState.folders.map((folder) => folder.id),
+        ["replay-concurrent-folder"],
+      );
+      assert.deepEqual(
+        isolatedState.labels.map((label) => label.id),
+        ["replay-concurrent-label"],
+      );
+      assert.deepEqual(
+        isolatedState.operations
+          .map((operation) => operation.operationKey)
+          .sort(),
+        ["3".repeat(64), "e".repeat(64)].sort(),
+      );
+      assert.deepEqual(
+        isolatedState.activities
+          .map((event) => [event.action, event.entityId])
+          .sort(),
+        [
+          ["folder_created", "replay-concurrent-folder"],
+          ["label_created", "replay-concurrent-label"],
+        ].sort(),
+      );
+      assert.deepEqual(
+        isolatedState.changes
+          .map((change) => [
+            change.resource,
+            change.entityId,
+            change.operation,
+          ])
+          .sort(),
+        [
+          ["folder", "replay-concurrent-folder", "created"],
+          ["label", "replay-concurrent-label", "created"],
+        ].sort(),
+      );
+      assert.deepEqual(await request("/resource-create-state"), beforeConflict);
+      const originalOperationStates = () =>
+        createState.operations
+          .filter((operation) =>
+            ["a".repeat(64), "c".repeat(64)].includes(operation.operationKey),
+          )
+          .map((operation) => operation.state);
+
+      const beforeNoOp = structuredClone(createState);
+      await request("/update-folder", {
+        id: "replay-folder",
+        name: "Replay folder",
+      });
+      await request("/update-label", {
+        id: "replay-label",
+        name: "Replay label",
+        color: "red",
+        actor,
+      });
+      createState = await request("/resource-create-state");
+      assert.deepEqual(createState, beforeNoOp);
+      assert.deepEqual(originalOperationStates(), ["active", "active"]);
+      await request("/update-folder", {
+        id: "replay-folder",
+        name: "Renamed folder",
+      });
+      await request("/update-label", {
+        id: "replay-label",
+        name: "Renamed label",
+        color: "blue",
+        actor,
+      });
+      createState = await request("/resource-create-state");
+      assert.deepEqual(originalOperationStates(), ["superseded", "superseded"]);
+      assert.equal(
+        createState.changes.filter(
+          (change) =>
+            change.resource === "folder" &&
+            change.entityId === "replay-folder" &&
+            change.operation === "updated",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.changes.filter(
+          (change) =>
+            change.resource === "label" &&
+            change.entityId === "replay-label" &&
+            change.operation === "updated",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.activities.filter(
+          (event) =>
+            event.action === "label_updated" &&
+            event.entityId === "replay-label",
+        ).length,
+        1,
+      );
+      const beforeSupersededRetry = structuredClone(createState);
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", folderCreate))
+          .status,
+        "creation_superseded",
+      );
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", labelCreate))
+          .status,
+        "creation_superseded",
+      );
+      assert.deepEqual(
+        await request("/resource-create-state"),
+        beforeSupersededRetry,
+      );
+      await request("/move", {
+        id: "folder-replay-unread-fixture",
+        folderId: "inbox",
+        actor,
+      });
+      await request("/delete-folder", { folderId: "replay-folder", actor });
+      await request("/delete-label", { id: "replay-label", actor });
+      createState = await request("/resource-create-state");
+      assert.deepEqual(originalOperationStates(), [
+        "unavailable",
+        "unavailable",
+      ]);
+      for (const [resource, entityId] of [
+        ["folder", "replay-folder"],
+        ["label", "replay-label"],
+      ] as const) {
+        assert.equal(
+          createState.changes.filter(
+            (change) =>
+              change.resource === resource &&
+              change.entityId === entityId &&
+              change.operation === "deleted",
+          ).length,
+          1,
+        );
+      }
+      assert.equal(
+        createState.activities.filter(
+          (event) =>
+            event.action === "folder_deleted" &&
+            event.entityId === "replay-folder",
+        ).length,
+        1,
+      );
+      assert.equal(
+        createState.activities.filter(
+          (event) =>
+            event.action === "label_deleted" &&
+            event.entityId === "replay-label",
+        ).length,
+        1,
+      );
+      const beforeUnavailableRetry = structuredClone(createState);
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", folderCreate))
+          .status,
+        "creation_unavailable",
+      );
+      assert.equal(
+        (await request<{ status: string }>("/resource-create", labelCreate))
+          .status,
+        "creation_unavailable",
+      );
+      assert.deepEqual(
+        await request("/resource-create-state"),
+        beforeUnavailableRetry,
+      );
+
+      const expiredRows = Array.from({ length: 101 }, (_, index) => ({
+        operationKey: `old-${index}`.padEnd(64, "x"),
+        resourceKind: "folder" as const,
+        fingerprint: "9".repeat(64),
+        resourceId: `expired-${index}`,
+        state: "unavailable" as const,
+        updatedAt: "2000-01-01T00:00:00.000Z",
+      }));
+      await request("/resource-create-operation-seed", [
+        ...expiredRows,
+        {
+          operationKey: "z".repeat(64),
+          resourceKind: "folder",
+          fingerprint: "8".repeat(64),
+          resourceId: "expired-exact-target",
+          state: "superseded",
+          updatedAt: "2000-01-01T00:00:00.000Z",
+        },
+        {
+          operationKey: "recent".padEnd(64, "r"),
+          resourceKind: "folder",
+          fingerprint: "7".repeat(64),
+          resourceId: "recent-terminal",
+          state: "unavailable",
+          updatedAt: "2999-01-01T00:00:00.000Z",
+        },
+        {
+          operationKey: "active-old".padEnd(64, "a"),
+          resourceKind: "folder",
+          fingerprint: "6".repeat(64),
+          resourceId: "active-old",
+          state: "active",
+          updatedAt: "2000-01-01T00:00:00.000Z",
+        },
+      ]);
+      assert.equal(
+        (
+          await request<{ status: string }>("/resource-create", {
+            ...folderCreate,
+            operationKey: "z".repeat(64),
+            fingerprint: "5".repeat(64),
+            resourceId: "replay-expired-operation-reuse",
+            name: "Expired operation reuse",
+          })
+        ).status,
+        "created",
+      );
+      let retentionState = await request<{
+        operations: Array<{ operationKey: string; state: string }>;
+      }>("/resource-create-state");
+      assert.equal(
+        retentionState.operations.filter((operation) =>
+          operation.operationKey.startsWith("old-"),
+        ).length,
+        2,
+      );
+      assert.equal(
+        retentionState.operations.some(
+          (operation) => operation.operationKey === "recent".padEnd(64, "r"),
+        ),
+        true,
+      );
+      assert.equal(
+        retentionState.operations.some(
+          (operation) =>
+            operation.operationKey === "active-old".padEnd(64, "a") &&
+            operation.state === "active",
+        ),
+        true,
+      );
+      assert.equal(
+        retentionState.operations.some(
+          (operation) =>
+            operation.operationKey === "z".repeat(64) &&
+            operation.state === "active",
+        ),
+        true,
+      );
+      assert.equal(
+        (
+          await request<{ status: string }>("/resource-create", {
+            ...folderCreate,
+            operationKey: "8".repeat(64),
+            fingerprint: "4".repeat(64),
+            resourceId: "replay-retention-second-pass",
+            name: "Retention second pass",
+          })
+        ).status,
+        "created",
+      );
+      retentionState = await request("/resource-create-state");
+      assert.equal(
+        retentionState.operations.filter((operation) =>
+          operation.operationKey.startsWith("old-"),
+        ).length,
+        0,
+      );
+
 			const { labelId } = await request<{ labelId: string }>("/seed");
 			const state = () => request<State>("/state");
 			let before = await state();
