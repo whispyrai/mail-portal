@@ -866,6 +866,152 @@ async function verifySavedViewLifecycle(page, mailboxId, viewportName) {
   }
 }
 
+async function verifyAutomationDryRunReplay(page, mailboxId, viewportName) {
+  const ruleName = `Dry-run recovery ${viewportName}`;
+  const definition = {
+    schemaVersion: 1,
+    name: ruleName,
+    match: "all",
+    conditions: [{ kind: "every_incoming" }],
+    actions: [{ kind: "star" }],
+    stopProcessing: false,
+  };
+  const origin = new URL(page.url()).origin;
+  const automationBase = `${origin}/api/v1/mailboxes/${encodeURIComponent(mailboxId)}`;
+  const rules = await responseJson(
+    await page.request.get(`${automationBase}/automation-rules`),
+  );
+  const created = await mutateThroughApi(
+    page,
+    `${automationBase}/automation-rules`,
+    "POST",
+    { definition, expectedOrderRevision: rules.orderRevision },
+  );
+  const routePattern = "**/api/v1/mailboxes/*/automation-rules/dry-run";
+  const gates = [deferred(), deferred()];
+  const committed = [deferred(), deferred()];
+  const requests = [];
+  const handler = async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const upstream = await route.fetch();
+    const json = await upstream.json();
+    const index = requests.length;
+    requests.push({
+      body: request.postDataJSON(),
+      status: upstream.status(),
+      json,
+    });
+    committed[index]?.release();
+    await gates[index]?.promise;
+    if (index === 0) {
+      await route.abort("connectionreset");
+      return;
+    }
+    await route.fulfill({ response: upstream });
+  };
+  await page.route(routePattern, handler);
+  try {
+    await page.goto(
+      `${origin}/mailbox/${encodeURIComponent(mailboxId)}/automations`,
+      { waitUntil: "networkidle" },
+    );
+    await page.getByRole("heading", { name: "Automations" }).waitFor();
+    const ruleRow = page.locator("li").filter({ hasText: ruleName }).first();
+    await ruleRow.getByRole("button", { name: "Edit" }).click();
+    const editor = page.getByLabel(`Edit ${ruleName}`);
+    await editor.waitFor();
+    const testButton = editor.getByRole("button", { name: "Test" });
+    const closeButton = editor.getByRole("button", { name: "Close rule editor" });
+    const cancelButton = editor.getByRole("button", { name: "Cancel" });
+    const ruleNameInput = editor.getByLabel("Rule name");
+    const runHistoryTab = page
+      .locator('button[role="tab"]')
+      .filter({ hasText: "Run history" });
+
+    await testButton.click();
+    await committed[0].promise;
+    assert.equal(await testButton.isDisabled(), true);
+    assert.equal(await closeButton.isDisabled(), true);
+    assert.equal(await cancelButton.isDisabled(), true);
+    assert.equal(await ruleNameInput.isDisabled(), true);
+    assert.equal(await runHistoryTab.isDisabled(), true);
+    gates[0].release();
+    const failureAlert = editor
+      .getByRole("alert")
+      .filter({ hasText: "couldn’t confirm whether the test finished" });
+    await failureAlert.waitFor();
+    await failureAlert.scrollIntoViewIfNeeded();
+    assert.equal(await editor.isVisible(), true);
+    await page.waitForFunction(() =>
+      document.activeElement?.textContent?.trim() === "Test",
+    );
+    await page.screenshot({
+      path: join(
+        logDirectory,
+        `automation-dry-run-${runStamp}-${viewportName}-failure.png`,
+      ),
+      fullPage: true,
+    });
+
+    await testButton.click();
+    await committed[1].promise;
+    assert.equal(await closeButton.isDisabled(), true);
+    assert.equal(await cancelButton.isDisabled(), true);
+    gates[1].release();
+    await editor
+      .getByText("Recovered the completed test. No duplicate history was added.")
+      .waitFor();
+    await page.waitForFunction(() =>
+      document.activeElement?.textContent?.trim() === "Test",
+    );
+    assert.equal(
+      await editor
+        .getByRole("alert")
+        .filter({ hasText: "couldn’t confirm" })
+        .count(),
+      0,
+    );
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests.map((request) => request.status), [201, 200]);
+    assert.deepEqual(
+      requests.map((request) => request.json.replayed),
+      [false, true],
+    );
+    assert.deepEqual(requests[1].body, requests[0].body);
+    assert.match(requests[0].body.operationId, /^[0-9a-f-]{36}$/iu);
+    assert.equal(requests[0].body.ruleId, created.rule.id);
+    assert.equal(requests[0].body.ruleVersion, created.rule.draftVersion);
+
+    await editor.getByText("Version and test history").click();
+    const recentTests = editor
+      .getByRole("heading", { name: "Recent tests" })
+      .locator("..");
+    await recentTests.getByText("0 of 0 matched", { exact: false }).waitFor();
+    assert.equal(await recentTests.locator("li").count(), 1);
+    const geometry = await page.evaluate(() => ({
+      viewport: window.innerWidth,
+      document: document.scrollingElement?.scrollWidth ?? 0,
+    }));
+    assert.ok(geometry.document <= geometry.viewport, JSON.stringify(geometry));
+    await page.screenshot({
+      path: join(
+        logDirectory,
+        `automation-dry-run-${runStamp}-${viewportName}-success.png`,
+      ),
+      fullPage: true,
+    });
+    detail(
+      `${viewportName} automation dry-run ${JSON.stringify({ requests, geometry })}`,
+    );
+  } finally {
+    await page.unroute(routePattern, handler);
+  }
+}
+
 async function verifyViewport({
   browser,
   baseUrl,
@@ -1036,6 +1182,7 @@ async function verifyViewport({
     await verifyLabelLifecycle(page, mailboxId, name);
     await verifySavedViewReplay(page, mailboxId, name);
     await verifySavedViewLifecycle(page, mailboxId, name);
+    await verifyAutomationDryRunReplay(page, mailboxId, name);
 
     assert.equal(postBodies.length, 2);
     assert.equal(postBodies[0].name, folderName);
@@ -1052,7 +1199,7 @@ async function verifyViewport({
     const resetMutationErrors = consoleErrors.filter((message) =>
       message.startsWith("Mutation failed: TypeError: Failed to fetch\n"),
     );
-    assert.equal(resetMutationErrors.length, 6, JSON.stringify(consoleErrors));
+    assert.equal(resetMutationErrors.length, 7, JSON.stringify(consoleErrors));
     const lifecycleResourceErrors = consoleErrors.filter(
       (message) =>
         message ===
@@ -1067,7 +1214,7 @@ async function verifyViewport({
       (message) =>
         message === "Failed to load resource: net::ERR_CONNECTION_RESET",
     );
-    assert.equal(resetResourceErrors.length, 6, JSON.stringify(consoleErrors));
+    assert.equal(resetResourceErrors.length, 7, JSON.stringify(consoleErrors));
     const lifecycleMutationErrors = consoleErrors.filter(
       (message) =>
         message.startsWith(
@@ -1097,9 +1244,21 @@ async function verifyViewport({
         !message.includes("Failed to fetch manifest patches"),
     );
     assert.deepEqual(unexpectedConsoleErrors, []);
-    assert.equal(requestFailures.length, 6, JSON.stringify(requestFailures));
+    const resetRequestFailures = requestFailures.filter((failure) =>
+      failure.errorText.includes("ERR_CONNECTION_RESET"),
+    );
+    const navigationCancellations = requestFailures.filter((failure) =>
+      failure.errorText.includes("ERR_ABORTED"),
+    );
+    assert.equal(resetRequestFailures.length, 7, JSON.stringify(requestFailures));
+    assert.equal(navigationCancellations.length, 3, JSON.stringify(requestFailures));
+    assert.equal(
+      resetRequestFailures.length + navigationCancellations.length,
+      requestFailures.length,
+      JSON.stringify(requestFailures),
+    );
     assert.deepEqual(
-      requestFailures.map((failure) => new URL(failure.url).pathname).sort(),
+      resetRequestFailures.map((failure) => new URL(failure.url).pathname).sort(),
       [
         `/api/v1/mailboxes/${mailboxId}/folders`,
         `/api/v1/mailboxes/${mailboxId}/folders`,
@@ -1107,10 +1266,11 @@ async function verifyViewport({
         `/api/v1/mailboxes/${mailboxId}/labels`,
         `/api/v1/mailboxes/${encodeURIComponent(mailboxId)}/saved-views`,
         `/api/v1/mailboxes/${encodeURIComponent(mailboxId)}/saved-views`,
+        `/api/v1/mailboxes/${encodeURIComponent(mailboxId)}/automation-rules/dry-run`,
       ].sort(),
     );
     assert.equal(
-      requestFailures.every((failure) =>
+      resetRequestFailures.every((failure) =>
         failure.errorText.includes("ERR_CONNECTION_RESET"),
       ),
       true,
@@ -1144,7 +1304,7 @@ async function verifyViewport({
 }
 
 async function main() {
-  progress("Folder, Label, and Saved View replay verification starting");
+  progress("Resource creation and Automation dry-run replay verification starting");
   progress(`Detailed log: ${logFilePath}`);
 	let stateDirectory;
 	let browser;
@@ -1297,7 +1457,7 @@ async function main() {
       viewport: { width: 1440, height: 900 },
     });
     progress(
-      "PASS: Folder, Label, and Saved View creation are truthful and recoverable at both widths",
+      "PASS: Resource creation and Automation dry runs are truthful and recoverable at both widths",
     );
   } finally {
     try {
@@ -1315,7 +1475,7 @@ main().catch((error) => {
     error instanceof Error ? (error.stack ?? error.message) : String(error),
   );
   console.error(
-    `FAIL: resource create replay verification failed. See ${logFilePath}`);
+    `FAIL: create and Automation replay verification failed. See ${logFilePath}`);
 	process.exitCode = interruptedSignal
 		? 128 + constants.signals[interruptedSignal]
 		: 1;

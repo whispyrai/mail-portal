@@ -10,7 +10,7 @@ import {
 	WarningCircleIcon,
 	XIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import {
 	canonicalAutomationRuleDefinition,
@@ -43,11 +43,15 @@ import {
 	useSetAutomationRuleEnabled,
 	useUpdateAutomationRule,
 } from "~/queries/automation-rules";
-import type {
-	AutomationRule,
-	AutomationRuleTest,
-	AutomationRuleVersion,
-	AutomationRun,
+
+import { automationDryRunIntent } from "~/lib/automation-dry-run-identity";
+import { CreateOperationIdentity } from "~/lib/create-operation-identity";
+import {
+	AutomationRulesApiError,
+	type AutomationRule,
+	type AutomationRuleTest,
+	type AutomationRuleVersion,
+	type AutomationRun,
 } from "~/services/automation-rules";
 
 const DEFAULT_DEFINITION: AutomationRuleDefinition = {
@@ -195,6 +199,7 @@ function AutomationRuleEditor({
 	labels,
 	folders,
 	onClose,
+	onPendingChange,
 	onAccessRevoked,
 }: {
 	mailboxId: string;
@@ -203,13 +208,18 @@ function AutomationRuleEditor({
 	labels: Label[];
 	folders: Folder[];
 	onClose(): void;
+	onPendingChange(pending: boolean): void;
 	onAccessRevoked(mailboxId: string): void;
 }) {
 	const seed = rule?.draftDefinition ?? rule?.activeDefinition ?? DEFAULT_DEFINITION;
 	const [definition, setDefinition] = useState<AutomationRuleDefinition>(() => structuredClone(seed));
 	const [error, setError] = useState<string | null>(null);
+	const [testError, setTestError] = useState<string | null>(null);
 	const [test, setTest] = useState<AutomationRuleTest | null>(null);
+	const [testRecovered, setTestRecovered] = useState(false);
 	const [acknowledgedZero, setAcknowledgedZero] = useState(false);
+	const dryRunIdentity = useRef(new CreateOperationIdentity());
+	const testControl = useRef<HTMLDivElement>(null);
 	const create = useCreateAutomationRule(mailboxId, onAccessRevoked);
 	const update = useUpdateAutomationRule(mailboxId, onAccessRevoked);
 	const dryRun = useDryRunAutomationRule(mailboxId, onAccessRevoked);
@@ -218,6 +228,10 @@ function AutomationRuleEditor({
 	const restore = useRestoreAutomationRuleVersion(mailboxId, onAccessRevoked);
 	const [restoringVersion, setRestoringVersion] = useState<number | null>(null);
 	const pending = create.isPending || update.isPending || dryRun.isPending || restore.isPending;
+	useEffect(() => {
+		onPendingChange(pending);
+	}, [onPendingChange, pending]);
+	useEffect(() => () => onPendingChange(false), [onPendingChange]);
 	const savedDraftCanonical = useMemo(() => rule?.draftDefinition
 		? canonicalAutomationRuleDefinition(rule.draftDefinition)
 		: null, [rule?.draftDefinition]);
@@ -256,7 +270,10 @@ function AutomationRuleEditor({
 	};
 	useEffect(() => {
 		if (testReady) return;
+		dryRunIdentity.current.invalidate();
 		setTest(null);
+		setTestRecovered(false);
+		setTestError(null);
 		setAcknowledgedZero(false);
 	}, [testReady]);
 
@@ -291,19 +308,53 @@ function AutomationRuleEditor({
 
 	const runTest = async (acknowledgement = acknowledgedZero) => {
 		if (!testReady || !rule?.draftDefinition || rule.draftVersion === null) {
-			setError("Save draft before testing.");
+			setTestError("Save draft before testing.");
 			return;
 		}
+		const intent = automationDryRunIntent({
+			mailboxId,
+			ruleId: rule.id,
+			ruleVersion: rule.draftVersion,
+			definition: rule.draftDefinition,
+			acknowledgedZero: acknowledgement,
+		});
+		dryRunIdentity.current.invalidateIfIntentChanged(intent);
+		const recovering = dryRunIdentity.current.hasActiveOperation();
+		const operationId = dryRunIdentity.current.operationIdFor(intent);
+		if (!recovering) {
+			setTest(null);
+			setTestRecovered(false);
+		}
+		setTestError(null);
 		try {
 			const response = await dryRun.mutateAsync({
 				definition: rule.draftDefinition,
 				ruleId: rule.id,
 				ruleVersion: rule.draftVersion,
 				acknowledgedZero: acknowledgement,
+				operationId,
 			});
 			setTest(response.test);
+			setTestRecovered(response.replayed);
+			dryRunIdentity.current.invalidate();
+			setTestError(null);
 		} catch (caught) {
-			setError(caught instanceof Error ? caught.message : "Test could not run.");
+			const isDefinitiveApiFailure =
+				caught instanceof AutomationRulesApiError &&
+				caught.status < 500 &&
+				caught.code !== "UNAVAILABLE";
+			setTestError(
+				isDefinitiveApiFailure &&
+					caught.code === "DRY_RUN_IDEMPOTENCY_CONFLICT"
+					? "This recovery no longer matches the original test. Save or change the draft before testing again."
+					: isDefinitiveApiFailure
+						? caught.message
+						: "We couldn’t confirm whether the test finished. Retry without changing the rule to recover it safely.",
+			);
+		} finally {
+			requestAnimationFrame(() => {
+				testControl.current?.querySelector<HTMLButtonElement>("button")?.focus();
+			});
 		}
 	};
 
@@ -332,10 +383,10 @@ function AutomationRuleEditor({
 					<h2 className="font-semibold text-kumo-default">{rule ? "Edit rule" : "New rule"}</h2>
 					<p className="mt-1 text-xs text-kumo-subtle">Changes stay in a draft until you test and enable them.</p>
 				</div>
-				<Button variant="ghost" shape="square" icon={<XIcon size={18} />} aria-label="Close rule editor" onClick={onClose} className="min-h-11 min-w-11" />
+				<Button variant="ghost" shape="square" icon={<XIcon size={18} />} aria-label="Close rule editor" onClick={onClose} disabled={pending} className="min-h-11 min-w-11" />
 			</header>
 			<div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
-				<div className="space-y-6">
+				<fieldset disabled={pending} className="min-w-0 space-y-6 border-0 p-0">
 					<label className="block">
 						<span className="mb-1.5 block text-sm font-medium text-kumo-default">Rule name</span>
 						<input className={inputClass} maxLength={80} value={definition.name} onChange={(event) => { setDefinition({ ...definition, name: event.target.value }); setTest(null); }} placeholder="e.g. Vendor invoices" autoFocus />
@@ -378,10 +429,11 @@ function AutomationRuleEditor({
 					<section className="border-t border-kumo-line pt-5" aria-labelledby="dry-run-title">
 						<div className="flex items-start justify-between gap-3">
 							<div><h3 id="dry-run-title" className="text-sm font-medium text-kumo-default">Test this rule</h3><p className="mt-1 text-xs leading-5 text-kumo-subtle">Test against recent incoming mail. Nothing will change.<br />Past results do not guarantee what future mail will match.</p></div>
-							<Button variant="secondary" icon={<FlaskIcon size={16} />} onClick={() => void runTest()} loading={dryRun.isPending} disabled={!testReady || pending} className="min-h-11">Test</Button>
+							<div ref={testControl} className="shrink-0"><Button variant="secondary" icon={<FlaskIcon size={16} />} onClick={() => void runTest()} loading={dryRun.isPending} disabled={!testReady || pending} className="min-h-11">Test</Button></div>
 						</div>
 						{!testReady && <p className="mt-2 text-xs font-medium text-kumo-subtle">Save draft before testing.</p>}
-						{test && <div className="mt-3 rounded-md bg-kumo-tint p-3" role="status"><div className="flex items-center gap-2 text-sm font-medium text-kumo-default"><CheckCircleIcon size={18} /> {test.matchedCount} of {test.evaluatedCount} messages matched</div><p className="mt-2 text-xs text-kumo-subtle">{test.actionCounts.wouldChange} would change · {test.actionCounts.alreadySatisfied} already satisfied · {test.actionCounts.conflicts} conflicts</p>{(test.evaluatedCount === 0 || test.matchedCount === 0) && (test.acknowledgedZero ? <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-kumo-default"><CheckCircleIcon size={15} aria-hidden="true" /> Zero-result acknowledgment stored. This draft may now be enabled.</p> : <label className="mt-3 flex items-start gap-2 text-xs text-kumo-default"><input type="checkbox" checked={acknowledgedZero} disabled={dryRun.isPending} onChange={(event) => { const checked = event.target.checked; setAcknowledgedZero(checked); if (checked) void runTest(true); }} /> I understand this test had {test.evaluatedCount === 0 ? "no eligible messages" : "no matches"}. Selecting this runs a confirming test and stores my acknowledgment before activation.</label>)}</div>}
+						{testError && <p className="mt-3 rounded-md bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger" role="alert">{testError}</p>}
+						{test && <div className="mt-3 rounded-md bg-kumo-tint p-3" role="status">{testRecovered && <p className="mb-2 text-xs font-medium text-kumo-default">Recovered the completed test. No duplicate history was added.</p>}<div className="flex items-center gap-2 text-sm font-medium text-kumo-default"><CheckCircleIcon size={18} /> {test.matchedCount} of {test.evaluatedCount} messages matched</div><p className="mt-2 text-xs text-kumo-subtle">{test.actionCounts.wouldChange} would change · {test.actionCounts.alreadySatisfied} already satisfied · {test.actionCounts.conflicts} conflicts</p>{(test.evaluatedCount === 0 || test.matchedCount === 0) && (test.acknowledgedZero ? <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-kumo-default"><CheckCircleIcon size={15} aria-hidden="true" /> Zero-result acknowledgment stored. This draft may now be enabled.</p> : <label className="mt-3 flex items-start gap-2 text-xs text-kumo-default"><input type="checkbox" checked={acknowledgedZero} disabled={dryRun.isPending} onChange={(event) => { const checked = event.target.checked; if (rule?.draftDefinition && rule.draftVersion !== null) dryRunIdentity.current.invalidateIfIntentChanged(automationDryRunIntent({ mailboxId, ruleId: rule.id, ruleVersion: rule.draftVersion, definition: rule.draftDefinition, acknowledgedZero: checked })); setAcknowledgedZero(checked); if (checked) void runTest(true); }} /> I understand this test had {test.evaluatedCount === 0 ? "no eligible messages" : "no matches"}. Selecting this runs a confirming test and stores my acknowledgment before activation.</label>)}</div>}
 					</section>
 					{rule && <details className="rounded-md border border-kumo-line bg-kumo-tint px-3 py-3">
 						<summary className="cursor-pointer text-sm font-medium text-kumo-default">Version and test history</summary>
@@ -389,9 +441,9 @@ function AutomationRuleEditor({
 						{versionsQuery.isLoading || testsQuery.isLoading ? <div className="mt-3 flex items-center gap-2 text-xs text-kumo-subtle"><Loader size="sm" /> Loading history…</div> : versionsQuery.isError || testsQuery.isError ? <div className="mt-3 rounded-md bg-kumo-danger-tint p-3" role="alert"><p className="text-xs text-kumo-danger">History could not be loaded. Your rule was not changed.</p><Button variant="secondary" icon={<ArrowsClockwiseIcon size={16} />} onClick={() => { void versionsQuery.refetch(); void testsQuery.refetch(); }} className="mt-3 min-h-11">Retry history</Button></div> : <AutomationRuleHistory versions={versionsQuery.data?.versions ?? []} tests={testsQuery.data?.tests ?? []} labels={labels} folders={folders} onRestore={(version) => void restoreVersion(version)} restoringVersion={restoringVersion} />}
 					</details>}
 					{error && <p className="rounded-md bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger" role="alert">{error}</p>}
-				</div>
+				</fieldset>
 			</div>
-			<footer className="flex justify-end gap-2 border-t border-kumo-line px-5 py-4"><Button variant="secondary" onClick={onClose} className="min-h-11">Cancel</Button><Button onClick={save} loading={create.isPending || update.isPending} disabled={pending && !create.isPending && !update.isPending} className="min-h-11">Save draft</Button></footer>
+			<footer className="flex justify-end gap-2 border-t border-kumo-line px-5 py-4"><Button variant="secondary" onClick={onClose} disabled={pending} className="min-h-11">Cancel</Button><Button onClick={save} loading={create.isPending || update.isPending} disabled={pending && !create.isPending && !update.isPending} className="min-h-11">Save draft</Button></footer>
 		</aside>
 	);
 }
@@ -413,6 +465,7 @@ export default function AutomationWorkspace({ mailboxId, mailbox, labels, folder
 	const composing = searchParams.get("compose") === "new";
 	const [runState, setRunState] = useState("");
 	const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+	const [editorPending, setEditorPending] = useState(false);
 	const rulesQuery = useAutomationRules(mailboxId, onAccessRevoked);
 	const runsQuery = useAutomationRuns(mailboxId, runState, onAccessRevoked, tab === "runs");
 	const selectedRunQuery = useAutomationRun(mailboxId, selectedRunId, onAccessRevoked);
@@ -438,8 +491,8 @@ export default function AutomationWorkspace({ mailboxId, mailbox, labels, folder
 	const reportActionError = (error: unknown) => setActionError(error instanceof Error ? error.message : "The rule could not be changed.");
 	const moveRule = (index: number, delta: number) => { const next = [...orderedRules]; const target = index + delta; if (target < 0 || target >= next.length || !rulesQuery.data) return; [next[index], next[target]] = [next[target]!, next[index]!]; setActionError(null); reorder.mutate({ orderedRuleIds: next.map((rule) => rule.id), expectedOrderRevision: rulesQuery.data.orderRevision }, { onError: reportActionError }); };
 
-	return <div className="flex h-full min-h-0 bg-kumo-base"><main className={`flex min-w-0 flex-1 flex-col ${editorOpen ? "hidden lg:flex" : "flex"}`}><header className="border-b border-kumo-line px-4 py-4 sm:px-6"><div className="flex items-start justify-between gap-4"><div><div className="flex items-center gap-2"><LightningIcon size={22} weight="duotone" /><h1 className="text-lg font-semibold text-kumo-default">Automations</h1></div><p className="mt-1 max-w-2xl text-sm leading-6 text-kumo-subtle">Rules organize future incoming mail in this mailbox. They never send messages or contact external services.</p></div>{tab === "rules" && canManage && <Button icon={<PlusIcon size={16} />} onClick={() => setSearchParams(paramsWithAutomationRule(searchParams, null, true))} className="min-h-11 shrink-0">New rule</Button>}</div>{mailbox?.type === "SHARED" && <div className="mt-3 border-l-2 border-kumo-brand pl-3 text-xs leading-5 text-kumo-subtle">These rules are shared by everyone with access to this mailbox. Changes affect future incoming messages for the whole mailbox.{!canManage && <strong className="ml-1 text-kumo-default">You have read-only access.</strong>}</div>}<div className="mt-4 flex gap-1" role="tablist" aria-label="Automation views">{(["rules", "runs"] as const).map((value) => <button key={value} type="button" role="tab" aria-selected={tab === value} onClick={() => setSearchParams(paramsWithAutomationTab(searchParams, value))} className={`min-h-11 rounded-md px-4 text-sm font-medium ${tab === value ? "bg-kumo-fill text-kumo-default" : "text-kumo-subtle hover:bg-kumo-tint"}`}>{value === "rules" ? "Rules" : "Run history"}</button>)}</div>{actionError && <p className="mt-3 rounded-md bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger" role="alert">{actionError}</p>}</header>
-		{tab === "rules" ? <section className="min-h-0 flex-1 overflow-y-auto" aria-label="Ordered rules">{rulesQuery.isLoading ? <StateMessage><Loader size="sm" /> Loading rules…</StateMessage> : rulesQuery.isError ? <ErrorState title="Rules could not be loaded" onRetry={() => void rulesQuery.refetch()} /> : orderedRules.length === 0 ? <StateMessage><div className="text-center"><LightningIcon className="mx-auto" size={28} /><p className="mt-2 font-medium text-kumo-default">No active rules yet</p><p className="mt-1">Create a draft to begin organizing future incoming mail.</p>{archivedCount > 0 && <p className="mt-1 text-xs">{archivedCount} archived {archivedCount === 1 ? "rule is" : "rules are"} retained in history.</p>}</div></StateMessage> : <ol>{orderedRules.map((rule, index) => { const definition = rule.draftDefinition ?? rule.activeDefinition; return <li key={rule.id} className="border-b border-kumo-line px-4 py-4 sm:px-6"><div className="flex items-start gap-3"><span className={`mt-2 size-2.5 shrink-0 rounded-full ${statusTone(rule.state)}`} aria-hidden="true" /><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><h2 className="font-medium text-kumo-default">{rule.name}</h2><span className="text-xs text-kumo-subtle">{automationRuleStateLabel(rule.state)}</span>{rule.targetHealth === "needs_attention" && <span className="inline-flex items-center gap-1 text-xs text-kumo-danger"><WarningCircleIcon size={14} /> Target needs attention</span>}</div>{definition && <p className="mt-1.5 text-sm leading-6 text-kumo-subtle">{describeAutomationDefinition(definition, { labels: labelNames, folders: { archive: "Archive", ...folderNames } })}</p>}<div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-kumo-subtle"><span>Active version {rule.activeVersion ?? "none"}</span><span>Draft version {rule.draftVersion ?? "none"}</span><span>{definition?.stopProcessing ? "Stops later rules" : "Continues to later rules"}</span><span>Last run {relativeAutomationTime(rule.lastRunAt)}</span><span>Last match {relativeAutomationTime(rule.lastMatchedAt)}</span><span>Updated {relativeAutomationTime(rule.updatedAt)}</span></div></div><div className="flex shrink-0 items-center gap-1">{canManage && <><Button variant="ghost" shape="square" icon={<ArrowUpIcon size={16} />} aria-label={`Move ${rule.name} earlier`} disabled={index === 0 || reorder.isPending} onClick={() => moveRule(index, -1)} className="min-h-11 min-w-11"/><Button variant="ghost" shape="square" icon={<ArrowDownIcon size={16} />} aria-label={`Move ${rule.name} later`} disabled={index === orderedRules.length - 1 || reorder.isPending} onClick={() => moveRule(index, 1)} className="min-h-11 min-w-11"/><Button variant="secondary" onClick={() => setSearchParams(paramsWithAutomationRule(searchParams, rule.id))} className="min-h-11">Edit</Button><Button variant="ghost" onClick={() => { setActionError(null); toggle.mutate({ ruleId: rule.id, expectedRevision: rule.revision, enabled: rule.state !== "enabled" }, { onError: reportActionError }); }} className="min-h-11">{rule.state === "enabled" ? "Disable" : "Enable"}</Button><Button variant="ghost" onClick={() => { if (window.confirm(`Archive “${rule.name}”?`)) { setActionError(null); archive.mutate({ ruleId: rule.id, expectedRevision: rule.revision }, { onError: reportActionError }); } }} className="min-h-11">Archive</Button></>}</div></div></li>; })}</ol>}</section> : <section className="min-h-0 flex-1 overflow-y-auto"><div className="flex items-center justify-between gap-3 border-b border-kumo-line px-4 py-3 sm:px-6"><label className="text-sm text-kumo-subtle">Status <select value={runState} onChange={(event) => { setRunState(event.target.value); setSelectedRunId(null); }} className="ml-2 min-h-11 rounded-md border border-kumo-line bg-kumo-base px-3 text-kumo-default"><option value="">All</option><option value="pending">Pending</option><option value="processing">Processing</option><option value="no_match">No match</option><option value="applied">Applied</option><option value="applied_with_skips">Applied with skips</option><option value="failed">Failed</option></select></label><Button variant="secondary" icon={<ArrowsClockwiseIcon size={16} className={runsQuery.isRefetching ? "animate-spin" : ""} />} onClick={() => void runsQuery.refetch()} className="min-h-11">Refresh</Button></div>{runsQuery.isLoading ? <StateMessage><Loader size="sm" /> Loading run history…</StateMessage> : runsQuery.isError && !runsQuery.data ? <ErrorState title="Run history could not be loaded" onRetry={() => void runsQuery.refetch()} /> : runs.length === 0 ? <StateMessage>No automation runs yet. New incoming messages will appear here.</StateMessage> : <><ol>{runs.map((run) => <li key={run.id} className="border-b border-kumo-line px-4 py-4 sm:px-6"><div className="flex items-start justify-between gap-4"><div className="min-w-0"><div className="flex items-center gap-2"><span className="font-medium text-kumo-default">{automationRunStateLabel(run.state)}</span>{run.failureCategory && <span className="text-xs text-kumo-danger">{readableAutomationCode(run.failureCategory)}</span>}</div>{run.message.state === "available" ? <Link to={run.message.href} className="mt-1 block truncate text-sm text-kumo-default hover:underline">{run.message.subject || "(No subject)"} · {run.message.sender}</Link> : <p className="mt-1 text-sm text-kumo-subtle">{run.message.label}</p>}<p className="mt-1 text-xs text-kumo-subtle">{run.matchedCount} matched · {run.appliedCount} applied · {run.attemptCount} {run.attemptCount === 1 ? "attempt" : "attempts"}</p></div><div className="flex shrink-0 flex-col items-end gap-2"><time className="text-xs text-kumo-subtle" dateTime={run.createdAt}>{relativeAutomationTime(run.completedAt ?? run.createdAt)}</time><Button variant="ghost" onClick={() => setSelectedRunId((current) => current === run.id ? null : run.id)} aria-expanded={selectedRunId === run.id} className="min-h-11">{selectedRunId === run.id ? "Hide details" : "View details"}</Button></div></div>{selectedRunId === run.id && (selectedRunQuery.isLoading ? <div className="mt-4 flex items-center gap-2 text-sm text-kumo-subtle"><Loader size="sm" /> Loading exact results…</div> : selectedRunQuery.isError ? <div className="mt-4"><ErrorState title="Run details could not be loaded" onRetry={() => void selectedRunQuery.refetch()} /></div> : selectedRunQuery.data ? <AutomationRunDetails run={selectedRunQuery.data.run} /> : null)}</li>)}</ol>{runsQuery.isFetchNextPageError && <div className="border-t border-kumo-line px-4 py-4 text-center" role="alert"><p className="text-sm text-kumo-danger">Older runs could not be loaded. Your loaded history is still available.</p><Button variant="secondary" onClick={() => void runsQuery.fetchNextPage({ cancelRefetch: false })} disabled={runsQuery.isFetchingNextPage} className="mt-3 min-h-11">Retry older runs</Button></div>}{runsQuery.isRefetchError && !runsQuery.isFetchNextPageError && <div className="border-t border-kumo-line px-4 py-3 text-center text-sm text-kumo-danger" role="alert">Latest run history could not refresh. Loaded results remain available.</div>}{runsQuery.hasNextPage && !runsQuery.isFetchNextPageError && <div className="flex justify-center border-t border-kumo-line px-4 py-4"><Button variant="secondary" onClick={() => void runsQuery.fetchNextPage({ cancelRefetch: false })} loading={runsQuery.isFetchingNextPage} disabled={runsQuery.isFetchingNextPage} className="min-h-11">Load older runs</Button></div>}</>}</section>}</main>{editorOpen && <AutomationRuleEditor key={selectedRule?.id ?? "new"} mailboxId={mailboxId} orderRevision={rulesQuery.data?.orderRevision ?? 0} rule={selectedRule} labels={labels} folders={folders} onClose={closeEditor} onAccessRevoked={onAccessRevoked} />}</div>;
+	return <div className="flex h-full min-h-0 bg-kumo-base"><main className={`flex min-w-0 flex-1 flex-col ${editorOpen ? "hidden lg:flex" : "flex"}`}><fieldset disabled={editorPending} className="contents"><header className="border-b border-kumo-line px-4 py-4 sm:px-6"><div className="flex items-start justify-between gap-4"><div><div className="flex items-center gap-2"><LightningIcon size={22} weight="duotone" /><h1 className="text-lg font-semibold text-kumo-default">Automations</h1></div><p className="mt-1 max-w-2xl text-sm leading-6 text-kumo-subtle">Rules organize future incoming mail in this mailbox. They never send messages or contact external services.</p></div>{tab === "rules" && canManage && <Button icon={<PlusIcon size={16} />} onClick={() => setSearchParams(paramsWithAutomationRule(searchParams, null, true))} className="min-h-11 shrink-0">New rule</Button>}</div>{mailbox?.type === "SHARED" && <div className="mt-3 border-l-2 border-kumo-brand pl-3 text-xs leading-5 text-kumo-subtle">These rules are shared by everyone with access to this mailbox. Changes affect future incoming messages for the whole mailbox.{!canManage && <strong className="ml-1 text-kumo-default">You have read-only access.</strong>}</div>}<div className="mt-4 flex gap-1" role="tablist" aria-label="Automation views">{(["rules", "runs"] as const).map((value) => <button key={value} type="button" role="tab" aria-selected={tab === value} onClick={() => setSearchParams(paramsWithAutomationTab(searchParams, value))} className={`min-h-11 rounded-md px-4 text-sm font-medium ${tab === value ? "bg-kumo-fill text-kumo-default" : "text-kumo-subtle hover:bg-kumo-tint"}`}>{value === "rules" ? "Rules" : "Run history"}</button>)}</div>{actionError && <p className="mt-3 rounded-md bg-kumo-danger-tint px-3 py-2 text-sm text-kumo-danger" role="alert">{actionError}</p>}</header>
+		{tab === "rules" ? <section className="min-h-0 flex-1 overflow-y-auto" aria-label="Ordered rules">{rulesQuery.isLoading ? <StateMessage><Loader size="sm" /> Loading rules…</StateMessage> : rulesQuery.isError ? <ErrorState title="Rules could not be loaded" onRetry={() => void rulesQuery.refetch()} /> : orderedRules.length === 0 ? <StateMessage><div className="text-center"><LightningIcon className="mx-auto" size={28} /><p className="mt-2 font-medium text-kumo-default">No active rules yet</p><p className="mt-1">Create a draft to begin organizing future incoming mail.</p>{archivedCount > 0 && <p className="mt-1 text-xs">{archivedCount} archived {archivedCount === 1 ? "rule is" : "rules are"} retained in history.</p>}</div></StateMessage> : <ol>{orderedRules.map((rule, index) => { const definition = rule.draftDefinition ?? rule.activeDefinition; return <li key={rule.id} className="border-b border-kumo-line px-4 py-4 sm:px-6"><div className="flex items-start gap-3"><span className={`mt-2 size-2.5 shrink-0 rounded-full ${statusTone(rule.state)}`} aria-hidden="true" /><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><h2 className="font-medium text-kumo-default">{rule.name}</h2><span className="text-xs text-kumo-subtle">{automationRuleStateLabel(rule.state)}</span>{rule.targetHealth === "needs_attention" && <span className="inline-flex items-center gap-1 text-xs text-kumo-danger"><WarningCircleIcon size={14} /> Target needs attention</span>}</div>{definition && <p className="mt-1.5 text-sm leading-6 text-kumo-subtle">{describeAutomationDefinition(definition, { labels: labelNames, folders: { archive: "Archive", ...folderNames } })}</p>}<div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-kumo-subtle"><span>Active version {rule.activeVersion ?? "none"}</span><span>Draft version {rule.draftVersion ?? "none"}</span><span>{definition?.stopProcessing ? "Stops later rules" : "Continues to later rules"}</span><span>Last run {relativeAutomationTime(rule.lastRunAt)}</span><span>Last match {relativeAutomationTime(rule.lastMatchedAt)}</span><span>Updated {relativeAutomationTime(rule.updatedAt)}</span></div></div><div className="flex shrink-0 items-center gap-1">{canManage && <><Button variant="ghost" shape="square" icon={<ArrowUpIcon size={16} />} aria-label={`Move ${rule.name} earlier`} disabled={index === 0 || reorder.isPending} onClick={() => moveRule(index, -1)} className="min-h-11 min-w-11"/><Button variant="ghost" shape="square" icon={<ArrowDownIcon size={16} />} aria-label={`Move ${rule.name} later`} disabled={index === orderedRules.length - 1 || reorder.isPending} onClick={() => moveRule(index, 1)} className="min-h-11 min-w-11"/><Button variant="secondary" onClick={() => setSearchParams(paramsWithAutomationRule(searchParams, rule.id))} className="min-h-11">Edit</Button><Button variant="ghost" onClick={() => { setActionError(null); toggle.mutate({ ruleId: rule.id, expectedRevision: rule.revision, enabled: rule.state !== "enabled" }, { onError: reportActionError }); }} className="min-h-11">{rule.state === "enabled" ? "Disable" : "Enable"}</Button><Button variant="ghost" onClick={() => { if (window.confirm(`Archive “${rule.name}”?`)) { setActionError(null); archive.mutate({ ruleId: rule.id, expectedRevision: rule.revision }, { onError: reportActionError }); } }} className="min-h-11">Archive</Button></>}</div></div></li>; })}</ol>}</section> : <section className="min-h-0 flex-1 overflow-y-auto"><div className="flex items-center justify-between gap-3 border-b border-kumo-line px-4 py-3 sm:px-6"><label className="text-sm text-kumo-subtle">Status <select value={runState} onChange={(event) => { setRunState(event.target.value); setSelectedRunId(null); }} className="ml-2 min-h-11 rounded-md border border-kumo-line bg-kumo-base px-3 text-kumo-default"><option value="">All</option><option value="pending">Pending</option><option value="processing">Processing</option><option value="no_match">No match</option><option value="applied">Applied</option><option value="applied_with_skips">Applied with skips</option><option value="failed">Failed</option></select></label><Button variant="secondary" icon={<ArrowsClockwiseIcon size={16} className={runsQuery.isRefetching ? "animate-spin" : ""} />} onClick={() => void runsQuery.refetch()} className="min-h-11">Refresh</Button></div>{runsQuery.isLoading ? <StateMessage><Loader size="sm" /> Loading run history…</StateMessage> : runsQuery.isError && !runsQuery.data ? <ErrorState title="Run history could not be loaded" onRetry={() => void runsQuery.refetch()} /> : runs.length === 0 ? <StateMessage>No automation runs yet. New incoming messages will appear here.</StateMessage> : <><ol>{runs.map((run) => <li key={run.id} className="border-b border-kumo-line px-4 py-4 sm:px-6"><div className="flex items-start justify-between gap-4"><div className="min-w-0"><div className="flex items-center gap-2"><span className="font-medium text-kumo-default">{automationRunStateLabel(run.state)}</span>{run.failureCategory && <span className="text-xs text-kumo-danger">{readableAutomationCode(run.failureCategory)}</span>}</div>{run.message.state === "available" ? <Link to={run.message.href} className="mt-1 block truncate text-sm text-kumo-default hover:underline">{run.message.subject || "(No subject)"} · {run.message.sender}</Link> : <p className="mt-1 text-sm text-kumo-subtle">{run.message.label}</p>}<p className="mt-1 text-xs text-kumo-subtle">{run.matchedCount} matched · {run.appliedCount} applied · {run.attemptCount} {run.attemptCount === 1 ? "attempt" : "attempts"}</p></div><div className="flex shrink-0 flex-col items-end gap-2"><time className="text-xs text-kumo-subtle" dateTime={run.createdAt}>{relativeAutomationTime(run.completedAt ?? run.createdAt)}</time><Button variant="ghost" onClick={() => setSelectedRunId((current) => current === run.id ? null : run.id)} aria-expanded={selectedRunId === run.id} className="min-h-11">{selectedRunId === run.id ? "Hide details" : "View details"}</Button></div></div>{selectedRunId === run.id && (selectedRunQuery.isLoading ? <div className="mt-4 flex items-center gap-2 text-sm text-kumo-subtle"><Loader size="sm" /> Loading exact results…</div> : selectedRunQuery.isError ? <div className="mt-4"><ErrorState title="Run details could not be loaded" onRetry={() => void selectedRunQuery.refetch()} /></div> : selectedRunQuery.data ? <AutomationRunDetails run={selectedRunQuery.data.run} /> : null)}</li>)}</ol>{runsQuery.isFetchNextPageError && <div className="border-t border-kumo-line px-4 py-4 text-center" role="alert"><p className="text-sm text-kumo-danger">Older runs could not be loaded. Your loaded history is still available.</p><Button variant="secondary" onClick={() => void runsQuery.fetchNextPage({ cancelRefetch: false })} disabled={runsQuery.isFetchingNextPage} className="mt-3 min-h-11">Retry older runs</Button></div>}{runsQuery.isRefetchError && !runsQuery.isFetchNextPageError && <div className="border-t border-kumo-line px-4 py-3 text-center text-sm text-kumo-danger" role="alert">Latest run history could not refresh. Loaded results remain available.</div>}{runsQuery.hasNextPage && !runsQuery.isFetchNextPageError && <div className="flex justify-center border-t border-kumo-line px-4 py-4"><Button variant="secondary" onClick={() => void runsQuery.fetchNextPage({ cancelRefetch: false })} loading={runsQuery.isFetchingNextPage} disabled={runsQuery.isFetchingNextPage} className="min-h-11">Load older runs</Button></div>}</>}</section>}</fieldset></main>{editorOpen && <AutomationRuleEditor key={selectedRule?.id ?? "new"} mailboxId={mailboxId} orderRevision={rulesQuery.data?.orderRevision ?? 0} rule={selectedRule} labels={labels} folders={folders} onClose={closeEditor} onPendingChange={setEditorPending} onAccessRevoked={onAccessRevoked} />}</div>;
 }
 
 function StateMessage({ children }: { children: React.ReactNode }) { return <div className="grid min-h-64 place-items-center px-5 text-sm text-kumo-subtle" role="status"><div className="flex items-center gap-2">{children}</div></div>; }

@@ -8219,6 +8219,7 @@ export class MailboxDO extends DurableObject<Env> {
 	}
 
 	async dryRunAutomationRule(input: {
+		testId: string;
 		definition: unknown;
 		actorId: string;
 		ruleId: string;
@@ -8226,6 +8227,12 @@ export class MailboxDO extends DurableObject<Env> {
 		acknowledgedZero: boolean;
 	}) {
 		const automation = this.#automationRules();
+		// Non-storage awaits can interleave Durable Object events. Keep replay selection,
+		// current-draft validation, evaluation, and commit synchronous after preparation.
+		// https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/#understand-how-input-and-output-gates-work
+		const prepared = await automation.prepareDryRun(input.definition);
+		const replay = automation.replayPreparedDryRun(input, prepared);
+		if (replay) return this.#automationTestView(replay);
 		const currentRules = automation.listRules(false);
 		const requestedRule = currentRules.find((rule) => rule.id === input.ruleId);
 		if (!requestedRule) {
@@ -8272,8 +8279,9 @@ export class MailboxDO extends DurableObject<Env> {
 				rule.position < requestedRule.position,
 		).length;
 		return this.#automationTestView(
-			await automation.dryRun({
-			...input,
+			automation.dryRunPrepared({
+				...input,
+				prepared,
 				contexts: readAutomationDryRunContexts(
 					this.ctx.storage.sql,
 					Date.now(),
@@ -8409,7 +8417,7 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 	}
 
-	#automationTestView(test: AutomationDryRunRecord) {
+	#automationTestView<T extends AutomationDryRunRecord>(test: T) {
 		return {
 			...test,
 			result: {

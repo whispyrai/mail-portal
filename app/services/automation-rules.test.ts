@@ -4,6 +4,7 @@ import {
 	AutomationRulesApiError,
 	AutomationRulesResponseError,
 	createAutomationRule,
+	dryRunAutomationRule,
 	fetchAutomationRun,
 	fetchAutomationRules,
 	setAutomationRuleEnabled,
@@ -105,6 +106,46 @@ test("enable transport sends only the revision fence", async () => {
 		});
 	});
 	assert.deepEqual(sentBody, { expectedRevision: 7 });
+});
+
+test("dry-run transport sends one operation identity and accepts replay truth", async () => {
+	let sentBody: unknown;
+	const operationId = "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147";
+	const result = await dryRunAutomationRule("mailbox", {
+		definition,
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		acknowledgedZero: false,
+		operationId,
+	}, async (_input, init) => {
+		sentBody = JSON.parse(String(init?.body));
+		return response({
+			test: {
+				id: `test_operation_${"a".repeat(64)}`,
+				ruleId: "rule-1",
+				ruleVersion: 1,
+				definitionFingerprint: "b".repeat(64),
+				evaluatedCount: 1,
+				matchedCount: 1,
+				acknowledgedZero: false,
+				actionCounts: { wouldChange: 1, alreadySatisfied: 0, conflicts: 0 },
+				samples: [],
+				actorId: "actor-1",
+				createdAt: "2026-07-12T10:00:00.000Z",
+				expiresAt: "2026-08-11T10:00:00.000Z",
+			},
+			replayed: true,
+			canManage: true,
+		});
+	});
+	assert.deepEqual(sentBody, {
+		definition,
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		acknowledgedZero: false,
+		operationId,
+	});
+	assert.equal(result.replayed, true);
 });
 
 test("run detail transport accepts the server's available-message contract", async () => {

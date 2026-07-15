@@ -254,9 +254,10 @@ export function useDryRunAutomationRule(mailboxId: string, onAccessRevoked?: Acc
 	return useMutation({
 		mutationFn: (input: {
 			definition: AutomationRuleDefinition;
-			ruleId?: string;
-			ruleVersion?: number;
+			ruleId: string;
+			ruleVersion: number;
 			acknowledgedZero: boolean;
+			operationId: string;
 		}) => withAccessBoundary(
 			mailboxId,
 			() => dryRunAutomationRule(mailboxId, input),

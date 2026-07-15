@@ -174,6 +174,7 @@ const TestsResponseSchema = z.object({
 
 const TestResponseSchema = z.object({
 	test: AutomationRuleTestSchema,
+	replayed: z.boolean(),
 	canManage: z.literal(true),
 }).strict();
 
@@ -373,16 +374,19 @@ export function dryRunAutomationRule(
 	mailboxId: string,
 	input: {
 		definition: AutomationRuleDefinition;
-		ruleId?: string;
-		ruleVersion?: number;
+		ruleId: string;
+		ruleVersion: number;
 		acknowledgedZero: boolean;
+		operationId: string;
 	},
+	fetcher?: FetchLike,
 ) {
 	return requestJson({
 		mailboxId,
 		path: "automation-rules/dry-run",
 		method: "POST",
 		body: input,
+		fetcher,
 		parse: (value) => TestResponseSchema.parse(value),
 	});
 }

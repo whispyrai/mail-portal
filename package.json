@@ -36,6 +36,8 @@
 		"test:playwright:folder-create": "node scripts/verify-folder-create-playwright.mjs",
 		"pretest:playwright:create-replay": "npm run test:playwright:install",
 		"test:playwright:create-replay": "node scripts/verify-folder-create-playwright.mjs",
+		"pretest:playwright:automation-dry-run": "npm run test:playwright:install",
+		"test:playwright:automation-dry-run": "node scripts/verify-folder-create-playwright.mjs",
 		"pretest:playwright:attachment-retry": "npm run test:playwright:install",
 		"test:playwright:attachment-retry": "node scripts/verify-attachment-retry-playwright.mjs",
 		"test:playwright:install": "playwright install chromium",

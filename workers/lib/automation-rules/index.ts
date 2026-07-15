@@ -189,6 +189,7 @@ export type AutomationRuleErrorCode =
 	| "INVALID"
 	| "NOT_FOUND"
 	| "CONFLICT"
+	| "DRY_RUN_IDEMPOTENCY_CONFLICT"
 	| "RULE_TARGET_IN_USE"
 	| "ACTIVATION_TEST_REQUIRED";
 
@@ -1008,7 +1009,13 @@ export function createAutomationRulesModule(input: {
 	}
 
 	function getTest(testId: string): AutomationDryRunRecord {
-		const row = first<AutomationTestRow>(storage.sql,
+		const row = automationTestRow(testId);
+		if (!row) throw new AutomationRuleError("NOT_FOUND", "Automation Rule test was not found");
+		return automationTestFromRow(row);
+	}
+
+	function automationTestRow(testId: string): AutomationTestRow | null {
+		return first<AutomationTestRow>(storage.sql,
 			`SELECT id, actor_id AS actorId, rule_id AS ruleId, rule_version AS ruleVersion,
 			        definition_fingerprint AS definitionFingerprint,
 			        evaluated_count AS evaluatedCount, matched_count AS matchedCount,
@@ -1017,8 +1024,6 @@ export function createAutomationRulesModule(input: {
 			 FROM automation_rule_tests WHERE id = ?`,
 			testId,
 		);
-		if (!row) throw new AutomationRuleError("NOT_FOUND", "Automation Rule test was not found");
-		return automationTestFromRow(row);
 	}
 
 	async function createDraft(command: {
@@ -1127,17 +1132,17 @@ export function createAutomationRulesModule(input: {
 		});
 	}
 
-	function latestPassingTest(ruleId: string, fingerprint: string, cutoff: string) {
+	function latestPassingTest(ruleId: string, fingerprint: string, timestamp: string) {
 		return first<{ evaluatedCount: number; matchedCount: number; acknowledgedZero: number }>(
 			storage.sql,
 			`SELECT evaluated_count AS evaluatedCount, matched_count AS matchedCount,
 			        acknowledged_zero AS acknowledgedZero
 			 FROM automation_rule_tests
-			 WHERE rule_id = ? AND definition_fingerprint = ? AND created_at >= ?
+			 WHERE rule_id = ? AND definition_fingerprint = ? AND expires_at > ?
 			 ORDER BY created_at DESC, id DESC LIMIT 1`,
 			ruleId,
 			fingerprint,
-			cutoff,
+			timestamp,
 		);
 	}
 
@@ -1166,7 +1171,7 @@ export function createAutomationRulesModule(input: {
 			const test = latestPassingTest(
 				current.id,
 				version.definitionFingerprint,
-				canonicalIso(timestampMs - AUTOMATION_RUNTIME_LIMITS.testRetentionMs),
+				timestamp,
 			);
 			if (
 				!test ||
@@ -1662,7 +1667,82 @@ export function createAutomationRulesModule(input: {
 		});
 	}
 
-	async function dryRun(command: {
+	type DryRunIdentity = {
+		testId: string;
+		definition: unknown;
+		actorId: string;
+		ruleId?: string;
+		ruleVersion?: number;
+		acknowledgedZero: boolean;
+	};
+	type PreparedDryRun = {
+		definition: AutomationRuleDefinition;
+		fingerprint: string;
+	};
+
+	async function prepareDryRun(definitionInput: unknown): Promise<PreparedDryRun> {
+		const definition = parseAutomationRuleDefinition(definitionInput);
+		return {
+			definition,
+			fingerprint: await fingerprintAutomationRuleDefinition(definition),
+		};
+	}
+
+	function assertDryRunIdentity(
+		row: AutomationTestRow,
+		command: Pick<
+			DryRunIdentity,
+			"actorId" | "ruleId" | "ruleVersion" | "acknowledgedZero"
+		>,
+		definitionFingerprint: string,
+	): AutomationDryRunRecord {
+		if (
+			row.actorId !== command.actorId ||
+			row.ruleId !== (command.ruleId ?? null) ||
+			row.ruleVersion !== (command.ruleVersion ?? null) ||
+			row.definitionFingerprint !== definitionFingerprint ||
+			(row.acknowledgedZero === 1) !== command.acknowledgedZero
+		) {
+			throw new AutomationRuleError(
+				"DRY_RUN_IDEMPOTENCY_CONFLICT",
+				"This Automation test retry no longer matches the original test",
+			);
+		}
+		return automationTestFromRow(row);
+	}
+
+	function deleteExactExpiredDryRun(testId: string, timestampMs: number): void {
+		storage.sql.exec(
+			"DELETE FROM automation_rule_tests WHERE id = ? AND expires_at <= ?",
+			testId,
+			canonicalIso(timestampMs),
+		);
+	}
+
+	function replayPreparedDryRun(
+		command: DryRunIdentity,
+		prepared: PreparedDryRun,
+	): (AutomationDryRunRecord & { replayed: true }) | null {
+		return storage.transactionSync(() => {
+			deleteExactExpiredDryRun(command.testId, now());
+			const row = automationTestRow(command.testId);
+			return row
+				? {
+					...assertDryRunIdentity(row, command, prepared.fingerprint),
+					replayed: true as const,
+				}
+				: null;
+		});
+	}
+
+	async function replayDryRun(
+		command: DryRunIdentity,
+	): Promise<(AutomationDryRunRecord & { replayed: true }) | null> {
+		return replayPreparedDryRun(command, await prepareDryRun(command.definition));
+	}
+
+	type DryRunCommand = {
+		testId?: string;
 		definition: unknown;
 		contexts: AutomationPlanningContext[];
 		orderedRules: AutomationRuleVersionSnapshot[];
@@ -1671,9 +1751,20 @@ export function createAutomationRulesModule(input: {
 		ruleId?: string;
 		ruleVersion?: number;
 		acknowledgedZero: boolean;
-	}): Promise<AutomationDryRunRecord> {
-		const definition = parseAutomationRuleDefinition(command.definition);
-		const fingerprint = await fingerprintAutomationRuleDefinition(definition);
+	};
+
+	function dryRunPrepared(
+		command: DryRunCommand & { prepared: PreparedDryRun },
+	): AutomationDryRunRecord & { replayed: boolean } {
+		const { prepared } = command;
+		const { definition, fingerprint } = prepared;
+		if (command.testId) {
+			const replay = replayPreparedDryRun(
+				{ ...command, testId: command.testId },
+				prepared,
+			);
+			if (replay) return replay;
+		}
 		const timestampMs = now();
 		const cutoff = timestampMs - AUTOMATION_RUNTIME_LIMITS.testRetentionMs;
 		if (
@@ -1741,7 +1832,7 @@ export function createAutomationRulesModule(input: {
 		const createdAt = canonicalIso(timestampMs);
 		const expiresAt = canonicalIso(timestampMs + AUTOMATION_RUNTIME_LIMITS.testRetentionMs);
 		const record: AutomationDryRunRecord = {
-			id: createId("test"),
+			id: command.testId ?? createId("test"),
 			actorId: command.actorId,
 			ruleId: command.ruleId ?? null,
 			ruleVersion: command.ruleVersion ?? null,
@@ -1753,7 +1844,17 @@ export function createAutomationRulesModule(input: {
 			createdAt,
 			expiresAt,
 		};
-		storage.transactionSync(() => {
+		return storage.transactionSync(() => {
+			if (command.testId) {
+				deleteExactExpiredDryRun(command.testId, timestampMs);
+				const existing = automationTestRow(command.testId);
+				if (existing) {
+					return {
+						...assertDryRunIdentity(existing, command, fingerprint),
+						replayed: true,
+					};
+				}
+			}
 			storage.sql.exec(
 				`INSERT INTO automation_rule_tests
 				 (id, actor_id, rule_id, rule_version, definition_json, definition_fingerprint,
@@ -1773,8 +1874,17 @@ export function createAutomationRulesModule(input: {
 				record.expiresAt,
 			);
 			pruneHistory(timestampMs);
+			return { ...record, replayed: false };
 		});
-		return record;
+	}
+
+	async function dryRun(
+		command: DryRunCommand,
+	): Promise<AutomationDryRunRecord & { replayed: boolean }> {
+		return dryRunPrepared({
+			...command,
+			prepared: await prepareDryRun(command.definition),
+		});
 	}
 
 	function pruneHistory(timestampMs = now()): void {
@@ -1857,6 +1967,10 @@ export function createAutomationRulesModule(input: {
 		planRun: planAutomationRun,
 		finalizeClaim,
 		failClaim,
+		prepareDryRun,
+		replayPreparedDryRun,
+		replayDryRun,
+		dryRunPrepared,
 		dryRun,
 		pruneHistory,
 		rulesUsingTarget,

@@ -223,6 +223,179 @@ test("dry run uses the exact combined live planner and stores no-op/conflict tru
 	database.close();
 });
 
+test("an exact Automation dry-run operation replays one immutable stored result", async () => {
+	const database = migratedDatabase();
+	const module = createAutomationRulesModule({
+		storage: databaseStorage(database),
+		now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+	});
+	const command = {
+		testId: `test_operation_${"a".repeat(64)}`,
+		definition: definition("Replay"),
+		contexts: [planningContext()],
+		orderedRules: [],
+		proposedOrdinal: 0,
+		actorId: "user-1",
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		acknowledgedZero: false,
+	};
+	const fresh = await module.dryRun(command);
+	const replay = await module.dryRun({
+		...command,
+		contexts: [planningContext({
+			snapshot: snapshot({ messageId: "later-message", subject: "Later state" }),
+		})],
+	});
+	assert.equal(fresh.replayed, false);
+	assert.equal(replay.replayed, true);
+	assert.equal(replay.id, fresh.id);
+	assert.deepEqual(replay.result, fresh.result);
+	assert.equal(
+		database.prepare("SELECT COUNT(*) AS count FROM automation_rule_tests WHERE id = ?")
+			.get(command.testId)?.count,
+		1,
+	);
+	database.close();
+});
+
+test("one Automation dry-run identity rejects changed intent", async () => {
+	const database = migratedDatabase();
+	const module = createAutomationRulesModule({
+		storage: databaseStorage(database),
+		now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+	});
+	const command = {
+		testId: `test_operation_${"b".repeat(64)}`,
+		definition: definition("Conflict"),
+		contexts: [],
+		orderedRules: [],
+		proposedOrdinal: 0,
+		actorId: "user-1",
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		acknowledgedZero: false,
+	};
+	await module.dryRun(command);
+	for (const changed of [
+		{ ...command, acknowledgedZero: true },
+		{ ...command, actorId: "user-2" },
+		{ ...command, ruleId: "rule-2" },
+		{ ...command, ruleVersion: 2 },
+		{ ...command, definition: definition("Changed") },
+	]) {
+		await assert.rejects(
+			module.dryRun(changed),
+			(error: unknown) =>
+				error instanceof AutomationRuleError &&
+				error.code === "DRY_RUN_IDEMPOTENCY_CONFLICT",
+		);
+	}
+	database.close();
+});
+
+test("concurrent exact Automation dry-run operations select one stored winner", async () => {
+	const database = migratedDatabase();
+	const module = createAutomationRulesModule({
+		storage: databaseStorage(database),
+		now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+	});
+	const command = {
+		testId: `test_operation_${"c".repeat(64)}`,
+		definition: definition("Concurrent"),
+		orderedRules: [],
+		proposedOrdinal: 0,
+		actorId: "user-1",
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		acknowledgedZero: false,
+	};
+	const evaluationReads = [0, 0];
+	const countedContext = (index: number) => {
+		const context = planningContext();
+		return {
+			...context,
+			get snapshot() {
+				evaluationReads[index] = (evaluationReads[index] ?? 0) + 1;
+				return context.snapshot;
+			},
+		};
+	};
+	const results = await Promise.all([
+		module.dryRun({ ...command, contexts: [countedContext(0)] }),
+		module.dryRun({ ...command, contexts: [countedContext(1)] }),
+	]);
+	assert.deepEqual(results.map((result) => result.replayed).sort(), [false, true]);
+	assert.equal(results[0]?.id, results[1]?.id);
+	assert.equal(
+		evaluationReads.filter((reads) => reads > 0).length,
+		1,
+		"the replay loser must not evaluate a second context set",
+	);
+	assert.equal(
+		database.prepare("SELECT COUNT(*) AS count FROM automation_rule_tests WHERE id = ?")
+			.get(command.testId)?.count,
+		1,
+	);
+	database.close();
+});
+
+test("expired or capacity-pruned Automation operations become fresh tests without extending retention", async () => {
+	const database = migratedDatabase();
+	let now = Date.parse("2026-07-12T12:00:00.000Z");
+	const module = createAutomationRulesModule({
+		storage: databaseStorage(database),
+		now: () => now,
+	});
+	const command = {
+		testId: `test_operation_${"d".repeat(64)}`,
+		definition: definition("Retained"),
+		contexts: [],
+		orderedRules: [],
+		proposedOrdinal: 0,
+		actorId: "user-1",
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		acknowledgedZero: true,
+	};
+	await module.dryRun(command);
+	now += AUTOMATION_RUNTIME_LIMITS.testRetentionMs + 1;
+	assert.equal(await module.replayDryRun(command), null);
+	const afterExpiry = await module.dryRun(command);
+	assert.equal(afterExpiry.replayed, false);
+	assert.equal(afterExpiry.createdAt, new Date(now).toISOString());
+
+	for (let index = 0; index < 500; index += 1) {
+		const createdAt = new Date(now + index + 1).toISOString();
+		database.prepare(
+			`INSERT INTO automation_rule_tests
+			 (id, actor_id, rule_id, rule_version, definition_json, definition_fingerprint,
+			  evaluated_count, matched_count, acknowledged_zero, result_json, created_at, expires_at)
+			 VALUES (?, 'user-1', 'rule-other', 1, '{}', ?, 0, 0, 1, ?, ?, ?)`,
+		).run(
+			`test-cap-${String(index).padStart(3, "0")}`,
+			"f".repeat(64),
+			JSON.stringify({ wouldChange: 0, alreadySatisfied: 0, conflicts: 0, samples: [] }),
+			createdAt,
+			new Date(now + AUTOMATION_RUNTIME_LIMITS.testRetentionMs).toISOString(),
+		);
+	}
+	module.pruneHistory(now + 1_000);
+	assert.equal(
+		database.prepare("SELECT COUNT(*) AS count FROM automation_rule_tests WHERE id = ?")
+			.get(command.testId)?.count,
+		0,
+	);
+	now += 2_000;
+	const afterCapacity = await module.dryRun(command);
+	assert.equal(afterCapacity.replayed, false);
+	assert.equal(
+		database.prepare("SELECT COUNT(*) AS count FROM automation_rule_tests").get()?.count,
+		500,
+	);
+	database.close();
+});
+
 test("draft activation requires the matching stored test acknowledgement for zero results", async () => {
 	const database = migratedDatabase();
 	const storage = databaseStorage(database);
@@ -256,6 +429,46 @@ test("draft activation requires the matching stored test acknowledgement for zer
 		}),
 		(error: unknown) => error instanceof AutomationRuleError && error.code === "ACTIVATION_TEST_REQUIRED",
 	);
+	database.close();
+});
+
+test("a test at the exact retention boundary cannot activate or replay", async () => {
+	const database = migratedDatabase();
+	let now = Date.parse("2026-07-12T12:00:00.000Z");
+	const module = createAutomationRulesModule({
+		storage: databaseStorage(database),
+		now: () => now,
+	});
+	const ruleDefinition = definition("Boundary");
+	const draft = await module.createDraft({
+		definition: ruleDefinition,
+		actorId: "user-1",
+		expectedOrderRevision: 0,
+	});
+	const command = {
+		testId: `test_operation_${"e".repeat(64)}`,
+		definition: ruleDefinition,
+		contexts: [],
+		orderedRules: [],
+		proposedOrdinal: 0,
+		actorId: "user-1",
+		ruleId: draft.id,
+		ruleVersion: draft.draftVersion ?? 1,
+		acknowledgedZero: true,
+	};
+	await module.dryRun(command);
+	now += AUTOMATION_RUNTIME_LIMITS.testRetentionMs;
+	assert.throws(
+		() => module.enable({
+			ruleId: draft.id,
+			actorId: "user-1",
+			expectedRevision: draft.revision,
+		}),
+		(error: unknown) =>
+			error instanceof AutomationRuleError &&
+			error.code === "ACTIVATION_TEST_REQUIRED",
+	);
+	assert.equal(await module.replayDryRun(command), null);
 	database.close();
 });
 

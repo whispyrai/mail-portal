@@ -12,6 +12,7 @@ import {
 	type AutomationRunRecord,
 	type AutomationRunResultRecord,
 } from "../lib/automation-rules/index.ts";
+import { automationDryRunTestId } from "../lib/automation-dry-run-idempotency.ts";
 import { mailboxAccess } from "../lib/mailbox-access.ts";
 import {
 	hasLiveMailboxContentAccess,
@@ -65,6 +66,7 @@ const DryRunBody = z.object({
 	ruleId: identifier,
 	ruleVersion: positiveInteger,
 	acknowledgedZero: z.boolean(),
+	operationId: z.string().uuid(),
 }).strict();
 const RestoreBody = z.object({
 	version: positiveInteger,
@@ -222,7 +224,12 @@ function mapAutomationError(c: AppContext, error: unknown) {
 	const code = errorCode(error);
 	const message = error instanceof Error ? error.message : "Automations are unavailable";
 	if (code === "NOT_FOUND") return c.json({ error: message, code }, 404);
-	if (code === "CONFLICT" || code === "ACTIVATION_TEST_REQUIRED" || code === "RULE_TARGET_IN_USE") {
+	if (
+		code === "CONFLICT" ||
+		code === "DRY_RUN_IDEMPOTENCY_CONFLICT" ||
+		code === "ACTIVATION_TEST_REQUIRED" ||
+		code === "RULE_TARGET_IN_USE"
+	) {
 		return c.json({ error: message, code }, 409);
 	}
 	if (code === "INVALID") return c.json({ error: message, code }, 400);
@@ -460,12 +467,26 @@ export function createAutomationRuleRoutes(
 			const identity = await manageIdentity(c);
 			if (isResponse(identity)) return identity;
 			const body = await parseBody(c.req.raw, DryRunBody);
+			const testId = await automationDryRunTestId({
+				mailboxId: identity.mailboxId,
+				actorId: identity.session.sub,
+				operationId: body.operationId,
+			});
+			const { operationId: _operationId, ...command } = body;
 			const test = await c.var.mailboxStub.dryRunAutomationRule({
-				...body,
+				...command,
+				testId,
 				actorId: identity.session.sub,
 			});
 			if (!(await canStillManage(c))) return c.json({ error: "Forbidden" }, 403);
-			return c.json({ test: publicTest(identity.mailboxId, test), canManage: true as const });
+			return c.json(
+				{
+					test: publicTest(identity.mailboxId, test),
+					replayed: test.replayed,
+					canManage: true as const,
+				},
+				test.replayed ? 200 : 201,
+			);
 		} catch (error) {
 			return automationError(c, error);
 		}

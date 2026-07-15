@@ -6,6 +6,7 @@ import {
 	createAutomationRuleRoutes,
 	type AutomationRouteDependencies,
 } from "./automation-rules.ts";
+import { automationDryRunTestId } from "../lib/automation-dry-run-idempotency.ts";
 
 const mailboxId = "team@wiserchat.ai";
 const base = `https://mail.test/api/v1/mailboxes/${encodeURIComponent(mailboxId)}`;
@@ -333,6 +334,65 @@ test("dry run requires one saved rule draft identity before Durable Object work"
 		assert.equal(response.status, 400);
 	}
 	assert.equal(calls, 0);
+});
+
+test("dry run derives one scoped test winner and distinguishes fresh creation from replay", async () => {
+	const operationId = "9a5e7bd2-52df-4f4d-b8a9-27a42c7e3147";
+	const expectedTestId = await automationDryRunTestId({
+		mailboxId,
+		actorId: "user-1",
+		operationId,
+	});
+	const record = {
+		id: expectedTestId,
+		actorId: "user-1",
+		ruleId: "rule-1",
+		ruleVersion: 1,
+		definitionFingerprint: "a".repeat(64),
+		evaluatedCount: 1,
+		matchedCount: 1,
+		acknowledgedZero: false,
+		result: {
+			wouldChange: 1,
+			alreadySatisfied: 0,
+			conflicts: 0,
+			samples: [],
+		},
+		createdAt: "2026-07-12T10:00:00.000Z",
+		expiresAt: "2026-08-11T10:00:00.000Z",
+	};
+	for (const replayed of [false, true]) {
+		let received: Record<string, unknown> | null = null;
+		const app = appWith({
+			async dryRunAutomationRule(input: Record<string, unknown>) {
+				received = input;
+				return { ...record, replayed };
+			},
+		}, access());
+		const response = await app.request(`${base}/automation-rules/dry-run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				definition,
+				ruleId: "rule-1",
+				ruleVersion: 1,
+				acknowledgedZero: false,
+				operationId,
+			}),
+		});
+		assert.equal(response.status, replayed ? 200 : 201);
+		assert.deepEqual(received, {
+			definition,
+			ruleId: "rule-1",
+			ruleVersion: 1,
+			acknowledgedZero: false,
+			testId: expectedTestId,
+			actorId: "user-1",
+		});
+		const payload = await response.json() as { replayed: boolean; test: { id: string } };
+		assert.equal(payload.replayed, replayed);
+		assert.equal(payload.test.id, expectedTestId);
+	}
 });
 
 test("serialized Durable Object error names retain stable conflict mapping", async () => {

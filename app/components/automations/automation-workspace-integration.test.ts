@@ -42,6 +42,25 @@ test("create uses order concurrency and zero-result acknowledgment is stored by 
 	assert.match(source, /ruleVersion: rule\.draftVersion/);
 });
 
+test("dry-run recovery preserves one operation through uncertainty and labels exact replay", () => {
+	assert.match(source, /new CreateOperationIdentity\(\)/);
+	assert.match(source, /automationDryRunIntent\(/);
+	assert.match(source, /invalidateIfIntentChanged\(intent\)/);
+	assert.match(source, /if \(!recovering\) \{[\s\S]{0,120}setTest\(null\)/);
+	assert.match(source, /operationId/);
+	assert.match(source, /dryRunIdentity\.current\.invalidate\(\)/);
+	assert.match(source, /Retry without changing the rule to recover it safely/);
+	assert.match(source, /caught\.status < 500/);
+	assert.match(source, /testError && <p[\s\S]{0,160}role="alert"/);
+	assert.match(source, /Recovered the completed test\. No duplicate history was added\./);
+	assert.match(source, /aria-label="Close rule editor"[\s\S]{0,180}disabled=\{pending\}/);
+	assert.match(source, /variant="secondary" onClick=\{onClose\} disabled=\{pending\}/);
+	assert.match(source, /<fieldset disabled=\{pending\}/);
+	assert.match(source, /<fieldset disabled=\{editorPending\} className="contents">/);
+	assert.match(source, /onPendingChange=\{setEditorPending\}/);
+	assert.match(source, /requestAnimationFrame\([\s\S]{0,180}\.focus\(\)/);
+});
+
 test("rule lifecycle history is visible and restore remains draft-only", () => {
 	assert.match(source, /useAutomationRuleVersions\(mailboxId, rule\?\.id \?\? null/);
 	assert.match(source, /useAutomationRuleTests\(mailboxId, rule\?\.id \?\? null/);
