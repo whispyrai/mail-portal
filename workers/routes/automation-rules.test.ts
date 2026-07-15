@@ -313,6 +313,28 @@ test("enable accepts only the revision fence and never a zero-result bypass", as
 	assert.equal(calls, 1);
 });
 
+test("dry run requires one saved rule draft identity before Durable Object work", async () => {
+	let calls = 0;
+	const app = appWith({
+		async dryRunAutomationRule() {
+			calls += 1;
+		},
+	}, access());
+	for (const body of [
+		{ definition, acknowledgedZero: false },
+		{ definition, ruleId: "rule-1", acknowledgedZero: false },
+		{ definition, ruleVersion: 1, acknowledgedZero: false },
+	]) {
+		const response = await app.request(`${base}/automation-rules/dry-run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		assert.equal(response.status, 400);
+	}
+	assert.equal(calls, 0);
+});
+
 test("serialized Durable Object error names retain stable conflict mapping", async () => {
 	const app = appWith({
 		async createAutomationRuleDraft() {

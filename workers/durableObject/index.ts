@@ -8221,16 +8221,14 @@ export class MailboxDO extends DurableObject<Env> {
 	async dryRunAutomationRule(input: {
 		definition: unknown;
 		actorId: string;
-		ruleId?: string;
-		ruleVersion?: number;
+		ruleId: string;
+		ruleVersion: number;
 		acknowledgedZero: boolean;
 	}) {
 		const automation = this.#automationRules();
 		const currentRules = automation.listRules(false);
-		const requestedRule = input.ruleId
-			? currentRules.find((rule) => rule.id === input.ruleId)
-			: null;
-		if (input.ruleId && !requestedRule) {
+		const requestedRule = currentRules.find((rule) => rule.id === input.ruleId);
+		if (!requestedRule) {
 			throw new AutomationRuleError(
 				"NOT_FOUND",
 				"Automation Rule was not found",
@@ -8268,13 +8266,11 @@ export class MailboxDO extends DurableObject<Env> {
 				definitionFingerprint: version.definitionFingerprint,
 			};
 		});
-		const proposedOrdinal = requestedRule
-			? enabled.filter(
-					(rule) =>
-						rule.id !== requestedRule.id &&
-						rule.position < requestedRule.position,
-				).length
-			: orderedRules.length;
+		const proposedOrdinal = enabled.filter(
+			(rule) =>
+				rule.id !== requestedRule.id &&
+				rule.position < requestedRule.position,
+		).length;
 		return this.#automationTestView(
 			await automation.dryRun({
 			...input,

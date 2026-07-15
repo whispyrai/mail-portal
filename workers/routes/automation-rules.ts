@@ -62,17 +62,10 @@ const ReorderBody = z.object({
 }).strict();
 const DryRunBody = z.object({
 	definition: AutomationRuleDefinitionSchema,
-	ruleId: identifier.optional(),
-	ruleVersion: positiveInteger.optional(),
+	ruleId: identifier,
+	ruleVersion: positiveInteger,
 	acknowledgedZero: z.boolean(),
-}).strict().superRefine((value, context) => {
-	if ((value.ruleId === undefined) !== (value.ruleVersion === undefined)) {
-		context.addIssue({
-			code: "custom",
-			message: "Rule identity and version must be supplied together",
-		});
-	}
-});
+}).strict();
 const RestoreBody = z.object({
 	version: positiveInteger,
 	expectedRevision: positiveInteger,
