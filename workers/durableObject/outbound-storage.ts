@@ -171,14 +171,6 @@ export function isCanonicalUtcTimestamp(value: unknown): value is string {
 	);
 }
 
-function optionalEnum<T extends string>(
-	value: string | null,
-	allowed: ReadonlySet<T>,
-	field: string,
-): T | undefined {
-	return value === null ? undefined : requiredEnum(value, allowed, field);
-}
-
 function sourceDraftFromStorage(
 	draftId: string | null,
 	draftVersion: number | null,
