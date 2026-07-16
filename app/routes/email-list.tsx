@@ -57,6 +57,7 @@ import {
 	selectAllVisible,
 	toggleVisibleSelection,
 } from "~/lib/batch-selection";
+import { resolveEmailListReadState } from "~/lib/email-list-read-state";
 import {
 	outboxFolderView,
 	shouldLoadOutboundState,
@@ -336,6 +337,67 @@ function FolderEmptyState({
 	);
 }
 
+function EmailListLoadError({
+	isRetrying,
+	onRetry,
+}: {
+	isRetrying: boolean;
+	onRetry: () => void;
+}) {
+	return (
+		<div
+			className="flex min-h-64 flex-col items-center justify-center px-6 py-12 text-center"
+			role="alert"
+		>
+			<h3 className="text-base font-semibold text-kumo-default">
+				Conversations could not be loaded
+			</h3>
+			<p className="mt-1.5 max-w-sm text-sm leading-6 text-kumo-subtle">
+				Your mail may still be available. Try again to load this folder.
+			</p>
+			<Button
+				className="mt-4 min-h-11 min-w-11"
+				variant="secondary"
+				icon={<ArrowsClockwiseIcon size={16} />}
+				onClick={onRetry}
+				loading={isRetrying}
+				disabled={isRetrying}
+			>
+				Try again
+			</Button>
+		</div>
+	);
+}
+
+function EmailListRefreshError({
+	isRetrying,
+	onRetry,
+}: {
+	isRetrying: boolean;
+	onRetry: () => void;
+}) {
+	return (
+		<div
+			className="flex flex-col gap-3 border-b border-kumo-line bg-kumo-danger-tint px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between"
+			role="alert"
+		>
+			<p className="leading-6 text-kumo-danger">
+				This folder could not refresh. The last loaded view is still shown.
+			</p>
+			<Button
+				className="min-h-11 min-w-11 shrink-0"
+				variant="secondary"
+				icon={<ArrowsClockwiseIcon size={16} />}
+				onClick={onRetry}
+				loading={isRetrying}
+				disabled={isRetrying}
+			>
+				Retry refresh
+			</Button>
+		</div>
+	);
+}
+
 function deliveryLabel(delivery: OutboundDelivery) {
 	if (delivery.status === "queued" && delivery.scheduledFor) return "Scheduled";
 	return {
@@ -461,11 +523,20 @@ export default function EmailListRoute() {
 		[folder, labelId, page],
 	);
 
-	const { data: emailData, isFetching: isRefreshing } = useEmails(
+	const {
+		data: emailData,
+		isError: isEmailListError,
+		isFetching: isRefreshing,
+		refetch: refetchEmails,
+	} = useEmails(
 		mailboxId,
 		params,
 		{ refetchInterval: 30_000 },
 	);
+	const emailListReadState = resolveEmailListReadState({
+		hasResolvedData: emailData !== undefined,
+		isError: isEmailListError,
+	});
 
 	const rawEmails = emailData?.emails ?? [];
 	const { data: outboundDeliveries = [] } = useOutboundDeliveries(
@@ -1170,8 +1241,19 @@ export default function EmailListRoute() {
 
 			{/* Email rows */}
 			<div className="flex-1 overflow-y-auto">
-				{isRefreshing && emails.length === 0 ? (
+				{emailListReadState.showRefreshError && (
+					<EmailListRefreshError
+						isRetrying={isRefreshing}
+						onRetry={() => void refetchEmails()}
+					/>
+				)}
+				{emailListReadState.content === "loading" ? (
 					<EmailListSkeleton />
+				) : emailListReadState.content === "initial-error" ? (
+					<EmailListLoadError
+						isRetrying={isRefreshing}
+						onRetry={() => void refetchEmails()}
+					/>
 				) : emails.length > 0 ? (
 					<div role="list" aria-label={`${folderName} conversations`}>
 						{emails.map((email) => {

@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { resolveEmailListRefetchInterval } from "~/lib/email-list-read-state";
 import api from "~/services/api";
 import type { Email, AttachmentRef, OutboundDelivery } from "~/types";
 import type { BatchTriageCommand } from "../../shared/batch-triage";
@@ -45,7 +46,11 @@ export function useEmails(
 			return { emails: arr, totalCount: arr.length };
 		},
 		enabled: !!mailboxId && (options?.enabled ?? true),
-		refetchInterval: options?.refetchInterval,
+		refetchInterval: (query) =>
+			resolveEmailListRefetchInterval({
+				isError: query.state.status === "error",
+				interval: options?.refetchInterval,
+			}),
 	});
 }
 
