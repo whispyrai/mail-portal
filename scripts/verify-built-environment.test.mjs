@@ -14,6 +14,7 @@ const identities = {
 		databaseName: "sales_portal_users",
 		databaseId: "f322fd13-dc49-4390-888c-ff862ca05882",
 		bucket: "sales-mail-portal",
+		previewBucket: "sales-mail-portal-preview",
 		rawBucket: "sales-mail-raw-archive",
 		rawPreviewBucket: "sales-mail-raw-archive-preview",
 		queue: "sales-mail-inbound",
@@ -29,6 +30,7 @@ const identities = {
 		databaseName: "wiser_mail_portal_users",
 		databaseId: "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
 		bucket: "wiser-mail-portal",
+		previewBucket: "wiser-mail-portal-preview",
 		rawBucket: "wiser-mail-raw-archive",
 		rawPreviewBucket: "wiser-mail-raw-archive-preview",
 		queue: "wiser-mail-inbound",
@@ -77,7 +79,7 @@ function validArtifact(brand) {
 			{
 				binding: "BUCKET",
 				bucket_name: identity.bucket,
-				preview_bucket_name: identity.bucket,
+				preview_bucket_name: identity.previewBucket,
 			},
 			{
 				binding: "RAW_MAIL_BUCKET",
@@ -178,6 +180,17 @@ test("rejects a missing required secret", async () => {
 	await assert.rejects(fixture.invocation, /required secrets/);
 });
 
+test("rejects an attachment preview bucket that aliases production", async () => {
+	const fixture = await runFixture("wiser", (artifact) => {
+		artifact.r2_buckets[0].preview_bucket_name =
+			artifact.r2_buckets[0].bucket_name;
+	});
+	await assert.rejects(
+		fixture.invocation,
+		/attachment R2 preview bucket must be isolated from production/,
+	);
+});
+
 test("rejects a missing Queue edge", async () => {
 	const fixture = await runFixture("wiser", (artifact) => {
 		delete artifact.queues.consumers[1].dead_letter_queue;
@@ -214,7 +227,11 @@ test("rejects an extra singleton platform binding", async () => {
 });
 
 test("rejects cross-brand and forbidden test-domain leakage", async () => {
-	for (const leakedIdentifier of ["sales-mail-inbound", "test.wiserchat.ai"]) {
+	for (const leakedIdentifier of [
+		"sales-mail-inbound",
+		"sales-mail-portal-preview",
+		"test.wiserchat.ai",
+	]) {
 		const fixture = await runFixture("wiser", (artifact) => {
 			artifact.metadata = leakedIdentifier;
 		});

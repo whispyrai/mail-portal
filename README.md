@@ -90,6 +90,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
 
    ```bash
    npx wrangler r2 bucket create sales-mail-portal --env whispyr
+   npx wrangler r2 bucket create sales-mail-portal-preview --env whispyr
    npx wrangler r2 bucket create sales-mail-raw-archive --env whispyr
    npx wrangler r2 bucket create sales-mail-raw-archive-preview --env whispyr
    npx wrangler queues create sales-mail-inbound --env whispyr --message-retention-period-secs 1209600
@@ -98,8 +99,9 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    ```
 
    `sales-mail-raw-archive` is the private authoritative copy of every accepted
-   raw inbound message. The separate preview bucket prevents remote development
-   from writing to the production archive. The Queue graph is exactly
+   raw inbound message. The separate `sales-mail-portal-preview` attachment and
+   `sales-mail-raw-archive-preview` raw-mail buckets prevent remote development
+   from writing to either production bucket. The Queue graph is exactly
    `sales-mail-inbound` â†’ `sales-mail-inbound-dlq` â†’
    `sales-mail-inbound-parking`, with the configured terminal parking consumer.
    All three Queues must use the locked 14-day retention.

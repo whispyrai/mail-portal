@@ -87,7 +87,7 @@
 				{
 					"binding": "BUCKET",
 					"bucket_name": "sales-mail-portal",
-					"preview_bucket_name": "sales-mail-portal"
+					"preview_bucket_name": "sales-mail-portal-preview"
 				},
 				{
 					"binding": "RAW_MAIL_BUCKET",
@@ -236,7 +236,7 @@
 				{
 					"binding": "BUCKET",
 					"bucket_name": "wiser-mail-portal",
-					"preview_bucket_name": "wiser-mail-portal"
+					"preview_bucket_name": "wiser-mail-portal-preview"
 				},
 				{
 					"binding": "RAW_MAIL_BUCKET",

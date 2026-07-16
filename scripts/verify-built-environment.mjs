@@ -30,6 +30,7 @@ const ENVIRONMENTS = {
 		databaseName: "sales_portal_users",
 		databaseId: "f322fd13-dc49-4390-888c-ff862ca05882",
 		attachmentBucket: "sales-mail-portal",
+		attachmentPreviewBucket: "sales-mail-portal-preview",
 		rawBucket: "sales-mail-raw-archive",
 		rawPreviewBucket: "sales-mail-raw-archive-preview",
 		inboundQueue: "sales-mail-inbound",
@@ -39,6 +40,7 @@ const ENVIRONMENTS = {
 		route: "mail.whispyrcrm.com",
 		forbidden: [
 			"wiser-mail-portal",
+			"wiser-mail-portal-preview",
 			"wiser_mail_portal_users",
 			"87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
 			"c934d803c2f8430d9088f4a5d9f29d55",
@@ -55,6 +57,7 @@ const ENVIRONMENTS = {
 		databaseName: "wiser_mail_portal_users",
 		databaseId: "87c3de98-d31b-4ec3-8e05-d26b4dc71d92",
 		attachmentBucket: "wiser-mail-portal",
+		attachmentPreviewBucket: "wiser-mail-portal-preview",
 		rawBucket: "wiser-mail-raw-archive",
 		rawPreviewBucket: "wiser-mail-raw-archive-preview",
 		inboundQueue: "wiser-mail-inbound",
@@ -64,6 +67,7 @@ const ENVIRONMENTS = {
 		route: "mail.wiserchat.ai",
 		forbidden: [
 			"sales-mail-portal",
+			"sales-mail-portal-preview",
 			"sales_portal_users",
 			"f322fd13-dc49-4390-888c-ff862ca05882",
 			"cd541026bdf949d9ac63b3b5fdff4969",
@@ -246,6 +250,16 @@ export async function verifyBuiltEnvironment({
 			],
 			"D1 bindings",
 		);
+		assert.notEqual(
+			config.r2_buckets?.[0]?.bucket_name,
+			config.r2_buckets?.[0]?.preview_bucket_name,
+			"attachment R2 preview bucket must be isolated from production",
+		);
+		assert.notEqual(
+			config.r2_buckets?.[1]?.bucket_name,
+			config.r2_buckets?.[1]?.preview_bucket_name,
+			"raw R2 preview bucket must be isolated from production",
+		);
 		await checkEqual(
 			logger,
 			config.r2_buckets,
@@ -253,7 +267,7 @@ export async function verifyBuiltEnvironment({
 				{
 					binding: "BUCKET",
 					bucket_name: expected.attachmentBucket,
-					preview_bucket_name: expected.attachmentBucket,
+					preview_bucket_name: expected.attachmentPreviewBucket,
 				},
 				{
 					binding: "RAW_MAIL_BUCKET",
@@ -262,11 +276,6 @@ export async function verifyBuiltEnvironment({
 				},
 			],
 			"R2 bindings",
-		);
-		assert.notEqual(
-			config.r2_buckets[1].bucket_name,
-			config.r2_buckets[1].preview_bucket_name,
-			"raw R2 preview bucket must be isolated from production",
 		);
 		await checkEqual(
 			logger,
