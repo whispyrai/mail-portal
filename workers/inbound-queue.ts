@@ -22,7 +22,8 @@ import {
   permanentMimeProjectionErrorCode,
   storeStreamingEmail,
 } from "./lib/streaming-email.ts";
-import { arrayBufferToHex, isSha256Hex } from "./lib/checksum.ts";
+import { isSha256Hex } from "./lib/checksum.ts";
+import { inboundRawArchiveMatchesPointer } from "./lib/inbound-raw-integrity.ts";
 import {
   mailTelemetryLogRef,
   mailTelemetryRef,
@@ -710,21 +711,7 @@ export async function processInboundMessage(
     status: "succeeded",
     target: "r2",
   });
-  if (
-    raw.key !== pointer.rawKey ||
-    raw.size !== pointer.rawSize ||
-    raw.etag !== pointer.etag ||
-    raw.version !== pointer.version ||
-    raw.customMetadata?.schemaVersion !== String(pointer.schemaVersion) ||
-    raw.customMetadata?.ingressId !== pointer.ingressId ||
-    raw.customMetadata?.mailboxId !== pointer.mailboxId ||
-    raw.customMetadata?.rawSize !== String(pointer.rawSize) ||
-    raw.customMetadata?.archivedAt !== pointer.archivedAt ||
-    (pointer.rawSha256 !== undefined &&
-      (raw.customMetadata?.rawSha256 !== pointer.rawSha256 ||
-        !raw.checksums?.sha256 ||
-        arrayBufferToHex(raw.checksums.sha256) !== pointer.rawSha256))
-  ) {
+  if (!inboundRawArchiveMatchesPointer(raw, pointer)) {
     const receiptStartedAt = runtime.now().getTime();
     await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "quarantined", runtime, {
       errorCode: "RAW_ARCHIVE_INTEGRITY_MISMATCH",

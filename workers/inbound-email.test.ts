@@ -102,6 +102,7 @@ test("inbound delivery forwards to the emergency destination only after verifyin
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
         EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        DB: mailboxDb(),
         BUCKET: {
           async head() {
             return {};
@@ -152,9 +153,66 @@ test("inbound delivery forwards to the emergency destination only after verifyin
     [
       { status: "started", target: "r2" },
       { found: true, status: "succeeded", target: "r2" },
+      { status: "started", target: "d1" },
+      { status: "succeeded", target: "d1" },
     ],
   );
 });
+
+for (const dbState of ["inactive", "unavailable"] as const) {
+  test(`unreadable messages never emergency-forward when the mailbox is ${dbState}`, async () => {
+    let forwarded = false;
+    let rejection: string | undefined;
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: "hello@wiserchat.ai",
+        raw: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error("simulated stream failure"));
+          },
+        }),
+        rawSize: 100,
+        async forward() {
+          forwarded = true;
+          return { messageId: "must-not-forward" };
+        },
+        setReject(reason: string) {
+          rejection = reason;
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        DB: mailboxDb(dbState),
+        BUCKET: {
+          async head() {
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: { async put() {} },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName() {
+            return "unused";
+          },
+          get() {
+            throw new Error("unused");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-15T10:00:00.000Z"),
+        randomUUID: () => `unreadable-${dbState}`,
+      },
+    );
+
+    assert.equal(forwarded, false);
+    assert.match(rejection ?? "", /mailbox unavailable/i);
+  });
+}
 
 test("inbound delivery rejects an unreadable message for an unverified recipient", async () => {
   let forwarded = false;
@@ -1744,6 +1802,64 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
   assert.match(rejection ?? "", /mailbox unavailable/i);
   assert.equal(rawWasRead, true);
   assert.equal(rawWasArchived, true);
+});
+
+test("inbound delivery never issues SMTP rejection until the rejected receipt is durable", async () => {
+  const mailboxAddress = "missing@wiserchat.ai";
+  const states: string[] = [];
+  let rejected = false;
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject() {
+        rejected = true;
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return null;
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (!key.startsWith("receipts/")) {
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          }
+          const state = JSON.parse(String(value)).state as string;
+          states.push(state);
+          return state === "archived"
+            ? r2Object(key, String(value).length, options, "archived-etag")
+            : null;
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("unprovisioned mail must not enqueue");
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-15T10:00:00.000Z"),
+      randomUUID: () => "rejection-receipt-race",
+    },
+  );
+
+  assert.deepEqual(states, ["archived", "rejected"]);
+  assert.equal(rejected, false);
 });
 
 test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", async () => {

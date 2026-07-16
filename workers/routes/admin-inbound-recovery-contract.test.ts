@@ -91,6 +91,109 @@ test("manual repair shares one attempt id and activates cleanup only after the p
   assert.ok(activate < repair);
 });
 
+for (const receiptBody of [
+  "{malformed-json",
+  JSON.stringify({ schemaVersion: 99, state: "archived" }),
+]) {
+  test("manual recovery uses the reconciler pointer when a malformed receipt has a matching pending anomaly", async () => {
+    const mailboxId = "hello@wiserchat.ai";
+    const ingressId = "mail-malformed-receipt";
+    const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+    const reads: string[] = [];
+    const pointer = {
+      schemaVersion: 1,
+      ingressId,
+      rawKey,
+      mailboxId,
+      rawSize: 3,
+      archivedAt: "2026-07-15T09:00:00.000Z",
+      etag: "raw-etag",
+      version: "raw-version",
+    };
+    const env = {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [mailboxId],
+      DB: {
+        prepare() {
+          return {
+            bind() {
+              return { async first() { return { id: mailboxId }; } };
+            },
+          };
+        },
+      },
+      BUCKET: { async head() { return {}; } },
+      RAW_MAIL_BUCKET: {
+        async get(key: string) {
+          reads.push(key);
+          if (key === `receipts/${ingressId}.json`) {
+            return { async text() { return receiptBody; } };
+          }
+          if (key === `system/inbound-recovery-pointers/${ingressId}.json`) {
+            return { async text() { return JSON.stringify(pointer); } };
+          }
+          if (
+            key ===
+            `system/reconciliation-anomalies/${encodeURIComponent(rawKey)}.json`
+          ) {
+            return {
+              async text() {
+                return JSON.stringify({
+                  detectedAt: "2026-07-15T09:30:00.000Z",
+                  errorCode: "ADMISSION_DECISION_MISSING",
+                  ingressId,
+                  mailboxId,
+                  rawKey,
+                  status: "pending_operator_review",
+                });
+              },
+            };
+          }
+          assert.fail(`unexpected R2 read: ${key}`);
+        },
+      },
+      MAILBOX: {
+        idFromName(value: string) { return value; },
+        get() {
+          return {
+            async getInboundDerivedContentManifest() { return null; },
+          };
+        },
+      },
+    } as unknown as Env;
+    const app = new Hono<{
+      Bindings: Env;
+      Variables: { session?: SessionClaims };
+    }>();
+    app.use("*", async (c, next) => {
+      c.set("session", {
+        sub: "admin-1",
+        email: "admin@wiserchat.ai",
+        role: "ADMIN",
+        mailbox: mailboxId,
+      });
+      await next();
+    });
+    app.route("/", adminInboundRecoveryApp);
+
+    const response = await app.request(
+      `http://mail.wiserchat.ai/recover-inbound/${encodeURIComponent(mailboxId)}?ingressId=${ingressId}`,
+      { method: "POST" },
+      env,
+    );
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: "Inbound derived-content manifest is invalid",
+    });
+    assert.deepEqual(reads, [
+      `receipts/${ingressId}.json`,
+      `system/inbound-recovery-pointers/${ingressId}.json`,
+      `system/reconciliation-anomalies/${encodeURIComponent(rawKey)}.json`,
+    ]);
+  });
+}
+
 test("manual recovery rejects a poisoned manifest before marker, raw, repair, or audit effects", async () => {
   const mailboxId = "hello@wiserchat.ai";
   const ingressId = "mail-123";

@@ -718,6 +718,113 @@ function resolvedIdentifierOriginSymbol(
   return symbol;
 }
 
+function identifierMayResolveToSymbol(
+  checker: ts.TypeChecker,
+  identifier: ts.Identifier,
+  expected: ts.Symbol,
+  seen = new Set<ts.Symbol>(),
+): boolean {
+  if (resolvedIdentifierOriginSymbol(checker, identifier) === expected) {
+    return true;
+  }
+  const symbol = checker.getSymbolAtLocation(identifier);
+  if (!symbol || seen.has(symbol)) return false;
+  const next = new Set(seen);
+  next.add(symbol);
+  const binding = symbol?.valueDeclaration;
+  if (
+    binding &&
+    ts.isVariableDeclaration(binding) &&
+    binding.initializer &&
+    expressionMayResolveToSymbol(checker, binding.initializer, expected, next)
+  ) {
+    return true;
+  }
+  if (!binding || !ts.isBindingElement(binding) || binding.dotDotDotToken) {
+    let assignedFromExpected = false;
+    const source = identifier.getSourceFile();
+    function containsSymbol(node: ts.Node, target: ts.Symbol): boolean {
+      let found = false;
+      function visit(candidate: ts.Node): void {
+        if (found) return;
+        if (
+          ts.isIdentifier(candidate) &&
+          checker.getSymbolAtLocation(candidate) === target
+        ) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(candidate, visit);
+      }
+      visit(node);
+      return found;
+    }
+    function containsExpectedOrigin(node: ts.Node): boolean {
+      let found = false;
+      function visit(candidate: ts.Node): void {
+        if (found) return;
+        if (
+          ts.isIdentifier(candidate) &&
+          identifierMayResolveToSymbol(checker, candidate, expected, next)
+        ) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(candidate, visit);
+      }
+      visit(node);
+      return found;
+    }
+    function visitAssignments(node: ts.Node): void {
+      if (assignedFromExpected || node.getStart(source) >= identifier.getStart(source)) {
+        return;
+      }
+      if (
+        ts.isBinaryExpression(node) &&
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        containsSymbol(node.left, symbol) &&
+        containsExpectedOrigin(node.right)
+      ) {
+        assignedFromExpected = true;
+        return;
+      }
+      if (
+        (ts.isForOfStatement(node) || ts.isForInStatement(node)) &&
+        containsSymbol(node.initializer, symbol) &&
+        containsExpectedOrigin(node.expression)
+      ) {
+        assignedFromExpected = true;
+        return;
+      }
+      ts.forEachChild(node, visitAssignments);
+    }
+    visitAssignments(source);
+    return assignedFromExpected;
+  }
+  let container: ts.Node = binding;
+  while (container.parent && !ts.isVariableDeclaration(container.parent)) {
+    container = container.parent;
+  }
+  const declaration = container.parent;
+  if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) {
+    return false;
+  }
+  let matched = false;
+  function visit(node: ts.Node): void {
+    if (matched) return;
+    if (
+      ts.isIdentifier(node) &&
+      resolvedIdentifierOriginSymbol(checker, node) === expected
+    ) {
+      matched = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(declaration.initializer);
+  return matched;
+}
+
 function resolvedObjectLiteral(
   checker: ts.TypeChecker,
   expression: ts.Expression,
@@ -740,6 +847,40 @@ function staticPropertyKey(expression: ts.Expression | undefined): string | null
   return expression && ts.isStringLiteralLike(expression) ? expression.text : null;
 }
 
+function resolvedStaticPropertyKey(
+  checker: ts.TypeChecker,
+  expression: ts.Expression | undefined,
+  seen = new Set<ts.Symbol>(),
+): string | null {
+  if (!expression) return null;
+  if (ts.isStringLiteralLike(expression) || ts.isNumericLiteral(expression)) {
+    return expression.text;
+  }
+  if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression(expression)
+  ) {
+    return resolvedStaticPropertyKey(checker, expression.expression, seen);
+  }
+  if (!ts.isIdentifier(expression)) return null;
+  const symbol = checker.getSymbolAtLocation(expression);
+  if (!symbol || seen.has(symbol)) return null;
+  const declaration = symbol.valueDeclaration;
+  if (
+    !declaration ||
+    !ts.isVariableDeclaration(declaration) ||
+    !declaration.initializer
+  ) {
+    return null;
+  }
+  const next = new Set(seen);
+  next.add(symbol);
+  return resolvedStaticPropertyKey(checker, declaration.initializer, next);
+}
+
 function directIdentityIdentifier(expression: ts.Expression): ts.Identifier | null {
   if (ts.isIdentifier(expression)) return expression;
   if (
@@ -752,6 +893,514 @@ function directIdentityIdentifier(expression: ts.Expression): ts.Identifier | nu
     return directIdentityIdentifier(expression.expression);
   }
   return null;
+}
+
+function resolvedStoredExpression(
+  checker: ts.TypeChecker,
+  expression: ts.Expression,
+  seen = new Set<ts.Symbol>(),
+): ts.Expression | null {
+  if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression(expression)
+  ) {
+    return resolvedStoredExpression(checker, expression.expression, seen);
+  }
+  if (ts.isIdentifier(expression)) {
+    const symbol = checker.getSymbolAtLocation(expression);
+    if (!symbol || seen.has(symbol)) return null;
+    const declaration = symbol.valueDeclaration;
+    if (
+      !declaration ||
+      !ts.isVariableDeclaration(declaration) ||
+      !declaration.initializer
+    ) {
+      return null;
+    }
+    const next = new Set(seen);
+    next.add(symbol);
+    return (
+      resolvedStoredExpression(checker, declaration.initializer, next) ??
+      declaration.initializer
+    );
+  }
+	if (
+		ts.isCallExpression(expression) &&
+		ts.isPropertyAccessExpression(expression.expression) &&
+		["filter", "reverse", "slice", "sort", "toReversed", "toSorted"].includes(
+			expression.expression.name.text,
+		)
+  ) {
+    return (
+      resolvedStoredExpression(checker, expression.expression.expression, seen) ??
+      expression.expression.expression
+    );
+  }
+  if (
+    !ts.isPropertyAccessExpression(expression) &&
+    !ts.isElementAccessExpression(expression)
+  ) {
+    return null;
+  }
+
+  const key = ts.isPropertyAccessExpression(expression)
+    ? expression.name.text
+    : resolvedStaticPropertyKey(checker, expression.argumentExpression, seen);
+  if (key === null) return null;
+  const container =
+    resolvedStoredExpression(checker, expression.expression, seen) ??
+    expression.expression;
+  return storedPropertyValue(checker, container, key, seen);
+}
+
+function storedPropertyValue(
+  checker: ts.TypeChecker,
+  container: ts.Expression,
+  key: string,
+  seen = new Set<ts.Symbol>(),
+): ts.Expression | null {
+	if (/^\d+$/.test(key)) {
+		const elements = arrayElementsFromExpression(checker, container, seen);
+		if (elements) return elements[Number(key)] ?? null;
+	}
+  const resolved = resolvedStoredExpression(checker, container, seen) ?? container;
+  if (ts.isObjectLiteralExpression(resolved)) {
+    const properties = [...resolved.properties].reverse();
+    for (const candidate of properties) {
+      if (
+        (ts.isPropertyAssignment(candidate) ||
+          ts.isShorthandPropertyAssignment(candidate)) &&
+        (ts.isIdentifier(candidate.name) ||
+          ts.isStringLiteralLike(candidate.name) ||
+          ts.isNumericLiteral(candidate.name)) &&
+        candidate.name.text === key
+      ) {
+        return ts.isPropertyAssignment(candidate)
+          ? candidate.initializer
+          : candidate.name;
+      }
+      if (ts.isSpreadAssignment(candidate)) {
+        const nested = storedPropertyValue(
+          checker,
+          candidate.expression,
+          key,
+          seen,
+        );
+        if (nested) return nested;
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+function arrayElementsFromExpression(
+	checker: ts.TypeChecker,
+	expression: ts.Expression,
+	seen = new Set<ts.Symbol>(),
+): ts.Expression[] | null {
+	if (
+		ts.isCallExpression(expression) &&
+		ts.isPropertyAccessExpression(expression.expression) &&
+		["filter", "reverse", "slice", "sort", "toReversed", "toSorted"].includes(
+			expression.expression.name.text,
+		)
+	) {
+		return arrayElementsFromExpression(
+			checker,
+			expression.expression.expression,
+			seen,
+		);
+	}
+	let resolved = resolvedStoredExpression(checker, expression, seen) ?? expression;
+	while (
+		ts.isParenthesizedExpression(resolved) ||
+		ts.isAsExpression(resolved) ||
+		ts.isTypeAssertionExpression(resolved) ||
+		ts.isNonNullExpression(resolved) ||
+		ts.isSatisfiesExpression(resolved)
+	) {
+		resolved = resolved.expression;
+	}
+	if (ts.isIdentifier(resolved)) {
+		const symbol = checker.getSymbolAtLocation(resolved);
+		const binding = symbol?.valueDeclaration;
+		if (
+			binding &&
+			ts.isBindingElement(binding) &&
+			binding.dotDotDotToken &&
+			ts.isArrayBindingPattern(binding.parent)
+		) {
+			const declaration = binding.parent.parent;
+			if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+				const source = arrayElementsFromExpression(
+					checker,
+					declaration.initializer,
+					seen,
+				);
+				if (!source) return null;
+				const index = binding.parent.elements.indexOf(binding);
+				return source.slice(index);
+			}
+		}
+	}
+	if (!ts.isArrayLiteralExpression(resolved)) return null;
+	const elements: ts.Expression[] = [];
+	for (const element of resolved.elements) {
+		if (ts.isOmittedExpression(element)) continue;
+		if (ts.isSpreadElement(element)) {
+			const spread = arrayElementsFromExpression(checker, element.expression, seen);
+			if (!spread) return null;
+			elements.push(...spread);
+		} else {
+			elements.push(element);
+		}
+	}
+	return elements;
+}
+
+function returnedExpressions(
+	checker: ts.TypeChecker,
+	expression: ts.Node,
+	seen = new Set<ts.Symbol>(),
+): ts.Expression[] {
+  let candidate: ts.Node = expression;
+  while (ts.isParenthesizedExpression(candidate)) candidate = candidate.expression;
+  if (ts.isIdentifier(candidate)) {
+	const symbol = checker.getSymbolAtLocation(candidate);
+	if (!symbol || seen.has(symbol)) return [];
+	const next = new Set(seen);
+	next.add(symbol);
+	const declaration = symbol.valueDeclaration;
+	if (
+		declaration &&
+		ts.isVariableDeclaration(declaration) &&
+		declaration.initializer
+	) {
+		return returnedExpressions(checker, declaration.initializer, next);
+	}
+	if (declaration && ts.isFunctionDeclaration(declaration) && declaration.body) {
+		candidate = declaration;
+	}
+  }
+  if (
+	!ts.isArrowFunction(candidate) &&
+	!ts.isFunctionExpression(candidate) &&
+	!ts.isFunctionDeclaration(candidate)
+  ) {
+    return [];
+  }
+  if (!ts.isBlock(candidate.body)) return [candidate.body];
+  const returned: ts.Expression[] = [];
+  function visit(node: ts.Node): void {
+    if (ts.isFunctionLike(node) && node !== candidate) return;
+    if (ts.isReturnStatement(node) && node.expression) {
+      returned.push(node.expression);
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(candidate.body);
+  return returned;
+}
+
+function expressionMayResolveToSymbol(
+  checker: ts.TypeChecker,
+  expression: ts.Expression,
+  expected: ts.Symbol,
+  seen = new Set<ts.Symbol>(),
+): boolean {
+  const direct = directIdentityIdentifier(expression);
+  if (direct) {
+    return identifierMayResolveToSymbol(checker, direct, expected, seen);
+  }
+  const stored = resolvedStoredExpression(checker, expression, seen);
+  if (
+    stored &&
+    stored !== expression &&
+    expressionMayResolveToSymbol(checker, stored, expected, seen)
+  ) {
+    return true;
+  }
+  if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression(expression)
+  ) {
+    return expressionMayResolveToSymbol(
+      checker,
+      expression.expression,
+      expected,
+      seen,
+    );
+  }
+  if (ts.isCallExpression(expression)) {
+    if (
+      expression.arguments.length === 0 &&
+      returnedExpressions(checker, expression.expression, seen).some((returned) =>
+        expressionMayResolveToSymbol(checker, returned, expected, seen),
+      )
+    ) {
+      return true;
+    }
+    if (
+      expression.arguments.some((argument) =>
+        expressionMayResolveToSymbol(checker, argument, expected, seen),
+      )
+    ) {
+      return true;
+    }
+    if (
+      ts.isPropertyAccessExpression(expression.expression) &&
+      ["at", "find", "pop", "shift"].includes(expression.expression.name.text)
+    ) {
+      const key =
+        expression.expression.name.text === "at"
+          ? resolvedStaticPropertyKey(checker, expression.arguments[0], seen)
+          : expression.expression.name.text === "shift"
+            ? "0"
+            : null;
+      if (key !== null) {
+        const value = storedPropertyValue(
+          checker,
+          expression.expression.expression,
+          key,
+          seen,
+        );
+        if (value && expressionMayResolveToSymbol(checker, value, expected, seen)) {
+          return true;
+        }
+      }
+      const receiver = resolvedStoredExpression(
+        checker,
+        expression.expression.expression,
+        seen,
+      );
+      if (
+        receiver &&
+        ts.isArrayLiteralExpression(receiver) &&
+        receiver.elements.some(
+          (element) =>
+            !ts.isOmittedExpression(element) &&
+            expressionMayResolveToSymbol(checker, element, expected, seen),
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (ts.isConditionalExpression(expression)) {
+    return (
+      expressionMayResolveToSymbol(checker, expression.whenTrue, expected, seen) ||
+      expressionMayResolveToSymbol(checker, expression.whenFalse, expected, seen)
+    );
+  }
+  if (
+    ts.isBinaryExpression(expression) &&
+    [
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.CommaToken,
+      ts.SyntaxKind.QuestionQuestionToken,
+    ].includes(expression.operatorToken.kind)
+  ) {
+    return (
+      expressionMayResolveToSymbol(checker, expression.left, expected, seen) ||
+      expressionMayResolveToSymbol(checker, expression.right, expected, seen)
+    );
+  }
+
+  let container: ts.Expression;
+  let key: string | null;
+  if (ts.isPropertyAccessExpression(expression)) {
+    container = expression.expression;
+    key = expression.name.text;
+  } else if (ts.isElementAccessExpression(expression)) {
+    container = expression.expression;
+    key = resolvedStaticPropertyKey(
+      checker,
+      expression.argumentExpression,
+      seen,
+    );
+  } else {
+    return false;
+  }
+  if (key === null) return false;
+	const collectionElements = arrayElementsFromExpression(checker, container, seen);
+	if (
+		collectionElements?.some((element) =>
+			expressionMayResolveToSymbol(checker, element, expected, seen),
+		)
+	) {
+		return true;
+	}
+
+  if (storedWriteMayResolveToSymbol(checker, expression, expected, seen)) {
+    return true;
+  }
+
+  const object = resolvedObjectLiteral(checker, container, seen);
+  if (object) {
+    const property = object.properties.find((candidate) => {
+      if (
+        !ts.isPropertyAssignment(candidate) &&
+        !ts.isShorthandPropertyAssignment(candidate)
+      ) {
+        return false;
+      }
+      return (
+        (ts.isIdentifier(candidate.name) ||
+          ts.isStringLiteralLike(candidate.name) ||
+          ts.isNumericLiteral(candidate.name)) &&
+        candidate.name.text === key
+      );
+    });
+    if (property) {
+      const value = ts.isPropertyAssignment(property)
+        ? property.initializer
+        : property.name;
+      return expressionMayResolveToSymbol(checker, value, expected, seen);
+    }
+  }
+
+  if (ts.isIdentifier(container)) {
+    const symbol = checker.getSymbolAtLocation(container);
+    if (symbol && !seen.has(symbol)) {
+      const declaration = symbol.valueDeclaration;
+      if (
+        declaration &&
+        ts.isVariableDeclaration(declaration) &&
+        declaration.initializer
+      ) {
+        const initializer = declaration.initializer;
+        if (ts.isArrayLiteralExpression(initializer) && /^\d+$/.test(key)) {
+          const element = initializer.elements[Number(key)];
+          if (element && !ts.isOmittedExpression(element)) {
+            const next = new Set(seen);
+            next.add(symbol);
+            return expressionMayResolveToSymbol(
+              checker,
+              element,
+              expected,
+              next,
+            );
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function storedWriteMayResolveToSymbol(
+  checker: ts.TypeChecker,
+  expression: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  expected: ts.Symbol,
+  seen: Set<ts.Symbol>,
+): boolean {
+  const source = expression.getSourceFile();
+  const root = propertyRootIdentifier(expression);
+  const rootSymbol = root
+    ? resolvedIdentifierOriginSymbol(checker, root) ?? checker.getSymbolAtLocation(root)
+    : undefined;
+  const key = ts.isPropertyAccessExpression(expression)
+    ? expression.name.text
+    : resolvedStaticPropertyKey(checker, expression.argumentExpression, seen);
+  if (!rootSymbol || key === null) return false;
+  let matched = false;
+  function visit(node: ts.Node): void {
+    if (matched || node.getStart(source) >= expression.getStart(source)) return;
+    if (
+      ts.isBinaryExpression(node) &&
+      assignmentOperators.has(node.operatorToken.kind) &&
+      (ts.isPropertyAccessExpression(node.left) ||
+        ts.isElementAccessExpression(node.left))
+    ) {
+      const candidateRoot = propertyRootIdentifier(node.left);
+      const candidateRootSymbol = candidateRoot
+        ? resolvedIdentifierOriginSymbol(checker, candidateRoot) ??
+          checker.getSymbolAtLocation(candidateRoot)
+        : undefined;
+      const candidateKey = ts.isPropertyAccessExpression(node.left)
+        ? node.left.name.text
+        : resolvedStaticPropertyKey(
+            checker,
+            node.left.argumentExpression,
+            seen,
+          );
+      if (
+        candidateRootSymbol === rootSymbol &&
+        candidateKey === key &&
+        expressionMayResolveToSymbol(checker, node.right, expected, seen)
+      ) {
+        matched = true;
+        return;
+      }
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      assignmentOperators.has(node.operatorToken.kind) &&
+      ts.isIdentifier(node.left) &&
+      (resolvedIdentifierOriginSymbol(checker, node.left) ??
+        checker.getSymbolAtLocation(node.left)) === rootSymbol
+    ) {
+      const value = storedPropertyValue(checker, node.right, key, seen);
+      if (value && expressionMayResolveToSymbol(checker, value, expected, seen)) {
+        matched = true;
+        return;
+      }
+    }
+    if (ts.isCallExpression(node) && node.arguments.length >= 2) {
+      const mutator = propertyPath(node.expression);
+      const target = propertyRootIdentifier(node.arguments[0]);
+      const targetSymbol = target
+        ? resolvedIdentifierOriginSymbol(checker, target) ??
+          checker.getSymbolAtLocation(target)
+        : undefined;
+      if (targetSymbol === rootSymbol && mutator === "Object.assign") {
+        for (const patch of node.arguments.slice(1)) {
+          const value = storedPropertyValue(checker, patch, key, seen);
+          if (
+            value &&
+            expressionMayResolveToSymbol(checker, value, expected, seen)
+          ) {
+            matched = true;
+            return;
+          }
+        }
+      }
+      if (
+        targetSymbol === rootSymbol &&
+        ["Object.defineProperty", "Reflect.defineProperty"].includes(
+          mutator ?? "",
+        ) &&
+        resolvedStaticPropertyKey(checker, node.arguments[1], seen) === key
+      ) {
+        const value = storedPropertyValue(
+          checker,
+          node.arguments[2],
+          "value",
+          seen,
+        );
+        if (
+          value &&
+          expressionMayResolveToSymbol(checker, value, expected, seen)
+        ) {
+          matched = true;
+          return;
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  return matched;
 }
 
 function isInsideTerminatingNestedBlock(
@@ -796,7 +1445,7 @@ function propertyAssignedValuesBeforeCall(
     const root = propertyRootIdentifier(candidate);
     if (
       root === null ||
-      resolvedIdentifierOriginSymbol(checker, root) !== expectedSymbol
+      !identifierMayResolveToSymbol(checker, root, expectedSymbol)
     ) {
       return "none";
     }
@@ -854,7 +1503,7 @@ function propertyAssignedValuesBeforeCall(
       const patch = resolvedObjectLiteral(checker, node.arguments[1]);
       if (
         target &&
-        resolvedIdentifierOriginSymbol(checker, target) === expectedSymbol
+        identifierMayResolveToSymbol(checker, target, expectedSymbol)
       ) {
         const property = patch?.properties.find(
           (candidate): candidate is ts.PropertyAssignment =>
@@ -871,7 +1520,7 @@ function propertyAssignedValuesBeforeCall(
       const target = propertyRootIdentifier(node.arguments[0]);
       if (
         target &&
-        resolvedIdentifierOriginSymbol(checker, target) === expectedSymbol
+        identifierMayResolveToSymbol(checker, target, expectedSymbol)
       ) {
         const key = staticPropertyKey(node.arguments[1]);
         const expectedKey = expression.name.text;
@@ -917,11 +1566,7 @@ function propertyAssignedValuesBeforeCall(
         "Reflect.setPrototypeOf",
       ]);
       const unresolvedIdentityArgument = node.arguments.some((argument, index) => {
-        const identifier = directIdentityIdentifier(argument);
-        if (
-          !identifier ||
-          resolvedIdentifierOriginSymbol(checker, identifier) !== expectedSymbol
-        ) {
+        if (!expressionMayResolveToSymbol(checker, argument, expectedSymbol)) {
           return false;
         }
         if (mutator === "Object.assign" && index > 0) return false;
@@ -930,11 +1575,11 @@ function propertyAssignedValuesBeforeCall(
       const receiver =
         ts.isPropertyAccessExpression(node.expression) ||
         ts.isElementAccessExpression(node.expression)
-          ? directIdentityIdentifier(node.expression.expression)
+          ? node.expression.expression
           : null;
       const unresolvedReceiver =
         receiver !== null &&
-        resolvedIdentifierOriginSymbol(checker, receiver) === expectedSymbol &&
+        expressionMayResolveToSymbol(checker, receiver, expectedSymbol) &&
         !(
           ts.isPropertyAccessExpression(node.expression) &&
           new Set([
@@ -1087,9 +1732,15 @@ function isKnownNumericCall(
     return callReturnsNumber(source, expression);
   }
   const path = propertyPath(expression.expression);
+  if (path === "Date.now") {
+    const root = path.includes(".") ? path.slice(0, path.indexOf(".")) : path;
+    return (
+      nearestValueDeclaration(source, call, root) === null &&
+      callReturnsNumber(source, expression)
+    );
+  }
   if (
     path === "Number" ||
-    path === "Date.now" ||
     path === "Math.floor" ||
     path === "Math.max" ||
     path === "Math.min"
@@ -1097,7 +1748,10 @@ function isKnownNumericCall(
     const root = path.includes(".") ? path.slice(0, path.indexOf(".")) : path;
     return (
       nearestValueDeclaration(source, call, root) === null &&
-      callReturnsNumber(source, expression)
+      callReturnsNumber(source, expression) &&
+      expression.arguments.every((argument) =>
+        isSafeNumericExpression(source, call, argument, new Set()),
+      )
     );
   }
   if (
@@ -1146,6 +1800,12 @@ function isSafeNumericExpression(
   if (ts.isNumericLiteral(expression)) return true;
   if (ts.isParenthesizedExpression(expression)) {
     return isSafeNumericExpression(source, call, expression.expression, seen);
+  }
+  if (ts.isConditionalExpression(expression)) {
+    return (
+      isSafeNumericExpression(source, call, expression.whenTrue, seen) &&
+      isSafeNumericExpression(source, call, expression.whenFalse, seen)
+    );
   }
   if (ts.isPrefixUnaryExpression(expression)) {
     return (
@@ -2125,7 +2785,238 @@ test("the privacy guard rejects aliases, object values, and scope evasions", () 
       target.rawSize = rawId;
     }
     function example(event: { rawSize: number }, rawId: any) {
+      const { value: alias } = { value: event };
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const [alias] = [event];
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
       const alias = event as { rawSize: number };
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      let alias: typeof event;
+      alias = event;
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = { value: event };
+      poison(holder.value, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = { value: event };
+      poison(holder["value"], rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = { value: event };
+      const alias = holder.value;
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = [{ nested: event }];
+      poison(holder[0].nested, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any, condition: boolean) {
+      const alias = condition ? event : event;
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = { value: event };
+      const key = "value" as const;
+      poison(holder[key], rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder: { value?: typeof event } = {};
+      holder.value = event;
+      poison(holder.value!, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder: Array<typeof event> = [];
+      holder[0] = event;
+      poison(holder[0], rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = { ...{ value: event } };
+      poison(holder.value, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder: { value?: typeof event } = {};
+      const holderAlias = holder;
+      holderAlias.value = event;
+      poison(holder.value!, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      let holder: { value: typeof event | null } = { value: null };
+      holder = { value: event };
+      poison(holder.value!, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder: { value?: typeof event } = {};
+      const patch = { value: event };
+      Object.assign(holder, patch);
+      poison(holder.value!, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = [event];
+      const alias = holder.at(0)!;
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const alias = (() => event)();
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder: { value?: typeof event } = {};
+      holder.value ??= event;
+      poison(holder.value, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder: { value?: typeof event } = {};
+      Object.defineProperty(holder, "value", { value: event });
+      poison(holder.value!, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const readEvent = () => event;
+      const alias = readEvent();
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = [...[event]];
+      poison(holder[0], rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const alias = [event].slice()[0];
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, rawId: any) {
+      const holder = [event].filter(Boolean);
+      const alias = holder[0];
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, other: typeof event, rawId: any) {
+      const [, ...rest] = [other, event];
+      poison(rest[0], rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, other: typeof event, rawId: any) {
+      const alias = [other, event].filter((value) => value === event)[0];
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, other: typeof event, rawId: any) {
+      const alias = [other, event].slice(1)[0];
+      poison(alias, rawId);
+      console.error("[mail-ingress] failed", { rawSize: event.rawSize });
+    }`,
+    `function poison(target: { rawSize: number }, rawId: any) {
+      target.rawSize = rawId;
+    }
+    function example(event: { rawSize: number }, other: typeof event, rawId: any) {
+      const alias = [other, event].reverse()[0];
       poison(alias, rawId);
       console.error("[mail-ingress] failed", { rawSize: event.rawSize });
     }`,
@@ -2138,6 +3029,12 @@ test("the privacy guard rejects aliases, object values, and scope evasions", () 
     `function safeErrorCode(value: unknown): string { return String(value); }
     function example(rawId: string) {
       console.error("[mail-ingress] failed", { errorCode: safeErrorCode(rawId) });
+    }`,
+    `function example(rawId: string) {
+      console.error("[mail-ingress] failed", { rawSize: Number(rawId) });
+    }`,
+    `function example(rawId: string) {
+      console.error("[mail-ingress] failed", { rawSize: Math.floor(Number(rawId)) });
     }`,
   ];
   for (const [index, text] of candidates.entries()) {

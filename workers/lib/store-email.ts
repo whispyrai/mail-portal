@@ -276,15 +276,13 @@ export async function putVerifiedEmailObject(
 					input.expectedSize,
 				)
 			: await dependencies.bucket.put(input.key, input.value);
-		const expectedSize = Number(
-			typeof input.expectedSize === "function"
-				? input.expectedSize()
-				: input.expectedSize,
-		);
-		assertR2DerivedUploadSize(result, expectedSize);
-			console.log("[mail-store] derived object upload completed", {
-				byteLength: expectedSize,
-				durationMs: Date.now() - startedAt,
+			const expectedSize =
+				typeof input.expectedSize === "function"
+					? input.expectedSize()
+					: input.expectedSize;
+			assertR2DerivedUploadSize(result, expectedSize);
+				console.log("[mail-store] derived object upload completed", {
+					durationMs: Date.now() - startedAt,
 				messageRef,
 				objectRef,
 			objectType,

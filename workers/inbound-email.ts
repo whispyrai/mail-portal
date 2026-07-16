@@ -346,6 +346,38 @@ async function recordReceiptState(
   return null;
 }
 
+async function recordDurableRejection(
+  env: InboundEnvironment,
+  pointer: InboundArchivePointer,
+  archivedReceipt: R2Object,
+  errorCode: InboundSmtpRejectionErrorCode,
+  runtime: InboundRuntime,
+): Promise<boolean> {
+  const rejectedReceipt = await recordReceiptState(
+    env,
+    pointer,
+    "rejected",
+    runtime.now().toISOString(),
+    runtime,
+    archivedReceipt.etag,
+  );
+  if (rejectedReceipt) return true;
+
+  const [ingressRef, objectRef] = await Promise.all([
+    mailTelemetryLogRef("ingress", pointer.ingressId),
+    mailTelemetryLogRef("object", pointer.rawKey),
+  ]);
+  console.error("[mail-ingress] permanent rejection deferred", {
+    errorCode,
+    ingressRef,
+    objectRef,
+    operation: "smtp_rejection",
+    recoveryAction: "scheduled_reconciliation",
+    status: "preserved",
+  });
+  return false;
+}
+
 function envelopeMailboxId(
   event: InboundEmailEvent,
   env: InboundEnvironment,
@@ -720,10 +752,9 @@ export async function receiveEmail(
       status: "started",
       target: "r2",
     });
+    let mailboxExists: boolean;
     try {
-      const mailboxExists = Boolean(
-        await env.BUCKET.head(`mailboxes/${mailboxId}.json`),
-      );
+      mailboxExists = Boolean(await env.BUCKET.head(`mailboxes/${mailboxId}.json`));
       console.log("[mail-ingress] emergency forward admission completed", {
         durationMs: durationMs(runtime, admissionStartedAt),
         found: mailboxExists,
@@ -733,13 +764,6 @@ export async function receiveEmail(
         status: "succeeded",
         target: "r2",
       });
-      if (!mailboxExists) {
-        rejectMessage(event, {
-          errorCode: "MAILBOX_UNAVAILABLE",
-          smtpMessage: "Mailbox unavailable",
-        });
-        return;
-      }
     } catch {
       console.error(
         "[mail-ingress] unreadable message recipient could not be verified",
@@ -755,6 +779,57 @@ export async function receiveEmail(
       );
       rejectMessage(event, {
         errorCode: "MAILBOX_VERIFICATION_FAILED",
+        smtpMessage: "Mailbox unavailable",
+      });
+      return;
+    }
+    if (!mailboxExists) {
+      rejectMessage(event, {
+        errorCode: "MAILBOX_UNAVAILABLE",
+        smtpMessage: "Mailbox unavailable",
+      });
+      return;
+    }
+    console.log("[mail-ingress] emergency forward admission started", {
+      ingressRef,
+      objectRef,
+      operation: "emergency_forward_admission",
+      status: "started",
+      target: "d1",
+    });
+    let mailboxActive: boolean;
+    try {
+      mailboxActive = await isActiveMailbox(env, mailboxId);
+      console.log("[mail-ingress] emergency forward admission completed", {
+        durationMs: durationMs(runtime, admissionStartedAt),
+        ingressRef,
+        objectRef,
+        operation: "emergency_forward_admission",
+        status: "succeeded",
+        target: "d1",
+      });
+    } catch {
+      console.error(
+        "[mail-ingress] unreadable message recipient could not be verified",
+        {
+          durationMs: durationMs(runtime, admissionStartedAt),
+          errorCode: "MAILBOX_VERIFICATION_FAILED",
+          ingressRef,
+          objectRef,
+          operation: "emergency_forward_admission",
+          status: "failed",
+          target: "d1",
+        },
+      );
+      rejectMessage(event, {
+        errorCode: "MAILBOX_VERIFICATION_FAILED",
+        smtpMessage: "Mailbox unavailable",
+      });
+      return;
+    }
+    if (!mailboxActive) {
+      rejectMessage(event, {
+        errorCode: "MAILBOX_INACTIVE",
         smtpMessage: "Mailbox unavailable",
       });
       return;
@@ -881,14 +956,13 @@ export async function receiveEmail(
     return;
   }
   if (!mailboxId || !isAddressInConfiguredMailDomains(mailboxId, env.DOMAINS)) {
-    await recordReceiptState(
+    if (!(await recordDurableRejection(
       env,
       pointer,
-      "rejected",
-      runtime.now().toISOString(),
+      archivedReceipt,
+      "RECIPIENT_DOMAIN_INVALID",
       runtime,
-      archivedReceipt.etag,
-    );
+    ))) return;
     console.log("[mail-ingress] message rejected", {
       durationMs: durationMs(runtime, handlerStartedAt),
       errorCode: "RECIPIENT_DOMAIN_INVALID",
@@ -908,14 +982,13 @@ export async function receiveEmail(
     address.toLowerCase(),
   );
   if (allowedAddresses.length > 0 && !allowedAddresses.includes(mailboxId)) {
-    await recordReceiptState(
+    if (!(await recordDurableRejection(
       env,
       pointer,
-      "rejected",
-      runtime.now().toISOString(),
+      archivedReceipt,
+      "RECIPIENT_NOT_ALLOWED",
       runtime,
-      archivedReceipt.etag,
-    );
+    ))) return;
     console.log("[mail-ingress] message rejected", {
       durationMs: durationMs(runtime, handlerStartedAt),
       errorCode: "RECIPIENT_NOT_ALLOWED",
@@ -936,14 +1009,13 @@ export async function receiveEmail(
     rawBytes.byteLength > MAX_EMAIL_SIZE ||
     event.rawSize !== rawBytes.byteLength
   ) {
-    await recordReceiptState(
+    if (!(await recordDurableRejection(
       env,
       pointer,
-      "rejected",
-      runtime.now().toISOString(),
+      archivedReceipt,
+      "RAW_SIZE_INVALID",
       runtime,
-      archivedReceipt.etag,
-    );
+    ))) return;
     console.error("[mail-ingress] message rejected", {
       actualRawSize: rawBytes.byteLength,
       declaredRawSize: event.rawSize,
@@ -985,14 +1057,13 @@ export async function receiveEmail(
     return;
   }
   if (mailboxProvisioned === false) {
-    await recordReceiptState(
+    if (!(await recordDurableRejection(
       env,
       pointer,
-      "rejected",
-      runtime.now().toISOString(),
+      archivedReceipt,
+      "MAILBOX_UNAVAILABLE",
       runtime,
-      archivedReceipt.etag,
-    );
+    ))) return;
     console.log("[mail-ingress] message rejected", {
       durationMs: durationMs(runtime, handlerStartedAt),
       errorCode: "MAILBOX_UNAVAILABLE",
@@ -1034,14 +1105,13 @@ export async function receiveEmail(
     return;
   }
   if (!mailboxActive) {
-    await recordReceiptState(
+    if (!(await recordDurableRejection(
       env,
       pointer,
-      "rejected",
-      runtime.now().toISOString(),
+      archivedReceipt,
+      "MAILBOX_INACTIVE",
       runtime,
-      archivedReceipt.etag,
-    );
+    ))) return;
     rejectMessage(event, {
       errorCode: "MAILBOX_INACTIVE",
       smtpMessage: "Mailbox unavailable",

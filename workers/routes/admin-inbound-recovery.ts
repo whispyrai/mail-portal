@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { arrayBufferToHex } from "../lib/checksum.ts";
 import {
   inboundDerivedContentAnomalyKey,
   isInboundDerivedContentAnomaly,
@@ -20,7 +19,7 @@ import {
   DerivedEmailConsumerError,
   deriveStreamingEmail,
 } from "../lib/streaming-email.ts";
-import { MAX_EMAIL_SIZE } from "../lib/store-email.ts";
+import { inboundRawArchiveMatchesPointer } from "../lib/inbound-raw-integrity.ts";
 import { isInboundArchivePointer } from "../inbound-queue.ts";
 import type { InboundArchivePointer } from "../inbound-email.ts";
 import {
@@ -40,6 +39,10 @@ import {
 import type { SessionClaims } from "../lib/auth.ts";
 import type { Env } from "../types.ts";
 import { mailTelemetryLogRef } from "../lib/mail-telemetry.ts";
+import {
+  inboundReconciliationAnomalyKey,
+  isStoredPendingReconciliationAnomaly,
+} from "../lib/inbound-reconciliation-anomaly.ts";
 
 type AdminInboundRecoveryEnv = {
   Bindings: Env;
@@ -123,19 +126,50 @@ async function finishRepairAttempt(
 
 async function readPointer(env: Env, ingressId: string, mailboxId: string) {
   const receipt = await env.RAW_MAIL_BUCKET.get(`receipts/${ingressId}.json`);
-  const source =
-    receipt ??
-    (await env.RAW_MAIL_BUCKET.get(
-      `system/inbound-recovery-pointers/${ingressId}.json`,
-    ));
-  if (!source) return null;
+  if (receipt) {
+    try {
+      const value: unknown = JSON.parse(await receipt.text());
+      if (isInboundArchivePointer(value) && value.mailboxId === mailboxId) {
+        return value;
+      }
+    } catch {
+      // Reconciliation owns the only safe fallback for malformed receipts.
+    }
+  }
+
+  const recoveryPointer = await env.RAW_MAIL_BUCKET.get(
+    `system/inbound-recovery-pointers/${ingressId}.json`,
+  );
+  if (!recoveryPointer) {
+    if (receipt) throw new Error("INBOUND_RECOVERY_POINTER_INVALID");
+    return null;
+  }
   let value: unknown;
   try {
-    value = JSON.parse(await source.text());
+    value = JSON.parse(await recoveryPointer.text());
   } catch {
     throw new Error("INBOUND_RECOVERY_POINTER_MALFORMED");
   }
   if (!isInboundArchivePointer(value) || value.mailboxId !== mailboxId) {
+    throw new Error("INBOUND_RECOVERY_POINTER_INVALID");
+  }
+  const anomalyObject = await env.RAW_MAIL_BUCKET.get(
+    inboundReconciliationAnomalyKey(value.rawKey),
+  );
+  if (!anomalyObject) throw new Error("INBOUND_RECOVERY_POINTER_INVALID");
+  let anomaly: unknown;
+  try {
+    anomaly = JSON.parse(await anomalyObject.text());
+  } catch {
+    throw new Error("INBOUND_RECOVERY_POINTER_INVALID");
+  }
+  if (
+    !isStoredPendingReconciliationAnomaly(anomaly) ||
+    anomaly.errorCode !== "ADMISSION_DECISION_MISSING" ||
+    anomaly.ingressId !== value.ingressId ||
+    anomaly.mailboxId !== value.mailboxId ||
+    anomaly.rawKey !== value.rawKey
+  ) {
     throw new Error("INBOUND_RECOVERY_POINTER_INVALID");
   }
   return value;
@@ -143,18 +177,7 @@ async function readPointer(env: Env, ingressId: string, mailboxId: string) {
 
 async function readVerifiedRaw(env: Env, pointer: InboundArchivePointer) {
   const raw = await env.RAW_MAIL_BUCKET.get(pointer.rawKey);
-  if (
-    !raw ||
-    raw.key !== pointer.rawKey ||
-    raw.size !== pointer.rawSize ||
-    raw.size <= 0 ||
-    raw.size > MAX_EMAIL_SIZE ||
-    raw.etag !== pointer.etag ||
-    raw.version !== pointer.version ||
-    (pointer.rawSha256 !== undefined &&
-      (!raw.checksums.sha256 ||
-        arrayBufferToHex(raw.checksums.sha256) !== pointer.rawSha256))
-  ) {
+  if (!raw || !inboundRawArchiveMatchesPointer(raw, pointer)) {
     throw new Error("INBOUND_RAW_INTEGRITY_FAILED");
   }
   return raw;

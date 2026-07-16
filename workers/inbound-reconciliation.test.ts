@@ -705,6 +705,88 @@ for (const testCase of [
   });
 }
 
+test("reconciliation terminalizes an archived receipt whose declared size disagrees with durable raw bytes", async () => {
+  const ingressId = "reconcile-size-mismatch";
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  let rejected: Record<string, unknown> | undefined;
+  const env = {
+    DOMAINS: "wiserchat.ai",
+    EMAIL_ADDRESSES: [],
+    DB: {
+      prepare() {
+        assert.fail("size mismatch must reject before D1 admission");
+      },
+    },
+    BUCKET: {
+      async head() {
+        assert.fail("size mismatch must reject before mailbox admission");
+      },
+    },
+    RAW_MAIL_BUCKET: {
+      async list() {
+        return { objects: [{ key: rawKey }], truncated: false };
+      },
+      async head() {
+        return {
+          key: rawKey,
+          size: 123,
+          etag: "archive-etag",
+          version: "archive-version",
+          customMetadata: {
+            archivedAt: "2026-07-15T09:00:00.000Z",
+            declaredRawSize: "124",
+            ingressId,
+            mailboxId: "hello@wiserchat.ai",
+            rawSize: "123",
+            schemaVersion: "1",
+          },
+        };
+      },
+      async get(key: string) {
+        if (
+          key === "system/reconciliation-cursor.json" ||
+          key.startsWith("system/reconciliation-anomalies/")
+        ) return null;
+        return {
+          etag: "archived-etag",
+          async text() {
+            return JSON.stringify({
+              state: "archived",
+              updatedAt: "2026-07-15T09:00:00.000Z",
+            });
+          },
+        };
+      },
+      async put(key: string, value: string) {
+        if (key.startsWith("receipts/")) rejected = JSON.parse(value);
+        return {};
+      },
+      async delete() {},
+    },
+    INBOUND_QUEUE: {
+      async send() {
+        assert.fail("size-mismatched mail must not enqueue");
+      },
+    },
+    MAILBOX: {
+      idFromName() {
+        assert.fail("size mismatch must reject before Mailbox resolution");
+      },
+      get() {
+        assert.fail("size mismatch must reject before Mailbox resolution");
+      },
+    },
+  };
+
+  const result = await reconcileInboundArchives(env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.terminalized, 1);
+  assert.equal(rejected?.state, "rejected");
+  assert.equal(rejected?.errorCode, "RAW_SIZE_INVALID");
+});
+
 test("reconciliation heals stale terminal receipts from Mailbox truth", async () => {
   const ingressIds = [
     "pending-but-stored",

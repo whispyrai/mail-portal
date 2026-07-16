@@ -639,6 +639,8 @@ async function runPhase(
       fetch: (input, init) => runtime.dispatchFetch(input, init),
     };
     logger.detail(`phase_${concurrency}_main_worker_ready`);
+    const runtimeUrl = await runtime.ready;
+    logger.detail(`phase_${concurrency}_runtime_listening=${runtimeUrl.origin}`);
     const mailboxIds = Array.from(
       { length: concurrency },
       (_, index) => `exact-${concurrency}-${index + 1}@wiserchat.ai`,
@@ -756,14 +758,14 @@ async function runPhase(
       );
       logger.progress(`QUEUE ${queueName} 1/1`);
     }
-    assertNoRuntimeTermination([
-      ...miniflareLog.messages,
-      ...runtimeOutput.messages,
-    ]);
     logger.detail(`phase_${concurrency}_control=${JSON.stringify(control)}`);
   } finally {
     await disposeRuntime(runtimeState, runtime);
   }
+  assertNoRuntimeTermination([
+    ...miniflareLog.messages,
+    ...runtimeOutput.messages,
+  ]);
 }
 
 export async function verifyInboundExactSizeWorkerd({
@@ -804,7 +806,6 @@ export async function verifyInboundExactSizeWorkerd({
       },
       GLOBAL_TIMEOUT_MS,
     );
-    globalTimer.unref();
   });
 
   logger.progress("Exact-size inbound workerd canary starting");
@@ -812,6 +813,8 @@ export async function verifyInboundExactSizeWorkerd({
   logger.progress("Mode: local-only Miniflare/workerd, outbound fetch denied");
   logger.detail(`ignored_environment_keys=${JSON.stringify(Object.keys(process.env).filter((key) => !CHILD_ENV_ALLOWLIST.includes(key)).sort())}`);
 
+  let failure = null;
+  let result;
   try {
     validateLocalViteBindingConfig(readFileSync(resolve("vite.config.ts"), "utf8"));
     logger.progress("Phase 1/6: Vite remote bindings are disabled by default");
@@ -848,22 +851,35 @@ export async function verifyInboundExactSizeWorkerd({
       ]);
     }
     logger.progress("Phase 5/6: all raw, receipt, manifest, and derived bytes verified");
-    logger.progress("Phase 6/6: PASS, no local workerd memory-limit termination observed");
-    return { logFilePath: logger.logFilePath, phases: [...phases] };
+    result = { logFilePath: logger.logFilePath, phases: [...phases] };
   } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    logger.failure(`FAIL: ${failure.message}`);
-    logger.detail(`failure_detail=${failure.stack ?? failure.message}`);
-    throw error;
-  } finally {
+    failure = error instanceof Error ? error : new Error(String(error));
+  }
+  try {
+    await Promise.race([disposeRuntime(runtimeState), timeoutPromise]);
     if (globalTimer) clearTimeout(globalTimer);
     process.off("unhandledRejection", handleUnhandledRejection);
     process.off("uncaughtException", handleUncaughtException);
     process.off("SIGINT", handleSigint);
     process.off("SIGTERM", handleSigterm);
-    await disposeRuntime(runtimeState);
     rmSync(outputDirectory, { recursive: true, force: true });
+  } catch (cleanupError) {
+    const normalized = cleanupError instanceof Error
+      ? cleanupError
+      : new Error(String(cleanupError));
+    failure = failure
+      ? new AggregateError([failure, normalized], "Canary execution and cleanup failed")
+      : normalized;
   }
+  failure ??= fatalState.error;
+  if (failure) {
+    logger.failure(`FAIL: ${failure.message}`);
+    logger.detail(`failure_detail=${failure.stack ?? failure.message}`);
+    throw failure;
+  }
+  assert.ok(result, "canary result is available after successful cleanup");
+  logger.progress("Phase 6/6: PASS, no local workerd memory-limit termination observed");
+  return result;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

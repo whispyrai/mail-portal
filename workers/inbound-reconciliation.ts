@@ -28,11 +28,17 @@ import {
 import { mailTelemetryLogRef } from "./lib/mail-telemetry.ts";
 import { safeErrorCode } from "./lib/safe-error-code.ts";
 import { INBOUND_ARCHIVE_RECONCILIATION_BATCH_SIZE } from "./lib/inbound-reconciliation-budget.ts";
+import {
+  inboundReconciliationAnomalyKey,
+  isStoredPendingReconciliationAnomaly,
+  type PendingReconciliationAnomaly,
+  type StoredPendingReconciliationAnomaly,
+} from "./lib/inbound-reconciliation-anomaly.ts";
+import { MAX_EMAIL_SIZE } from "./lib/store-email.ts";
 
 const RAW_PREFIX = "raw/";
 const SWEEP_CURSOR_KEY = "system/reconciliation-cursor.json";
 const FAILURE_LEDGER_PREFIX = "system/reconciliation-failures/";
-const ANOMALY_LEDGER_PREFIX = "system/reconciliation-anomalies/";
 const LIST_PAGE_SIZE = INBOUND_ARCHIVE_RECONCILIATION_BATCH_SIZE;
 const STALE_HANDOFF_MS = 15 * 60 * 1000;
 const MAX_DERIVED_OBJECTS_PER_PROJECTION = 512;
@@ -120,34 +126,6 @@ type InboundTerminalFailure = {
   recordedAt: string;
 };
 
-type ReconciliationAnomalyErrorCode =
-  | "ADMISSION_DECISION_MISSING"
-  | "DLQ_TERMINAL_LEDGER_MISSING"
-  | "DLQ_TERMINAL_RECEIPT_ETAG_MISSING"
-  | "RAW_ARCHIVE_METADATA_INVALID"
-  | "RECEIPT_STATE_UNKNOWN"
-  | "STORED_PROJECTION_MISSING";
-
-type PendingReconciliationAnomaly =
-  | { errorCode: "RAW_ARCHIVE_METADATA_INVALID" }
-  | {
-      errorCode: Exclude<
-        ReconciliationAnomalyErrorCode,
-        "RAW_ARCHIVE_METADATA_INVALID"
-      >;
-      ingressId: string;
-      mailboxId: string;
-    };
-
-type StoredPendingReconciliationAnomaly = {
-  detectedAt: string;
-  errorCode: ReconciliationAnomalyErrorCode;
-  ingressId?: string;
-  mailboxId?: string;
-  rawKey: string;
-  status: "pending_operator_review";
-};
-
 type ReconciliationAnomalyResolution =
   | "admission_rejected"
   | "dead_letter_intent_terminalized"
@@ -159,7 +137,8 @@ type ReconciliationAnomalyResolution =
 type ArchivedAdmissionErrorCode =
   | "RECIPIENT_NOT_ALLOWED"
   | "MAILBOX_UNAVAILABLE"
-  | "MAILBOX_INACTIVE";
+  | "MAILBOX_INACTIVE"
+  | "RAW_SIZE_INVALID";
 
 type ReconciliationSubSweepStatus = "succeeded" | "degraded";
 type ReconciliationSweepStatus = "succeeded" | "partial" | "failed";
@@ -220,47 +199,6 @@ function failureLedgerKey(rawKey: string): string {
   return `${FAILURE_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`;
 }
 
-function anomalyLedgerKey(rawKey: string): string {
-  return `${ANOMALY_LEDGER_PREFIX}${encodeURIComponent(rawKey)}.json`;
-}
-
-function isStoredPendingReconciliationAnomaly(
-  value: unknown,
-): value is StoredPendingReconciliationAnomaly {
-  if (!isRecord(value)) return false;
-  const baseKeys = ["detectedAt", "errorCode", "rawKey", "status"];
-  const identifiedKeys = [...baseKeys, "ingressId", "mailboxId"];
-  const expectedKeys =
-    value.errorCode === "RAW_ARCHIVE_METADATA_INVALID"
-      ? baseKeys
-      : identifiedKeys;
-  const keys = Object.keys(value);
-  if (
-    keys.length !== expectedKeys.length ||
-    !keys.every((key) => expectedKeys.some((candidate) => candidate === key))
-  ) {
-    return false;
-  }
-  const errorCodes = new Set<unknown>([
-    "ADMISSION_DECISION_MISSING",
-    "DLQ_TERMINAL_LEDGER_MISSING",
-    "DLQ_TERMINAL_RECEIPT_ETAG_MISSING",
-    "RAW_ARCHIVE_METADATA_INVALID",
-    "RECEIPT_STATE_UNKNOWN",
-    "STORED_PROJECTION_MISSING",
-  ]);
-  return (
-    errorCodes.has(value.errorCode) &&
-    typeof value.rawKey === "string" &&
-    typeof value.detectedAt === "string" &&
-    Number.isFinite(Date.parse(value.detectedAt)) &&
-    value.status === "pending_operator_review" &&
-    (value.errorCode === "RAW_ARCHIVE_METADATA_INVALID" ||
-      (typeof value.ingressId === "string" &&
-        typeof value.mailboxId === "string"))
-  );
-}
-
 async function persistAnomaly(
   bucket: ReconciliationBucket,
   rawKey: string,
@@ -277,7 +215,7 @@ async function persistAnomaly(
     status: "pending_operator_review",
   };
   await bucket.put(
-    anomalyLedgerKey(rawKey),
+    inboundReconciliationAnomalyKey(rawKey),
     JSON.stringify(record),
     {
       customMetadata: {
@@ -295,7 +233,7 @@ async function resolveAnomaly(
   resolution: ReconciliationAnomalyResolution,
   runtime: ReconciliationRuntime,
 ): Promise<void> {
-  const key = anomalyLedgerKey(rawKey);
+  const key = inboundReconciliationAnomalyKey(rawKey);
   const object = await bucket.get(key);
   if (!object) return;
   const value: unknown = JSON.parse(await object.text());
@@ -384,6 +322,7 @@ function pointerFromArchive(
     !Number.isFinite(Date.parse(archivedAt)) ||
     !Number.isSafeInteger(parsedSize) ||
     parsedSize <= 0 ||
+    parsedSize > MAX_EMAIL_SIZE ||
     parsedSize !== archive.size ||
     (rawSha256 !== undefined && !isSha256Hex(rawSha256)) ||
     !archive.key.endsWith(`/${ingressId}.eml`) ||
@@ -442,9 +381,22 @@ function shouldEnqueue(receipt: Receipt | null, now: Date): boolean {
 async function archivedAdmission(
   env: ReconciliationEnvironment,
   pointer: InboundArchivePointer,
+  archive: ArchiveMetadata,
 ): Promise<
   { admitted: true } | { admitted: false; errorCode: ArchivedAdmissionErrorCode }
 > {
+  const declaredRawSize = archive.customMetadata?.declaredRawSize;
+  if (declaredRawSize !== undefined) {
+    const parsedDeclaredRawSize = Number(declaredRawSize);
+    if (
+      !Number.isSafeInteger(parsedDeclaredRawSize) ||
+      parsedDeclaredRawSize <= 0 ||
+      parsedDeclaredRawSize > MAX_EMAIL_SIZE ||
+      parsedDeclaredRawSize !== pointer.rawSize
+    ) {
+      return { admitted: false, errorCode: "RAW_SIZE_INVALID" };
+    }
+  }
   const mailboxId = normalizeMailAddress(pointer.mailboxId);
   const allowed = (env.EMAIL_ADDRESSES ?? []).map((address) => address.toLowerCase());
   if (
@@ -589,7 +541,7 @@ async function reconcileArchive(
   const objectRef = await mailTelemetryLogRef("object", rawKey);
   const archive = await env.RAW_MAIL_BUCKET.head(rawKey);
   const pointer = archive ? pointerFromArchive(archive) : null;
-  if (!pointer) {
+  if (!archive || !pointer) {
     await persistAnomaly(
       env.RAW_MAIL_BUCKET,
       rawKey,
@@ -680,7 +632,7 @@ async function reconcileArchive(
     return "pendingReview";
   }
   if (receipt.state === "archived" || receipt.state === "admitted") {
-    const admission = await archivedAdmission(env, pointer);
+    const admission = await archivedAdmission(env, pointer, archive);
     if (!admission.admitted) {
       const rejected = await env.RAW_MAIL_BUCKET.put(
         `receipts/${pointer.ingressId}.json`,
