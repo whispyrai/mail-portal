@@ -343,13 +343,14 @@ minutes. It never re-enqueues `dead_letter_pending`, `dead_lettered`, `deleted`,
 it checks authoritative Mailbox truth in this order: deletion tombstone,
 existing Message projection, then the independent terminal-failure ledger. A
 Mailbox terminal ledger reconstructs `dead_lettered`; a stale
-`dead_letter_pending` receipt without that ledger is conditionally terminalized
-without re-enqueueing, so Queue exhaustion cannot silently restart a retry
-budget. A genuinely missing `stored` projection reports
-`STORED_PROJECTION_MISSING`. Conditional receipt writes prevent reconciliation
-from overwriting a state concurrently advanced by another worker. An
-object-level failure is written to a durable failure ledger before the main
-cursor advances. If the ledger write also fails, the cursor stays on the page.
+`dead_letter_pending` receipt without that ledger remains pending, creates
+durable `pending_operator_review` anomaly evidence, and is not re-enqueued.
+Elapsed time alone never creates terminal truth. A genuinely missing `stored`
+projection reports `STORED_PROJECTION_MISSING`. Conditional receipt writes
+prevent reconciliation from overwriting a state concurrently advanced by
+another worker. An object-level failure is written to a durable failure ledger
+before the main cursor advances. If the ledger write also fails, the cursor
+stays on the page.
 
 Raw objects without a receipt are never auto-admitted. Reconciliation writes `system/reconciliation-anomalies/<encoded-raw-key>.json` and a server-derived `system/inbound-recovery-pointers/<ingressId>.json`. The recovery pointer contains the immutable R2 identity validated from raw-object metadata and lets an operator use the normal audited recovery command without supplying a raw key. Do not manufacture or edit recovery pointers manually.
 

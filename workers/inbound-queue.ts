@@ -1173,8 +1173,9 @@ export async function processInboundDeadLetterBatch(
         message.ack();
         continue;
       }
-      terminalLedgered =
-        disposition === "ledgered" || disposition === undefined;
+      // Cloudflare Queues batching/retries: ack() prevents redelivery even if
+      // the batch later fails. Only an explicit ledger commit may authorize it.
+      terminalLedgered = disposition === "ledgered";
     } catch {
       console.error("[mail-projection] terminal fallback ledger failed", {
         attempt: message.attempts,

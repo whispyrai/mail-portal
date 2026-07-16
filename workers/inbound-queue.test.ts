@@ -2286,7 +2286,7 @@ test("a late DLQ delivery cannot override an email that is already stored", asyn
   assert.equal(acknowledged, true);
 });
 
-test("DLQ consumption does not acknowledge a failed terminal receipt write", async () => {
+test("a delayed DLQ delivery does not acknowledge a stale pending receipt when terminal evidence cannot commit", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "dead-letter-write-race",
@@ -2297,8 +2297,13 @@ test("DLQ consumption does not acknowledge a failed terminal receipt write", asy
     etag: "archive-etag",
     version: "archive-version",
   };
+  const receipt = {
+    state: "dead_letter_pending",
+    updatedAt: "2026-07-13T09:00:00.000Z",
+  };
   let headCalls = 0;
   let acknowledged = false;
+  let attemptedReceipt: Record<string, unknown> | undefined;
   await assert.rejects(
     processInboundDeadLetterBatch(
       {
@@ -2324,10 +2329,11 @@ test("DLQ consumption does not acknowledge a failed terminal receipt write", asy
             headCalls += 1;
             return {
               etag: `pending-etag-${headCalls}`,
-              customMetadata: { state: "dead_letter_pending" },
+              customMetadata: { state: receipt.state },
             };
           },
-          async put() {
+          async put(_key: string, value: string) {
+            attemptedReceipt = JSON.parse(value);
             return null;
           },
         },
@@ -2344,10 +2350,16 @@ test("DLQ consumption does not acknowledge a failed terminal receipt write", asy
           },
         },
       },
+      { now: () => new Date("2026-07-13T10:00:00.000Z") },
     ),
     /either durable terminal ledger/,
   );
 
+  assert.deepEqual(receipt, {
+    state: "dead_letter_pending",
+    updatedAt: "2026-07-13T09:00:00.000Z",
+  });
+  assert.equal(attemptedReceipt?.state, "dead_lettered");
   assert.equal(acknowledged, false);
   assert.equal(headCalls, 3);
 });
@@ -2403,8 +2415,11 @@ test("DLQ consumption acknowledges an R2 outage after the Mailbox terminal ledge
         },
         get() {
           return {
-            async recordInboundTerminalFailure(input: Record<string, unknown>) {
+            async recordInboundTerminalFailure(
+              input: Record<string, unknown>,
+            ): Promise<"ledgered"> {
               terminalLedgerInput = input;
+              return "ledgered";
             },
           };
         },
@@ -2415,6 +2430,67 @@ test("DLQ consumption acknowledges an R2 outage after the Mailbox terminal ledge
   assert.equal(acknowledged, true);
   assert.equal(terminalLedgerInput?.id, pointer.ingressId);
   assert.equal(terminalLedgerInput?.errorCode, "QUEUE_RETRY_EXHAUSTED");
+});
+
+test("DLQ consumption rejects an undefined terminal-ledger disposition during an R2 outage", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "dead-letter-undefined-disposition",
+    rawKey: "raw/2026/07/13/dead-letter-undefined-disposition.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    archivedAt: "2026-07-13T09:30:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  let acknowledged = false;
+
+  await assert.rejects(
+    processInboundDeadLetterBatch(
+      {
+        messages: [
+          {
+            id: "dlq-undefined-disposition",
+            timestamp: new Date("2026-07-13T10:00:00.000Z"),
+            body: pointer,
+            attempts: 10,
+            ack() {
+              acknowledged = true;
+            },
+            retry() {},
+          },
+        ],
+      },
+      {
+        RAW_MAIL_BUCKET: {
+          async get() {
+            throw new Error("simulated receipt outage");
+          },
+          async head() {
+            throw new Error("simulated receipt outage");
+          },
+          async put() {
+            throw new Error("simulated receipt outage");
+          },
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            return {
+              async recordInboundTerminalFailure() {
+                return undefined;
+              },
+            };
+          },
+        },
+      },
+    ),
+    /simulated receipt outage/,
+  );
+
+  assert.equal(acknowledged, false);
 });
 
 test("a later retry cannot regress dead-letter-pending receipt state", async () => {

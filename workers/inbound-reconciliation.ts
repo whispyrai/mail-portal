@@ -128,7 +128,6 @@ type InboundTerminalFailure = {
 
 type ReconciliationAnomalyResolution =
   | "admission_rejected"
-  | "dead_letter_intent_terminalized"
   | "mailbox_projection_deleted"
   | "mailbox_projection_stored"
   | "terminal_failure_ledger_recovered"
@@ -887,61 +886,25 @@ async function reconcileArchive(
     receipt.state === "dead_letter_pending" &&
     isStale(receipt.updatedAt, now)
   ) {
-    if (!receipt.etag) {
-      await persistAnomaly(
-        env.RAW_MAIL_BUCKET,
-        pointer.rawKey,
-        {
-          errorCode: "DLQ_TERMINAL_RECEIPT_ETAG_MISSING",
-          ingressId: pointer.ingressId,
-          mailboxId: pointer.mailboxId,
-        },
-        runtime,
-      );
-      return "pendingReview";
-    }
-    const errorCode = safeErrorCode(
-      { code: receipt.errorCode },
-      "QUEUE_RETRY_EXHAUSTED",
-    );
-    const terminalReceipt = await env.RAW_MAIL_BUCKET.put(
-      `receipts/${pointer.ingressId}.json`,
-      JSON.stringify({
-        ...projectInboundArchivePointer(pointer),
-        state: "dead_lettered",
-        updatedAt: now.toISOString(),
-        reconciled: true,
-        errorCode,
-      }),
-      {
-        customMetadata: { state: "dead_lettered" },
-        onlyIf: { etagMatches: receipt.etag },
-      },
-    );
-    if (!terminalReceipt) {
-      console.log("[mail-reconciliation] dead-letter state superseded", {
-        ingressRef,
-        objectRef,
-        operation: "dead_letter_terminalize",
-        status: "superseded",
-      });
-      return "skipped";
-    }
-    await resolveAnomaly(
+    await persistAnomaly(
       env.RAW_MAIL_BUCKET,
       pointer.rawKey,
-      "dead_letter_intent_terminalized",
+      {
+        errorCode: "DLQ_TERMINAL_LEDGER_MISSING",
+        ingressId: pointer.ingressId,
+        mailboxId: pointer.mailboxId,
+      },
       runtime,
     );
-    console.error("[mail-reconciliation] stale dead-letter terminalized", {
+    console.error("[mail-reconciliation] stale dead-letter remains pending", {
       durationMs: durationMs(runtime, startedAt),
-      errorCode,
+      errorCode: "DLQ_TERMINAL_LEDGER_MISSING",
       ingressRef,
       objectRef,
-      operation: "dead_letter_terminalize",
-      status: "dead_lettered",
+      operation: "dead_letter_reconcile",
+      status: "pending_operator_review",
     });
-    return "terminalized";
+    return "pendingReview";
   }
   if (
     (receipt?.state === "stored" || shouldEnqueue(receipt, now)) &&

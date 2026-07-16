@@ -470,7 +470,7 @@ test("reconciliation degrades the aggregate for an unknown receipt state", async
   });
 });
 
-test("reconciliation skips terminal and dead-letter handoffs while repairing stale and archived states", async () => {
+test("reconciliation preserves dead-letter handoffs while repairing stale and archived states", async () => {
   const ingressIds = [
     "stored",
     "recent",
@@ -595,12 +595,12 @@ test("reconciliation skips terminal and dead-letter handoffs while repairing sta
     invalid: 0,
     failed: 0,
     projectionMissing: 0,
-    pendingReview: 0,
-    terminalized: 1,
+    pendingReview: 1,
+    terminalized: 0,
     failureLedgered: 0,
   });
-  assert.equal(states["dead-letter-stale"].state, "dead_lettered");
-  assert.equal(states["dead-letter-stale"].errorCode, "QUEUE_RETRY_EXHAUSTED");
+  assert.equal(states["dead-letter-stale"].state, "dead_letter_pending");
+  assert.equal(states["dead-letter-stale"].errorCode, undefined);
 });
 
 for (const testCase of [
@@ -1201,12 +1201,16 @@ test("reconciliation resolves a pending anomaly from an R2-only terminal receipt
   assert.equal(resolvedAnomaly?.resolution, "terminal_receipt_persisted");
 });
 
-test("reconciliation terminalizes a stale dead-letter intent without a Mailbox terminal ledger", async () => {
+test("reconciliation creates operator-review evidence for a fresh stale dead-letter intent without a Mailbox terminal ledger", async () => {
   const ingressId = "stale-dead-letter-without-ledger";
   const rawKey = `raw/2026/07/13/${ingressId}.eml`;
-  let terminalReceipt: Record<string, unknown> | undefined;
-  let receiptCondition: string | undefined;
-  let resolvedAnomaly: Record<string, unknown> | undefined;
+  let receipt: Record<string, unknown> = {
+    state: "dead_letter_pending",
+    errorCode: "FORGED_UPPERCASE_CODE",
+    updatedAt: "2026-07-13T09:00:00.000Z",
+  };
+  let anomaly: Record<string, unknown> | undefined;
+  let anomalyCreateCondition: string | undefined;
   let queueCalls = 0;
   const env = {
     BUCKET: derivedBucketWithoutDelete,
@@ -1235,10 +1239,11 @@ test("reconciliation terminalizes a stale dead-letter intent without a Mailbox t
       async get(key: string) {
         if (key.includes("cursor.json")) return null;
         if (key.startsWith("system/reconciliation-anomalies/")) {
+          if (!anomaly) return null;
           return {
             etag: "anomaly-etag",
             async text() {
-              return pendingReconciliationAnomaly(ingressId, rawKey);
+              return JSON.stringify(anomaly);
             },
           };
         }
@@ -1246,11 +1251,7 @@ test("reconciliation terminalizes a stale dead-letter intent without a Mailbox t
           return {
             etag: "stale-receipt-etag",
             async text() {
-              return JSON.stringify({
-                state: "dead_letter_pending",
-                errorCode: "FORGED_UPPERCASE_CODE",
-                updatedAt: "2026-07-13T09:00:00.000Z",
-              });
+              return JSON.stringify(receipt);
             },
           };
         }
@@ -1259,14 +1260,16 @@ test("reconciliation terminalizes a stale dead-letter intent without a Mailbox t
       async put(
         key: string,
         value: string,
-        options?: { onlyIf?: { etagMatches?: string } },
+        options?: {
+          onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+        },
       ) {
         if (key === `receipts/${ingressId}.json`) {
-          terminalReceipt = JSON.parse(value);
-          receiptCondition = options?.onlyIf?.etagMatches;
+          receipt = JSON.parse(value);
         }
         if (key.startsWith("system/reconciliation-anomalies/")) {
-          resolvedAnomaly = JSON.parse(value);
+          anomaly = JSON.parse(value);
+          anomalyCreateCondition = options?.onlyIf?.etagDoesNotMatch;
         }
         return {};
       },
@@ -1304,22 +1307,30 @@ test("reconciliation terminalizes a stale dead-letter intent without a Mailbox t
     now: () => new Date("2026-07-13T10:00:00.000Z"),
   });
 
-  assert.equal(result.terminalized, 1);
-  assert.equal(result.pendingReview, 0);
-  assert.equal(terminalReceipt?.state, "dead_lettered");
-  assert.equal(terminalReceipt?.errorCode, "QUEUE_RETRY_EXHAUSTED");
-  assert.equal(terminalReceipt?.reconciled, true);
-  assert.equal(terminalReceipt?.updatedAt, "2026-07-13T10:00:00.000Z");
-  assert.equal(receiptCondition, "stale-receipt-etag");
-  assert.equal(resolvedAnomaly?.status, "resolved");
-  assert.equal(resolvedAnomaly?.resolution, "dead_letter_intent_terminalized");
+  assert.equal(result.terminalized, 0);
+  assert.equal(result.pendingReview, 1);
+  assert.deepEqual(receipt, {
+    state: "dead_letter_pending",
+    errorCode: "FORGED_UPPERCASE_CODE",
+    updatedAt: "2026-07-13T09:00:00.000Z",
+  });
+  assert.deepEqual(anomaly, {
+    detectedAt: "2026-07-13T10:00:00.000Z",
+    errorCode: "DLQ_TERMINAL_LEDGER_MISSING",
+    ingressId,
+    mailboxId: "hello@wiserchat.ai",
+    rawKey,
+    status: "pending_operator_review",
+  });
+  assert.equal(anomalyCreateCondition, "*");
   assert.equal(queueCalls, 0);
 });
 
-test("reconciliation preserves the concurrent winner when stale dead-letter terminalization loses CAS", async () => {
+test("reconciliation preserves the concurrent winner when Mailbox-ledger reconstruction loses CAS", async () => {
   const ingressId = "stale-dead-letter-cas-loss";
   const rawKey = `raw/2026/07/13/${ingressId}.eml`;
   let receiptWrites = 0;
+  let receiptCondition: string | undefined;
   let anomalyWrites = 0;
   let queueCalls = 0;
   const env = {
@@ -1362,9 +1373,14 @@ test("reconciliation preserves the concurrent winner when stale dead-letter term
         }
         return null;
       },
-      async put(key: string) {
+      async put(
+        key: string,
+        _value: string,
+        options?: { onlyIf?: { etagMatches?: string } },
+      ) {
         if (key === `receipts/${ingressId}.json`) {
           receiptWrites += 1;
+          receiptCondition = options?.onlyIf?.etagMatches;
           return null;
         }
         if (key.startsWith("system/reconciliation-anomalies/")) {
@@ -1395,7 +1411,12 @@ test("reconciliation preserves the concurrent winner when stale dead-letter term
             return false;
           },
           async getInboundTerminalFailure() {
-            return null;
+            return {
+              queueRef: "d06683c38d7755ce",
+              attempts: 10,
+              errorCode: "QUEUE_RETRY_EXHAUSTED",
+              recordedAt: "2026-07-13T09:45:00.000Z",
+            };
           },
         };
       },
@@ -1409,6 +1430,7 @@ test("reconciliation preserves the concurrent winner when stale dead-letter term
   assert.equal(result.skipped, 1);
   assert.equal(result.terminalized, 0);
   assert.equal(receiptWrites, 1);
+  assert.equal(receiptCondition, "stale-receipt-etag");
   assert.equal(anomalyWrites, 0);
   assert.equal(queueCalls, 0);
 });
