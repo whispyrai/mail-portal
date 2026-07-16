@@ -81,8 +81,13 @@ export function recoveredDraftId(snapshotEmailId: string): string {
 	return `draft_recovered_${snapshotEmailId}`;
 }
 
-export function recoveredAttachmentId(snapshotAttachmentId: string): string {
-	return `recovered_${snapshotAttachmentId}`;
+export function recoveredAttachmentId(
+	snapshotAttachmentId: string,
+	recoveryGeneration = 0,
+): string {
+	return recoveryGeneration > 0
+		? `recovered_${snapshotAttachmentId}_g${recoveryGeneration}`
+		: `recovered_${snapshotAttachmentId}`;
 }
 
 /**
@@ -95,22 +100,45 @@ export async function prepareRecoveredDraftAttachments(
 	bucket: RecoveryBucket,
 	snapshotEmailId: string,
 	attachments: CancelledSnapshotAttachment[],
+	options: {
+		recordDestinationIntent?: (
+			draftId: string,
+			keys: string[],
+		) => Promise<void>;
+		recoveryGeneration?: number;
+	} = {},
 ): Promise<{ draftId: string; attachments: CancelledSnapshotAttachment[] }> {
 	const draftId = recoveredDraftId(snapshotEmailId);
+	const planned = attachments.map((attachment) => {
+		const id = recoveredAttachmentId(
+			attachment.id,
+			options.recoveryGeneration,
+		);
+		const filename = safeAttachmentStorageFilename(
+			attachment.filename,
+			attachmentKeyPrefix(draftId, id),
+		);
+		return {
+			attachment,
+			id,
+			filename,
+			destinationKey: attachmentKey(draftId, id, filename),
+		};
+	});
+	if (planned.length > 0) {
+		await options.recordDestinationIntent?.(
+			draftId,
+			planned.map(({ destinationKey }) => destinationKey),
+		);
+	}
 	const copiedKeys: string[] = [];
 	const recovered: CancelledSnapshotAttachment[] = [];
 	try {
-		for (const attachment of attachments) {
+		for (const { attachment, id, filename, destinationKey } of planned) {
 			const object = await bucket.get(storedAttachmentKey(attachment));
 			if (!object) {
 				throw new Error(`Missing cancelled attachment ${attachment.id}`);
 			}
-			const id = recoveredAttachmentId(attachment.id);
-			const filename = safeAttachmentStorageFilename(
-				attachment.filename,
-				attachmentKeyPrefix(draftId, id),
-			);
-			const destinationKey = attachmentKey(draftId, id, filename);
 			await bucket.put(destinationKey, await object.arrayBuffer());
 			copiedKeys.push(destinationKey);
 				recovered.push({
@@ -127,7 +155,7 @@ export async function prepareRecoveredDraftAttachments(
 		}
 		return { draftId, attachments: recovered };
 	} catch (error) {
-		if (copiedKeys.length > 0) {
+		if (copiedKeys.length > 0 && !options.recordDestinationIntent) {
 			try {
 				await bucket.delete(copiedKeys);
 			} catch {

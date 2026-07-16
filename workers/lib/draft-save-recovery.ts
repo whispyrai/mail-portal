@@ -30,6 +30,7 @@ type RecoveryStub = {
 		draftId?: string;
 		committedVersion?: number | null;
 		claimToken?: string | null;
+		draft?: AuthoritativeDraft | null;
 	}>;
 	abortDraftSave(
 		saveKey: string,
@@ -97,11 +98,13 @@ export async function reconcileAmbiguousDraftSave(input: {
 		);
 		return { status: "not_committed" };
 	}
-	let draft: AuthoritativeDraft | null;
-	try {
-		draft = await input.stub.getEmail(input.draftId);
-	} catch {
-		return { status: "indeterminate" };
+	let draft = outcome.draft ?? null;
+	if (!draft) {
+		try {
+			draft = await input.stub.getEmail(input.draftId);
+		} catch {
+			return { status: "indeterminate" };
+		}
 	}
 	if (
 		!draft ||
@@ -112,20 +115,22 @@ export async function reconcileAmbiguousDraftSave(input: {
 	) {
 		return { status: "indeterminate" };
 	}
-	await completeAttachmentPromotion(
-		input.bucket,
-		input.stub,
-		input.draftId,
-		input.promotion,
-		input.actor,
-	);
-	await cleanupStoredAttachmentObjects(
-		input.bucket,
-		input.stub,
-		input.draftId,
-		input.replacedAttachments,
-		input.actor,
-	);
+	await Promise.allSettled([
+		completeAttachmentPromotion(
+			input.bucket,
+			input.stub,
+			input.draftId,
+			input.promotion,
+			input.actor,
+		),
+		cleanupStoredAttachmentObjects(
+			input.bucket,
+			input.stub,
+			input.draftId,
+			input.replacedAttachments,
+			input.actor,
+		),
+	]);
 	return {
 		status: "committed",
 		draft,

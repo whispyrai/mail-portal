@@ -5,6 +5,7 @@
 import {
 	InvalidDeliveryTransitionError,
 	canCancelDelivery,
+	canRetryFailedDelivery,
 	computeAvailableAt,
 	transitionDelivery,
 	type EnqueueOutboundCommand,
@@ -20,12 +21,30 @@ export interface StoredOutboundDelivery extends OutboundDeliveryRecord {
 	maxAttempts: number;
 	commandFingerprint?: string;
 	preflightDeferralCount: number;
+	cancellationRecoveryAttemptCount: number;
+	retryOriginStatus?: "failed" | "unknown";
 	dispatchPhase?: "preflight" | "provider";
 	activeAttemptId?: string;
 	acceptedAttemptCount: number;
 	duplicateAcceptanceAt?: string;
 	leaseToken?: string;
+	/** Transient adapter signal used only while recovering malformed storage. */
+	recoveryIntegrityCode?:
+		| "outbound_dispatch_phase_invalid"
+		| "outbound_sending_lease_invalid"
+		| "outbound_delivery_record_invalid";
+	storageIntegrityCode?: "outbound_delivery_record_invalid";
 }
+
+export type DispatchableDeliveryCandidate =
+	| { state: "ready"; delivery: StoredOutboundDelivery }
+	| {
+			state: "integrity_failure";
+			deliveryId: string;
+			status: "queued" | "retrying";
+			code: "outbound_dispatch_metadata_invalid";
+			outcome: "failed" | "unknown";
+	  };
 
 export type OutboundDeliveryAttemptStatus =
 	| "sending"
@@ -46,9 +65,59 @@ export interface OutboundDeliveryAttempt {
 	httpStatus?: number;
 	errorCode?: string;
 	errorMessage?: string;
-	providerState: "none" | "delivered" | "bounced" | "complained";
+	providerState:
+		| "none"
+		| "delivered"
+		| "bounced"
+		| "complained"
+		| "bounce_scope_unknown";
 	providerEventAt?: string;
 	providerEventId?: string;
+	/** Transient adapter signal. Invalid persisted attempt metadata is never sendable. */
+	storageIntegrityCode?: "outbound_attempt_record_invalid";
+}
+
+export type AcceptedAttemptProviderState =
+	| "none"
+	| "delivered"
+	| "bounced"
+	| "complained"
+	| "bounce_scope_unknown";
+
+export function aggregateAcceptedAttemptProviderTruth(
+	states: readonly string[],
+): "sent" | "bounced" | "unknown" {
+	const validStates = new Set<AcceptedAttemptProviderState>([
+		"none",
+		"delivered",
+		"bounced",
+		"complained",
+		"bounce_scope_unknown",
+	]);
+	if (
+		states.length === 0 ||
+		states.some((state) => !validStates.has(state as AcceptedAttemptProviderState))
+	) {
+		return "unknown";
+	}
+	if (
+		states.some(
+			(state) =>
+				state === "none" || state === "delivered" || state === "complained",
+		)
+	) {
+		return "sent";
+	}
+	if (states.some((state) => state === "bounce_scope_unknown")) {
+		return "unknown";
+	}
+	return "bounced";
+}
+
+export function canReconcileConcurrentProviderTerminal(
+	status: OutboundDeliveryRecord["status"] | undefined,
+): status is "sent" | "bounced" | "unknown" {
+	return status === "sent" || status === "bounced" || status === "unknown";
 }
 
 /**
@@ -73,23 +142,45 @@ export interface OutboundDeliveryTransaction {
 	getDelivery(id: string): StoredOutboundDelivery | null;
 	listDeliveries(): StoredOutboundDelivery[];
 	/** Optional indexed production seams. In-memory test stores may use fallbacks. */
+	findNextDispatchableCandidate?(
+		now: string,
+	): DispatchableDeliveryCandidate | null;
 	findNextDispatchable?(now: string): StoredOutboundDelivery | null;
+	failDispatchableIntegrity?(
+		candidate: Extract<
+			DispatchableDeliveryCandidate,
+			{ state: "integrity_failure" }
+		>,
+		at: string,
+	): void;
 	listExpiredSending?(now: string): StoredOutboundDelivery[];
 	listDeliveriesByStatuses?(
 		statuses: StoredOutboundDelivery["status"][],
 	): StoredOutboundDelivery[];
-	listUnreconciledAccepted?(): StoredOutboundDelivery[];
+	listUnreconciledAccepted?(now: string, limit: number): StoredOutboundDelivery[];
+	listPendingCancellationRecovery?(
+		now: string,
+		limit: number,
+	): StoredOutboundDelivery[];
+	deferAcceptedReconciliation?(
+		deliveryId: string,
+		retryAt: string,
+		code: string,
+		message: string,
+	): void;
+	completeAcceptedReconciliation?(deliveryId: string): void;
 	findNextActionAt?(): string | null;
 	insertDelivery(delivery: StoredOutboundDelivery): void;
 	updateDelivery(delivery: StoredOutboundDelivery): void;
 	insertSnapshot(emailId: string, snapshot: OutboundMessageSnapshot): void;
 	getSnapshot(emailId: string): OutboundMessageSnapshot | null;
 	insertAttempt(attempt: OutboundDeliveryAttempt): void;
-	findAttemptByLease(
-		deliveryId: string,
-		leaseToken: string,
-	): OutboundDeliveryAttempt | null;
+	listAttemptsByDelivery(deliveryId: string): OutboundDeliveryAttempt[];
 	updateAttempt(attempt: OutboundDeliveryAttempt): void;
+	recordAcceptedRecovery?(
+		delivery: StoredOutboundDelivery,
+		attempt: OutboundDeliveryAttempt,
+	): void;
 }
 
 export interface OutboundDeliveryStorage {
@@ -125,16 +216,24 @@ export function outboundEnqueueOutcome(
 		: "terminal_replay";
 }
 
+export type ClaimedPreflight = {
+	delivery: StoredOutboundDelivery;
+	snapshot: OutboundMessageSnapshot;
+};
+
 export interface ClaimedDelivery {
 	delivery: StoredOutboundDelivery;
 	attempt: OutboundDeliveryAttempt;
 	snapshot: OutboundMessageSnapshot;
 }
 
-export interface RecoveredDeliveryLease {
+export type RecoveredDeliveryLease =
+	| { phase: "preflight"; delivery: StoredOutboundDelivery }
+	| {
+			phase: "provider";
 	delivery: StoredOutboundDelivery;
-	attempt: OutboundDeliveryAttempt;
-}
+			attempt?: OutboundDeliveryAttempt;
+	  };
 
 export interface FinalizedDeliveryAttempt {
 	delivery: StoredOutboundDelivery;
@@ -146,7 +245,13 @@ export interface DeliveryMutationResult {
 	delivery: StoredOutboundDelivery;
 	actor: OutboundDeliveryActor;
 	sourceDraftAction: SourceDraftAction;
+	retryCancellationRestored?: boolean;
 }
+
+export type PreflightMutationResult = {
+	delivery: StoredOutboundDelivery;
+	sourceDraftAction: SourceDraftAction;
+};
 
 export type SourceDraftAction = "retain" | "consume" | "none";
 
@@ -176,6 +281,22 @@ export class OutboundDeliveryNotFoundError extends Error {
 	constructor(deliveryId: string) {
 		super(`Outbound delivery ${deliveryId} was not found`);
 		this.name = "OutboundDeliveryNotFoundError";
+	}
+}
+
+export class OutboundDeliveryIntegrityError extends Error {
+	constructor(deliveryId: string) {
+		super(`Outbound delivery ${deliveryId} requires audited storage repair`);
+		this.name = "OutboundDeliveryIntegrityError";
+	}
+}
+
+export class OutboundDeliveryNotRetryableError extends Error {
+	constructor(deliveryId: string) {
+		super(
+			`Outbound delivery ${deliveryId} cannot be retried without rebuilding its immutable message snapshot`,
+		);
+		this.name = "OutboundDeliveryNotRetryableError";
 	}
 }
 
@@ -284,6 +405,8 @@ export class SourceDraftConflictError extends Error {
 }
 
 export class TruthfulOutboxService {
+	static readonly MAX_PREFLIGHT_INTEGRITY_FAILURES_PER_CLAIM = 25;
+
 	readonly #storage: OutboundDeliveryStorage;
 	readonly #createId: TruthfulOutboxServiceOptions["createId"];
 	readonly #defaultMaxAttempts: number;
@@ -391,6 +514,7 @@ export class TruthfulOutboxService {
 				attemptCount: 0,
 				maxAttempts: this.#defaultMaxAttempts,
 				preflightDeferralCount: 0,
+				cancellationRecoveryAttemptCount: 0,
 				acceptedAttemptCount: 0,
 			};
 
@@ -427,8 +551,7 @@ export class TruthfulOutboxService {
 						.listDeliveries()
 						.find(
 							(delivery) =>
-								delivery.draftId === id &&
-								delivery.draftVersion === version,
+								delivery.draftId === id && delivery.draftVersion === version,
 						) ?? null),
 		);
 	}
@@ -458,12 +581,82 @@ export class TruthfulOutboxService {
 		);
 	}
 
-	listUnreconciledAccepted(): StoredOutboundDelivery[] {
+	listUnreconciledAccepted(
+		now: string,
+		limit = 10,
+	): StoredOutboundDelivery[] {
 		return this.#storage.transaction((tx) =>
 			tx.listUnreconciledAccepted
-				? tx.listUnreconciledAccepted()
-				: tx.listDeliveries().filter((delivery) => delivery.status === "sent"),
+				? tx.listUnreconciledAccepted(now, limit)
+				: tx
+						.listDeliveries()
+						.filter((delivery) => delivery.status === "sent")
+						.slice(0, limit),
 		);
+	}
+
+	listPendingCancellationRecovery(
+		now: string,
+		limit = 10,
+	): StoredOutboundDelivery[] {
+		return this.#storage.transaction((tx) =>
+			tx.listPendingCancellationRecovery
+				? tx.listPendingCancellationRecovery(now, limit)
+				: tx
+						.listDeliveries()
+						.filter(
+							(delivery) =>
+								delivery.status === "cancelled" &&
+								delivery.cancelRecoveryPending === true &&
+								(delivery.nextAttemptAt === undefined ||
+									delivery.nextAttemptAt <= now),
+						)
+						.slice(0, limit),
+		);
+	}
+
+	deferAcceptedReconciliation(
+		deliveryId: string,
+		retryAt: string,
+		code: string,
+		message: string,
+	): void {
+		this.#storage.transaction((tx) => {
+			if (!tx.deferAcceptedReconciliation) {
+				const delivery = tx.getDelivery(deliveryId);
+				if (!delivery || delivery.status !== "sent") return;
+				tx.updateDelivery({
+					...delivery,
+					nextAttemptAt: retryAt,
+					lastErrorCode: code,
+					lastErrorMessage: message,
+				});
+				return;
+			}
+			tx.deferAcceptedReconciliation(deliveryId, retryAt, code, message);
+		});
+	}
+
+	completeAcceptedReconciliation(deliveryId: string): void {
+		this.#storage.transaction((tx) => {
+			if (tx.completeAcceptedReconciliation) {
+				tx.completeAcceptedReconciliation(deliveryId);
+				return;
+			}
+			const delivery = tx.getDelivery(deliveryId);
+			if (!delivery || delivery.status !== "sent") return;
+			tx.updateDelivery({
+				...delivery,
+				nextAttemptAt: undefined,
+				...([
+					"outbound_reconciliation_record_invalid",
+					"outbound_acceptance_identity_missing",
+					"outbound_reconciliation_deferred",
+				].includes(delivery.lastErrorCode ?? "")
+					? { lastErrorCode: undefined, lastErrorMessage: undefined }
+					: {}),
+			});
+		});
 	}
 
 	nextActionAt(): string | null {
@@ -477,6 +670,9 @@ export class TruthfulOutboxService {
 				if (delivery.status === "sending" && delivery.leaseExpiresAt) {
 					return [delivery.leaseExpiresAt];
 				}
+				if (delivery.status === "cancelled" && delivery.cancelRecoveryPending) {
+					return [delivery.nextAttemptAt ?? delivery.updatedAt];
+				}
 				return [];
 			});
 			return candidates.sort((a, b) => a.localeCompare(b))[0] ?? null;
@@ -487,20 +683,62 @@ export class TruthfulOutboxService {
 		deliveryId: string,
 		actor: OutboundDeliveryActor,
 		at: string,
+		onCommitted?: (
+			delivery: StoredOutboundDelivery,
+			outcome: "delivery_cancelled" | "retry_restored",
+		) => void,
 	): DeliveryMutationResult {
 		return this.#storage.transaction((tx) => {
 			const delivery = tx.getDelivery(deliveryId);
 			if (!delivery) throw new OutboundDeliveryNotFoundError(deliveryId);
+			assertDeliveryStorageIntegrity(delivery);
 			if (!canCancelDelivery(delivery.status)) {
 				throw new InvalidDeliveryTransitionError(delivery.status, "cancel");
 			}
+			if (delivery.retryOriginStatus) {
+				const retryOriginStatus = delivery.retryOriginStatus;
+				const restored: StoredOutboundDelivery = {
+					...delivery,
+					actor: { ...actor },
+					status: retryOriginStatus,
+					retryOriginStatus: undefined,
+					dispatchPhase: undefined,
+					activeAttemptId: undefined,
+					leaseToken: undefined,
+					leaseExpiresAt: undefined,
+					nextAttemptAt: undefined,
+					failedAt:
+						retryOriginStatus === "failed" ? delivery.failedAt ?? at : undefined,
+					unknownAt:
+						retryOriginStatus === "unknown" ? delivery.unknownAt ?? at : undefined,
+					cancelledAt: undefined,
+					lastErrorCode: `outbound_retry_cancelled_restored_${retryOriginStatus}`,
+					lastErrorMessage:
+						retryOriginStatus === "unknown"
+							? "The retry was cancelled. The prior provider outcome remains unknown."
+							: "The retry was cancelled. The prior failed outcome remains authoritative.",
+					updatedAt: at,
+				};
+				tx.updateDelivery(restored);
+				onCommitted?.(restored, "retry_restored");
+				return {
+					delivery: restored,
+					actor: { ...actor },
+					sourceDraftAction: sourceDraftAction(restored, "retain"),
+					retryCancellationRestored: true,
+				};
+			}
 			const cancelled: StoredOutboundDelivery = {
 				...delivery,
+				actor: { ...actor },
 				status: transitionDelivery(delivery.status, "cancel"),
+				nextAttemptAt: at,
+				cancellationRecoveryAttemptCount: 0,
 				cancelledAt: at,
 				updatedAt: at,
 			};
 			tx.updateDelivery(cancelled);
+			onCommitted?.(cancelled, "delivery_cancelled");
 			return {
 				delivery: cancelled,
 				actor: { ...actor },
@@ -509,10 +747,29 @@ export class TruthfulOutboxService {
 		});
 	}
 
-	claimNext(now: string, leaseDurationMs: number): ClaimedDelivery | null {
+	claimNextForPreflight(
+		now: string,
+		leaseDurationMs: number,
+	): ClaimedPreflight | null {
 		return this.#storage.transaction((tx) => {
-			const delivery = (
-				tx.findNextDispatchable
+			for (
+				let inspected = 0;
+				inspected <
+				TruthfulOutboxService.MAX_PREFLIGHT_INTEGRITY_FAILURES_PER_CLAIM;
+				inspected += 1
+			) {
+				const indexedCandidate = tx.findNextDispatchableCandidate?.(now);
+				if (indexedCandidate?.state === "integrity_failure") {
+					if (!tx.failDispatchableIntegrity) {
+						throw new Error("Outbox storage cannot repair dispatch integrity");
+					}
+					tx.failDispatchableIntegrity(indexedCandidate, now);
+					continue;
+				}
+				const delivery =
+					indexedCandidate?.state === "ready"
+						? indexedCandidate.delivery
+						: (tx.findNextDispatchable
 				? [tx.findNextDispatchable(now)].filter(
 							(candidate): candidate is StoredOutboundDelivery =>
 								Boolean(candidate),
@@ -521,7 +778,8 @@ export class TruthfulOutboxService {
 					)
 				.filter(
 					(candidate) =>
-						(candidate.status === "queued" && candidate.availableAt <= now) ||
+										(candidate.status === "queued" &&
+											candidate.availableAt <= now) ||
 						(candidate.status === "retrying" &&
 							candidate.nextAttemptAt !== undefined &&
 							candidate.nextAttemptAt <= now),
@@ -536,7 +794,34 @@ export class TruthfulOutboxService {
 
 			const snapshot = tx.getSnapshot(delivery.emailId);
 			if (!snapshot) {
-				throw new Error(`Missing outbox snapshot for ${delivery.id}`);
+						const failed: StoredOutboundDelivery = {
+							...delivery,
+							status:
+								delivery.retryOriginStatus === "unknown" ? "unknown" : "failed",
+							retryOriginStatus: undefined,
+						dispatchPhase: undefined,
+						activeAttemptId: undefined,
+						nextAttemptAt: undefined,
+						leaseToken: undefined,
+						leaseExpiresAt: undefined,
+							failedAt:
+								delivery.retryOriginStatus === "unknown" ? undefined : now,
+							unknownAt:
+								delivery.retryOriginStatus === "unknown"
+									? delivery.unknownAt ?? now
+									: undefined,
+							lastErrorCode:
+								delivery.retryOriginStatus === "unknown"
+									? "outbound_retry_failed_original_unknown"
+									: "outbound_snapshot_invalid",
+							lastErrorMessage:
+								delivery.retryOriginStatus === "unknown"
+									? "The retry could not run, but an earlier provider outcome remains unknown."
+									: "The immutable outbound snapshot is unavailable or invalid.",
+						updatedAt: now,
+					};
+					tx.updateDelivery(failed);
+					continue;
 			}
 
 			const leaseToken = this.#createId("lease");
@@ -550,25 +835,143 @@ export class TruthfulOutboxService {
 			const claimed: StoredOutboundDelivery = {
 				...delivery,
 				status: transitionDelivery(readyStatus, "start_sending"),
-				attemptCount: delivery.attemptCount + 1,
+					dispatchPhase: "preflight",
+					activeAttemptId: undefined,
 				nextAttemptAt: undefined,
 				leaseToken,
 				leaseExpiresAt,
 				updatedAt: now,
 			};
+				tx.updateDelivery(claimed);
+				return { delivery: claimed, snapshot };
+			}
+			return null;
+		});
+	}
+
+	deferPreflight(
+		deliveryId: string,
+		leaseToken: string,
+		details: RetryableFailureDetails,
+	): PreflightMutationResult {
+		return this.#storage.transaction((tx) => {
+			const delivery = this.#requirePreflightLease(tx, deliveryId, leaseToken);
+			if (hasUnsafeProviderAttempt(tx, deliveryId, leaseToken)) {
+				throw new DeliveryLeaseError(deliveryId);
+			}
+			const deferred: StoredOutboundDelivery = {
+				...delivery,
+				status: transitionDelivery(delivery.status, "schedule_retry"),
+				dispatchPhase: undefined,
+				activeAttemptId: undefined,
+				leaseToken: undefined,
+				leaseExpiresAt: undefined,
+				nextAttemptAt: details.retryAt,
+				preflightDeferralCount: delivery.preflightDeferralCount + 1,
+				lastErrorCode: details.code,
+				lastErrorMessage: details.message,
+				updatedAt: details.at,
+			};
+			tx.updateDelivery(deferred);
+			return {
+				delivery: deferred,
+				sourceDraftAction: sourceDraftAction(deferred, "retain"),
+			};
+		});
+	}
+
+	failPreflight(
+		deliveryId: string,
+		leaseToken: string,
+		details: DefinitiveFailureDetails,
+	): PreflightMutationResult {
+		return this.#storage.transaction((tx) => {
+			const delivery = this.#requirePreflightLease(tx, deliveryId, leaseToken);
+			if (hasUnsafeProviderAttempt(tx, deliveryId, leaseToken)) {
+				throw new DeliveryLeaseError(deliveryId);
+			}
+			const failed: StoredOutboundDelivery = {
+				...delivery,
+				status:
+					delivery.retryOriginStatus === "unknown" ? "unknown" : "failed",
+				retryOriginStatus: undefined,
+				dispatchPhase: undefined,
+				activeAttemptId: undefined,
+				leaseToken: undefined,
+				leaseExpiresAt: undefined,
+				failedAt:
+					delivery.retryOriginStatus === "unknown" ? undefined : details.at,
+				unknownAt:
+					delivery.retryOriginStatus === "unknown"
+						? delivery.unknownAt ?? details.at
+						: undefined,
+				lastErrorCode:
+					delivery.retryOriginStatus === "unknown"
+						? "outbound_retry_failed_original_unknown"
+						: details.code,
+				lastErrorMessage:
+					delivery.retryOriginStatus === "unknown"
+						? "The retry failed before provider acceptance, but an earlier provider outcome remains unknown."
+						: details.message,
+				updatedAt: details.at,
+			};
+			tx.updateDelivery(failed);
+			return {
+				delivery: failed,
+				sourceDraftAction: sourceDraftAction(failed, "retain"),
+			};
+		});
+	}
+
+	beginProviderAttempt(
+		deliveryId: string,
+		leaseToken: string,
+		attemptId: string,
+		at: string,
+		providerLeaseDurationMs: number,
+	): ClaimedDelivery {
+		return this.#storage.transaction((tx) => {
+			const delivery = this.#requirePreflightLease(tx, deliveryId, leaseToken);
+			if (hasUnsafeProviderAttempt(tx, deliveryId, leaseToken)) {
+				throw new DeliveryLeaseError(deliveryId);
+			}
+			const startedAt = Date.parse(at);
+			const preflightLeaseExpiresAt = Date.parse(delivery.leaseExpiresAt ?? "");
+			if (
+				!Number.isFinite(startedAt) ||
+				!Number.isFinite(preflightLeaseExpiresAt) ||
+				startedAt >= preflightLeaseExpiresAt ||
+				!attemptId.trim() ||
+				!Number.isFinite(providerLeaseDurationMs) ||
+				providerLeaseDurationMs <= 0
+			) {
+				throw new DeliveryLeaseError(deliveryId);
+			}
+			const snapshot = tx.getSnapshot(delivery.emailId);
+			if (!snapshot)
+				throw new Error(`Missing outbox snapshot for ${delivery.id}`);
 			const attempt: OutboundDeliveryAttempt = {
-				id: this.#createId("attempt"),
-				deliveryId: delivery.id,
-				attemptNumber: claimed.attemptCount,
+				id: attemptId,
+				deliveryId,
+				attemptNumber: delivery.attemptCount + 1,
 				status: "sending",
 				leaseToken,
-				startedAt: now,
+				startedAt: at,
 				providerState: "none",
 			};
-
-			tx.updateDelivery(claimed);
+			const dispatching: StoredOutboundDelivery = {
+				...delivery,
+				attemptCount: attempt.attemptNumber,
+				dispatchPhase: "provider",
+				activeAttemptId: attempt.id,
+				leaseExpiresAt: new Date(
+					startedAt + providerLeaseDurationMs,
+				).toISOString(),
+				updatedAt: at,
+			};
+			tx.updateDelivery(dispatching);
 			tx.insertAttempt(attempt);
-			return { delivery: claimed, attempt, snapshot };
+			return { delivery: dispatching, attempt, snapshot };
 		});
 	}
 
@@ -586,16 +989,37 @@ export class TruthfulOutboxService {
 			const exhausted = delivery.attemptCount >= delivery.maxAttempts;
 			const finalizedDelivery: StoredOutboundDelivery = {
 				...delivery,
-				status: transitionDelivery(
-					delivery.status,
-					exhausted ? "exhaust_retries" : "schedule_retry",
-				),
+				status:
+					exhausted && delivery.retryOriginStatus === "unknown"
+						? "unknown"
+						: transitionDelivery(
+								delivery.status,
+								exhausted ? "exhaust_retries" : "schedule_retry",
+							),
+				retryOriginStatus: exhausted
+					? undefined
+					: delivery.retryOriginStatus,
+				dispatchPhase: undefined,
+				activeAttemptId: undefined,
 				leaseToken: undefined,
 				leaseExpiresAt: undefined,
 				nextAttemptAt: exhausted ? undefined : details.retryAt,
-				failedAt: exhausted ? details.at : undefined,
-				lastErrorCode: details.code,
-				lastErrorMessage: details.message,
+				failedAt:
+					exhausted && delivery.retryOriginStatus !== "unknown"
+						? details.at
+						: delivery.failedAt,
+				unknownAt:
+					exhausted && delivery.retryOriginStatus !== "unknown"
+						? undefined
+						: delivery.unknownAt,
+				lastErrorCode:
+					exhausted && delivery.retryOriginStatus === "unknown"
+						? "outbound_retry_failed_original_unknown"
+						: details.code,
+				lastErrorMessage:
+					exhausted && delivery.retryOriginStatus === "unknown"
+						? "The retry was rejected, but an earlier provider outcome remains unknown."
+						: details.message,
 				updatedAt: details.at,
 			};
 			const finalizedAttempt: OutboundDeliveryAttempt = {
@@ -630,12 +1054,27 @@ export class TruthfulOutboxService {
 			);
 			const failedDelivery: StoredOutboundDelivery = {
 				...delivery,
-				status: transitionDelivery(delivery.status, "definitive_failure"),
+				status:
+					delivery.retryOriginStatus === "unknown" ? "unknown" : "failed",
+				retryOriginStatus: undefined,
+				dispatchPhase: undefined,
+				activeAttemptId: undefined,
 				leaseToken: undefined,
 				leaseExpiresAt: undefined,
-				failedAt: details.at,
-				lastErrorCode: details.code,
-				lastErrorMessage: details.message,
+				failedAt:
+					delivery.retryOriginStatus === "unknown" ? undefined : details.at,
+				unknownAt:
+					delivery.retryOriginStatus === "unknown"
+						? delivery.unknownAt ?? details.at
+						: undefined,
+				lastErrorCode:
+					delivery.retryOriginStatus === "unknown"
+						? "outbound_retry_failed_original_unknown"
+						: details.code,
+				lastErrorMessage:
+					delivery.retryOriginStatus === "unknown"
+						? "The retry was rejected, but an earlier provider outcome remains unknown."
+						: details.message,
 				updatedAt: details.at,
 			};
 			const failedAttempt: OutboundDeliveryAttempt = {
@@ -666,12 +1105,17 @@ export class TruthfulOutboxService {
 		return this.#storage.transaction((tx) => {
 			const delivery = tx.getDelivery(deliveryId);
 			if (!delivery) throw new OutboundDeliveryNotFoundError(deliveryId);
+			assertDeliveryStorageIntegrity(delivery);
+			if (!canRetryFailedDelivery(delivery.lastErrorCode)) {
+				throw new OutboundDeliveryNotRetryableError(deliveryId);
+			}
 			const queued: StoredOutboundDelivery = {
 				...delivery,
+				actor: { ...actor },
 				status: transitionDelivery(delivery.status, "retry_failed"),
+				retryOriginStatus: "failed",
 				availableAt: at,
 				nextAttemptAt: undefined,
-				failedAt: undefined,
 				lastErrorCode: undefined,
 				lastErrorMessage: undefined,
 				updatedAt: at,
@@ -700,9 +1144,13 @@ export class TruthfulOutboxService {
 			const unknownDelivery: StoredOutboundDelivery = {
 				...delivery,
 				status: transitionDelivery(delivery.status, "ambiguous_outcome"),
+				retryOriginStatus: undefined,
+				dispatchPhase: undefined,
+				activeAttemptId: undefined,
 				leaseToken: undefined,
 				leaseExpiresAt: undefined,
 				unknownAt: details.at,
+				failedAt: undefined,
 				lastErrorCode: details.code,
 				lastErrorMessage: details.message,
 				updatedAt: details.at,
@@ -738,11 +1186,13 @@ export class TruthfulOutboxService {
 		return this.#storage.transaction((tx) => {
 			const delivery = tx.getDelivery(deliveryId);
 			if (!delivery) throw new OutboundDeliveryNotFoundError(deliveryId);
+			assertDeliveryStorageIntegrity(delivery);
 			const queued: StoredOutboundDelivery = {
 				...delivery,
+				actor: { ...actor },
 				status: transitionDelivery(delivery.status, "force_retry_unknown"),
+				retryOriginStatus: "unknown",
 				availableAt: at,
-				unknownAt: undefined,
 				lastErrorCode: undefined,
 				lastErrorMessage: undefined,
 				updatedAt: at,
@@ -775,10 +1225,15 @@ export class TruthfulOutboxService {
 			const sentDelivery: StoredOutboundDelivery = {
 				...delivery,
 				status: transitionDelivery(delivery.status, "provider_accepted"),
+				retryOriginStatus: undefined,
+				dispatchPhase: undefined,
+				activeAttemptId: undefined,
 				leaseToken: undefined,
 				leaseExpiresAt: undefined,
 				sesMessageId,
 				sentAt: at,
+				failedAt: undefined,
+				unknownAt: undefined,
 				lastErrorCode: undefined,
 				lastErrorMessage: undefined,
 				updatedAt: at,
@@ -792,6 +1247,7 @@ export class TruthfulOutboxService {
 
 			tx.updateDelivery(sentDelivery);
 			tx.updateAttempt(acceptedAttempt);
+			tx.recordAcceptedRecovery?.(sentDelivery, acceptedAttempt);
 			return {
 				delivery: sentDelivery,
 				attempt: acceptedAttempt,
@@ -812,10 +1268,14 @@ export class TruthfulOutboxService {
 		return this.#storage.transaction((tx) => {
 			const delivery = tx.getDelivery(deliveryId);
 			if (!delivery) throw new OutboundDeliveryNotFoundError(deliveryId);
+			assertDeliveryStorageIntegrity(delivery);
 			const bounced: StoredOutboundDelivery = {
 				...delivery,
 				status: transitionDelivery(delivery.status, "provider_bounced"),
+				retryOriginStatus: undefined,
 				sesMessageId: details.sesMessageId ?? delivery.sesMessageId,
+				failedAt: undefined,
+				unknownAt: undefined,
 				lastErrorCode: details.code,
 				lastErrorMessage: details.message,
 				updatedAt: details.at,
@@ -832,43 +1292,99 @@ export class TruthfulOutboxService {
 				? tx.listExpiredSending(now)
 				: tx.listDeliveries();
 			for (const delivery of candidates) {
+				if (delivery.status !== "sending") {
+					continue;
+				}
+				const integrityFailure = delivery.recoveryIntegrityCode !== undefined;
 				if (
-					delivery.status !== "sending" ||
-					!delivery.leaseToken ||
+					!integrityFailure &&
+					(!delivery.leaseToken ||
 					!delivery.leaseExpiresAt ||
-					delivery.leaseExpiresAt > now
+						delivery.leaseExpiresAt > now)
 				) {
 					continue;
 				}
+				const attempts = tx.listAttemptsByDelivery(delivery.id);
+				const currentLeaseAttempts = delivery.leaseToken
+					? attempts.filter(
+							(attempt) => attempt.leaseToken === delivery.leaseToken,
+						)
+					: [];
+				const unsafeAttempts = attempts.filter(
+					(attempt) =>
+						attempt.storageIntegrityCode !== undefined ||
+						currentLeaseAttempts.includes(attempt) ||
+						attempt.status === "sending" ||
+						attempt.status === "accepted",
+				);
+				const activeAttempt = unsafeAttempts[0];
 
-				const attempt = tx.findAttemptByLease(delivery.id, delivery.leaseToken);
-				if (!attempt) {
-					throw new Error(`Missing leased attempt for ${delivery.id}`);
+				if (
+					delivery.dispatchPhase === "preflight" &&
+					!integrityFailure &&
+					!activeAttempt
+				) {
+					const retrying: StoredOutboundDelivery = {
+						...delivery,
+						status: transitionDelivery(delivery.status, "schedule_retry"),
+						dispatchPhase: undefined,
+						activeAttemptId: undefined,
+						leaseToken: undefined,
+						leaseExpiresAt: undefined,
+						nextAttemptAt: now,
+						preflightDeferralCount: delivery.preflightDeferralCount + 1,
+						updatedAt: now,
+						lastErrorCode: "preflight_lease_expired",
+						lastErrorMessage:
+							"Local preflight lease expired before provider dispatch.",
+					};
+					tx.updateDelivery(retrying);
+					recovered.push({ phase: "preflight", delivery: retrying });
+					continue;
 				}
+
+				const recoveryCode =
+					delivery.recoveryIntegrityCode ??
+					(activeAttempt
+						? "lease_expired"
+						: "provider_attempt_integrity_missing");
 
 				const unknownDelivery: StoredOutboundDelivery = {
 					...delivery,
 					status: transitionDelivery(delivery.status, "lease_expired"),
+					retryOriginStatus: undefined,
+					dispatchPhase: undefined,
+					activeAttemptId: undefined,
 					leaseToken: undefined,
 					leaseExpiresAt: undefined,
 					unknownAt: now,
+					failedAt: undefined,
 					updatedAt: now,
-					lastErrorCode: "lease_expired",
-					lastErrorMessage:
-						"The provider result is ambiguous because the send lease expired.",
-				};
-				const unknownAttempt: OutboundDeliveryAttempt = {
-					...attempt,
-					status: "unknown",
-					finishedAt: now,
-					errorCode: "lease_expired",
+					lastErrorCode: recoveryCode,
+					lastErrorMessage: delivery.recoveryIntegrityCode
+						? "The provider result is ambiguous because dispatch metadata is invalid."
+						: activeAttempt
+							? "The provider result is ambiguous because the send lease expired."
+							: "The provider result is ambiguous because its attempt record is unavailable.",
 				};
 
 				tx.updateDelivery(unknownDelivery);
+				const unknownAttempts = unsafeAttempts
+					.filter((candidate) => candidate.status !== "accepted")
+					.map((candidate) => ({
+						...candidate,
+						status: "unknown" as const,
+						finishedAt: now,
+						errorCode: recoveryCode,
+					}));
+				for (const unknownAttempt of unknownAttempts) {
 				tx.updateAttempt(unknownAttempt);
+				}
+				const reportedAttempt = unknownAttempts[0] ?? activeAttempt;
 				recovered.push({
+					phase: "provider",
 					delivery: unknownDelivery,
-					attempt: unknownAttempt,
+					...(reportedAttempt ? { attempt: reportedAttempt } : {}),
 				});
 			}
 			return recovered;
@@ -887,15 +1403,70 @@ export class TruthfulOutboxService {
 		if (
 			!delivery ||
 			delivery.status !== "sending" ||
-			delivery.leaseToken !== leaseToken
+			delivery.leaseToken !== leaseToken ||
+			delivery.dispatchPhase !== "provider" ||
+			delivery.activeAttemptId === undefined
 		) {
 			throw new DeliveryLeaseError(deliveryId);
 		}
-		const attempt = tx.findAttemptByLease(deliveryId, leaseToken);
-		if (!attempt || attempt.status !== "sending") {
+		const matchingAttempts = tx
+			.listAttemptsByDelivery(deliveryId)
+			.filter(
+				(candidate) =>
+					candidate.storageIntegrityCode === undefined &&
+					candidate.leaseToken === leaseToken &&
+					candidate.status === "sending",
+			);
+		if (matchingAttempts.length !== 1) {
+			throw new DeliveryLeaseError(deliveryId);
+		}
+		const attempt = matchingAttempts[0]!;
+		if (delivery.activeAttemptId !== attempt.id) {
 			throw new DeliveryLeaseError(deliveryId);
 		}
 		return { delivery, attempt };
+	}
+
+	#requirePreflightLease(
+		tx: OutboundDeliveryTransaction,
+		deliveryId: string,
+		leaseToken: string,
+	): StoredOutboundDelivery {
+		const delivery = tx.getDelivery(deliveryId);
+		if (
+			!delivery ||
+			delivery.status !== "sending" ||
+			delivery.dispatchPhase !== "preflight" ||
+			delivery.leaseToken !== leaseToken ||
+			delivery.activeAttemptId !== undefined
+		) {
+			throw new DeliveryLeaseError(deliveryId);
+		}
+		return delivery;
+	}
+}
+
+function hasUnsafeProviderAttempt(
+	tx: OutboundDeliveryTransaction,
+	deliveryId: string,
+	leaseToken: string,
+): boolean {
+	return tx
+		.listAttemptsByDelivery(deliveryId)
+		.some(
+			(attempt) =>
+				attempt.storageIntegrityCode !== undefined ||
+				attempt.leaseToken === leaseToken ||
+				attempt.status === "sending" ||
+				attempt.status === "accepted",
+		);
+}
+
+function assertDeliveryStorageIntegrity(
+	delivery: StoredOutboundDelivery,
+): void {
+	if (delivery.storageIntegrityCode) {
+		throw new OutboundDeliveryIntegrityError(delivery.id);
 	}
 }
 

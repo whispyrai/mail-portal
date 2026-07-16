@@ -7,6 +7,7 @@ import type {
 	AutomationRuleVersionSnapshot,
 } from "../../../shared/automation-rules.ts";
 import { mailboxMigrations } from "../../durableObject/migrations.ts";
+import { applySqliteMigrations } from "../../testing/sqlite-migrations.test.ts";
 import {
 	AUTOMATION_RUNTIME_LIMITS,
 	AutomationRuleError,
@@ -45,7 +46,7 @@ function databaseStorage(database: DatabaseSync): AutomationRulesStorage {
 function migratedDatabase(): DatabaseSync {
 	const database = new DatabaseSync(":memory:");
 	database.exec("PRAGMA foreign_keys = ON");
-	for (const migration of mailboxMigrations) database.exec(migration.sql);
+	applySqliteMigrations(database, mailboxMigrations);
 	return database;
 }
 

@@ -10,6 +10,7 @@ import {
   or,
   asc,
   desc,
+	gt,
   inArray,
   isNotNull,
   isNull,
@@ -25,7 +26,7 @@ import {
 } from "../../shared/folders";
 import type { Env } from "../types";
 import { applyMigrations, mailboxMigrations } from "./migrations";
-import { sendEmailWithOutcome } from "../email-sender";
+import { dispatchPreparedSesSend, prepareSesSend } from "../email-sender";
 import {
   generateMessageId,
   buildThreadToken,
@@ -33,9 +34,12 @@ import {
 } from "../lib/email-helpers";
 import {
   arrayBufferToBase64,
+  attachmentSha256,
   attachmentKey,
   attachmentKeyPrefix,
   storedAttachmentKey,
+  outboundAttachmentByteIdentities,
+  outboundAttachmentBytesMatch,
   uploadKey,
 } from "../lib/attachments";
 import type {
@@ -48,9 +52,7 @@ import type {
   InboundProjectionResult,
   StoredEmailBodyObject,
 } from "../lib/inbound-projection-contract.ts";
-import {
-  inboundDerivedContentRepairCommandFingerprint,
-} from "../lib/inbound-derived-content-repair-attempt.ts";
+import { inboundDerivedContentRepairCommandFingerprint } from "../lib/inbound-derived-content-repair-attempt.ts";
 import {
   classifyInboundDerivedContentCleanup,
   classifyInboundProjectionDerivedContent,
@@ -101,11 +103,14 @@ import {
 import {
   classifySesOutcome,
   type EnqueueOutboundCommand,
+  type OutboundAttachmentByteIdentity,
   type OutboundDeliveryActor,
   type OutboundDeliveryStatus,
 } from "../lib/outbound-delivery-contract";
 import { CONVERSATION_ID_SQL } from "../lib/conversation-identity";
 import {
+	aggregateAcceptedAttemptProviderTruth,
+	canReconcileConcurrentProviderTerminal,
   assertOutboundCommandFingerprint,
   classifyOutboundReplay,
   OutboundIdempotencyConflictError,
@@ -117,6 +122,7 @@ import {
 import {
   DurableObjectOutboundDeliveryStorage,
   deserializeOutboundSnapshot,
+	isCanonicalUtcTimestamp,
   type PendingOutboundAttachment,
 } from "./outbound-storage";
 import {
@@ -166,7 +172,10 @@ import {
   type BulkReservationResult,
 } from "../lib/bulk-job-admission.ts";
 import { mailboxSendCutoffs } from "../lib/send-rate-limit.ts";
-import { finalizeCommittedOutboundMutation } from "../lib/outbound-liveness.ts";
+import {
+  finalizeCommittedOutboundMutation,
+  runOutboundAlarmLane,
+} from "../lib/outbound-liveness.ts";
 import {
   validateLabelDefinition,
   validateLabelMutationTargets,
@@ -294,6 +303,21 @@ import { semanticMailboxNamespace } from "../lib/semantic-search.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
 import { resolveBrand } from "../routes/brand.ts";
 
+class OutboundAttachmentIntegrityError extends Error {
+  constructor(
+    readonly code:
+      | "snapshot_missing"
+      | "attachment_missing"
+      | "attachment_metadata_mismatch"
+      | "attachment_size_mismatch"
+      | "attachment_integrity_unverifiable"
+      | "attachment_content_mismatch",
+  ) {
+    super(code);
+    this.name = "OutboundAttachmentIntegrityError";
+  }
+}
+
 /**
  * SQL expression to normalize email subjects by stripping common
  * reply/forward prefixes (Re:, Fwd:, FW:, AW:, WG:, Réf:, SV:).
@@ -407,8 +431,45 @@ type EmailDeletionArtifacts = {
 const ATTACHMENT_CLEANUP_QUEUE_KEY = "attachment-cleanup:queue";
 const DRAFT_SAVE_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const DRAFT_SAVE_PRUNE_BATCH = 100;
+const DRAFT_SAVE_EXPIRY_SWEEP_BATCH = 100;
 const DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS = 5 * 60_000;
 const DRAFT_SAVE_CLEANUP_MAX_DELAY_MS = 24 * 60 * 60_000;
+
+type DraftSaveDestinationPlan =
+  | { ok: true; keys: string[] }
+  | { ok: false; code: "draft_save_destination_plan_invalid" };
+
+function decodeDraftSaveDestinationPlan(
+  value: string,
+): DraftSaveDestinationPlan {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length > ATTACHMENT_LIMITS.maxFiles ||
+      parsed.some((key) => typeof key !== "string" || key.length === 0)
+    ) {
+      return { ok: false, code: "draft_save_destination_plan_invalid" };
+    }
+    const keys = parsed as string[];
+    if (new Set(keys).size !== keys.length) {
+      return { ok: false, code: "draft_save_destination_plan_invalid" };
+    }
+    return { ok: true, keys };
+  } catch {
+    return { ok: false, code: "draft_save_destination_plan_invalid" };
+  }
+}
+
+async function privacySafeRecipientHash(address: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(address.trim().toLowerCase()),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 type AttachmentCleanupJob = {
   id: string;
@@ -417,6 +478,11 @@ type AttachmentCleanupJob = {
   promotionOwner?: string;
   attempts: number;
   createdAt: number;
+  state?: "pending" | "parked";
+  generation?: number;
+  nextAttemptAt?: number;
+  lastErrorCode?: string;
+  parkedAt?: number;
 };
 const BULK_QUEUE_KEY = "bulk:queue";
 const BULK_ACTIVE_KEY = "bulk:active";
@@ -443,6 +509,7 @@ interface BulkAttachment {
   filename: string;
   type: string;
   size: number;
+  contentSha256: string;
 }
 
 interface BulkJob {
@@ -610,6 +677,7 @@ export class MailboxDO extends DurableObject<Env> {
 
   async getEmails(options: GetEmailsOptions = {}) {
     await this.#selfHealSnoozes();
+    await this.#selfHealCleanupAlarm();
     const {
       folder,
       label_id,
@@ -757,6 +825,7 @@ export class MailboxDO extends DurableObject<Env> {
       // Fallback to regular getEmails if no folder specified
       return this.getEmails(options);
     }
+    await this.#selfHealCleanupAlarm();
     const visibleFolderId = this.#visibleFolderId(folder);
     if (!visibleFolderId) return [];
 
@@ -1031,6 +1100,7 @@ export class MailboxDO extends DurableObject<Env> {
 
   async getEmail(id: string) {
     await this.#selfHealSnoozes();
+    await this.#selfHealCleanupAlarm();
     const email = this.db
       .select()
       .from(schema.emails)
@@ -1540,6 +1610,7 @@ export class MailboxDO extends DurableObject<Env> {
     emailId: string;
     projectionAttemptId: string | null;
     createdAt: string;
+	nextAttemptAt?: string;
   }): void {
     this.db
       .insert(schema.r2DeletionOutbox)
@@ -1552,7 +1623,7 @@ export class MailboxDO extends DurableObject<Env> {
         lease_token: null,
         lease_expires_at: null,
         attempts: 0,
-        next_attempt_at: input.createdAt,
+		next_attempt_at: input.nextAttemptAt ?? input.createdAt,
         last_error: null,
         created_at: input.createdAt,
       })
@@ -1650,8 +1721,7 @@ export class MailboxDO extends DurableObject<Env> {
               existingAttempt.expected_generation !==
                 command.expectedGeneration ||
               existingAttempt.marker_id !== command.markerId ||
-              existingAttempt.command_fingerprint !==
-                command.commandFingerprint
+              existingAttempt.command_fingerprint !== command.commandFingerprint
             )
               throw new Error(
                 "Inbound repair attempt identity cannot be reused",
@@ -3143,6 +3213,14 @@ export class MailboxDO extends DurableObject<Env> {
         occurredAt,
       );
       this.#refreshTerminalDraftSaveRetention(id, occurredAt);
+	  for (const attachment of emailAttachments) {
+		this.#enqueueR2DeletionSync({
+		  r2Key: storedAttachmentKey(attachment),
+		  emailId: id,
+		  projectionAttemptId: null,
+		  createdAt: occurredAt,
+		});
+	  }
       this.db
         .delete(schema.emails)
         .where(
@@ -3161,8 +3239,19 @@ export class MailboxDO extends DurableObject<Env> {
         occurredAt,
       );
     });
+	if (emailAttachments.length > 0) {
+	  try {
+		await this.#scheduleAlarmAt(Date.now() + 100);
+	  } catch (error) {
+		console.error("Draft discarded with durable attachment cleanup pending", {
+		  draftId: id,
+		  objectCount: emailAttachments.length,
+		  errorName: error instanceof Error ? error.name : "UnknownError",
+		});
+	  }
+	}
 
-    return { status: "discarded" as const, attachments: emailAttachments };
+    return { status: "discarded" as const };
   }
 
   #applyDraftUpdate(input: {
@@ -3434,6 +3523,26 @@ export class MailboxDO extends DurableObject<Env> {
     };
   }
 
+  #readDraftSnapshot(draftId: string) {
+	const draft = this.db
+	  .select()
+	  .from(schema.emails)
+	  .where(eq(schema.emails.id, draftId))
+	  .get();
+	if (!draft || draft.folder_id !== Folders.DRAFT) return null;
+	return {
+	  ...draft,
+	  read: Boolean(draft.read),
+	  starred: Boolean(draft.starred),
+	  attachments: this.db
+		.select()
+		.from(schema.attachments)
+		.where(eq(schema.attachments.email_id, draftId))
+		.all(),
+	  labels: this.#labelsForEmailIds([draftId]).get(draftId) ?? [],
+	};
+  }
+
   async getDraftCreateReplay(createKey: string, fingerprint: string) {
     return this.#getDraftCreateReplay(createKey, fingerprint);
   }
@@ -3483,6 +3592,7 @@ export class MailboxDO extends DurableObject<Env> {
           draftId: existingOperation.draft_id,
           committedVersion: existingOperation.committed_version,
           claimToken: existingOperation.claim_token,
+		  draft: this.#readDraftSnapshot(existingOperation.draft_id),
         };
       }
       if (
@@ -3511,39 +3621,55 @@ export class MailboxDO extends DurableObject<Env> {
           ),
         )
         .all();
-      const stalePromotions = expiredOperations.flatMap((operation) => {
-        const parsed: unknown = JSON.parse(operation.destinationKeys);
-        const destinationKeys = Array.isArray(parsed)
-          ? parsed.filter((key): key is string => typeof key === "string")
-          : [];
-        return destinationKeys.length > 0
-          ? [
-              {
-                destinationKeys,
-                promotionOwner: operation.claimToken ?? operation.saveKey,
-              },
-            ]
-          : [];
+      const staleCleanupPlans = expiredOperations.flatMap((operation) => {
+        const plan = decodeDraftSaveDestinationPlan(operation.destinationKeys);
+        if (plan.ok && plan.keys.length === 0) return [];
+        return [{
+          destinationKeys: plan.ok ? plan.keys : [],
+          serializedDestinationKeys: plan.ok
+            ? JSON.stringify(plan.keys)
+            : operation.destinationKeys,
+          promotionOwner: operation.claimToken ?? operation.saveKey,
+          integrityFailure: !plan.ok,
+        }];
       });
+      const stalePromotions = staleCleanupPlans.flatMap((plan) =>
+        plan.integrityFailure
+          ? []
+          : [{
+              destinationKeys: plan.destinationKeys,
+              promotionOwner: plan.promotionOwner,
+            }],
+      );
       const occurredAt = new Date(now).toISOString();
-      for (const stalePromotion of stalePromotions) {
+      for (const stalePlan of staleCleanupPlans) {
         this.db
           .insert(schema.draftSaveCleanupIntents)
           .values({
-            claim_token: stalePromotion.promotionOwner,
+            claim_token: stalePlan.promotionOwner,
             draft_id: input.draftId,
-            destination_keys: JSON.stringify(stalePromotion.destinationKeys),
+            destination_keys: stalePlan.serializedDestinationKeys,
             next_attempt_at: now + DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS,
             verify_until: now + DRAFT_SAVE_REPLAY_RETENTION_MS,
             attempts: 0,
+            state: stalePlan.integrityFailure ? "parked" : "pending",
+            last_error_code: stalePlan.integrityFailure
+              ? "draft_save_destination_plan_invalid"
+              : null,
+            parked_at: stalePlan.integrityFailure ? now : null,
             updated_at: occurredAt,
           })
           .onConflictDoUpdate({
             target: schema.draftSaveCleanupIntents.claim_token,
             set: {
-              destination_keys: JSON.stringify(stalePromotion.destinationKeys),
+              destination_keys: stalePlan.serializedDestinationKeys,
               next_attempt_at: now + DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS,
               verify_until: now + DRAFT_SAVE_REPLAY_RETENTION_MS,
+              state: stalePlan.integrityFailure ? "parked" : "pending",
+              last_error_code: stalePlan.integrityFailure
+                ? "draft_save_destination_plan_invalid"
+                : null,
+              parked_at: stalePlan.integrityFailure ? now : null,
               updated_at: occurredAt,
             },
           })
@@ -3636,10 +3762,26 @@ export class MailboxDO extends DurableObject<Env> {
         .run();
       return { status: "claimed" as const, stalePromotions };
     });
-    if (claim.status === "claimed" && claim.stalePromotions.length > 0) {
-      await this.#scheduleAlarmAt(
-        Date.now() + DRAFT_SAVE_CLEANUP_INITIAL_DELAY_MS,
-      );
+    const nextDraftSaveAlarm = earliestMailboxAlarm([
+      this.#nextDraftSaveCleanupAt(),
+      this.#nextDraftSaveClaimExpiryAt(),
+    ]);
+    if (nextDraftSaveAlarm !== null) {
+      try {
+        await this.#scheduleAlarmAt(Math.max(Date.now(), nextDraftSaveAlarm));
+      } catch (error) {
+        console.error("Draft save recovery remains durably pending", {
+          saveKey: input.saveKey,
+          objectCount:
+            claim.status === "claimed"
+              ? claim.stalePromotions.reduce(
+                  (count, promotion) => count + promotion.destinationKeys.length,
+                  0,
+                )
+              : 0,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        });
+      }
     }
     return claim;
   }
@@ -3650,8 +3792,12 @@ export class MailboxDO extends DurableObject<Env> {
     claimToken: string,
     destinationKeys: string[],
   ) {
-    return this.ctx.storage.transactionSync(() => {
-      const serializedDestinationKeys = JSON.stringify(destinationKeys);
+    const destinationPlan = decodeDraftSaveDestinationPlan(
+      JSON.stringify(destinationKeys),
+    );
+    if (!destinationPlan.ok) return false;
+    const recorded = this.ctx.storage.transactionSync(() => {
+      const serializedDestinationKeys = JSON.stringify(destinationPlan.keys);
       this.db
         .update(schema.draftSaveOperations)
         .set({
@@ -3670,6 +3816,7 @@ export class MailboxDO extends DurableObject<Env> {
       const recorded = this.db
         .select({
           destinationKeys: schema.draftSaveOperations.destination_keys,
+          claimExpiresAt: schema.draftSaveOperations.claim_expires_at,
         })
         .from(schema.draftSaveOperations)
         .where(
@@ -3681,8 +3828,19 @@ export class MailboxDO extends DurableObject<Env> {
           ),
         )
         .get();
-      return recorded?.destinationKeys === serializedDestinationKeys;
+      return recorded?.destinationKeys === serializedDestinationKeys
+        ? recorded
+        : null;
     });
+    if (!recorded) return false;
+
+    // This is the hard recovery gate before the caller writes any promoted R2
+    // object. If the alarm cannot be armed, the save aborts without creating
+    // bytes that have no autonomous expiry path.
+    await this.#scheduleAlarmAt(
+      Math.max(Date.now(), recorded.claimExpiresAt),
+    );
+    return true;
   }
 
   async abortDraftSave(
@@ -3690,9 +3848,11 @@ export class MailboxDO extends DurableObject<Env> {
     fingerprint: string,
     claimToken: string,
   ) {
-    return this.ctx.storage.transactionSync(() => {
+    let cleanupQueued = 0;
+    const result = this.ctx.storage.transactionSync(() => {
       const operation = this.db
         .select({
+          draftId: schema.draftSaveOperations.draft_id,
           destinationKeys: schema.draftSaveOperations.destination_keys,
         })
         .from(schema.draftSaveOperations)
@@ -3707,9 +3867,64 @@ export class MailboxDO extends DurableObject<Env> {
         .get();
       if (!operation)
         return { status: "not_claimed" as const, destinationKeys: [] };
+      const destinationPlan = decodeDraftSaveDestinationPlan(
+        operation.destinationKeys,
+      );
+      const destinationKeys = destinationPlan.ok ? destinationPlan.keys : [];
+      const cleanupNow = Date.now();
+      const occurredAt = new Date(cleanupNow).toISOString();
+      if (!destinationPlan.ok) {
+        this.db
+          .insert(schema.draftSaveCleanupIntents)
+          .values({
+            claim_token: claimToken,
+            draft_id: operation.draftId,
+            destination_keys: operation.destinationKeys,
+            next_attempt_at: cleanupNow,
+            verify_until: cleanupNow + DRAFT_SAVE_REPLAY_RETENTION_MS,
+            attempts: 0,
+            state: "parked",
+            last_error_code: "draft_save_destination_plan_invalid",
+            parked_at: cleanupNow,
+            updated_at: occurredAt,
+          })
+          .onConflictDoNothing()
+          .run();
+        cleanupQueued = 1;
+      } else if (destinationKeys.length > 0) {
+        this.db
+          .insert(schema.draftSaveCleanupIntents)
+          .values({
+            claim_token: claimToken,
+            draft_id: operation.draftId,
+            destination_keys: JSON.stringify(destinationKeys),
+            next_attempt_at: cleanupNow,
+            verify_until: cleanupNow + DRAFT_SAVE_REPLAY_RETENTION_MS,
+            attempts: 0,
+            state: "pending",
+            last_error_code: null,
+            parked_at: null,
+            updated_at: occurredAt,
+          })
+          .onConflictDoUpdate({
+            target: schema.draftSaveCleanupIntents.claim_token,
+            set: {
+              draft_id: operation.draftId,
+              destination_keys: JSON.stringify(destinationKeys),
+              next_attempt_at: cleanupNow,
+              verify_until: cleanupNow + DRAFT_SAVE_REPLAY_RETENTION_MS,
+              state: "pending",
+              last_error_code: null,
+              parked_at: null,
+              updated_at: occurredAt,
+            },
+          })
+          .run();
+        cleanupQueued = destinationKeys.length;
+      }
       this.db
         .update(schema.draftSaveOperations)
-        .set({ state: "aborted", updated_at: new Date().toISOString() })
+        .set({ state: "aborted", updated_at: occurredAt })
         .where(
           and(
             eq(schema.draftSaveOperations.save_key, saveKey),
@@ -3719,15 +3934,24 @@ export class MailboxDO extends DurableObject<Env> {
           ),
         )
         .run();
-      const parsed: unknown = JSON.parse(operation.destinationKeys);
       return {
         status: "aborted" as const,
         promotionOwner: claimToken,
-        destinationKeys: Array.isArray(parsed)
-          ? parsed.filter((key): key is string => typeof key === "string")
-          : [],
+        destinationKeys,
       };
     });
+    if (cleanupQueued > 0) {
+      try {
+        await this.#scheduleAlarmAt(Date.now() + 100);
+      } catch (error) {
+        console.error("Draft abort committed with durable attachment cleanup pending", {
+          saveKey,
+          objectCount: cleanupQueued,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        });
+      }
+    }
+    return result;
   }
 
   async getDraftSaveOutcome(saveKey: string, fingerprint: string) {
@@ -3745,6 +3969,9 @@ export class MailboxDO extends DurableObject<Env> {
       draftId: operation.draft_id,
       committedVersion: operation.committed_version,
       claimToken: operation.claim_token,
+	  ...(operation.state === "committed"
+		? { draft: this.#readDraftSnapshot(operation.draft_id) }
+		: {}),
     };
   }
 
@@ -3793,11 +4020,28 @@ export class MailboxDO extends DurableObject<Env> {
       saveKey?: string;
       saveFingerprint?: string;
       saveClaimToken?: string;
+	  stagingCleanupKeys?: string[];
     },
     attachments: AttachmentData[],
     actor: ActivityActor = { kind: "system" },
   ) {
-    return this.ctx.storage.transactionSync(() => {
+	const stagingCleanupKeys = input.stagingCleanupKeys ?? [];
+	if (
+		stagingCleanupKeys.length > ATTACHMENT_LIMITS.maxFiles ||
+		new Set(stagingCleanupKeys).size !== stagingCleanupKeys.length ||
+		stagingCleanupKeys.some(
+			(key) =>
+				typeof key !== "string" ||
+				key.length === 0 ||
+				key.length > 1_024 ||
+				!key.startsWith("uploads/") ||
+				key.includes(".."),
+		)
+	) {
+		throw new Error("Draft staging cleanup scope is invalid");
+	}
+	let cleanupQueued = 0;
+	const result = this.ctx.storage.transactionSync(() => {
       const hasSaveClaim = Boolean(
         input.saveKey || input.saveFingerprint || input.saveClaimToken,
       );
@@ -3875,8 +4119,10 @@ export class MailboxDO extends DurableObject<Env> {
       const replacedAttachments = existing
         ? this.db
             .select({
-              id: schema.attachments.id,
-              filename: schema.attachments.filename,
+          id: schema.attachments.id,
+		  email_id: schema.attachments.email_id,
+          filename: schema.attachments.filename,
+		  r2_key: schema.attachments.r2_key,
             })
             .from(schema.attachments)
             .where(eq(schema.attachments.email_id, input.id))
@@ -3958,6 +4204,22 @@ export class MailboxDO extends DurableObject<Env> {
           this.db.insert(schema.attachments).values(chunk).run();
         });
       }
+	  const cleanupCandidates = [
+		...replacedAttachments.map((attachment) => ({
+		  r2Key: storedAttachmentKey(attachment),
+		  emailId: input.id,
+		  projectionAttemptId: null,
+		})),
+		...stagingCleanupKeys.map((r2Key) => ({
+		  r2Key,
+		  emailId: input.id,
+		  projectionAttemptId: null,
+		})),
+	  ];
+	  if (cleanupCandidates.length > 0) {
+		this.#enqueueUnownedR2DeletionSync(cleanupCandidates, occurredAt);
+		cleanupQueued = cleanupCandidates.length;
+	  }
       if (input.saveKey && input.saveFingerprint && input.saveClaimToken) {
         this.db
           .update(schema.draftSaveOperations)
@@ -3984,13 +4246,30 @@ export class MailboxDO extends DurableObject<Env> {
         { draftVersion },
         occurredAt,
       );
+	  const savedDraft = this.#readDraftSnapshot(input.id);
+	  if (!savedDraft || savedDraft.draft_version !== draftVersion) {
+		throw new Error("Committed draft snapshot could not be materialized");
+	  }
       return {
         status: "saved" as const,
         draftId: input.id,
         draftVersion,
         replacedAttachments,
+		draft: savedDraft,
       };
     });
+	if (cleanupQueued > 0) {
+		try {
+			await this.#scheduleAlarmAt(Date.now() + 100);
+		} catch (error) {
+			console.error("Draft committed with durable attachment cleanup pending", {
+				draftId: input.id,
+				objectCount: cleanupQueued,
+				errorName: error instanceof Error ? error.name : "UnknownError",
+			});
+		}
+	}
+	return result;
   }
 
   /** Consume only the exact draft revision captured by the outbound snapshot. */
@@ -4030,6 +4309,14 @@ export class MailboxDO extends DurableObject<Env> {
         .where(eq(schema.attachments.email_id, id))
         .all();
       const occurredAt = new Date().toISOString();
+	  for (const attachment of draftAttachments) {
+		this.#enqueueR2DeletionSync({
+			r2Key: storedAttachmentKey(attachment),
+			emailId: id,
+			projectionAttemptId: null,
+			createdAt: occurredAt,
+		});
+	  }
       this.#markDraftCreateOperation(
         id,
         "consumed",
@@ -4068,6 +4355,7 @@ export class MailboxDO extends DurableObject<Env> {
           nextAttemptAt: schema.draftSaveCleanupIntents.next_attempt_at,
         })
         .from(schema.draftSaveCleanupIntents)
+        .where(eq(schema.draftSaveCleanupIntents.state, "pending"))
         .orderBy(
           asc(schema.draftSaveCleanupIntents.next_attempt_at),
           asc(schema.draftSaveCleanupIntents.claim_token),
@@ -4077,11 +4365,123 @@ export class MailboxDO extends DurableObject<Env> {
     );
   }
 
+  #nextDraftSaveClaimExpiryAt() {
+    return (
+      this.db
+        .select({
+          claimExpiresAt: schema.draftSaveOperations.claim_expires_at,
+        })
+        .from(schema.draftSaveOperations)
+        .where(eq(schema.draftSaveOperations.state, "claimed"))
+        .orderBy(
+          asc(schema.draftSaveOperations.claim_expires_at),
+          asc(schema.draftSaveOperations.save_key),
+        )
+        .limit(1)
+        .get()?.claimExpiresAt ?? null
+    );
+  }
+
+  #promoteExpiredDraftSaveClaimsToCleanup(now: number) {
+    return this.ctx.storage.transactionSync(() => {
+      const expiredOperations = this.db
+        .select({
+          saveKey: schema.draftSaveOperations.save_key,
+          draftId: schema.draftSaveOperations.draft_id,
+          destinationKeys: schema.draftSaveOperations.destination_keys,
+          claimToken: schema.draftSaveOperations.claim_token,
+        })
+        .from(schema.draftSaveOperations)
+        .where(
+          and(
+            eq(schema.draftSaveOperations.state, "claimed"),
+            lte(schema.draftSaveOperations.claim_expires_at, now),
+          ),
+        )
+        .orderBy(
+          asc(schema.draftSaveOperations.claim_expires_at),
+          asc(schema.draftSaveOperations.save_key),
+        )
+        .limit(DRAFT_SAVE_EXPIRY_SWEEP_BATCH)
+        .all();
+      const occurredAt = new Date(now).toISOString();
+      let integrityFailures = 0;
+
+      for (const operation of expiredOperations) {
+        const destinationPlan = decodeDraftSaveDestinationPlan(
+          operation.destinationKeys,
+        );
+        const promotionOwner = operation.claimToken ?? operation.saveKey;
+        if (!destinationPlan.ok) integrityFailures += 1;
+        if (!destinationPlan.ok || destinationPlan.keys.length > 0) {
+          const serializedDestinationKeys = destinationPlan.ok
+            ? JSON.stringify(destinationPlan.keys)
+            : operation.destinationKeys;
+          this.db
+            .insert(schema.draftSaveCleanupIntents)
+            .values({
+              claim_token: promotionOwner,
+              draft_id: operation.draftId,
+              destination_keys: serializedDestinationKeys,
+              next_attempt_at: now,
+              verify_until: now + DRAFT_SAVE_REPLAY_RETENTION_MS,
+              attempts: 0,
+              state: destinationPlan.ok ? "pending" : "parked",
+              last_error_code: destinationPlan.ok
+                ? null
+                : "draft_save_destination_plan_invalid",
+              parked_at: destinationPlan.ok ? null : now,
+              updated_at: occurredAt,
+            })
+            .onConflictDoUpdate({
+              target: schema.draftSaveCleanupIntents.claim_token,
+              set: {
+                draft_id: operation.draftId,
+                destination_keys: serializedDestinationKeys,
+                next_attempt_at: now,
+                verify_until: now + DRAFT_SAVE_REPLAY_RETENTION_MS,
+                state: destinationPlan.ok ? "pending" : "parked",
+                last_error_code: destinationPlan.ok
+                  ? null
+                  : "draft_save_destination_plan_invalid",
+                parked_at: destinationPlan.ok ? null : now,
+                updated_at: occurredAt,
+              },
+            })
+            .run();
+        }
+        this.db
+          .update(schema.draftSaveOperations)
+          .set({ state: "aborted", updated_at: occurredAt })
+          .where(
+            and(
+              eq(schema.draftSaveOperations.save_key, operation.saveKey),
+              eq(schema.draftSaveOperations.state, "claimed"),
+              lte(schema.draftSaveOperations.claim_expires_at, now),
+            ),
+          )
+          .run();
+      }
+
+      return {
+        moreDue:
+          expiredOperations.length === DRAFT_SAVE_EXPIRY_SWEEP_BATCH,
+        promoted: expiredOperations.length,
+        integrityFailures,
+      };
+    });
+  }
+
   async #processDraftSaveCleanup(now: number): Promise<number | null> {
     const intent = this.db
       .select()
       .from(schema.draftSaveCleanupIntents)
-      .where(lte(schema.draftSaveCleanupIntents.next_attempt_at, now))
+      .where(
+        and(
+          eq(schema.draftSaveCleanupIntents.state, "pending"),
+          lte(schema.draftSaveCleanupIntents.next_attempt_at, now),
+        ),
+      )
       .orderBy(
         asc(schema.draftSaveCleanupIntents.next_attempt_at),
         asc(schema.draftSaveCleanupIntents.claim_token),
@@ -4091,13 +4491,17 @@ export class MailboxDO extends DurableObject<Env> {
     if (!intent) return this.#nextDraftSaveCleanupAt();
 
     let succeeded = false;
+    let integrityFailure = false;
     try {
-      const parsed: unknown = JSON.parse(intent.destination_keys);
-      const keys = Array.isArray(parsed)
-        ? parsed.filter((key): key is string => typeof key === "string")
-        : [];
+      const destinationPlan = decodeDraftSaveDestinationPlan(
+        intent.destination_keys,
+      );
+      if (!destinationPlan.ok) {
+        integrityFailure = true;
+        throw new Error(destinationPlan.code);
+      }
       const ownedKeys: string[] = [];
-      for (const key of keys) {
+      for (const key of destinationPlan.keys) {
         const object = await this.env.BUCKET.get(key);
         if (object?.customMetadata?.promotionOwner === intent.claim_token) {
           ownedKeys.push(key);
@@ -4122,7 +4526,28 @@ export class MailboxDO extends DurableObject<Env> {
           eq(schema.draftSaveCleanupIntents.claim_token, intent.claim_token),
         )
         .get();
-      if (!current) return;
+      if (!current || current.state !== "pending") return;
+      if (integrityFailure) {
+        this.db
+          .update(schema.draftSaveCleanupIntents)
+          .set({
+            state: "parked",
+            generation: current.generation + 1,
+            attempts: current.attempts + 1,
+            last_error_code: "draft_save_destination_plan_invalid",
+            parked_at: completedAt,
+            updated_at: new Date(completedAt).toISOString(),
+          })
+          .where(
+            and(
+              eq(schema.draftSaveCleanupIntents.claim_token, intent.claim_token),
+              eq(schema.draftSaveCleanupIntents.state, "pending"),
+              eq(schema.draftSaveCleanupIntents.generation, current.generation),
+            ),
+          )
+          .run();
+        return;
+      }
       if (succeeded && completedAt >= current.verify_until) {
         this.db
           .delete(schema.draftSaveCleanupIntents)
@@ -4142,6 +4567,7 @@ export class MailboxDO extends DurableObject<Env> {
         .set({
           attempts,
           next_attempt_at: completedAt + delay,
+          last_error_code: succeeded ? null : "draft_save_cleanup_r2_failed",
           updated_at: new Date(completedAt).toISOString(),
         })
         .where(
@@ -4152,42 +4578,213 @@ export class MailboxDO extends DurableObject<Env> {
     return this.#nextDraftSaveCleanupAt();
   }
 
+  listParkedDraftSaveCleanupIntents(
+    afterClaimToken: string | undefined,
+    limit: number,
+  ) {
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+    const rows = this.db
+      .select({
+        claimToken: schema.draftSaveCleanupIntents.claim_token,
+        draftId: schema.draftSaveCleanupIntents.draft_id,
+        generation: schema.draftSaveCleanupIntents.generation,
+        attempts: schema.draftSaveCleanupIntents.attempts,
+        lastErrorCode: schema.draftSaveCleanupIntents.last_error_code,
+        parkedAt: schema.draftSaveCleanupIntents.parked_at,
+      })
+      .from(schema.draftSaveCleanupIntents)
+      .where(
+        and(
+          eq(schema.draftSaveCleanupIntents.state, "parked"),
+          ...(afterClaimToken
+            ? [gt(schema.draftSaveCleanupIntents.claim_token, afterClaimToken)]
+            : []),
+        ),
+      )
+      .orderBy(asc(schema.draftSaveCleanupIntents.claim_token))
+      .limit(boundedLimit + 1)
+      .all();
+    const hasMore = rows.length > boundedLimit;
+    const items = rows.slice(0, boundedLimit);
+    return {
+      items,
+      ...(hasMore ? { next: items.at(-1)?.claimToken } : {}),
+    };
+  }
+
+  async repairParkedDraftSaveCleanupIntent(
+    claimToken: string,
+    input: { expectedGeneration: number; destinationKeys: string[] },
+    actor: ActivityActor,
+  ) {
+    const destinationPlan = decodeDraftSaveDestinationPlan(
+      JSON.stringify(input.destinationKeys),
+    );
+    if (!destinationPlan.ok || destinationPlan.keys.length === 0) {
+      return { status: "invalid_plan" as const };
+    }
+    const repairedAt = Date.now();
+    const result = this.ctx.storage.transactionSync(() => {
+      const current = this.db
+        .select()
+        .from(schema.draftSaveCleanupIntents)
+        .where(eq(schema.draftSaveCleanupIntents.claim_token, claimToken))
+        .get();
+      if (!current) return { status: "not_found" as const };
+      if (current.state !== "parked") {
+        return { status: "not_parked" as const };
+      }
+      if (current.generation !== input.expectedGeneration) {
+        return {
+          status: "generation_conflict" as const,
+          generation: current.generation,
+        };
+      }
+      const generation = current.generation + 1;
+      const occurredAt = new Date(repairedAt).toISOString();
+      this.db
+        .update(schema.draftSaveCleanupIntents)
+        .set({
+          destination_keys: JSON.stringify(destinationPlan.keys),
+          state: "pending",
+          generation,
+          attempts: 0,
+          next_attempt_at: repairedAt,
+          verify_until: repairedAt + DRAFT_SAVE_REPLAY_RETENTION_MS,
+          last_error_code: null,
+          parked_at: null,
+          updated_at: occurredAt,
+        })
+        .where(
+          and(
+            eq(schema.draftSaveCleanupIntents.claim_token, claimToken),
+            eq(schema.draftSaveCleanupIntents.state, "parked"),
+            eq(schema.draftSaveCleanupIntents.generation, current.generation),
+          ),
+        )
+        .run();
+      this.#recordActivity(
+        actor,
+        "draft_save_cleanup_repaired",
+        "draft",
+        current.draft_id,
+        { generation, objectCount: destinationPlan.keys.length },
+        occurredAt,
+      );
+      return { status: "repaired" as const, generation };
+    });
+    if (result.status === "repaired") {
+      try {
+        await this.#scheduleAlarmAt(repairedAt + 100);
+      } catch {
+        console.error(
+          "[draft-save-cleanup] repaired intent remains durably pending",
+        );
+      }
+    }
+    return result;
+  }
+
   async queueAttachmentCleanup(
     emailId: string,
     keys: string[],
     actor: ActivityActor = { kind: "system" },
     promotionOwner?: string,
-  ) {
-    if (keys.length === 0) return;
-    const queue =
-      (await this.ctx.storage.get<AttachmentCleanupJob[]>(
-        ATTACHMENT_CLEANUP_QUEUE_KEY,
-      )) ?? [];
-    queue.push({
-      id: crypto.randomUUID(),
-      emailId,
-      keys,
-      ...(promotionOwner ? { promotionOwner } : {}),
-      attempts: 0,
-      createdAt: Date.now(),
-    });
-    await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, queue);
-    this.#recordActivity(actor, "attachment_cleanup_queued", "email", emailId, {
-      objectCount: keys.length,
-    });
-    const alarm = await this.ctx.storage.getAlarm();
-    if (alarm === null || alarm > Date.now() + 100) {
-      await this.ctx.storage.setAlarm(Date.now() + 100);
-    }
+	  ) {
+	    if (keys.length === 0) return;
+	const createdAt = Date.now();
+	await this.ctx.storage.transaction(async (transaction) => {
+	  const queue =
+		(await transaction.get<AttachmentCleanupJob[]>(
+		  ATTACHMENT_CLEANUP_QUEUE_KEY,
+		)) ?? [];
+	  for (const key of [...new Set(keys)]) {
+		queue.push({
+		  id: crypto.randomUUID(),
+		  emailId,
+		  keys: [key],
+		  ...(promotionOwner ? { promotionOwner } : {}),
+		  attempts: 0,
+		  createdAt,
+		  state: "pending",
+		  generation: 0,
+		  nextAttemptAt: createdAt,
+		});
+	  }
+	  await transaction.put(ATTACHMENT_CLEANUP_QUEUE_KEY, queue);
+	});
+	try {
+	  this.#recordActivity(actor, "attachment_cleanup_queued", "email", emailId, {
+		objectCount: keys.length,
+	  });
+	} catch (error) {
+	  console.error("Attachment cleanup queued without activity projection", {
+		emailId,
+		objectCount: keys.length,
+		errorName: error instanceof Error ? error.name : "UnknownError",
+	  });
+	}
+	try {
+	  await this.#scheduleAlarmAt(Date.now() + 100);
+	} catch (error) {
+	  console.error("Attachment cleanup remains durably pending", {
+		emailId,
+		objectCount: keys.length,
+		errorName: error instanceof Error ? error.name : "UnknownError",
+	  });
+	}
   }
 
-  async #processAttachmentCleanup(): Promise<boolean> {
-    const queue =
-      (await this.ctx.storage.get<AttachmentCleanupJob[]>(
-        ATTACHMENT_CLEANUP_QUEUE_KEY,
-      )) ?? [];
-    const job = queue[0];
-    if (!job) return false;
+	#normalizeAttachmentCleanupQueue(
+	  queue: AttachmentCleanupJob[],
+	  now: number,
+	): AttachmentCleanupJob[] {
+	  return queue.flatMap((job) =>
+		[...new Set(job.keys)]
+		  .filter((key) => typeof key === "string" && key.length > 0 && key.length <= 1024)
+		  .map((key, index) => ({
+			...job,
+			id: job.keys.length === 1 ? job.id : `${job.id}:${index}`,
+			keys: [key],
+			state: job.state === "parked" ? "parked" as const : "pending" as const,
+			generation: Number.isInteger(job.generation) && (job.generation ?? 0) >= 0
+			  ? job.generation
+			  : 0,
+			nextAttemptAt: Number.isFinite(job.nextAttemptAt)
+			  ? job.nextAttemptAt
+			  : now,
+		  })),
+	  );
+	}
+
+	#nextAttachmentCleanupAt(queue: AttachmentCleanupJob[]): number | null {
+	  return queue
+		.filter((job) => job.state !== "parked")
+		.map((job) => job.nextAttemptAt ?? job.createdAt)
+		.filter(Number.isFinite)
+		.sort((a, b) => a - b)[0] ?? null;
+	}
+
+	  async #processAttachmentCleanup(now = Date.now()): Promise<number | null> {
+	    const queue =
+	      (await this.ctx.storage.get<AttachmentCleanupJob[]>(
+	        ATTACHMENT_CLEANUP_QUEUE_KEY,
+	      )) ?? [];
+	const normalized = this.#normalizeAttachmentCleanupQueue(queue, now);
+	const job = normalized
+	  .filter((candidate) =>
+		candidate.state !== "parked" && (candidate.nextAttemptAt ?? now) <= now,
+	  )
+	  .sort((a, b) =>
+		(a.nextAttemptAt ?? a.createdAt) - (b.nextAttemptAt ?? b.createdAt) ||
+		a.createdAt - b.createdAt || a.id.localeCompare(b.id),
+	  )[0];
+	if (!job) {
+	  if (JSON.stringify(normalized) !== JSON.stringify(queue)) {
+		await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, normalized);
+	  }
+	  return this.#nextAttachmentCleanupAt(normalized);
+	}
     let succeeded = false;
     try {
       if (job.promotionOwner) {
@@ -4219,22 +4816,115 @@ export class MailboxDO extends DurableObject<Env> {
     }
     // R2 I/O yields the input gate. Re-read before finalization so a cleanup
     // queued during that yield cannot be overwritten by this job's old snapshot.
-    const latestQueue =
-      (await this.ctx.storage.get<AttachmentCleanupJob[]>(
-        ATTACHMENT_CLEANUP_QUEUE_KEY,
-      )) ?? [];
-    const latestJob = latestQueue.find((candidate) => candidate.id === job.id);
-    if (succeeded) {
-      const remaining = latestQueue.filter(
-        (candidate) => candidate.id !== job.id,
-      );
-      await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, remaining);
-      return remaining.length > 0;
-    }
-    if (latestJob) latestJob.attempts += 1;
-    await this.ctx.storage.put(ATTACHMENT_CLEANUP_QUEUE_KEY, latestQueue);
-    return latestQueue.length > 0;
-  }
+	return this.ctx.storage.transaction(async (transaction) => {
+	  const latestQueue = this.#normalizeAttachmentCleanupQueue(
+		(await transaction.get<AttachmentCleanupJob[]>(
+		  ATTACHMENT_CLEANUP_QUEUE_KEY,
+		)) ?? [],
+		now,
+	  );
+	  const latestJob = latestQueue.find(
+		(candidate) => candidate.id === job.id && candidate.generation === job.generation,
+	  );
+	  if (succeeded) {
+		const remaining = latestQueue.filter(
+		  (candidate) =>
+			candidate.id !== job.id || candidate.generation !== job.generation,
+		);
+		await transaction.put(ATTACHMENT_CLEANUP_QUEUE_KEY, remaining);
+		return this.#nextAttachmentCleanupAt(remaining);
+	  }
+	  if (latestJob) {
+		latestJob.attempts += 1;
+		latestJob.generation = (latestJob.generation ?? 0) + 1;
+		latestJob.lastErrorCode = "attachment_cleanup_r2_failed";
+		if (latestJob.attempts >= 6) {
+		  latestJob.state = "parked";
+		  latestJob.parkedAt = now;
+		  delete latestJob.nextAttemptAt;
+		} else {
+		  const delays = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000, 12 * 60 * 60_000];
+		  latestJob.nextAttemptAt = now + delays[latestJob.attempts - 1]!;
+		}
+	  }
+	  await transaction.put(ATTACHMENT_CLEANUP_QUEUE_KEY, latestQueue);
+	  return this.#nextAttachmentCleanupAt(latestQueue);
+	});
+	  }
+
+	async listParkedAttachmentCleanupJobs(limit: number) {
+	  const queue = this.#normalizeAttachmentCleanupQueue(
+		(await this.ctx.storage.get<AttachmentCleanupJob[]>(ATTACHMENT_CLEANUP_QUEUE_KEY)) ?? [],
+		Date.now(),
+	  );
+	  return {
+		items: queue
+		  .filter((job) => job.state === "parked")
+		  .sort((a, b) => (a.parkedAt ?? 0) - (b.parkedAt ?? 0) || a.id.localeCompare(b.id))
+		  .slice(0, Math.max(1, Math.min(100, Math.trunc(limit))))
+		  .map((job) => ({
+			recoveryRef: job.id,
+			emailId: job.emailId,
+			generation: job.generation ?? 0,
+			attempts: job.attempts,
+			lastErrorCode: job.lastErrorCode ?? null,
+			parkedAt: job.parkedAt ?? null,
+		  })),
+	  };
+	}
+
+	async repairParkedAttachmentCleanupJob(
+	  recoveryRef: string,
+	  input: { operationKey: string; expectedGeneration: number },
+	  actor: ActivityActor,
+	) {
+	  const now = Date.now();
+	  const result = await this.ctx.storage.transaction(async (transaction) => {
+		const queue = this.#normalizeAttachmentCleanupQueue(
+		  (await transaction.get<AttachmentCleanupJob[]>(ATTACHMENT_CLEANUP_QUEUE_KEY)) ?? [],
+		  now,
+		);
+		const job = queue.find((candidate) => candidate.id === recoveryRef);
+		if (!job) return { status: "not_found" as const };
+		if (job.state !== "parked") return { status: "not_parked" as const };
+		if ((job.generation ?? 0) !== input.expectedGeneration) {
+		  return { status: "generation_conflict" as const, generation: job.generation ?? 0 };
+		}
+		const generation = (job.generation ?? 0) + 1;
+		job.state = "pending";
+		job.generation = generation;
+		job.attempts = 0;
+		job.nextAttemptAt = now;
+		delete job.lastErrorCode;
+		delete job.parkedAt;
+		await transaction.put(ATTACHMENT_CLEANUP_QUEUE_KEY, queue);
+		return { status: "repaired" as const, generation, emailId: job.emailId };
+	  });
+	  if (result.status !== "repaired") return result;
+	  try {
+		this.#recordActivityOnce(
+		  `attachment_cleanup_repaired:${recoveryRef}:${input.operationKey}`,
+		  actor,
+		  "attachment_cleanup_repaired",
+		  "email",
+		  result.emailId,
+		  { generation: result.generation },
+		  new Date(now).toISOString(),
+		);
+	  } catch {
+		console.error("Attachment cleanup repair committed without activity projection", {
+		  recoveryRef,
+		});
+	  }
+	  try {
+		await this.#scheduleAlarmAt(now + 100);
+	  } catch {
+		console.error("Attachment cleanup repair remains durably pending", {
+		  recoveryRef,
+		});
+	  }
+	  return { status: "repaired" as const, generation: result.generation };
+	}
 
   #activeOutboundDeliveryForEmail(emailId: string) {
     const delivery = this.db
@@ -4388,6 +5078,31 @@ export class MailboxDO extends DurableObject<Env> {
         metadata_json: JSON.stringify(metadata),
         occurred_at: occurredAt,
       })
+      .run();
+  }
+
+  #recordActivityOnce(
+    id: string,
+    actor: ActivityActor,
+    action: string,
+    entityType: string,
+    entityId: string,
+    metadata: Record<string, unknown>,
+    occurredAt: string,
+  ) {
+    this.db
+      .insert(schema.activityEvents)
+      .values({
+        id,
+        actor_kind: actor.kind,
+        actor_id: actor.id ?? null,
+        action,
+        entity_type: entityType,
+        entity_id: entityId,
+        metadata_json: JSON.stringify(metadata),
+        occurred_at: occurredAt,
+      })
+      .onConflictDoNothing()
       .run();
   }
 
@@ -4610,7 +5325,9 @@ export class MailboxDO extends DurableObject<Env> {
         ),
       ][0];
       if (!intent || intent.proof_fingerprint !== proofFingerprint) {
-        throw new Error("Import promotion finalizer does not match durable intent");
+        throw new Error(
+          "Import promotion finalizer does not match durable intent",
+        );
       }
       if (intent.state === "integrity_blocked") {
         return { terminal: "integrity_blocked" as const, objects: [] };
@@ -4625,7 +5342,11 @@ export class MailboxDO extends DurableObject<Env> {
       ) {
         return { terminal: "pending" as const, objects: [] };
       }
-      if (!['recorded', 'reconciling', 'abandoned_watching'].includes(intent.state)) {
+      if (
+        !["recorded", "reconciling", "abandoned_watching"].includes(
+          intent.state,
+        )
+      ) {
         throw new Error("Import promotion intent is not sealed");
       }
       if (!intent.reconciliation_phase) {
@@ -4655,7 +5376,11 @@ export class MailboxDO extends DurableObject<Env> {
           ordinal: number;
           r2_key: string;
           byte_length: number;
-          observation_state: "authoritative" | "unowned_present" | "absent" | null;
+          observation_state:
+            | "authoritative"
+            | "unowned_present"
+            | "absent"
+            | null;
           observation_cycle: number | null;
           observed_byte_length: number | null;
         }>(
@@ -4725,7 +5450,8 @@ export class MailboxDO extends DurableObject<Env> {
         (claim.phase === "validation"
           ? current.validation_cursor
           : current.settlement_cursor) !== claim.cursor
-      ) return { status: "pending" as const, nextAt: now + 100 };
+      )
+        return { status: "pending" as const, nextAt: now + 100 };
 
       const blockIntent = () => {
         this.ctx.storage.sql.exec(
@@ -4843,7 +5569,8 @@ export class MailboxDO extends DurableObject<Env> {
         const nextCursor = claim.cursor + claim.objects.length;
         const validationComplete = nextCursor === claim.objectCount;
         if (validationComplete) {
-          const validationCount = [
+          const validationCount =
+            [
             ...this.ctx.storage.sql.exec<{ total: number }>(
               `SELECT COUNT(*) AS total
                FROM import_promotion_intent_objects
@@ -4936,10 +5663,7 @@ export class MailboxDO extends DurableObject<Env> {
             claimToken,
           ),
         ][0] ?? { retained: 0, outboxed: 0, absent: 0 };
-        if (
-          !claim.writerClosed &&
-          (counts.outboxed > 0 || counts.absent > 0)
-        ) {
+        if (!claim.writerClosed && (counts.outboxed > 0 || counts.absent > 0)) {
           const nextAt = now + IMPORT_PROMOTION_ABANDONED_WATCH_MS;
           this.ctx.storage.sql.exec(
             `UPDATE import_promotion_intents SET state = 'abandoned_watching',
@@ -6105,7 +6829,9 @@ export class MailboxDO extends DurableObject<Env> {
             intent.proof_fingerprint !== importProjection.proofFingerprint ||
             intent.object_count !== attachments.length
           ) {
-            throw new Error("Import promotion commitment is not live and sealed");
+            throw new Error(
+              "Import promotion commitment is not live and sealed",
+            );
           }
           for (
             let offset = 0;
@@ -6453,11 +7179,30 @@ export class MailboxDO extends DurableObject<Env> {
     });
   }
 
+	async recordOutboundPromotionIntent(emailId: string, keys: string[]) {
+		const createdAt = new Date().toISOString();
+		const nextAttemptAt = new Date(Date.parse(createdAt) + 20 * 60_000).toISOString();
+		this.ctx.storage.transactionSync(() => {
+			for (const r2Key of [...new Set(keys)]) {
+				this.#enqueueR2DeletionSync({
+					r2Key,
+					emailId,
+					projectionAttemptId: null,
+					createdAt,
+					nextAttemptAt,
+				});
+			}
+		});
+		await this.#scheduleAlarmAt(Date.parse(nextAttemptAt));
+		return true;
+	}
+
   async #enqueueOutboundInternal(
     command: EnqueueOutboundCommand,
     attachments: readonly PendingOutboundAttachment[],
     emailId: string,
     onCommittedSync?: (result: EnqueuedDelivery) => void,
+	cleanupKeys: readonly string[] = [],
   ) {
     const inlineMapping = validateResolvedInlineImages(
       command.snapshot.html ?? "",
@@ -6466,26 +7211,49 @@ export class MailboxDO extends DurableObject<Env> {
     if (!inlineMapping.ok) {
       throw new InlineImageMappingError(inlineMapping.error);
     }
-    const result = this.#outboxService(attachments, emailId).enqueue(
-      command,
-      onCommittedSync,
-    );
-    await finalizeCommittedOutboundMutation({
-      ensureAlarm: () => this.#ensureOutboundAlarm(),
-      recordActivity: () =>
-        this.#recordActivity(
+    const result = this.#outboxService(attachments, emailId).enqueue(command, (committed) => {
+		const ownershipObjects = attachments.map((attachment) => ({
+			r2Key: attachmentKey(emailId, attachment.id, attachment.filename),
+			projectionAttemptId: null,
+		}));
+		if (
+		  committed.delivery.emailId === emailId &&
+		  !this.#adoptR2OwnershipSync(ownershipObjects)
+		) {
+			throw new Error(
+				"Outbound attachment ownership was already retired for cleanup",
+			);
+		}
+		for (const key of cleanupKeys) {
+			this.#enqueueR2DeletionSync({
+				r2Key: key,
+				emailId: committed.delivery.emailId,
+				projectionAttemptId: null,
+				createdAt: command.requestedAt,
+			});
+		}
+		onCommittedSync?.(committed);
+		this.#recordActivity(
           command.actor,
-          result.replayed ? "outbound_enqueue_replayed" : "outbound_enqueued",
+		  committed.replayed ? "outbound_enqueue_replayed" : "outbound_enqueued",
           "outbound_delivery",
-          result.delivery.id,
+		  committed.delivery.id,
           {
-            emailId: result.delivery.emailId,
-            kind: result.delivery.kind,
-            status: result.delivery.status,
+			emailId: committed.delivery.emailId,
+			kind: committed.delivery.kind,
+			status: committed.delivery.status,
           },
           command.requestedAt,
-        ),
-    });
+		);
+	});
+	try {
+		await this.#ensureOutboundAlarm();
+	} catch (error) {
+		console.error(
+			"[outbound] enqueue committed but immediate alarm recovery is pending",
+			error,
+		);
+	}
     if (result.replayed && result.delivery.emailId !== emailId) {
       const orphanKeys = attachments.map((attachment) =>
         attachmentKey(emailId, attachment.id, attachment.filename),
@@ -6505,8 +7273,15 @@ export class MailboxDO extends DurableObject<Env> {
     command: EnqueueOutboundCommand,
     attachments: readonly PendingOutboundAttachment[],
     emailId: string,
+	cleanupKeys: readonly string[] = [],
   ) {
-    return this.#enqueueOutboundInternal(command, attachments, emailId);
+	return this.#enqueueOutboundInternal(
+		command,
+		attachments,
+		emailId,
+		undefined,
+		cleanupKeys,
+	);
   }
 
   async listOutboundDeliveries() {
@@ -6637,7 +7412,11 @@ export class MailboxDO extends DurableObject<Env> {
       delivery,
       input.commandFingerprint,
     );
-    await this.#ensureOutboundAlarm();
+	try {
+		await this.#ensureOutboundAlarm();
+	} catch (error) {
+		console.error("Outbound replay truth returned while alarm recovery is pending", error);
+	}
     return resolution;
   }
 
@@ -6649,11 +7428,44 @@ export class MailboxDO extends DurableObject<Env> {
     const service = this.#outboxService();
     const existing = service.get(deliveryId);
     if (existing?.status === "cancelled") {
-      const recoveredDraftId = await this.#recoverCancelledOutboundSnapshot(
-        existing,
-        actor,
-        at,
-      );
+	  this.ctx.storage.transactionSync(() => {
+		const recorded = this.db
+		  .select({ id: schema.activityEvents.id })
+		  .from(schema.activityEvents)
+		  .where(eq(schema.activityEvents.id, `outbound_cancelled:${deliveryId}`))
+		  .get();
+		if (recorded) return;
+		this.#recordActivityOnce(
+		  `outbound_cancelled:${deliveryId}`,
+		  { kind: "system" },
+		  "outbound_cancelled",
+		  "outbound_delivery",
+		  deliveryId,
+		  { originalActorUnavailable: true },
+		  existing.cancelledAt ?? existing.updatedAt,
+		);
+	  });
+	  const recoveryActor = this.#cancelledOutboundRecoveryActor(deliveryId);
+	  let recoveredDraftId: string | undefined;
+	  let recoveryPending = false;
+	  try {
+		await this.#scheduleAlarmAt(Date.now() + 100);
+	  } catch (error) {
+		recoveryPending = true;
+		console.error("Cancelled outbound cleanup wake is pending", error);
+	  }
+	  if (!recoveryPending) try {
+		recoveredDraftId = await this.#recoverCancelledOutboundSnapshot(
+			existing,
+			recoveryActor,
+			at,
+		);
+		this.#completeCancelledOutboundRecovery(deliveryId);
+	  } catch (error) {
+		recoveryPending = true;
+		await this.#deferCancelledOutboundRecovery(deliveryId, error);
+		console.error("Cancelled outbound draft recovery remains pending", error);
+	  }
       const recoveredDelivery = service.get(deliveryId) ?? existing;
       return {
         delivery: recoveredDelivery,
@@ -6662,27 +7474,171 @@ export class MailboxDO extends DurableObject<Env> {
           ? ("retain" as const)
           : ("none" as const),
         ...(recoveredDraftId ? { recoveredDraftId } : {}),
+		...(recoveryPending ? { recoveryPending: true as const } : {}),
       };
     }
-    const result = service.cancel(deliveryId, actor, at);
-    const recoveredDraftId = await this.#recoverCancelledOutboundSnapshot(
-      result.delivery,
-      actor,
-      at,
-    );
-    this.#recordActivity(
-      actor,
-      "outbound_cancelled",
-      "outbound_delivery",
-      deliveryId,
-      {},
-      at,
-    );
-    return { ...result, ...(recoveredDraftId ? { recoveredDraftId } : {}) };
+	await this.#scheduleAlarmAt(Date.now() + 100);
+	const result = service.cancel(deliveryId, actor, at, (cancelled, outcome) => {
+	  if (outcome === "retry_restored") {
+		this.#recordActivity(
+		  cancelled.actor,
+		  "outbound_retry_cancelled",
+		  "outbound_delivery",
+		  deliveryId,
+		  { restoredStatus: cancelled.status },
+		  at,
+		);
+		return;
+	  }
+	  this.#recordActivityOnce(
+		`outbound_cancelled:${deliveryId}`,
+		cancelled.actor,
+		"outbound_cancelled",
+		"outbound_delivery",
+		deliveryId,
+		{},
+		at,
+	  );
+	});
+	if (result.retryCancellationRestored) {
+		return {
+			...result,
+			recoveredDraftId: undefined,
+			recoveryPending: false as const,
+		};
+	}
+	let recoveredDraftId: string | undefined;
+	let recoveryPending = false;
+	try {
+		recoveredDraftId = await this.#recoverCancelledOutboundSnapshot(
+			result.delivery,
+			result.delivery.actor,
+			at,
+		);
+		this.#completeCancelledOutboundRecovery(deliveryId);
+	} catch (error) {
+		recoveryPending = true;
+		await this.#deferCancelledOutboundRecovery(deliveryId, error);
+		console.error("Cancelled outbound draft recovery remains pending", error);
+	}
+	const authoritativeDelivery = service.get(deliveryId) ?? result.delivery;
+    return {
+		...result,
+		delivery: authoritativeDelivery,
+		...(recoveredDraftId ? { recoveredDraftId } : {}),
+		...(recoveryPending ? { recoveryPending: true as const } : {}),
+	};
+  }
+
+  #cancelledOutboundRecoveryActor(deliveryId: string): OutboundDeliveryActor {
+	const event = this.db
+	  .select({
+		actorKind: schema.activityEvents.actor_kind,
+		actorId: schema.activityEvents.actor_id,
+	  })
+	  .from(schema.activityEvents)
+	  .where(eq(schema.activityEvents.id, `outbound_cancelled:${deliveryId}`))
+	  .get();
+	if (!event) return { kind: "system" };
+	return {
+	  kind: event.actorKind as OutboundDeliveryActor["kind"],
+	  ...(event.actorId ? { id: event.actorId } : {}),
+	};
+  }
+
+  #completeCancelledOutboundRecovery(deliveryId: string) {
+	this.db
+	  .update(schema.outboundDeliveries)
+	  .set({
+		next_attempt_at: null,
+		cancellation_recovery_attempt_count: 0,
+		last_error_code: sql`CASE
+		  WHEN ${schema.outboundDeliveries.last_error_code} IN (
+			'outbound_cancellation_recovery_deferred',
+			'outbound_cancellation_recovery_parked'
+		  )
+		  THEN NULL ELSE ${schema.outboundDeliveries.last_error_code} END`,
+		last_error_message: sql`CASE
+		  WHEN ${schema.outboundDeliveries.last_error_code} IN (
+			'outbound_cancellation_recovery_deferred',
+			'outbound_cancellation_recovery_parked'
+		  )
+		  THEN NULL ELSE ${schema.outboundDeliveries.last_error_message} END`,
+	  })
+	  .where(eq(schema.outboundDeliveries.id, deliveryId))
+	  .run();
+  }
+
+  async #deferCancelledOutboundRecovery(deliveryId: string, error: unknown) {
+	const current = this.db
+	  .select({ attempts: schema.outboundDeliveries.cancellation_recovery_attempt_count })
+	  .from(schema.outboundDeliveries)
+	  .where(eq(schema.outboundDeliveries.id, deliveryId))
+	  .get();
+	const attempts = Math.max(0, current?.attempts ?? 0) + 1;
+	if (attempts >= 6) {
+	  const parkedAt = new Date().toISOString();
+	  this.ctx.storage.transactionSync(() => {
+		this.db
+		  .update(schema.outboundDeliveries)
+		  .set({
+			next_attempt_at: null,
+			cancellation_recovery_attempt_count: attempts,
+			last_error_code: "outbound_cancellation_recovery_parked",
+			last_error_message:
+			  "Cancellation is committed, but draft recovery requires explicit repair.",
+		  })
+		  .where(eq(schema.outboundDeliveries.id, deliveryId))
+		  .run();
+		this.#recordActivityOnce(
+		  `outbound_cancellation_recovery_parked:${deliveryId}`,
+		  { kind: "system" },
+		  "outbound_cancellation_recovery_parked",
+		  "outbound_delivery",
+		  deliveryId,
+		  { attempts },
+		  parkedAt,
+		);
+	  });
+	  return;
+	}
+	const retryDelayMs = Math.min(60 * 60_000, 30_000 * 2 ** Math.min(attempts - 1, 7));
+	const retryAt = new Date(Date.now() + retryDelayMs).toISOString();
+	this.db
+	  .update(schema.outboundDeliveries)
+	  .set({
+		next_attempt_at: retryAt,
+		cancellation_recovery_attempt_count: attempts,
+		last_error_code: "outbound_cancellation_recovery_deferred",
+		last_error_message:
+		  "Cancellation is committed. Draft recovery remains safely pending.",
+	  })
+	  .where(
+		and(
+		  eq(schema.outboundDeliveries.id, deliveryId),
+		  eq(schema.outboundDeliveries.status, "cancelled"),
+		),
+	  )
+	  .run();
+	console.error("Deferred cancelled outbound recovery", {
+	  deliveryId,
+	  error: error instanceof Error ? error.message : String(error),
+	});
+	await this.#scheduleAlarmAt(Date.parse(retryAt)).catch((alarmError) =>
+	  console.error("Cancelled outbound recovery alarm rearm remains pending", {
+		deliveryId,
+		error:
+		  alarmError instanceof Error ? alarmError.message : String(alarmError),
+	  }),
+	);
   }
 
   async #recoverCancelledOutboundSnapshot(
-    delivery: { emailId: string; draftId?: string },
+    delivery: {
+	  emailId: string;
+	  draftId?: string;
+	  cancellationRecoveryAttemptCount?: number;
+	},
     actor: OutboundDeliveryActor,
     at: string,
   ) {
@@ -6769,13 +7725,15 @@ export class MailboxDO extends DurableObject<Env> {
               this.env.BUCKET,
               delivery.emailId,
               snapshotAttachments,
+			  {
+				recordDestinationIntent: (draftId, keys) =>
+				  this.recordOutboundPromotionIntent(draftId, keys).then(() => undefined),
+				recoveryGeneration:
+				  delivery.cancellationRecoveryAttemptCount ?? 0,
+			  },
             )
           ).attachments
         : [];
-    const attachments = plan.deleteSnapshotAttachments
-      ? snapshotAttachments
-      : [];
-
     const recoveryCommitted = this.ctx.storage.transactionSync(() => {
       const currentSnapshot = this.db
         .select({ folderId: schema.emails.folder_id })
@@ -6788,6 +7746,16 @@ export class MailboxDO extends DurableObject<Env> {
         return false;
       }
       if (recoveredDraftIdValue && !recoveredExists) {
+		if (
+		  !this.#adoptR2OwnershipSync(
+			recoveredAttachments.map((attachment) => ({
+			  r2Key: storedAttachmentKey(attachment),
+			  projectionAttemptId: null,
+			})),
+		  )
+		) {
+		  throw new Error("Recovered draft attachment ownership was already retired");
+		}
         this.db
           .insert(schema.emails)
           .values({
@@ -6826,6 +7794,14 @@ export class MailboxDO extends DurableObject<Env> {
         .where(eq(schema.emails.id, delivery.emailId))
         .run();
       if (plan.deleteSnapshotAttachments) {
+		for (const attachment of snapshotAttachments) {
+			this.#enqueueR2DeletionSync({
+				r2Key: storedAttachmentKey(attachment),
+				emailId: delivery.emailId,
+				projectionAttemptId: null,
+				createdAt: at,
+			});
+		}
         this.db
           .delete(schema.attachments)
           .where(eq(schema.attachments.email_id, delivery.emailId))
@@ -6843,16 +7819,6 @@ export class MailboxDO extends DurableObject<Env> {
     });
     if (!recoveryCommitted) return recoveredDraftIdValue;
 
-    if (attachments.length > 0) {
-      const keys = attachments.map((attachment) =>
-        storedAttachmentKey(attachment),
-      );
-      try {
-        await this.env.BUCKET.delete(keys);
-      } catch {
-        await this.queueAttachmentCleanup(delivery.emailId, keys, actor);
-      }
-    }
     return recoveredDraftIdValue;
   }
 
@@ -6865,6 +7831,17 @@ export class MailboxDO extends DurableObject<Env> {
     const existing = this.#outboxService().get(deliveryId);
     if (!existing)
       throw new Error(`Outbound delivery ${deliveryId} was not found`);
+	const authorizeRetry = (delivery: StoredOutboundDelivery) => {
+		this.#assertBulkRetryCapacitySync(delivery);
+		this.#recordActivity(
+			actor,
+			"outbound_retry_requested",
+			"outbound_delivery",
+			deliveryId,
+			{ acknowledgedDuplicateRisk: acknowledgeDuplicateRisk },
+			at,
+		);
+	};
     const result =
       existing.status === "unknown"
         ? this.#outboxService().retryUnknown(
@@ -6872,89 +7849,846 @@ export class MailboxDO extends DurableObject<Env> {
             actor,
             acknowledgeDuplicateRisk as true,
             at,
-            (delivery) => this.#assertBulkRetryCapacitySync(delivery),
+			authorizeRetry,
           )
-        : this.#outboxService().retryFailed(deliveryId, actor, at, (delivery) =>
-            this.#assertBulkRetryCapacitySync(delivery),
-          );
-    await finalizeCommittedOutboundMutation({
-      ensureAlarm: () => this.#ensureOutboundAlarm(),
-      recordActivity: () =>
-        this.#recordActivity(
-          actor,
-          "outbound_retry_requested",
-          "outbound_delivery",
-          deliveryId,
-          { acknowledgedDuplicateRisk: acknowledgeDuplicateRisk },
-          at,
-        ),
-    });
-    return result;
+        : this.#outboxService().retryFailed(
+			deliveryId,
+			actor,
+			at,
+			authorizeRetry,
+		  );
+	try {
+		await this.#ensureOutboundAlarm();
+		return { ...result, alarmRecoveryPending: false as const };
+	} catch (error) {
+		console.error(
+			"[outbound] retry committed but immediate alarm recovery is pending",
+			error,
+		);
+		return { ...result, alarmRecoveryPending: true as const };
+	}
   }
 
-  async recordSesBounce(input: {
-    deliveryId?: string;
+	#acceptedOutboundProviderEvidence(deliveryId: string) {
+		const attempts = this.db
+			.select()
+			.from(schema.outboundDeliveryAttempts)
+			.where(
+				and(
+					eq(schema.outboundDeliveryAttempts.delivery_id, deliveryId),
+					eq(schema.outboundDeliveryAttempts.status, "accepted"),
+				),
+			)
+			.orderBy(desc(schema.outboundDeliveryAttempts.attempt_number))
+			.all();
+		if (attempts.length === 0) {
+			return {
+				status: "missing" as const,
+				acceptedAttemptCount: 0,
+				distinctProviderIdentityCount: 0,
+			};
+		}
+		const attemptIds = attempts.map((attempt) => attempt.id);
+		const events = this.db
+			.select()
+			.from(schema.outboundProviderEvents)
+			.where(inArray(schema.outboundProviderEvents.attempt_id, attemptIds))
+			.all();
+		const valid = attempts.every((attempt) => {
+			const providerEvent = attempt.provider_event_id
+				? events.find((event) => event.id === attempt.provider_event_id)
+				: null;
+			const providerEvidenceValid = attempt.provider_state === "none"
+				? attempt.provider_event_at === null && attempt.provider_event_id === null
+				: Boolean(
+						providerEvent &&
+						isCanonicalUtcTimestamp(attempt.provider_event_at) &&
+						providerEvent.attempt_id === attempt.id &&
+						providerEvent.ses_message_id === attempt.ses_message_id &&
+						providerEvent.occurred_at === attempt.provider_event_at &&
+						(attempt.provider_state === "complained"
+							? providerEvent.event_class === "complaint"
+							: attempt.provider_state === "delivered"
+								? providerEvent.event_class === "delivery" ||
+									providerEvent.event_class === "bounce"
+								: providerEvent.event_class === "bounce"),
+					);
+			return (
+				Boolean(attempt.id) &&
+				attempt.delivery_id === deliveryId &&
+				attempt.status === "accepted" &&
+				Number.isInteger(attempt.attempt_number) &&
+				attempt.attempt_number >= 1 &&
+				Boolean(attempt.lease_token) &&
+				Boolean(attempt.ses_message_id?.trim()) &&
+				isCanonicalUtcTimestamp(attempt.started_at) &&
+				isCanonicalUtcTimestamp(attempt.finished_at) &&
+				(attempt.http_status === null ||
+					(Number.isInteger(attempt.http_status) &&
+						attempt.http_status >= 100 &&
+						attempt.http_status <= 599)) &&
+				[
+					"none",
+					"delivered",
+					"bounced",
+					"complained",
+					"bounce_scope_unknown",
+				].includes(attempt.provider_state) &&
+				providerEvidenceValid
+			);
+		});
+		const distinctProviderIdentityCount = new Set(
+			attempts.map((attempt) => attempt.ses_message_id),
+		).size;
+		if (!valid) {
+			return {
+				status: "invalid" as const,
+				acceptedAttemptCount: attempts.length,
+				distinctProviderIdentityCount,
+			};
+		}
+		const truth = aggregateAcceptedAttemptProviderTruth(
+			attempts.map((attempt) => attempt.provider_state),
+		);
+		const authoritativeAttempt =
+			attempts.find((attempt) =>
+				truth === "sent"
+					? ["none", "delivered", "complained"].includes(
+							attempt.provider_state,
+						)
+					: truth === "unknown"
+						? attempt.provider_state === "bounce_scope_unknown"
+						: attempt.provider_state === "bounced",
+			) ?? attempts[0]!;
+		return {
+			status: "valid" as const,
+			attempts,
+			events,
+			truth,
+			authoritativeAttempt,
+			acceptedAttemptCount: attempts.length,
+			distinctProviderIdentityCount,
+		};
+	}
+
+  async recoverParkedOutboundAcceptance(
+	deliveryId: string,
+	input: {
+	  operationKey: string;
+	  expectedGeneration: number;
+	  action: "reconcile_from_ledger" | "retry_projection";
+	},
+	actor: OutboundDeliveryActor,
+  ) {
+	const at = new Date().toISOString();
+	const auditId = `outbound_acceptance_recovery_operator:${deliveryId}:${input.operationKey}`;
+	const result = this.ctx.storage.transactionSync(() => {
+	  const row = this.db
+		.select()
+		.from(schema.outboundAcceptanceRecovery)
+		.where(eq(schema.outboundAcceptanceRecovery.delivery_id, deliveryId))
+		.get();
+	  if (!row) return { status: "not_found" as const };
+	  const replay = this.db
+		.select({ id: schema.activityEvents.id })
+		.from(schema.activityEvents)
+		.where(eq(schema.activityEvents.id, auditId))
+		.get();
+	  if (replay) return { status: "replayed" as const, generation: row.generation };
+	  if (row.state !== "parked") {
+		return { status: "not_parked" as const, state: row.state };
+	  }
+	  if (row.generation !== input.expectedGeneration) {
+		return { status: "generation_conflict" as const, generation: row.generation };
+	  }
+
+	  const deliveryEvidence = this.db
+		.select()
+		.from(schema.outboundDeliveries)
+		.where(eq(schema.outboundDeliveries.id, deliveryId))
+		.get();
+	  if (!deliveryEvidence) return { status: "evidence_conflict" as const };
+	  const acceptedEvidence = this.#acceptedOutboundProviderEvidence(deliveryId);
+	  if (acceptedEvidence.status !== "valid") {
+		return { status: "evidence_conflict" as const };
+	  }
+	  const attemptId = acceptedEvidence.authoritativeAttempt.id;
+	  const sesMessageId = acceptedEvidence.authoritativeAttempt.ses_message_id;
+	  const acceptedAt = acceptedEvidence.authoritativeAttempt.finished_at;
+	  const generation = row.generation + 1;
+	  this.db
+		.update(schema.outboundAcceptanceRecovery)
+		.set({
+		  email_id: deliveryEvidence.email_id,
+		  attempt_id: attemptId,
+		  ses_message_id: sesMessageId,
+		  accepted_at: acceptedAt,
+		  source_draft_id: deliveryEvidence.source_draft_id,
+		  source_draft_version: deliveryEvidence.source_draft_version,
+		  actor_kind: ["user", "mcp", "agent", "rule", "system"].includes(
+			deliveryEvidence.actor_kind,
+		  )
+			? deliveryEvidence.actor_kind
+			: "system",
+		  actor_id: ["user", "mcp", "agent", "rule", "system"].includes(
+			deliveryEvidence.actor_kind,
+		  )
+			? deliveryEvidence.actor_id
+			: null,
+		  state: "pending",
+		  generation,
+		  attempt_count: 0,
+		  next_attempt_at: at,
+		  last_error_code: null,
+		  updated_at: at,
+		  completed_at: null,
+		})
+		.where(eq(schema.outboundAcceptanceRecovery.delivery_id, deliveryId))
+		.run();
+	  this.#recordActivityOnce(
+		auditId,
+		actor,
+		"outbound_acceptance_recovery_requested",
+		"outbound_delivery",
+		deliveryId,
+		{
+		  action: input.action,
+		  generation,
+		  acceptedAttemptCount: acceptedEvidence.acceptedAttemptCount,
+		  distinctProviderIdentityCount:
+			acceptedEvidence.distinctProviderIdentityCount,
+		  duplicateAcceptanceRisk:
+			acceptedEvidence.distinctProviderIdentityCount > 1,
+		},
+		at,
+	  );
+	  return { status: "committed" as const, generation };
+	});
+	if (result.status !== "committed" && result.status !== "replayed") return result;
+	try {
+	  await this.#scheduleAlarmAt(Date.now() + 100);
+	  return { ...result, recoveryPending: false as const };
+	} catch (error) {
+	  console.error("Outbound acceptance repair committed while alarm recovery is pending", {
+		deliveryId,
+		errorName: error instanceof Error ? error.name : "UnknownError",
+	  });
+	  return { ...result, recoveryPending: true as const };
+	}
+  }
+
+	listParkedOutboundAcceptanceRecoveries(
+		afterDeliveryId: string | undefined,
+		limit: number,
+	) {
+		const pageSize = Math.max(1, Math.min(100, Math.trunc(limit)));
+		const rows = this.db
+			.select()
+			.from(schema.outboundAcceptanceRecovery)
+			.where(
+				afterDeliveryId
+					? and(
+							eq(schema.outboundAcceptanceRecovery.state, "parked"),
+							gt(
+								schema.outboundAcceptanceRecovery.delivery_id,
+								afterDeliveryId,
+							),
+						)
+					: eq(schema.outboundAcceptanceRecovery.state, "parked"),
+			)
+			.orderBy(asc(schema.outboundAcceptanceRecovery.delivery_id))
+			.limit(pageSize + 1)
+			.all();
+		const page = rows.slice(0, pageSize);
+		const recoveries = page.map((row) => {
+			const evidence = this.#acceptedOutboundProviderEvidence(row.delivery_id);
+			return {
+				deliveryId: row.delivery_id,
+				emailId: row.email_id,
+				generation: row.generation,
+				attemptCount: row.attempt_count,
+				lastErrorCode: row.last_error_code,
+				updatedAt: row.updated_at,
+				evidence: {
+					acceptedAttemptCount: evidence.acceptedAttemptCount,
+					distinctProviderIdentityCount:
+						evidence.distinctProviderIdentityCount,
+					status:
+						evidence.status === "missing"
+							? ("missing" as const)
+							: evidence.status === "invalid"
+								? ("invalid" as const)
+								: evidence.distinctProviderIdentityCount === 1
+								? ("unique" as const)
+								: ("duplicate_acceptance" as const),
+				},
+			};
+		});
+		return {
+			recoveries,
+			nextCursor:
+				rows.length > pageSize ? page[page.length - 1]?.delivery_id ?? null : null,
+		};
+	}
+
+  async recordSesProviderEvent(input: {
+	eventId: string;
+	deliveryId: string;
+	attemptId: string;
     sesMessageId: string;
-    eventType: "bounce" | "complaint";
-    message?: string;
-    at: string;
+	eventType: "delivery" | "bounce" | "complaint";
+	recipientHashes: string[];
+	occurredAt: string;
+	receivedAt: string;
   }) {
-    const service = this.#outboxService();
-    const delivery = input.deliveryId
-      ? service.get(input.deliveryId)
-      : service.getBySesMessageId(input.sesMessageId);
-    if (!delivery) return { status: "not_found" as const };
-    if (delivery.status === "bounced") {
-      const email = await this.getEmail(delivery.emailId);
-      if (email?.folder_id !== Folders.SENT) {
-        await this.#moveAcceptedOutboundToSent(
-          delivery.emailId,
-          delivery.sesMessageId ?? input.sesMessageId,
-          delivery.actor,
-          delivery.updatedAt,
-        );
-      }
-      await this.#consumeAcceptedSourceDraft(
-        delivery.draftId,
-        delivery.draftVersion,
-        delivery.actor,
-      );
-      return { status: "already_recorded" as const, delivery };
-    }
-    if (delivery.status !== "sent" && delivery.status !== "unknown") {
-      return { status: "invalid_state" as const, delivery };
-    }
-    const bounced = service.markBounced(delivery.id, {
-      at: input.at,
-      code: input.eventType === "complaint" ? "ses_complaint" : "ses_bounce",
-      message: input.message,
-      sesMessageId: input.sesMessageId,
-    });
-    this.#recordActivity(
-      { kind: "system" },
-      input.eventType === "complaint"
-        ? "outbound_complaint_recorded"
-        : "outbound_bounce_recorded",
-      "outbound_delivery",
-      delivery.id,
-      { sesMessageId: input.sesMessageId },
-      input.at,
-    );
-    const email = await this.getEmail(bounced.emailId);
-    if (email?.folder_id !== Folders.SENT) {
-      await this.#moveAcceptedOutboundToSent(
-        bounced.emailId,
-        input.sesMessageId,
-        bounced.actor,
-        input.at,
-      );
-    }
+	const correlation = this.db
+	  .select({ rawHeaders: schema.emails.raw_headers })
+	  .from(schema.outboundDeliveries)
+	  .innerJoin(
+		schema.emails,
+		eq(schema.emails.id, schema.outboundDeliveries.email_id),
+	  )
+	  .where(eq(schema.outboundDeliveries.id, input.deliveryId))
+	  .get();
+	const snapshot = deserializeOutboundSnapshot(correlation?.rawHeaders ?? null);
+	const intendedRecipientHashes = new Set(
+	  snapshot
+		? await Promise.all(
+			[...snapshot.to, ...snapshot.cc, ...snapshot.bcc].map(
+			  privacySafeRecipientHash,
+			),
+		  )
+		: [],
+	);
+	const normalizedRecipientHashes = [...new Set(input.recipientHashes)].sort();
+	if (
+		normalizedRecipientHashes.length !== input.recipientHashes.length ||
+		normalizedRecipientHashes.some((hash) => !/^[0-9a-f]{64}$/.test(hash))
+	) {
+		return { status: "invalid_correlation" as const };
+	}
+	const recorded = this.ctx.storage.transactionSync(() => {
+		const deliveryRow = this.db
+			.select()
+			.from(schema.outboundDeliveries)
+			.where(eq(schema.outboundDeliveries.id, input.deliveryId))
+			.get();
+		const attemptRow = this.db
+			.select()
+			.from(schema.outboundDeliveryAttempts)
+			.where(
+				and(
+					eq(schema.outboundDeliveryAttempts.id, input.attemptId),
+					eq(schema.outboundDeliveryAttempts.delivery_id, input.deliveryId),
+				),
+			)
+			.get();
+		if (!deliveryRow || !attemptRow) return { status: "not_found" as const };
+		if (
+			attemptRow.ses_message_id !== null &&
+			attemptRow.ses_message_id !== input.sesMessageId
+		) {
+			return { status: "invalid_correlation" as const };
+		}
+		const priorEvent = this.db
+			.select()
+			.from(schema.outboundProviderEvents)
+			.where(eq(schema.outboundProviderEvents.id, input.eventId))
+			.get();
+		if (priorEvent) {
+			return priorEvent.attempt_id === input.attemptId &&
+				priorEvent.ses_message_id === input.sesMessageId &&
+				priorEvent.event_class === input.eventType &&
+				priorEvent.recipient_hashes_json === JSON.stringify(normalizedRecipientHashes)
+				? { status: "already_recorded" as const }
+				: { status: "invalid_correlation" as const };
+		}
+
+		this.db.insert(schema.outboundProviderEvents).values({
+			id: input.eventId,
+			attempt_id: input.attemptId,
+			ses_message_id: input.sesMessageId,
+			event_class: input.eventType,
+			recipient_hashes_json: JSON.stringify(normalizedRecipientHashes),
+			occurred_at: input.occurredAt,
+			received_at: input.receivedAt,
+		}).run();
+		const attemptEvents = this.db
+			.select()
+			.from(schema.outboundProviderEvents)
+			.where(eq(schema.outboundProviderEvents.attempt_id, input.attemptId))
+			.orderBy(desc(schema.outboundProviderEvents.occurred_at))
+			.all();
+		const hashesFor = (event: (typeof attemptEvents)[number]) => {
+			try {
+				const parsed: unknown = JSON.parse(event.recipient_hashes_json);
+				return Array.isArray(parsed)
+					? parsed.filter(
+							(hash): hash is string =>
+								typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash),
+						)
+					: [];
+			} catch {
+				return [];
+			}
+		};
+		const attemptOutcome = (
+			events: typeof attemptEvents,
+		): "successful" | "bounced" | "unknown" => {
+			if (
+				events.length === 0 ||
+				events.some(
+					(event) =>
+						event.event_class === "delivery" ||
+						event.event_class === "complaint",
+				)
+			) {
+				return "successful";
+			}
+			const bounced = new Set(
+				events
+					.filter((event) => event.event_class === "bounce")
+					.flatMap(hashesFor),
+			);
+			if (bounced.size === 0 || intendedRecipientHashes.size === 0) {
+				return "unknown";
+			}
+			return [...intendedRecipientHashes].every((hash) => bounced.has(hash))
+				? "bounced"
+				: "successful";
+		};
+		const currentAttemptOutcome = attemptOutcome(attemptEvents);
+		const authoritativeEvent =
+			attemptEvents.find((event) => event.event_class === "complaint") ??
+			attemptEvents.find((event) => event.event_class === "delivery") ??
+			attemptEvents.find((event) => event.event_class === "bounce")!;
+		const providerState =
+			attemptEvents.some((event) => event.event_class === "complaint")
+				? "complained"
+				: currentAttemptOutcome === "successful"
+					? "delivered"
+					: currentAttemptOutcome === "bounced"
+						? "bounced"
+						: "bounce_scope_unknown";
+		this.db
+			.update(schema.outboundDeliveryAttempts)
+			.set({
+				status: "accepted",
+				finished_at: attemptRow.finished_at ?? input.occurredAt,
+				ses_message_id: input.sesMessageId,
+				provider_state: providerState,
+				provider_event_at: authoritativeEvent.occurred_at,
+				provider_event_id: authoritativeEvent.id,
+			})
+			.where(eq(schema.outboundDeliveryAttempts.id, input.attemptId))
+			.run();
+
+		const attempts = this.db
+			.select()
+			.from(schema.outboundDeliveryAttempts)
+			.where(eq(schema.outboundDeliveryAttempts.delivery_id, input.deliveryId))
+			.orderBy(desc(schema.outboundDeliveryAttempts.attempt_number))
+			.all();
+		const accepted = attempts.filter((attempt) => attempt.status === "accepted");
+		const acceptedIds = accepted.map((attempt) => attempt.id);
+		const acceptedEvents = acceptedIds.length > 0
+			? this.db
+					.select()
+					.from(schema.outboundProviderEvents)
+					.where(inArray(schema.outboundProviderEvents.attempt_id, acceptedIds))
+					.all()
+			: [];
+		const eventsForAttempt = (attemptId: string) =>
+			acceptedEvents.filter((event) => event.attempt_id === attemptId);
+		const outcomes = accepted.map((attempt) => ({
+			attempt,
+			outcome: attemptOutcome(eventsForAttempt(attempt.id)),
+		}));
+		const successful = outcomes.filter(({ outcome }) => outcome === "successful");
+		const ambiguous = outcomes.filter(({ outcome }) => outcome === "unknown");
+		const aggregateStatus = aggregateAcceptedAttemptProviderTruth(
+			outcomes.map(({ outcome }) =>
+				outcome === "successful"
+					? "delivered"
+					: outcome === "unknown"
+						? "bounce_scope_unknown"
+						: "bounced",
+			),
+		);
+		const authoritativeAttempt =
+			successful[0]?.attempt ??
+			ambiguous[0]?.attempt ??
+			accepted[0] ??
+			attemptRow;
+		const hasComplaint = acceptedEvents.some(
+			(event) => event.event_class === "complaint",
+		);
+		const hasBounce = acceptedEvents.some(
+			(event) => event.event_class === "bounce",
+		);
+		this.db
+			.update(schema.outboundDeliveries)
+			.set({
+				status: aggregateStatus,
+				retry_origin_status: null,
+				dispatch_phase: null,
+				active_attempt_id: null,
+				lease_token: null,
+				lease_expires_at: null,
+				next_attempt_at: null,
+				ses_message_id:
+					authoritativeAttempt.ses_message_id ?? input.sesMessageId,
+				sent_at: authoritativeAttempt.finished_at ?? input.occurredAt,
+				failed_at: null,
+				unknown_at: aggregateStatus === "unknown" ? input.receivedAt : null,
+				accepted_attempt_count: accepted.length,
+				duplicate_acceptance_at:
+					accepted.length > 1
+						? deliveryRow.duplicate_acceptance_at ?? input.occurredAt
+						: deliveryRow.duplicate_acceptance_at,
+				last_error_code: hasComplaint
+					? "ses_complaint"
+					: aggregateStatus === "unknown"
+						? "ses_bounce_scope_unknown"
+					: aggregateStatus === "bounced"
+						? "ses_bounce"
+						: hasBounce
+							? "ses_partial_bounce"
+							: null,
+				last_error_message: null,
+				updated_at: input.receivedAt,
+			})
+			.where(eq(schema.outboundDeliveries.id, input.deliveryId))
+			.run();
+		this.db
+			.insert(schema.outboundAcceptanceRecovery)
+			.values({
+				delivery_id: input.deliveryId,
+				email_id: deliveryRow.email_id,
+				attempt_id: authoritativeAttempt.id,
+				ses_message_id:
+					authoritativeAttempt.ses_message_id ?? input.sesMessageId,
+				accepted_at: authoritativeAttempt.finished_at ?? input.occurredAt,
+				source_draft_id: deliveryRow.source_draft_id,
+				source_draft_version: deliveryRow.source_draft_version,
+				actor_kind: deliveryRow.actor_kind,
+				actor_id: deliveryRow.actor_id,
+				state: "pending",
+				generation: 0,
+				attempt_count: 0,
+				next_attempt_at: input.receivedAt,
+				created_at: input.receivedAt,
+				updated_at: input.receivedAt,
+			})
+			.onConflictDoUpdate({
+				target: schema.outboundAcceptanceRecovery.delivery_id,
+				set: {
+					attempt_id: authoritativeAttempt.id,
+					ses_message_id:
+						authoritativeAttempt.ses_message_id ?? input.sesMessageId,
+					accepted_at:
+						authoritativeAttempt.finished_at ?? input.occurredAt,
+					state: "pending",
+					generation: sql`${schema.outboundAcceptanceRecovery.generation} + 1`,
+					attempt_count: 0,
+					next_attempt_at: input.receivedAt,
+					message_projected_at: null,
+					last_error_code: null,
+					updated_at: input.receivedAt,
+					completed_at: null,
+				},
+			})
+			.run();
+		this.#recordActivity(
+			{ kind: "system" },
+			`outbound_${input.eventType}_recorded`,
+			"outbound_delivery_attempt",
+			input.attemptId,
+			{ deliveryId: input.deliveryId, sesMessageId: input.sesMessageId },
+			input.receivedAt,
+		);
+		return { status: "recorded" as const };
+	});
+	if (recorded.status !== "recorded" && recorded.status !== "already_recorded") {
+		return recorded;
+	}
+	const delivery = this.#outboxService().get(input.deliveryId);
+	if (!delivery) return { status: "not_found" as const };
+	try {
+		await this.#scheduleAlarmAt(Date.now() + 100);
+	} catch (error) {
+		console.error("SES event committed while projection recovery is pending", error);
+		return { ...recorded, delivery, recoveryPending: true as const };
+	}
+		const projection = await this.#moveAcceptedOutboundToSent(
+			delivery.emailId,
+			delivery.sesMessageId ?? input.sesMessageId,
+			delivery.actor,
+			delivery.sentAt ?? input.occurredAt,
+		);
+		if (projection.status !== "projected") {
+			this.#parkOutboundAcceptanceRecovery(
+				delivery.id,
+				projection.status,
+				input.receivedAt,
+			);
+			return { ...recorded, delivery, recoveryPending: true as const };
+		}
     await this.#consumeAcceptedSourceDraft(
-      bounced.draftId,
-      bounced.draftVersion,
-      bounced.actor,
+	  delivery.draftId,
+	  delivery.draftVersion,
+	  delivery.actor,
     );
-    return { status: "recorded" as const, delivery: bounced };
+	this.#outboxService().completeAcceptedReconciliation(delivery.id);
+	return { ...recorded, delivery };
+  }
+
+  #recordConcurrentAcceptedProviderOutcome(input: {
+	deliveryId: string;
+	attemptId: string;
+	leaseToken: string;
+	sesMessageId: string;
+	acceptedAt: string;
+  }): boolean {
+	return this.ctx.storage.transactionSync(() => {
+	  const delivery = this.db
+		.select()
+		.from(schema.outboundDeliveries)
+		.where(eq(schema.outboundDeliveries.id, input.deliveryId))
+		.get();
+	  const attempt = this.db
+		.select()
+		.from(schema.outboundDeliveryAttempts)
+		.where(
+		  and(
+			eq(schema.outboundDeliveryAttempts.id, input.attemptId),
+			eq(schema.outboundDeliveryAttempts.delivery_id, input.deliveryId),
+		  ),
+		)
+		.get();
+	  if (!delivery || !attempt) return false;
+	  if (attempt.status === "accepted") {
+		return attempt.ses_message_id === input.sesMessageId;
+	  }
+	  if (attempt.status !== "sending" || attempt.lease_token !== input.leaseToken) {
+		return false;
+	  }
+	  this.db
+		.update(schema.outboundDeliveryAttempts)
+		.set({
+		  status: "accepted",
+		  finished_at: input.acceptedAt,
+		  ses_message_id: input.sesMessageId,
+		})
+		.where(eq(schema.outboundDeliveryAttempts.id, input.attemptId))
+		.run();
+	  const accepted = this.db
+		.select()
+		.from(schema.outboundDeliveryAttempts)
+		.where(
+		  and(
+			eq(schema.outboundDeliveryAttempts.delivery_id, input.deliveryId),
+			eq(schema.outboundDeliveryAttempts.status, "accepted"),
+		  ),
+		)
+		.all();
+	  const hasPartialFailure = accepted.some(
+		(candidate) =>
+		  candidate.provider_state === "bounced" ||
+		  candidate.provider_state === "complained" ||
+		  candidate.provider_state === "bounce_scope_unknown",
+	  );
+	  const aggregateStatus = aggregateAcceptedAttemptProviderTruth(
+		accepted.map((candidate) => candidate.provider_state),
+	  );
+	  this.db
+		.update(schema.outboundDeliveries)
+			.set({
+			  status: aggregateStatus,
+			  retry_origin_status: null,
+		  dispatch_phase: null,
+		  active_attempt_id: null,
+		  lease_token: null,
+		  lease_expires_at: null,
+		  next_attempt_at: null,
+		  ses_message_id: input.sesMessageId,
+		  sent_at: input.acceptedAt,
+		  failed_at: null,
+		  unknown_at: aggregateStatus === "unknown" ? input.acceptedAt : null,
+		  accepted_attempt_count: accepted.length,
+		  duplicate_acceptance_at:
+			accepted.length > 1
+			  ? delivery.duplicate_acceptance_at ?? input.acceptedAt
+			  : delivery.duplicate_acceptance_at,
+		  last_error_code: hasPartialFailure
+			? "ses_duplicate_attempt_partial_failure"
+			: null,
+		  last_error_message: null,
+		  updated_at: input.acceptedAt,
+		})
+		.where(eq(schema.outboundDeliveries.id, input.deliveryId))
+		.run();
+	  this.db
+		.insert(schema.outboundAcceptanceRecovery)
+		.values({
+		  delivery_id: input.deliveryId,
+		  email_id: delivery.email_id,
+		  attempt_id: input.attemptId,
+		  ses_message_id: input.sesMessageId,
+		  accepted_at: input.acceptedAt,
+		  source_draft_id: delivery.source_draft_id,
+		  source_draft_version: delivery.source_draft_version,
+		  actor_kind: delivery.actor_kind,
+		  actor_id: delivery.actor_id,
+		  state: "pending",
+		  generation: 0,
+		  attempt_count: 0,
+		  next_attempt_at: input.acceptedAt,
+		  created_at: input.acceptedAt,
+		  updated_at: input.acceptedAt,
+		})
+		.onConflictDoUpdate({
+		  target: schema.outboundAcceptanceRecovery.delivery_id,
+		  set: {
+			attempt_id: input.attemptId,
+			ses_message_id: input.sesMessageId,
+			accepted_at: input.acceptedAt,
+			state: "pending",
+			generation: sql`${schema.outboundAcceptanceRecovery.generation} + 1`,
+			attempt_count: 0,
+			next_attempt_at: input.acceptedAt,
+			message_projected_at: null,
+			last_error_code: null,
+			updated_at: input.acceptedAt,
+			completed_at: null,
+		  },
+		})
+		.run();
+	  this.#recordActivityOnce(
+		`outbound_duplicate_acceptance:${input.attemptId}`,
+		{ kind: "system" },
+		"outbound_duplicate_acceptance_recorded",
+		"outbound_delivery_attempt",
+		input.attemptId,
+		{ deliveryId: input.deliveryId },
+		input.acceptedAt,
+	  );
+	  return true;
+	});
+  }
+
+  #recordConcurrentNonAcceptedProviderOutcome(input: {
+	deliveryId: string;
+	attemptId: string;
+	leaseToken: string;
+	at: string;
+	outcome:
+	  | { kind: "unknown"; code: string }
+	  | {
+		  kind: "rejected";
+		  code: string;
+		  automaticRetry: boolean;
+		  httpStatus?: number;
+		};
+  }): boolean {
+	return this.ctx.storage.transactionSync(() => {
+	  const delivery = this.db
+		.select()
+		.from(schema.outboundDeliveries)
+		.where(eq(schema.outboundDeliveries.id, input.deliveryId))
+		.get();
+	  const attempt = this.db
+		.select()
+		.from(schema.outboundDeliveryAttempts)
+		.where(
+		  and(
+			eq(schema.outboundDeliveryAttempts.id, input.attemptId),
+			eq(schema.outboundDeliveryAttempts.delivery_id, input.deliveryId),
+		  ),
+		)
+		.get();
+	  if (!delivery || !attempt) return false;
+	  if (attempt.status !== "sending" || attempt.lease_token !== input.leaseToken) {
+		return attempt.status !== "sending";
+	  }
+	  const attemptStatus =
+		input.outcome.kind === "unknown"
+		  ? "unknown"
+		  : input.outcome.automaticRetry
+			? "rejected_retryable"
+			: "rejected_permanent";
+	  this.db
+		.update(schema.outboundDeliveryAttempts)
+		.set({
+		  status: attemptStatus,
+		  finished_at: input.at,
+		  error_code: input.outcome.code,
+		  http_status:
+			input.outcome.kind === "rejected"
+			  ? input.outcome.httpStatus ?? null
+			  : null,
+		})
+		.where(eq(schema.outboundDeliveryAttempts.id, input.attemptId))
+		.run();
+	  const accepted = this.db
+		.select()
+		.from(schema.outboundDeliveryAttempts)
+		.where(
+		  and(
+			eq(schema.outboundDeliveryAttempts.delivery_id, input.deliveryId),
+			eq(schema.outboundDeliveryAttempts.status, "accepted"),
+		  ),
+		)
+		.all();
+	  const acceptedTruth = accepted.length > 0
+		? aggregateAcceptedAttemptProviderTruth(
+			accepted.map((candidate) => candidate.provider_state),
+		  )
+		: null;
+	  const nextStatus =
+		acceptedTruth === "sent"
+		  ? "sent"
+		  : acceptedTruth === "unknown" || input.outcome.kind === "unknown"
+			? "unknown"
+			: acceptedTruth === "bounced"
+			  ? "bounced"
+			  : delivery.status;
+	  this.db
+		.update(schema.outboundDeliveries)
+			.set({
+			  status: nextStatus,
+			  retry_origin_status: ["queued", "retrying", "sending"].includes(nextStatus)
+				? delivery.retry_origin_status
+				: null,
+		  dispatch_phase: null,
+		  active_attempt_id: null,
+		  lease_token: null,
+		  lease_expires_at: null,
+		  next_attempt_at: null,
+		  failed_at: null,
+		  unknown_at: nextStatus === "unknown" ? input.at : null,
+		  last_error_code:
+			input.outcome.kind === "unknown" && acceptedTruth === "sent"
+			  ? "ses_duplicate_attempt_outcome_unknown"
+			  : acceptedTruth === "unknown"
+				? "ses_bounce_scope_unknown"
+			  : input.outcome.code,
+		  last_error_message: null,
+		  updated_at: input.at,
+		})
+		.where(eq(schema.outboundDeliveries.id, input.deliveryId))
+		.run();
+	  this.#recordActivityOnce(
+		`outbound_concurrent_attempt_terminal:${input.attemptId}`,
+		{ kind: "system" },
+		"outbound_concurrent_attempt_terminal_recorded",
+		"outbound_delivery_attempt",
+		input.attemptId,
+		{ outcome: attemptStatus },
+		input.at,
+	  );
+	  return true;
+	});
   }
 
   async #scheduleAlarmAt(timestamp: number) {
@@ -7398,31 +9132,143 @@ export class MailboxDO extends DurableObject<Env> {
     }
   }
 
-  async #ensureOutboundAlarm() {
-    const nextActionAt = this.#outboxService().nextActionAt();
-    if (!nextActionAt) return;
-    const next = Date.parse(nextActionAt);
-    if (Number.isFinite(next)) {
-      await this.#scheduleAlarmAt(Math.max(Date.now(), next));
+  async #selfHealCleanupAlarm(now = Date.now()) {
+    const nextPending = this.db
+      .select({ nextAttemptAt: schema.r2DeletionOutbox.next_attempt_at })
+	      .from(schema.r2DeletionOutbox)
+	      .where(
+		and(
+		  eq(schema.r2DeletionOutbox.state, "pending"),
+		  isNull(schema.r2DeletionOutbox.parked_at),
+		),
+	  )
+      .orderBy(
+        asc(schema.r2DeletionOutbox.next_attempt_at),
+        asc(schema.r2DeletionOutbox.r2_key),
+      )
+      .limit(1)
+      .get();
+    const nextDeleting = this.db
+      .select({ leaseExpiresAt: schema.r2DeletionOutbox.lease_expires_at })
+      .from(schema.r2DeletionOutbox)
+	      .where(
+		and(
+		  eq(schema.r2DeletionOutbox.state, "deleting"),
+		  isNull(schema.r2DeletionOutbox.parked_at),
+		),
+	  )
+      .orderBy(
+        asc(schema.r2DeletionOutbox.lease_expires_at),
+        asc(schema.r2DeletionOutbox.r2_key),
+      )
+      .limit(1)
+      .get();
+	let attachmentCleanupNextAt: number | null = null;
+	try {
+	  attachmentCleanupNextAt = this.#nextAttachmentCleanupAt(
+		this.#normalizeAttachmentCleanupQueue(
+		  (await this.ctx.storage.get<AttachmentCleanupJob[]>(
+			ATTACHMENT_CLEANUP_QUEUE_KEY,
+		  )) ?? [],
+		  now,
+		),
+	  );
+	} catch (error) {
+	  console.error("failed to inspect attachment cleanup during mailbox read", {
+		operation: "attachment_cleanup_queue",
+		status: "unknown",
+		errorName: error instanceof Error ? error.name : "UnknownError",
+	  });
+    }
+    const nextDraftSaveCleanupAt = this.#nextDraftSaveCleanupAt();
+    const nextDraftSaveClaimExpiryAt = this.#nextDraftSaveClaimExpiryAt();
+    const candidates = [
+      nextPending?.nextAttemptAt,
+      nextDeleting?.leaseExpiresAt,
+      nextDraftSaveCleanupAt,
+	  nextDraftSaveClaimExpiryAt,
+	  attachmentCleanupNextAt,
+    ].flatMap((value) => {
+      if (!value) return [];
+      if (typeof value === "number") {
+        return [Number.isFinite(value) ? value : now];
+      }
+      const parsed = Date.parse(value);
+      return [Number.isFinite(parsed) ? parsed : now];
+    });
+    if (candidates.length === 0) return;
+    try {
+      await this.#scheduleAlarmAt(Math.max(now, Math.min(...candidates)));
+    } catch (error) {
+      console.error("failed to re-arm mailbox cleanup during mailbox read", {
+        operation: "mailbox_cleanup_alarm",
+        status: "pending",
+        errorName: error instanceof Error ? error.name : "UnknownError",
+      });
     }
   }
 
-  async #moveAcceptedOutboundToSent(
+  async #ensureOutboundAlarm() {
+    const nextActionAt = this.#outboxService().nextActionAt();
+	const recoveryNext = this.db
+	  .select({
+		next: sql<string | null>`MIN(CASE
+		  WHEN ${schema.outboundAcceptanceRecovery.next_attempt_at} IS NULL
+			OR strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.outboundAcceptanceRecovery.next_attempt_at}) IS NULL
+			OR strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.outboundAcceptanceRecovery.next_attempt_at}) <> ${schema.outboundAcceptanceRecovery.next_attempt_at}
+		  THEN '1970-01-01T00:00:00.000Z'
+		  ELSE ${schema.outboundAcceptanceRecovery.next_attempt_at} END)`,
+	  })
+	  .from(schema.outboundAcceptanceRecovery)
+	  .where(
+		inArray(schema.outboundAcceptanceRecovery.state, ["pending", "retrying"]),
+	  )
+	  .get()?.next;
+	const next = [nextActionAt, recoveryNext]
+	  .flatMap((value) => (value ? [Date.parse(value)] : []))
+	  .filter(Number.isFinite)
+	  .sort((a, b) => a - b)[0];
+	if (next !== undefined) await this.#scheduleAlarmAt(Math.max(Date.now(), next));
+  }
+
+	  async #moveAcceptedOutboundToSent(
     emailId: string,
     sesMessageId: string,
     actor: OutboundDeliveryActor,
     at: string,
   ) {
-    const snapshotRow = this.db
-      .select({ raw_headers: schema.emails.raw_headers })
-      .from(schema.emails)
-      .where(eq(schema.emails.id, emailId))
-      .get();
-    const snapshot = deserializeOutboundSnapshot(
-      snapshotRow?.raw_headers ?? null,
-    );
-    this.ctx.storage.transactionSync(() => {
-      this.db
+	    return this.ctx.storage.transactionSync(() => {
+		  const current = this.db
+			.select({
+			  folderId: schema.emails.folder_id,
+			  previousFolderId: schema.emails.previous_folder_id,
+			  rawHeaders: schema.emails.raw_headers,
+			})
+			.from(schema.emails)
+			.where(eq(schema.emails.id, emailId))
+			.get();
+		  if (!current || current.rawHeaders === null) {
+			return { status: "snapshot_missing" as const };
+		  }
+		  const snapshot = deserializeOutboundSnapshot(current.rawHeaders);
+		  if (!snapshot) {
+			return { status: "outbound_snapshot_invalid" as const };
+		  }
+	  if (current.folderId !== Folders.OUTBOX) {
+		this.db
+		  .update(schema.emails)
+		  .set({
+			message_id: sesMessageId,
+			date: at,
+			recipient_memory_origin: RecipientMemoryOrigins.ACCEPTED_OUTBOUND,
+			...(current.previousFolderId === Folders.OUTBOX
+			  ? { previous_folder_id: Folders.SENT }
+			  : {}),
+		  })
+		  .where(eq(schema.emails.id, emailId))
+		  .run();
+	  } else {
+        this.db
         .update(schema.emails)
         .set({
           folder_id: Folders.SENT,
@@ -7431,31 +9277,37 @@ export class MailboxDO extends DurableObject<Env> {
           read: 1,
           recipient_memory_origin: RecipientMemoryOrigins.ACCEPTED_OUTBOUND,
         })
-        .where(eq(schema.emails.id, emailId))
+		.where(
+		  and(
+			eq(schema.emails.id, emailId),
+			eq(schema.emails.folder_id, Folders.OUTBOX),
+		  ),
+		)
         .run();
-      if (snapshot) {
-        recordRecipientInteractions(this.ctx.storage.sql, {
-          sourceEmailId: emailId,
-          direction: "sent",
-          occurredAt: at,
-          mailboxAddress: snapshot.mailboxId,
-          addresses: [...snapshot.to, ...snapshot.cc, ...snapshot.bcc],
-        });
-        createMailPeopleProjector({
-          store: this.ctx.storage,
-          mailboxAddress: snapshot.mailboxId,
-        }).projectMessage(emailId);
-      }
-      this.#recordActivity(
+	  }
+	      recordRecipientInteractions(this.ctx.storage.sql, {
+	          sourceEmailId: emailId,
+	          direction: "sent",
+	          occurredAt: at,
+	          mailboxAddress: snapshot.mailboxId,
+	          addresses: [...snapshot.to, ...snapshot.cc, ...snapshot.bcc],
+	        });
+	        createMailPeopleProjector({
+	          store: this.ctx.storage,
+	          mailboxAddress: snapshot.mailboxId,
+	        }).projectMessage(emailId);
+	  this.#recordActivityOnce(
+		`outbound_provider_accepted:${emailId}`,
         actor,
         "outbound_provider_accepted",
         "email",
         emailId,
-        { sesMessageId },
-        at,
-      );
-    });
-  }
+	        { sesMessageId },
+	        at,
+	      );
+		  return { status: "projected" as const };
+	    });
+	  }
 
   async getRecipientSuggestions(
     mailboxAddress: string,
@@ -7573,47 +9425,98 @@ export class MailboxDO extends DurableObject<Env> {
       actor,
     );
     if (consumed.status !== "consumed") return;
-    const keys = consumed.attachments.map((attachment) =>
-      storedAttachmentKey({ ...attachment, email_id: draftId }),
-    );
-    if (keys.length === 0) return;
-    try {
-      await this.env.BUCKET.delete(keys);
-    } catch {
-      await this.queueAttachmentCleanup(draftId, keys, actor);
-    }
+	// Exact R2 deletion intents were committed in the same transaction that
+	// consumed the draft and retired its attachment ownership rows.
   }
 
-  async #loadOutboundAttachments(emailId: string) {
+  async #loadOutboundAttachments(
+    emailId: string,
+    expectedAttachmentIds: readonly string[],
+    byteIdentities: readonly OutboundAttachmentByteIdentity[] | undefined,
+  ) {
     const email = this.db
       .select({ id: schema.emails.id })
       .from(schema.emails)
       .where(eq(schema.emails.id, emailId))
       .get();
-    if (!email) throw new Error(`Missing outbound email snapshot ${emailId}`);
+    if (!email) throw new OutboundAttachmentIntegrityError("snapshot_missing");
     const attachments = this.db
       .select()
       .from(schema.attachments)
       .where(eq(schema.attachments.email_id, emailId))
       .all();
+    const storedAttachmentIds = attachments
+      .map((attachment) => attachment.id)
+      .sort();
+    const expectedIds = [...expectedAttachmentIds].sort();
+    if (expectedIds.length > 0 && byteIdentities === undefined) {
+      throw new OutboundAttachmentIntegrityError(
+        "attachment_integrity_unverifiable",
+      );
+    }
+    const identityById = new Map(
+      (byteIdentities ?? []).map((identity) => [identity.id, identity]),
+    );
+    if (
+      storedAttachmentIds.length !== expectedIds.length ||
+      storedAttachmentIds.some((id, index) => id !== expectedIds[index]) ||
+      identityById.size !== expectedIds.length ||
+      expectedIds.some((id) => !identityById.has(id))
+    ) {
+      throw new OutboundAttachmentIntegrityError(
+        "attachment_metadata_mismatch",
+      );
+    }
     return Promise.all(
       attachments.map(async (attachment) => {
+        const identity = identityById.get(attachment.id);
+        if (!identity) {
+          throw new OutboundAttachmentIntegrityError(
+            "attachment_integrity_unverifiable",
+          );
+        }
         const object = await this.env.BUCKET.get(
           storedAttachmentKey(attachment),
         );
         if (!object) {
-          throw new Error(`Outbound attachment ${attachment.id} is missing`);
+          throw new OutboundAttachmentIntegrityError("attachment_missing");
         }
+        if (
+          object.size !== attachment.size ||
+          identity.byteLength !== attachment.size
+        ) {
+          throw new OutboundAttachmentIntegrityError(
+            "attachment_size_mismatch",
+          );
+        }
+        const bytes = await object.arrayBuffer();
+        if (bytes.byteLength !== attachment.size) {
+          throw new OutboundAttachmentIntegrityError(
+            "attachment_size_mismatch",
+          );
+        }
+        if (!(await outboundAttachmentBytesMatch(bytes, identity))) {
+          throw new OutboundAttachmentIntegrityError(
+            "attachment_content_mismatch",
+          );
+        }
+		if (
+			identity.filename !== attachment.filename ||
+			identity.mimetype !== attachment.mimetype ||
+			identity.disposition !== attachment.disposition ||
+			(identity.contentId ?? null) !== (attachment.content_id ?? null)
+		) {
+			throw new OutboundAttachmentIntegrityError(
+				"attachment_metadata_mismatch",
+			);
+		}
         return {
-          content: arrayBufferToBase64(await object.arrayBuffer()),
-          filename: attachment.filename,
-          type: attachment.mimetype,
-          disposition:
-            attachment.disposition === "inline"
-              ? ("inline" as const)
-              : ("attachment" as const),
-          ...(attachment.disposition === "inline" && attachment.content_id
-            ? { contentId: attachment.content_id }
+          content: arrayBufferToBase64(bytes),
+          filename: identity.filename,
+          type: identity.mimetype,
+          disposition: identity.disposition,
+          ...(identity.disposition === "inline" && identity.contentId
+            ? { contentId: identity.contentId }
             : {}),
         };
       }),
@@ -7667,123 +9570,539 @@ export class MailboxDO extends DurableObject<Env> {
     });
   }
 
+  #parkOutboundAcceptanceRecovery(
+	deliveryId: string,
+	code: string,
+	at: string,
+  ) {
+	this.ctx.storage.transactionSync(() => {
+	  const current = this.db
+		.select({ generation: schema.outboundAcceptanceRecovery.generation })
+		.from(schema.outboundAcceptanceRecovery)
+		.where(eq(schema.outboundAcceptanceRecovery.delivery_id, deliveryId))
+		.get();
+	  if (!current) return;
+	  const generation = current.generation + 1;
+	  this.db
+		.update(schema.outboundAcceptanceRecovery)
+		.set({
+		  state: "parked",
+		  generation,
+		  next_attempt_at: null,
+		  last_error_code: code,
+		  updated_at: at,
+		})
+		.where(eq(schema.outboundAcceptanceRecovery.delivery_id, deliveryId))
+		.run();
+	  this.#recordActivityOnce(
+		`outbound_acceptance_recovery_parked:${deliveryId}:${generation}`,
+		{ kind: "system" },
+		"outbound_acceptance_recovery_parked",
+		"outbound_delivery",
+		deliveryId,
+		{ code, generation },
+		at,
+	  );
+	});
+  }
+
+  #deferOutboundAcceptanceRecovery(
+	row: typeof schema.outboundAcceptanceRecovery.$inferSelect,
+	at: string,
+  ) {
+	const attempts = row.attempt_count + 1;
+	if (attempts >= 6) {
+	  this.#parkOutboundAcceptanceRecovery(
+		row.delivery_id,
+		"outbound_projection_retry_exhausted",
+		at,
+	  );
+	  return;
+	}
+	const delays = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000, 12 * 60 * 60_000];
+	this.db
+	  .update(schema.outboundAcceptanceRecovery)
+	  .set({
+		state: "retrying",
+		attempt_count: attempts,
+		next_attempt_at: new Date(Date.parse(at) + delays[attempts - 1]!).toISOString(),
+		last_error_code: "outbound_projection_deferred",
+		updated_at: at,
+	  })
+	  .where(eq(schema.outboundAcceptanceRecovery.delivery_id, row.delivery_id))
+	  .run();
+  }
+
+  async #processOutboundAcceptanceRecovery(now: string) {
+	const rows = this.db
+	  .select()
+	  .from(schema.outboundAcceptanceRecovery)
+	  .where(
+		and(
+		  inArray(schema.outboundAcceptanceRecovery.state, ["pending", "retrying"]),
+		  or(
+			isNull(schema.outboundAcceptanceRecovery.next_attempt_at),
+			lte(schema.outboundAcceptanceRecovery.next_attempt_at, now),
+			sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.outboundAcceptanceRecovery.next_attempt_at}) IS NULL`,
+			sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.outboundAcceptanceRecovery.next_attempt_at}) <> ${schema.outboundAcceptanceRecovery.next_attempt_at}`,
+		  ),
+		),
+	  )
+	  .orderBy(
+		asc(schema.outboundAcceptanceRecovery.next_attempt_at),
+		asc(schema.outboundAcceptanceRecovery.delivery_id),
+	  )
+	  .limit(10)
+	  .all();
+	const actorKinds = new Set(["user", "mcp", "agent", "rule", "system"]);
+	for (const row of rows) {
+	  const acceptedAt = row.accepted_at;
+	  const acceptedAtMs = acceptedAt ? Date.parse(acceptedAt) : Number.NaN;
+	  const acceptedAtValid =
+		acceptedAt !== null &&
+		Number.isFinite(acceptedAtMs) &&
+		new Date(acceptedAtMs).toISOString() === acceptedAt;
+	  const sourcePairValid =
+		(row.source_draft_id === null && row.source_draft_version === null) ||
+		(Boolean(row.source_draft_id) &&
+		  Number.isInteger(row.source_draft_version) &&
+		  (row.source_draft_version ?? 0) >= 1);
+	  const deliveryEvidence = this.db
+		.select()
+		.from(schema.outboundDeliveries)
+		.where(eq(schema.outboundDeliveries.id, row.delivery_id))
+		.get();
+	  const attemptEvidence = row.attempt_id
+		? this.db
+			.select()
+			.from(schema.outboundDeliveryAttempts)
+			.where(eq(schema.outboundDeliveryAttempts.id, row.attempt_id))
+			.get()
+		: null;
+	  const recoveryIdentityMatchesDelivery =
+		Boolean(deliveryEvidence) &&
+		deliveryEvidence!.email_id === row.email_id &&
+		deliveryEvidence!.source_draft_id === row.source_draft_id &&
+		deliveryEvidence!.source_draft_version === row.source_draft_version &&
+		deliveryEvidence!.actor_kind === row.actor_kind &&
+		(deliveryEvidence!.actor_id ?? null) === (row.actor_id ?? null);
+	  const acceptedEvidence = this.#acceptedOutboundProviderEvidence(row.delivery_id);
+	  const acceptedAttemptEvidenceValid =
+		acceptedEvidence.status === "valid" &&
+		attemptEvidence?.delivery_id === row.delivery_id &&
+		attemptEvidence.status === "accepted" &&
+		acceptedEvidence.attempts.some(
+		  (attempt) => attempt.id === attemptEvidence.id,
+		);
+	  if (
+		!deliveryEvidence ||
+		!recoveryIdentityMatchesDelivery ||
+		!acceptedAttemptEvidenceValid ||
+		!actorKinds.has(row.actor_kind) ||
+		!sourcePairValid
+	  ) {
+		this.#parkOutboundAcceptanceRecovery(
+		  row.delivery_id,
+		  "outbound_repair_evidence_mismatch",
+		  now,
+		);
+		continue;
+	  }
+	  if (acceptedEvidence.status !== "valid") {
+		this.#parkOutboundAcceptanceRecovery(
+		  row.delivery_id,
+		  "outbound_repair_evidence_mismatch",
+		  now,
+		);
+		continue;
+	  }
+	  const acceptedAttempts = acceptedEvidence.attempts;
+	  const acceptedEvents = acceptedEvidence.events;
+	  const acceptedTruth = acceptedEvidence.truth;
+	  const authoritativeAttempt = acceptedEvidence.authoritativeAttempt;
+	  const newerAmbiguousAttempt = this.db
+		.select({ id: schema.outboundDeliveryAttempts.id })
+		.from(schema.outboundDeliveryAttempts)
+		.where(
+		  and(
+			eq(schema.outboundDeliveryAttempts.delivery_id, row.delivery_id),
+			eq(schema.outboundDeliveryAttempts.status, "unknown"),
+			sql`${schema.outboundDeliveryAttempts.attempt_number} > ${authoritativeAttempt.attempt_number}`,
+		  ),
+		)
+		.get();
+	  const aggregateStatus =
+		acceptedTruth === "sent"
+		  ? "sent"
+		  : acceptedTruth === "unknown" || newerAmbiguousAttempt
+			? "unknown"
+			: "bounced";
+	  const aggregateErrorCode = acceptedEvents.some(
+		(event) => event.event_class === "complaint",
+	  )
+		? "ses_complaint"
+		: aggregateStatus === "unknown" && acceptedTruth === "unknown"
+		  ? "ses_bounce_scope_unknown"
+		  : aggregateStatus === "bounced"
+			? "ses_bounce"
+			: aggregateStatus === "sent" && acceptedEvents.some(
+				(event) => event.event_class === "bounce",
+			  )
+			  ? "ses_partial_bounce"
+			  : aggregateStatus === "sent" && acceptedAttempts.some(
+				  (attempt) =>
+					attempt.provider_state === "bounced" ||
+					attempt.provider_state === "bounce_scope_unknown",
+				)
+				? "ses_duplicate_attempt_partial_failure"
+				: aggregateStatus === "unknown"
+				  ? newerAmbiguousAttempt
+					? "ses_duplicate_attempt_outcome_unknown"
+					: deliveryEvidence.last_error_code ?? "ses_duplicate_attempt_outcome_unknown"
+				  : null;
+	  const duplicateAcceptanceAt = acceptedAttempts.length > 1
+		? isCanonicalUtcTimestamp(deliveryEvidence.duplicate_acceptance_at)
+		  ? deliveryEvidence.duplicate_acceptance_at
+		  : acceptedAttempts[acceptedAttempts.length - 2]!.finished_at
+		: null;
+	  const deliveryPreservesAcceptedTruth =
+		deliveryEvidence.status === aggregateStatus &&
+		deliveryEvidence.retry_origin_status === null &&
+		deliveryEvidence.dispatch_phase === null &&
+		deliveryEvidence.active_attempt_id === null &&
+		deliveryEvidence.lease_token === null &&
+		deliveryEvidence.lease_expires_at === null &&
+		deliveryEvidence.next_attempt_at === null &&
+		deliveryEvidence.accepted_attempt_count === acceptedAttempts.length &&
+		deliveryEvidence.duplicate_acceptance_at === duplicateAcceptanceAt &&
+		deliveryEvidence.ses_message_id === authoritativeAttempt.ses_message_id &&
+		deliveryEvidence.sent_at === authoritativeAttempt.finished_at &&
+		deliveryEvidence.failed_at === null &&
+		deliveryEvidence.cancelled_at === null &&
+		deliveryEvidence.last_error_code === aggregateErrorCode &&
+		deliveryEvidence.last_error_message === null &&
+		(aggregateStatus === "unknown"
+		  ? isCanonicalUtcTimestamp(deliveryEvidence.unknown_at)
+		  : deliveryEvidence.unknown_at === null);
+	  if (
+		!deliveryPreservesAcceptedTruth ||
+		row.attempt_id !== authoritativeAttempt.id ||
+		row.accepted_at !== authoritativeAttempt.finished_at ||
+		row.ses_message_id !== authoritativeAttempt.ses_message_id
+	  ) {
+		this.ctx.storage.transactionSync(() => {
+		  this.db
+			.update(schema.outboundDeliveries)
+			.set({
+			  status: aggregateStatus,
+			  retry_origin_status: null,
+			  dispatch_phase: null,
+			  active_attempt_id: null,
+			  lease_token: null,
+			  lease_expires_at: null,
+			  next_attempt_at: null,
+			  ses_message_id: authoritativeAttempt.ses_message_id,
+			  sent_at: authoritativeAttempt.finished_at,
+			  failed_at: null,
+			  unknown_at: aggregateStatus === "unknown" ? now : null,
+			  cancelled_at: null,
+			  duplicate_acceptance_at: duplicateAcceptanceAt,
+			  last_error_code: aggregateErrorCode,
+			  last_error_message: null,
+			  accepted_attempt_count: acceptedAttempts.length,
+			  updated_at: now,
+			})
+			.where(eq(schema.outboundDeliveries.id, row.delivery_id))
+			.run();
+		  this.db
+			.update(schema.outboundAcceptanceRecovery)
+			.set({
+			  attempt_id: authoritativeAttempt.id,
+			  ses_message_id: authoritativeAttempt.ses_message_id,
+			  accepted_at: authoritativeAttempt.finished_at,
+			  next_attempt_at: now,
+			  last_error_code: null,
+			  updated_at: now,
+			})
+			.where(eq(schema.outboundAcceptanceRecovery.delivery_id, row.delivery_id))
+			.run();
+		});
+		continue;
+	  }
+	  const structuralEvidenceValid =
+		deliveryEvidence !== undefined &&
+		deliveryPreservesAcceptedTruth &&
+		recoveryIdentityMatchesDelivery &&
+		attemptEvidence.id === authoritativeAttempt.id &&
+		attemptEvidence.ses_message_id === row.ses_message_id &&
+		attemptEvidence.finished_at === row.accepted_at;
+	  if (
+		!row.ses_message_id?.trim() ||
+		!acceptedAtValid ||
+		!actorKinds.has(row.actor_kind) ||
+		!sourcePairValid ||
+		!structuralEvidenceValid
+	  ) {
+		this.#parkOutboundAcceptanceRecovery(
+		  row.delivery_id,
+		  structuralEvidenceValid
+			? "outbound_repair_evidence_insufficient"
+			: "outbound_repair_evidence_mismatch",
+		  now,
+		);
+		continue;
+	  }
+	  const actor: OutboundDeliveryActor = {
+		kind: row.actor_kind as OutboundDeliveryActor["kind"],
+		...(row.actor_id ? { id: row.actor_id } : {}),
+	  };
+	  try {
+			if (!row.message_projected_at) {
+			  const projection = await this.#moveAcceptedOutboundToSent(
+				row.email_id,
+				row.ses_message_id,
+				actor,
+				acceptedAt,
+			  );
+			  if (projection.status !== "projected") {
+				this.#parkOutboundAcceptanceRecovery(
+					row.delivery_id,
+					projection.status,
+					now,
+				);
+				continue;
+			  }
+		  this.db
+			.update(schema.outboundAcceptanceRecovery)
+			.set({ message_projected_at: now, updated_at: now })
+			.where(eq(schema.outboundAcceptanceRecovery.delivery_id, row.delivery_id))
+			.run();
+		}
+		if (!row.draft_consumed_at) {
+		  await this.#consumeAcceptedSourceDraft(
+			row.source_draft_id ?? undefined,
+			row.source_draft_version ?? undefined,
+			actor,
+		  );
+		  this.db
+			.update(schema.outboundAcceptanceRecovery)
+			.set({ draft_consumed_at: now, updated_at: now })
+			.where(eq(schema.outboundAcceptanceRecovery.delivery_id, row.delivery_id))
+			.run();
+		}
+		this.db
+		  .update(schema.outboundAcceptanceRecovery)
+		  .set({
+			state: "completed",
+			next_attempt_at: null,
+			last_error_code: null,
+			updated_at: now,
+			completed_at: now,
+		  })
+		  .where(eq(schema.outboundAcceptanceRecovery.delivery_id, row.delivery_id))
+		  .run();
+	  } catch {
+		this.#deferOutboundAcceptanceRecovery(row, now);
+	  }
+	}
+  }
+
   async #processOutboundAlarm(): Promise<void> {
     const service = this.#outboxService();
     const now = new Date().toISOString();
     service.recoverExpiredLeases(now);
+	await this.#processOutboundAcceptanceRecovery(now);
+
+	for (const delivery of service.listPendingCancellationRecovery(now, 10)) {
+	  try {
+		await this.#recoverCancelledOutboundSnapshot(
+		  delivery,
+		  this.#cancelledOutboundRecoveryActor(delivery.id),
+		  delivery.cancelledAt ?? delivery.updatedAt,
+		);
+		this.#completeCancelledOutboundRecovery(delivery.id);
+	  } catch (error) {
+		await this.#deferCancelledOutboundRecovery(delivery.id, error);
+	  }
+	}
 
     // Reconcile both the Sent move and exact draft-version consumption. The
     // latter also runs after the email already moved, covering a crash between
     // those two idempotent steps.
-    for (const delivery of service.listUnreconciledAccepted()) {
-      if (delivery.sesMessageId) {
-        const email = await this.getEmail(delivery.emailId);
-        if (email?.folder_id !== Folders.SENT) {
-          await this.#moveAcceptedOutboundToSent(
-            delivery.emailId,
-            delivery.sesMessageId,
-            delivery.actor,
-            delivery.sentAt ?? now,
-          );
-        }
+    for (const delivery of service.listUnreconciledAccepted(now, 10)) {
+		try {
+			if (!delivery.sesMessageId?.trim()) {
+				service.deferAcceptedReconciliation(
+					delivery.id,
+					new Date(Date.parse(now) + 5 * 60_000).toISOString(),
+					"outbound_acceptance_identity_missing",
+					"Provider acceptance is preserved, but its local message identity requires audited repair.",
+				);
+				continue;
+			}
+			const projection = await this.#moveAcceptedOutboundToSent(
+	            delivery.emailId,
+	            delivery.sesMessageId,
+	            delivery.actor,
+	            delivery.sentAt ?? now,
+			);
+			if (projection.status !== "projected") {
+				const evidence = this.#acceptedOutboundProviderEvidence(delivery.id);
+				if (evidence.status === "valid") {
+					const attempt = evidence.authoritativeAttempt;
+					this.db
+						.insert(schema.outboundAcceptanceRecovery)
+						.values({
+							delivery_id: delivery.id,
+							email_id: delivery.emailId,
+							attempt_id: attempt.id,
+							ses_message_id: attempt.ses_message_id,
+							accepted_at: attempt.finished_at,
+							source_draft_id: delivery.draftId ?? null,
+							source_draft_version: delivery.draftVersion ?? null,
+							actor_kind: delivery.actor.kind,
+							actor_id: delivery.actor.id ?? null,
+							state: "pending",
+							generation: 0,
+							attempt_count: 0,
+							next_attempt_at: now,
+							created_at: now,
+							updated_at: now,
+						})
+						.onConflictDoNothing()
+						.run();
+					this.#parkOutboundAcceptanceRecovery(
+						delivery.id,
+						projection.status,
+						now,
+					);
+				} else {
+					service.deferAcceptedReconciliation(
+						delivery.id,
+						new Date(Date.parse(now) + 5 * 60_000).toISOString(),
+						"outbound_reconciliation_record_invalid",
+						"Provider acceptance is preserved, but its local recovery evidence requires audited repair.",
+					);
+				}
+				continue;
+			}
         await this.#consumeAcceptedSourceDraft(
           delivery.draftId,
           delivery.draftVersion,
           delivery.actor,
         );
-      }
+		service.completeAcceptedReconciliation(delivery.id);
+		} catch {
+			service.deferAcceptedReconciliation(
+				delivery.id,
+				new Date(Date.parse(now) + 60_000).toISOString(),
+				"outbound_reconciliation_deferred",
+				"The accepted message remains safe while local reconciliation retries.",
+			);
+		}
     }
 
-    const claimed = service.claimNext(now, 60_000);
-    if (!claimed) {
-      await this.#ensureOutboundAlarm();
+    const preflight = service.claimNextForPreflight(now, 60_000);
+    if (!preflight) {
       return;
     }
-    await this.#scheduleAlarmAt(Date.parse(claimed.delivery.leaseExpiresAt!));
+    // Per Cloudflare Durable Objects alarm docs, alarms run at least once and
+    // only one alarm is scheduled per object. Persist and schedule the local
+    // lease before any external preflight I/O so a restart has a recovery wake.
+    await this.#scheduleAlarmAt(Date.parse(preflight.delivery.leaseExpiresAt!));
 
-    let observed;
-    try {
-      const snapshot = claimed.snapshot;
-      const fromDomain = snapshot.from.split("@")[1] ?? "";
-      const attachments = await this.#loadOutboundAttachments(
-        claimed.delivery.emailId,
-      );
-
+    const leaseToken = preflight.delivery.leaseToken!;
+    const snapshot = preflight.snapshot;
       let actorAuthorized: boolean;
       try {
         actorAuthorized = await this.#outboundActorStillAuthorized(
-          claimed.delivery.actor,
-          claimed.delivery.mailboxId,
+        preflight.delivery.actor,
+        preflight.delivery.mailboxId,
         );
-      } catch (error) {
+    } catch {
         const failedAt = new Date().toISOString();
-        service.finalizeRetryableFailure(
-          claimed.delivery.id,
-          claimed.attempt.leaseToken,
-          {
+      service.deferPreflight(preflight.delivery.id, leaseToken, {
             at: failedAt,
             retryAt: new Date(Date.parse(failedAt) + 60_000).toISOString(),
             code: "authority_check_unavailable",
-            message: error instanceof Error ? error.message : String(error),
-          },
-        );
-        await this.#ensureOutboundAlarm();
+        message: "Mailbox authorization could not be verified.",
+      });
         return;
       }
       if (!actorAuthorized) {
         const failedAt = new Date().toISOString();
-        service.finalizeDefinitiveFailure(
-          claimed.delivery.id,
-          claimed.attempt.leaseToken,
-          {
+      service.failPreflight(preflight.delivery.id, leaseToken, {
             at: failedAt,
             code: "authorization_revoked",
-            message:
-              "The initiating actor no longer has access to this mailbox.",
-          },
-        );
+        message: "The initiating actor no longer has access to this mailbox.",
+      });
         this.#recordActivity(
           { kind: "system" },
           "outbound_authorization_revoked",
           "outbound_delivery",
-          claimed.delivery.id,
+        preflight.delivery.id,
           {
-            actorKind: claimed.delivery.actor.kind,
-            actorId: claimed.delivery.actor.id,
+          actorKind: preflight.delivery.actor.kind,
+          actorId: preflight.delivery.actor.id,
           },
           failedAt,
         );
-        await this.#ensureOutboundAlarm();
         return;
       }
 
       const quota = this.#dispatchQuotaPlan(new Date().toISOString());
       if (!quota.allowed) {
         const failedAt = new Date().toISOString();
-        service.finalizeRetryableFailure(
-          claimed.delivery.id,
-          claimed.attempt.leaseToken,
-          {
+      service.deferPreflight(preflight.delivery.id, leaseToken, {
             at: failedAt,
             retryAt: quota.retryAt,
             code: quota.code,
             message:
               "Mailbox send capacity is reserved until the current window advances.",
-          },
-        );
+      });
         this.#recordActivity(
           { kind: "system" },
           "outbound_quota_deferred",
           "outbound_delivery",
-          claimed.delivery.id,
+        preflight.delivery.id,
           { code: quota.code, retryAt: quota.retryAt },
           failedAt,
         );
-        await this.#ensureOutboundAlarm();
         return;
       }
 
-      observed = await sendEmailWithOutcome(this.env, {
+    let attachments;
+    try {
+      attachments = await this.#loadOutboundAttachments(
+        preflight.delivery.emailId,
+        snapshot.attachmentIds,
+        snapshot.attachmentByteIdentities,
+      );
+    } catch (error) {
+      const failedAt = new Date().toISOString();
+      if (error instanceof OutboundAttachmentIntegrityError) {
+        service.failPreflight(preflight.delivery.id, leaseToken, {
+          at: failedAt,
+          code: error.code,
+          message:
+            error.code === "attachment_integrity_unverifiable"
+              ? "This queued message predates exact attachment verification. Re-attach the files and send again."
+              : "The immutable outbound snapshot is incomplete or corrupt.",
+        });
+      } else {
+        service.deferPreflight(preflight.delivery.id, leaseToken, {
+          at: failedAt,
+          retryAt: new Date(Date.parse(failedAt) + 60_000).toISOString(),
+          code: "attachment_store_unavailable",
+          message: "Attachment storage could not be read.",
+        });
+      }
+      return;
+    }
+
+    const fromDomain = snapshot.from.split("@")[1] ?? "";
+    const attemptId = `attempt_${crypto.randomUUID()}`;
+    const preparation = await prepareSesSend(this.env, {
         to: snapshot.to,
         cc: snapshot.cc,
         bcc: snapshot.bcc,
@@ -7799,33 +10118,106 @@ export class MailboxDO extends DurableObject<Env> {
         ),
         tracking: {
           mailboxId: snapshot.mailboxId,
-          deliveryId: claimed.delivery.id,
+        deliveryId: preflight.delivery.id,
+        attemptId,
         },
       });
-    } catch (error) {
-      // Attachment reads and other failures before SES dispatch are proven safe
-      // to retry. The SES adapter separately classifies transport ambiguity.
-      observed = {
-        kind: "not_dispatched" as const,
-        detail: error instanceof Error ? error.message : String(error),
-      };
+    if (!preparation.ok) {
+      const failedAt = new Date().toISOString();
+      if (preparation.stage === "request") {
+        service.failPreflight(preflight.delivery.id, leaseToken, {
+          at: failedAt,
+          code: "ses_request_invalid",
+          message:
+            "The immutable outbound snapshot cannot form a valid request.",
+        });
+      } else {
+        service.deferPreflight(preflight.delivery.id, leaseToken, {
+          at: failedAt,
+          retryAt: new Date(Date.parse(failedAt) + 60_000).toISOString(),
+          code: "ses_signing_unavailable",
+          message: "The provider request could not be prepared.",
+        });
+      }
+      return;
     }
+
+	// Attachment reads, hashing, and signing can be slow. Revalidate access and
+	// capacity at the final pre-provider boundary so revoked actors and expired
+	// reservations cannot cross into an external send.
+	let stillAuthorized: boolean;
+	try {
+		stillAuthorized = await this.#outboundActorStillAuthorized(
+			preflight.delivery.actor,
+			preflight.delivery.mailboxId,
+		);
+	} catch {
+		const deferredAt = new Date().toISOString();
+		service.deferPreflight(preflight.delivery.id, leaseToken, {
+			at: deferredAt,
+			retryAt: new Date(Date.parse(deferredAt) + 60_000).toISOString(),
+			code: "authority_check_unavailable",
+			message: "Mailbox authorization could not be verified.",
+		});
+		return;
+	}
+	if (!stillAuthorized) {
+		const failedAt = new Date().toISOString();
+		service.failPreflight(preflight.delivery.id, leaseToken, {
+			at: failedAt,
+			code: "authorization_revoked",
+			message: "The initiating actor no longer has access to this mailbox.",
+		});
+		return;
+	}
+	const finalQuota = this.#dispatchQuotaPlan(new Date().toISOString());
+	if (!finalQuota.allowed) {
+		const deferredAt = new Date().toISOString();
+		service.deferPreflight(preflight.delivery.id, leaseToken, {
+			at: deferredAt,
+			retryAt: finalQuota.retryAt,
+			code: finalQuota.code,
+			message:
+				"Mailbox send capacity is reserved until the current window advances.",
+		});
+		return;
+	}
+
+    // Keep the durable provider begin and single-use fetch adjacent. Once the
+    // attempt begins, a missing response is ambiguous and must not auto-retry.
+    const claimed = service.beginProviderAttempt(
+      preflight.delivery.id,
+      leaseToken,
+      attemptId,
+      new Date().toISOString(),
+      5 * 60_000,
+    );
+    const observed = await dispatchPreparedSesSend(preparation.prepared);
 
     const classified = classifySesOutcome(observed);
     const finishedAt = new Date().toISOString();
-    if (classified.kind === "sent") {
+	try {
+	if (classified.kind === "sent") {
       const finalized = service.finalizeAccepted(
         claimed.delivery.id,
         claimed.attempt.leaseToken,
         classified.sesMessageId,
         finishedAt,
       );
-      await this.#moveAcceptedOutboundToSent(
-        finalized.delivery.emailId,
-        classified.sesMessageId,
-        finalized.delivery.actor,
-        finishedAt,
-      );
+	      const projection = await this.#moveAcceptedOutboundToSent(
+	        finalized.delivery.emailId,
+	        classified.sesMessageId,
+	        finalized.delivery.actor,
+	        finishedAt,
+	      );
+	      if (projection.status !== "projected") {
+			this.#parkOutboundAcceptanceRecovery(
+				finalized.delivery.id,
+				projection.status,
+				finishedAt,
+			);
+			return;
+	      }
       await this.#consumeAcceptedSourceDraft(
         finalized.delivery.draftId,
         finalized.delivery.draftVersion,
@@ -7835,7 +10227,6 @@ export class MailboxDO extends DurableObject<Env> {
       service.finalizeUnknown(claimed.delivery.id, claimed.attempt.leaseToken, {
         at: finishedAt,
         code: classified.code,
-        message: observed.detail,
       });
     } else if (classified.automaticRetry) {
       const backoffMs = Math.min(
@@ -7849,7 +10240,6 @@ export class MailboxDO extends DurableObject<Env> {
           at: finishedAt,
           retryAt: new Date(Date.now() + backoffMs).toISOString(),
           code: classified.code,
-          message: observed.detail,
           ...(observed.kind === "http_error"
             ? { httpStatus: observed.status }
             : {}),
@@ -7862,15 +10252,47 @@ export class MailboxDO extends DurableObject<Env> {
         {
           at: finishedAt,
           code: classified.code,
-          message: observed.detail,
           ...(observed.kind === "http_error"
             ? { httpStatus: observed.status }
             : {}),
         },
       );
-    }
-
-    await this.#ensureOutboundAlarm();
+	}
+	} catch (error) {
+		const eventReconciled = service.get(claimed.delivery.id);
+		if (canReconcileConcurrentProviderTerminal(eventReconciled?.status)) {
+			const terminalized = classified.kind === "sent"
+			  ? this.#recordConcurrentAcceptedProviderOutcome({
+				deliveryId: claimed.delivery.id,
+				attemptId: claimed.attempt.id,
+				leaseToken: claimed.attempt.leaseToken,
+				sesMessageId: classified.sesMessageId,
+				acceptedAt: finishedAt,
+			  })
+			  : this.#recordConcurrentNonAcceptedProviderOutcome({
+				deliveryId: claimed.delivery.id,
+				attemptId: claimed.attempt.id,
+				leaseToken: claimed.attempt.leaseToken,
+				at: finishedAt,
+				outcome:
+				  classified.kind === "unknown"
+					? { kind: "unknown", code: classified.code }
+					: {
+						kind: "rejected",
+						code: classified.code,
+						automaticRetry: classified.automaticRetry,
+						...(observed.kind === "http_error"
+						  ? { httpStatus: observed.status }
+						  : {}),
+					  },
+			  });
+			if (!terminalized) {
+			  throw error;
+			}
+			return;
+		}
+		throw error;
+	}
   }
 
   // ── Bulk send (mail merge) — alarm-scheduled, throttled (F-06) ──
@@ -8208,6 +10630,7 @@ export class MailboxDO extends DurableObject<Env> {
         filename: string;
         type: string;
         size: number;
+		acceptedContentSha256: string;
       }> = [];
       for (const sourceKey of job.preparationAttachmentKeys ?? []) {
         const object = await this.env.BUCKET.get(sourceKey);
@@ -8215,6 +10638,9 @@ export class MailboxDO extends DurableObject<Env> {
           throw new Error("missing_bulk_upload");
         }
         const metadata = object.customMetadata ?? {};
+		if (!/^[a-f0-9]{64}$/.test(metadata.contentSha256 ?? "")) {
+			throw new Error("invalid_bulk_attachment_identity");
+		}
         staged.push({
           bytes: await object.arrayBuffer(),
           filename: (metadata.filename || "untitled").replace(
@@ -8226,6 +10652,7 @@ export class MailboxDO extends DurableObject<Env> {
             object.httpMetadata?.contentType ||
             "application/octet-stream",
           size: object.size,
+		  acceptedContentSha256: metadata.contentSha256!,
         });
       }
       const setError = validateAttachmentSet(
@@ -8246,14 +10673,21 @@ export class MailboxDO extends DurableObject<Env> {
           admission.generation,
           index,
         );
+        const digest = await attachmentSha256(attachment.bytes);
+		if (digest.hex !== attachment.acceptedContentSha256) {
+			throw new Error("bulk_attachment_content_changed");
+		}
         await this.env.BUCKET.put(key, attachment.bytes, {
           httpMetadata: { contentType: attachment.type },
+          customMetadata: { contentSha256: digest.hex },
+          sha256: digest.binary,
         });
         attachments.push({
           key,
           filename: attachment.filename,
           type: attachment.type,
           size: attachment.size,
+          contentSha256: digest.hex,
         });
       }
     } catch (error) {
@@ -9113,6 +11547,7 @@ export class MailboxDO extends DurableObject<Env> {
         mimetype: attachment.type,
         size: attachment.size,
         disposition: "attachment",
+        content_sha256: attachment.contentSha256,
       } satisfies PendingOutboundAttachment;
     });
     const keys = attachments.map((attachment) =>
@@ -9425,7 +11860,11 @@ export class MailboxDO extends DurableObject<Env> {
         })
         .from(schema.inboundDerivedContentRetiredAttempts)
         .where(
-          lte(schema.inboundDerivedContentRetiredAttempts.expires_at, nowIso),
+		  or(
+			lte(schema.inboundDerivedContentRetiredAttempts.expires_at, nowIso),
+			sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.inboundDerivedContentRetiredAttempts.expires_at}) IS NULL`,
+			sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.inboundDerivedContentRetiredAttempts.expires_at}) <> ${schema.inboundDerivedContentRetiredAttempts.expires_at}`,
+		  ),
         )
         .orderBy(
           asc(schema.inboundDerivedContentRetiredAttempts.expires_at),
@@ -9448,18 +11887,28 @@ export class MailboxDO extends DurableObject<Env> {
       const dueCandidates = this.db
         .select()
         .from(schema.r2DeletionOutbox)
-        .where(
-          or(
-            and(
+	        .where(
+		  and(
+			isNull(schema.r2DeletionOutbox.parked_at),
+	          or(
+	            and(
               eq(schema.r2DeletionOutbox.state, "pending"),
-              lte(schema.r2DeletionOutbox.next_attempt_at, nowIso),
+			  or(
+				lte(schema.r2DeletionOutbox.next_attempt_at, nowIso),
+				sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.r2DeletionOutbox.next_attempt_at}) IS NULL`,
+				sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.r2DeletionOutbox.next_attempt_at}) <> ${schema.r2DeletionOutbox.next_attempt_at}`,
+			  ),
             ),
             and(
               eq(schema.r2DeletionOutbox.state, "deleting"),
-              lte(schema.r2DeletionOutbox.lease_expires_at, nowIso),
+			  or(
+				lte(schema.r2DeletionOutbox.lease_expires_at, nowIso),
+				sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.r2DeletionOutbox.lease_expires_at}) IS NULL`,
+				sql`strftime('%Y-%m-%dT%H:%M:%fZ', ${schema.r2DeletionOutbox.lease_expires_at}) <> ${schema.r2DeletionOutbox.lease_expires_at}`,
+			  ),
             ),
-          ),
-        )
+	          )),
+	        )
         .orderBy(
           asc(schema.r2DeletionOutbox.next_attempt_at),
           asc(schema.r2DeletionOutbox.r2_key),
@@ -9551,100 +12000,87 @@ export class MailboxDO extends DurableObject<Env> {
           .run();
       }
 
-      return due.map((row) => ({
-        r2Key: row.r2_key,
-        claimGeneration: row.claim_generation + 1,
-        attempts: row.attempts + 1,
-      }));
-    });
-    if (claimed.length > 0) {
-      try {
-        // R2 delete is strongly consistent once this Promise resolves. Keep the
-        // network wait outside transactionSync so other mailbox inputs can proceed.
-        // https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
-        await this.env.BUCKET.delete(claimed.map((row) => row.r2Key));
-        this.ctx.storage.transactionSync(() => {
-          for (const claimChunk of sqlParameterChunks(
-            claimed,
-            R2_CLAIM_KEY_CHUNK_SIZE,
-          )) {
-            this.db
-              .delete(schema.r2DeletionOutbox)
-              .where(
-                and(
-                  eq(schema.r2DeletionOutbox.state, "deleting"),
-                  eq(schema.r2DeletionOutbox.lease_token, leaseToken),
-                  or(
-                    ...claimChunk.map((row) =>
-                      and(
-                        eq(schema.r2DeletionOutbox.r2_key, row.r2Key),
-                        eq(
-                          schema.r2DeletionOutbox.claim_generation,
-                          row.claimGeneration,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              )
-              .run();
-          }
-        });
-        console.info("[mail-cleanup] R2 deletion batch completed", {
-          count: claimed.length,
-          operation: "r2_deletion_outbox",
-          status: "succeeded",
-        });
-      } catch {
-        const attempts = Math.max(...claimed.map((row) => row.attempts));
-        const delayMs = Math.min(
-          3_600_000,
-          2 ** Math.min(attempts, 10) * 1_000,
-        );
-        const retryAt = new Date(now + delayMs).toISOString();
-        this.ctx.storage.transactionSync(() => {
-          for (const claimChunk of sqlParameterChunks(
-            claimed,
-            R2_CLAIM_KEY_CHUNK_SIZE,
-          )) {
-            this.db
-              .update(schema.r2DeletionOutbox)
-              .set({
-                lease_expires_at: retryAt,
-                last_error: "R2_DELETION_FAILED",
-              })
-              .where(
-                and(
-                  eq(schema.r2DeletionOutbox.state, "deleting"),
-                  eq(schema.r2DeletionOutbox.lease_token, leaseToken),
-                  or(
-                    ...claimChunk.map((row) =>
-                      and(
-                        eq(schema.r2DeletionOutbox.r2_key, row.r2Key),
-                        eq(
-                          schema.r2DeletionOutbox.claim_generation,
-                          row.claimGeneration,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              )
-              .run();
-          }
-        });
-        console.error("[mail-cleanup] R2 deletion batch failed", {
-          count: claimed.length,
-          errorCode: "R2_DELETION_OUTBOX_FAILED",
-          operation: "r2_deletion_outbox",
-          status: "retrying",
-        });
-      }
-    }
+	      return due.map((row) => ({
+	        r2Key: row.r2_key,
+	        claimGeneration: row.claim_generation + 1,
+	        attempts: row.attempts + 1,
+			recoveryRef: crypto.randomUUID(),
+	      }));
+	    });
+	    if (claimed.length > 0) {
+	  const outcomes: Array<{
+		row: (typeof claimed)[number];
+		succeeded: boolean;
+	  }> = [];
+	  // Isolate each key so one R2-specific failure cannot retain valid siblings.
+	  for (const row of claimed) {
+		try {
+		  await this.env.BUCKET.delete(row.r2Key);
+		  outcomes.push({ row, succeeded: true });
+		} catch {
+		  outcomes.push({ row, succeeded: false });
+		}
+	  }
+	  this.ctx.storage.transactionSync(() => {
+		for (const outcome of outcomes) {
+		  const fence = and(
+			eq(schema.r2DeletionOutbox.r2_key, outcome.row.r2Key),
+			eq(schema.r2DeletionOutbox.state, "deleting"),
+			eq(schema.r2DeletionOutbox.lease_token, leaseToken),
+			eq(
+			  schema.r2DeletionOutbox.claim_generation,
+			  outcome.row.claimGeneration,
+			),
+		  );
+		  if (outcome.succeeded) {
+			this.db.delete(schema.r2DeletionOutbox).where(fence).run();
+			continue;
+		  }
+		  const parked = outcome.row.attempts >= 6;
+		  const delayMs = Math.min(
+			3_600_000,
+			2 ** Math.min(outcome.row.attempts, 10) * 1_000,
+		  );
+		  this.db
+			.update(schema.r2DeletionOutbox)
+			.set({
+			  lease_expires_at: new Date(now + delayMs).toISOString(),
+			  last_error: "R2_DELETION_FAILED",
+			  parked_at: parked ? nowIso : null,
+			  recovery_ref: parked ? outcome.row.recoveryRef : null,
+			})
+			.where(fence)
+			.run();
+		}
+	  });
+	  const succeeded = outcomes.filter((outcome) => outcome.succeeded).length;
+	  const parked = outcomes.filter(
+		(outcome) => !outcome.succeeded && outcome.row.attempts >= 6,
+	  ).length;
+	  console.info("[mail-cleanup] R2 deletion batch completed", {
+		count: claimed.length,
+		failed: claimed.length - succeeded,
+		pendingReview: parked,
+		operation: "r2_deletion_outbox",
+		status: succeeded === claimed.length ? "succeeded" : "partial",
+	  });
+	  if (succeeded !== claimed.length) {
+		console.error("[mail-cleanup] R2 deletion items require recovery", {
+		  failed: claimed.length - succeeded,
+		  pendingReview: parked,
+		  operation: "r2_deletion_outbox",
+		  recoveryAction: parked > 0 ? "operator_repair" : "retry",
+		  errorCode: "R2_DELETION_OUTBOX_FAILED",
+		});
+	  }
+	    }
     const nextPending = this.db
       .select({ nextAttemptAt: schema.r2DeletionOutbox.next_attempt_at })
       .from(schema.r2DeletionOutbox)
-      .where(eq(schema.r2DeletionOutbox.state, "pending"))
+	      .where(and(
+		  eq(schema.r2DeletionOutbox.state, "pending"),
+		  isNull(schema.r2DeletionOutbox.parked_at),
+		))
       .orderBy(
         asc(schema.r2DeletionOutbox.next_attempt_at),
         asc(schema.r2DeletionOutbox.r2_key),
@@ -9654,7 +12090,10 @@ export class MailboxDO extends DurableObject<Env> {
     const nextDeleting = this.db
       .select({ leaseExpiresAt: schema.r2DeletionOutbox.lease_expires_at })
       .from(schema.r2DeletionOutbox)
-      .where(eq(schema.r2DeletionOutbox.state, "deleting"))
+	      .where(and(
+		  eq(schema.r2DeletionOutbox.state, "deleting"),
+		  isNull(schema.r2DeletionOutbox.parked_at),
+		))
       .orderBy(
         asc(schema.r2DeletionOutbox.lease_expires_at),
         asc(schema.r2DeletionOutbox.r2_key),
@@ -9678,15 +12117,144 @@ export class MailboxDO extends DurableObject<Env> {
         ? Date.parse(nextDeleting.leaseExpiresAt)
         : null,
       nextFenceExpiry ? Date.parse(nextFenceExpiry.expiresAt) : null,
-    ].filter((candidate): candidate is number => candidate !== null);
-    return candidates.length > 0 ? Math.min(...candidates) : null;
-  }
+	].filter(
+	  (candidate): candidate is number =>
+		candidate !== null && Number.isFinite(candidate),
+	);
+	    return candidates.length > 0 ? Math.min(...candidates) : null;
+	  }
 
-  /** Enqueue the next recipient of the head job, persist progress, reschedule. */
+	listParkedR2DeletionRecoveries(
+	  afterRecoveryRef: string | undefined,
+	  limit: number,
+	) {
+	  const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+	  const rows = this.db
+		.select({
+		  recoveryRef: schema.r2DeletionOutbox.recovery_ref,
+		  emailId: schema.r2DeletionOutbox.email_id,
+		  generation: schema.r2DeletionOutbox.claim_generation,
+		  attempts: schema.r2DeletionOutbox.attempts,
+		  lastErrorCode: schema.r2DeletionOutbox.last_error,
+		  parkedAt: schema.r2DeletionOutbox.parked_at,
+		})
+		.from(schema.r2DeletionOutbox)
+		.where(and(
+		  isNotNull(schema.r2DeletionOutbox.parked_at),
+		  isNotNull(schema.r2DeletionOutbox.recovery_ref),
+		  ...(afterRecoveryRef
+			? [gt(schema.r2DeletionOutbox.recovery_ref, afterRecoveryRef)]
+			: []),
+		))
+		.orderBy(asc(schema.r2DeletionOutbox.recovery_ref))
+		.limit(boundedLimit + 1)
+		.all();
+	  const hasMore = rows.length > boundedLimit;
+	  const items = rows.slice(0, boundedLimit);
+	  return {
+		items,
+		...(hasMore ? { next: items.at(-1)?.recoveryRef ?? undefined } : {}),
+	  };
+	}
+
+	async repairParkedR2Deletion(
+	  recoveryRef: string,
+	  input: { operationKey: string; expectedGeneration: number },
+	  actor: ActivityActor,
+	) {
+	  const auditId = `r2_deletion_repaired:${recoveryRef}:${input.operationKey}`;
+	  const at = new Date().toISOString();
+	  const result = this.ctx.storage.transactionSync(() => {
+		const replay = this.db
+		  .select({ id: schema.activityEvents.id })
+		  .from(schema.activityEvents)
+		  .where(eq(schema.activityEvents.id, auditId))
+		  .get();
+		if (replay) return { status: "replayed" as const };
+		const current = this.db
+		  .select()
+		  .from(schema.r2DeletionOutbox)
+		  .where(eq(schema.r2DeletionOutbox.recovery_ref, recoveryRef))
+		  .get();
+		if (!current) return { status: "not_found" as const };
+		if (current.parked_at === null) return { status: "not_parked" as const };
+		if (current.claim_generation !== input.expectedGeneration) {
+		  return {
+			status: "generation_conflict" as const,
+			generation: current.claim_generation,
+		  };
+		}
+		const generation = current.claim_generation + 1;
+		this.db
+		  .update(schema.r2DeletionOutbox)
+		  .set({
+			state: "pending",
+			claim_generation: generation,
+			lease_token: null,
+			lease_expires_at: null,
+			attempts: 0,
+			next_attempt_at: at,
+			last_error: null,
+			parked_at: null,
+			recovery_ref: null,
+		  })
+		  .where(and(
+			eq(schema.r2DeletionOutbox.r2_key, current.r2_key),
+			eq(schema.r2DeletionOutbox.recovery_ref, recoveryRef),
+			eq(schema.r2DeletionOutbox.claim_generation, current.claim_generation),
+		  ))
+		  .run();
+		this.#recordActivityOnce(
+		  auditId,
+		  actor,
+		  "r2_deletion_repaired",
+		  "email",
+		  current.email_id,
+		  { generation },
+		  at,
+		);
+		return { status: "repaired" as const, generation };
+	  });
+	  if (result.status === "repaired") {
+		try {
+		  await this.#scheduleAlarmAt(Date.now() + 100);
+		} catch {
+		  console.error("R2 deletion repair remains durably pending", {
+			recoveryRef,
+		  });
+		}
+	  }
+	  return result;
+	}
+
+	  /** Enqueue the next recipient of the head job, persist progress, reschedule. */
   async alarm(): Promise<void> {
     const alarmNow = Date.now();
-    await this.#processImportPromotionIntents(alarmNow);
-    const nextR2DeletionAt = await this.#processR2DeletionOutbox(alarmNow);
+    await runOutboundAlarmLane({
+      process: () => this.#processOutboundAlarm(),
+      ensureAlarm: () => this.#ensureOutboundAlarm(),
+      logFailure: ({ stage, error }) =>
+        console.error("[outbound] alarm lane failed", {
+          operation: "outbound_alarm_lane",
+          stage,
+          status: "failure",
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          retryDecision:
+            stage === "rearm" ? "cloudflare_alarm_retry" : "durable_rearm",
+        }),
+    });
+	try {
+		await this.#processImportPromotionIntents(alarmNow);
+	} catch (error) {
+		console.error("[import-promotion] alarm lane failed", {
+			operation: "import_promotion_alarm_lane",
+			status: "failure",
+			errorName: error instanceof Error ? error.name : "UnknownError",
+			retryDecision: "durable_rearm",
+		});
+		await this.#scheduleAlarmAt(Date.now() + 1_000);
+	}
+    const nextR2DeletionAt = await this.#processR2DeletionOutbox(Date.now());
     if (nextR2DeletionAt !== null) {
       // Durable Object alarms are at-least-once and automatic retries stop after
       // six attempts, so every handled pass explicitly schedules durable follow-up.
@@ -9754,19 +12322,34 @@ export class MailboxDO extends DurableObject<Env> {
     if (nextSnoozeAlarm !== null) {
       await this.#scheduleAlarmAt(Math.max(alarmNow, nextSnoozeAlarm));
     }
+    const draftSaveNow = Date.now();
+    const expiredDraftSaveClaims =
+      this.#promoteExpiredDraftSaveClaimsToCleanup(draftSaveNow);
+    if (expiredDraftSaveClaims.integrityFailures > 0) {
+	      console.error("[draft-save-cleanup] invalid plans are durably parked", {
+        code: "draft_save_destination_plan_invalid",
+        operationCount: expiredDraftSaveClaims.integrityFailures,
+      });
+    }
     const nextDraftSaveCleanupAt =
-      await this.#processDraftSaveCleanup(alarmNow);
-    if (nextDraftSaveCleanupAt !== null) {
+      await this.#processDraftSaveCleanup(draftSaveNow);
+    const nextDraftSaveAlarm = earliestMailboxAlarm([
+      expiredDraftSaveClaims.moreDue ? Date.now() + 100 : null,
+      nextDraftSaveCleanupAt,
+      this.#nextDraftSaveClaimExpiryAt(),
+    ]);
+    if (nextDraftSaveAlarm !== null) {
       await this.#scheduleAlarmAt(
-        Math.max(Date.now() + 100, nextDraftSaveCleanupAt),
+        Math.max(Date.now() + 100, nextDraftSaveAlarm),
       );
     }
-    const cleanupPending = await this.#processAttachmentCleanup();
-    await this.#processBulkAttachmentCleanup();
-    if (cleanupPending) {
-      await this.#scheduleAlarmAt(Date.now() + 60_000);
-    }
-    await this.#processOutboundAlarm();
+	    const nextAttachmentCleanupAt = await this.#processAttachmentCleanup();
+	    await this.#processBulkAttachmentCleanup();
+	    if (nextAttachmentCleanupAt !== null) {
+	      await this.#scheduleAlarmAt(
+			Math.max(Date.now() + 100, nextAttachmentCleanupAt),
+		  );
+	    }
     let queue: string[];
     try {
       queue = (await this.ctx.storage.get<string[]>(BULK_QUEUE_KEY)) ?? [];
@@ -9993,6 +12576,7 @@ export class MailboxDO extends DurableObject<Env> {
 		  ...(text !== undefined ? { text } : {}),
 		  threadId: "generated",
 		  attachmentIds: [],
+          attachmentByteIdentities: [],
 		},
 		requestedAt: "1970-01-01T00:00:00.000Z",
 		undoUntil: "1970-01-01T00:00:00.000Z",
@@ -10084,11 +12668,20 @@ export class MailboxDO extends DurableObject<Env> {
                 attachment.filename,
               );
             }
+            const sourceBytes = await source.arrayBuffer();
+            const sourceDigest = await attachmentSha256(sourceBytes);
+            if (sourceDigest.hex !== attachment.contentSha256) {
+              throw new BulkRecipientAttachmentUnavailableError(
+                attachment.filename,
+              );
+            }
             await this.env.BUCKET.put(
               activePreparation.keys[index],
-              await source.arrayBuffer(),
+              sourceBytes,
               {
                 httpMetadata: { contentType: attachment.type },
+                customMetadata: { contentSha256: sourceDigest.hex },
+                sha256: sourceDigest.binary,
               },
             );
           }
@@ -10105,6 +12698,8 @@ export class MailboxDO extends DurableObject<Env> {
               attachmentIds: pendingAttachments.map(
                 (attachment) => attachment.id,
               ),
+              attachmentByteIdentities:
+                outboundAttachmentByteIdentities(pendingAttachments),
             },
             requestedAt,
             undoUntil: requestedAt,

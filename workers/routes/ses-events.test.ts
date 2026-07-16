@@ -7,6 +7,16 @@ function mailboxKey(value: string) {
 	return btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+async function recipientHash(value: string) {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(value.toLowerCase()),
+	);
+	return [...new Uint8Array(digest)]
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
 function testApp(resultStatus = "recorded") {
 	const recorded: unknown[] = [];
 	const app = new Hono();
@@ -21,9 +31,11 @@ function testApp(resultStatus = "recorded") {
 			get(value: string) {
 				assert.equal(value, "team@wiserchat.ai");
 				return {
-					async recordSesBounce(input: unknown) {
+					async recordSesProviderEvent(input: unknown) {
 						recorded.push(input);
-						return { status: resultStatus };
+						return resultStatus === "recovery_pending"
+							? { status: "recorded", recoveryPending: true }
+							: { status: resultStatus };
 					},
 				};
 			},
@@ -53,6 +65,8 @@ test("authenticated bounce is correlated to the tagged mailbox and delivery", as
 				Authorization: "Bearer event-secret",
 			},
 			body: JSON.stringify({
+				id: "event-1",
+				time: "2026-07-16T10:00:00.000Z",
 				detail: {
 					eventType: "Bounce",
 					mail: {
@@ -60,9 +74,13 @@ test("authenticated bounce is correlated to the tagged mailbox and delivery", as
 						tags: {
 							MailboxKey: [mailboxKey("team@wiserchat.ai")],
 							DeliveryId: ["delivery-1"],
+							AttemptId: ["attempt-1"],
 						},
 					},
-					bounce: { bounceType: "Permanent" },
+					bounce: {
+						bounceType: "Permanent",
+						bouncedRecipients: [{ emailAddress: "Customer@Example.com" }],
+					},
 				},
 			}),
 		},
@@ -71,15 +89,18 @@ test("authenticated bounce is correlated to the tagged mailbox and delivery", as
 	assert.equal(response.status, 202);
 	assert.equal(recorded.length, 1);
 	assert.deepEqual(recorded[0], {
+		eventId: "event-1",
 		deliveryId: "delivery-1",
+		attemptId: "attempt-1",
 		sesMessageId: "ses-message-1",
 		eventType: "bounce",
-		message: JSON.stringify({ bounceType: "Permanent" }),
-		at: (recorded[0] as { at: string }).at,
+		recipientHashes: [await recipientHash("customer@example.com")],
+		occurredAt: "2026-07-16T10:00:00.000Z",
+		receivedAt: (recorded[0] as { receivedAt: string }).receivedAt,
 	});
 });
 
-test("non-failure SES events are ignored without touching mailbox state", async () => {
+test("a bounce without parseable recipient scope is preserved for unknown-outcome handling", async () => {
 	const { app, env, recorded } = testApp();
 	const response = await app.request(
 		"http://local/webhooks/ses",
@@ -89,7 +110,42 @@ test("non-failure SES events are ignored without touching mailbox state", async 
 				"Content-Type": "application/json",
 				Authorization: "Bearer event-secret",
 			},
-			body: JSON.stringify({ detail: { eventType: "Delivery" } }),
+			body: JSON.stringify({
+				id: "event-unscoped-bounce",
+				detail: {
+					eventType: "Bounce",
+					mail: {
+						messageId: "ses-message-1",
+						tags: {
+							MailboxKey: [mailboxKey("team@wiserchat.ai")],
+							DeliveryId: ["delivery-1"],
+							AttemptId: ["attempt-1"],
+						},
+					},
+					bounce: { bouncedRecipients: [{ diagnosticCode: "scope omitted" }] },
+				},
+			}),
+		},
+		env as never,
+	);
+	assert.equal(response.status, 202);
+	assert.deepEqual(
+		(recorded[0] as { recipientHashes: string[] }).recipientHashes,
+		[],
+	);
+});
+
+test("unsupported SES events are ignored without touching mailbox state", async () => {
+	const { app, env, recorded } = testApp();
+	const response = await app.request(
+		"http://local/webhooks/ses",
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer event-secret",
+			},
+			body: JSON.stringify({ detail: { eventType: "Open" } }),
 		},
 		env as never,
 	);
@@ -98,7 +154,7 @@ test("non-failure SES events are ignored without touching mailbox state", async 
 });
 
 test("raced SES events return a retryable response", async () => {
-	const { app, env } = testApp("invalid_state");
+	const { app, env } = testApp("not_found");
 	const response = await app.request(
 		"http://local/webhooks/ses",
 		{
@@ -108,6 +164,7 @@ test("raced SES events return a retryable response", async () => {
 				Authorization: "Bearer event-secret",
 			},
 			body: JSON.stringify({
+				id: "event-2",
 				detail: {
 					eventType: "Complaint",
 					mail: {
@@ -115,6 +172,37 @@ test("raced SES events return a retryable response", async () => {
 						tags: {
 							MailboxKey: [mailboxKey("team@wiserchat.ai")],
 							DeliveryId: ["delivery-1"],
+							AttemptId: ["attempt-1"],
+						},
+					},
+				},
+			}),
+		},
+		env as never,
+	);
+	assert.equal(response.status, 503);
+});
+
+test("a committed event with pending projection asks the provider to retry", async () => {
+	const { app, env } = testApp("recovery_pending");
+	const response = await app.request(
+		"http://local/webhooks/ses",
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: "Bearer event-secret",
+			},
+			body: JSON.stringify({
+				id: "event-recovery",
+				detail: {
+					eventType: "Delivery",
+					mail: {
+						messageId: "ses-message-1",
+						tags: {
+							MailboxKey: [mailboxKey("team@wiserchat.ai")],
+							DeliveryId: ["delivery-1"],
+							AttemptId: ["attempt-1"],
 						},
 					},
 				},

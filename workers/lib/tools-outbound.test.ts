@@ -117,6 +117,7 @@ test("MCP compose is accepted into the truthful outbox without direct delivery",
 		html: "<p>Hello</p>",
 		threadId: enqueued[0]!.emailId,
 		attachmentIds: [],
+		attachmentByteIdentities: [],
 	});
 	assert.deepEqual(enqueued[0]!.attachments, []);
 	assert.equal(
@@ -201,6 +202,31 @@ test("an MCP transport retry returns the existing truthful state without enqueue
 		replayed: true,
 		message: "This send action already exists with status sent.",
 	});
+	assert.equal(enqueued.length, 0);
+});
+
+test("an exact tool reply replay does not require the original message", async () => {
+	const existingDelivery = {
+		id: "delivery-existing",
+		emailId: "email-existing",
+		status: "sent" as const,
+		undoUntil: "2026-07-11T08:00:10.000Z",
+	};
+	const { env, enqueued } = testEnvironment({ existingDelivery });
+	const result = await toolSendReply(
+		env,
+		"team@example.com",
+		{
+			originalEmailId: "deleted-original",
+			to: "customer@example.com",
+			subject: "Re: Hello",
+			bodyHtml: "<p>Hello</p>",
+			idempotencyKey: "reply-replay-1",
+		},
+		{ kind: "mcp", id: "user-1" },
+	);
+
+	assert.equal(result.status, "sent");
 	assert.equal(enqueued.length, 0);
 });
 

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { EnqueueOutboundCommand } from "./outbound-delivery-contract.ts";
-import { outboundCommandFingerprint } from "./outbound-command-fingerprint.ts";
+import {
+	outboundCommandFingerprint,
+	outboundReplyIntentFingerprint,
+} from "./outbound-command-fingerprint.ts";
 
 function command(
 	overrides: Partial<EnqueueOutboundCommand> = {},
@@ -134,5 +137,45 @@ test("reply and forward source email identity is bound", async () => {
 		await outboundCommandFingerprint(command(), [], {
 			sourceEmailId: "source-email-b",
 		}),
+	);
+});
+
+test("reply intent fingerprint ignores mutable source-derived threading", async () => {
+	const snapshot = {
+		...command().snapshot,
+		kind: "reply" as const,
+		threadId: "thread-a",
+		inReplyTo: "message-a@example.com",
+		references: ["message-a@example.com"],
+	};
+	const baseline = command({ snapshot });
+	const changedSourceProjection = command({
+		snapshot: {
+			...snapshot,
+			threadId: "thread-b",
+			inReplyTo: "message-b@example.com",
+			references: ["message-b@example.com"],
+		},
+	});
+
+	assert.equal(
+		await outboundReplyIntentFingerprint(baseline, ["upload-1"], "source-1"),
+		await outboundReplyIntentFingerprint(
+			changedSourceProjection,
+			["upload-1"],
+			"source-1",
+		),
+	);
+	assert.notEqual(
+		await outboundReplyIntentFingerprint(baseline, ["upload-1"], "source-1"),
+		await outboundReplyIntentFingerprint(
+			command({ snapshot: { ...snapshot, subject: "Changed" } }),
+			["upload-1"],
+			"source-1",
+		),
+	);
+	assert.notEqual(
+		await outboundReplyIntentFingerprint(baseline, ["upload-1"], "source-1"),
+		await outboundReplyIntentFingerprint(baseline, ["upload-1"], "source-2"),
 	);
 });

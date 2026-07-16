@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { mailboxMigrations } from "../durableObject/migrations.ts";
+import { applySqliteMigrations } from "../testing/sqlite-migrations.test.ts";
 import { createSemanticIndex } from "./semantic-index.ts";
 
 function setup() {
 	const database = new DatabaseSync(":memory:");
 	database.exec("PRAGMA foreign_keys = ON");
-	for (const migration of mailboxMigrations) database.exec(migration.sql);
+	applySqliteMigrations(database, mailboxMigrations);
 	let nextId = 0;
 	const store = {
 		sql: {

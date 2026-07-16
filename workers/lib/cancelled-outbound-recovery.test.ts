@@ -35,6 +35,7 @@ class MemoryBucket {
 		["attachments/snapshot-1/attachment-2/terms.txt", new Uint8Array([5, 6, 7]).buffer],
 	]);
 	putCalls = 0;
+	deleteCalls = 0;
 	failPutAt?: number;
 	failDelete = false;
 
@@ -50,10 +51,57 @@ class MemoryBucket {
 	}
 
 	async delete(keys: string | string[]) {
+		this.deleteCalls += 1;
 		if (this.failDelete) throw new Error("rollback failed");
 		for (const key of Array.isArray(keys) ? keys : [keys]) this.objects.delete(key);
 	}
 }
+
+test("records durable destination ownership before the first recovered copy", async () => {
+	const bucket = new MemoryBucket();
+	const calls: string[] = [];
+	const originalPut = bucket.put.bind(bucket);
+	bucket.put = async (key, bytes) => {
+		calls.push("put");
+		await originalPut(key, bytes);
+	};
+
+	await prepareRecoveredDraftAttachments(bucket as never, "snapshot-1", source, {
+		recordDestinationIntent: async (_draftId, keys) => {
+			calls.push(`intent:${keys.join(",")}`);
+		},
+	});
+
+	assert.match(calls[0] ?? "", /^intent:attachments\/draft_recovered_snapshot-1\//);
+	assert.equal(calls[1], "put");
+});
+
+test("does not copy recovered objects when durable ownership cannot be recorded", async () => {
+	const bucket = new MemoryBucket();
+
+	await assert.rejects(
+		prepareRecoveredDraftAttachments(bucket as never, "snapshot-1", source, {
+			recordDestinationIntent: async () => {
+				throw new Error("intent unavailable");
+			},
+		}),
+		/intent unavailable/,
+	);
+	assert.equal(bucket.putCalls, 0);
+});
+
+test("leaves intent-backed partial-copy cleanup to its durable owner", async () => {
+	const bucket = new MemoryBucket();
+	bucket.failPutAt = 2;
+
+	await assert.rejects(
+		prepareRecoveredDraftAttachments(bucket as never, "snapshot-1", source, {
+			recordDestinationIntent: async () => undefined,
+		}),
+		/copy failed/,
+	);
+	assert.equal(bucket.deleteCalls, 0);
+});
 
 test("cancel recovery copies every attachment before returning draft metadata", async () => {
 	const bucket = new MemoryBucket();
@@ -68,6 +116,27 @@ test("cancel recovery copies every attachment before returning draft metadata", 
 	assert.equal(result.attachments[1]?.content_id, "legacy-inline@example.com");
 	assert.equal(bucket.objects.has("attachments/snapshot-1/attachment-1/proposal.pdf"), true);
 	assert.equal(bucket.objects.has("attachments/draft_recovered_snapshot-1/recovered_attachment-1/proposal.pdf"), true);
+});
+
+test("a later explicit recovery generation cannot reuse fenced destination keys", async () => {
+	const bucket = new MemoryBucket();
+	const result = await prepareRecoveredDraftAttachments(
+		bucket as never,
+		"snapshot-1",
+		source,
+		{ recoveryGeneration: 7 },
+	);
+
+	assert.deepEqual(
+		result.attachments.map((attachment) => attachment.id),
+		["recovered_attachment-1_g7", "recovered_attachment-2_g7"],
+	);
+	assert.equal(
+		bucket.objects.has(
+			"attachments/draft_recovered_snapshot-1/recovered_attachment-1_g7/proposal.pdf",
+		),
+		true,
+	);
 });
 
 test("partial copy failure rolls back destinations and returns no exposed metadata", async () => {

@@ -26,6 +26,8 @@ export default function OutboundDeliveryActions({
 	const action = outboundDeliveryAction(
 		delivery.status,
 		delivery.cancelRecoveryPending,
+		delivery.storageIntegrityCode,
+		delivery.lastErrorCode,
 	);
 	const isPending = cancelMutation.isPending || retryMutation.isPending;
 
@@ -55,7 +57,12 @@ export default function OutboundDeliveryActions({
 			cancelMutation.mutate(
 				{ mailboxId, deliveryId: delivery.id },
 				{
-					onSuccess: () => toastManager.add({ title: "Send cancelled" }),
+					onSuccess: (result) =>
+						toastManager.add({
+							title: result.retryCancellationRestored
+								? "Retry cancelled; previous delivery state restored"
+								: "Send cancelled",
+						}),
 					onError,
 				},
 			);
@@ -78,6 +85,11 @@ export default function OutboundDeliveryActions({
 
 	const providerError =
 		delivery.lastErrorMessage?.trim() || delivery.lastErrorCode?.trim();
+	const compactActionLabel = action?.kind === "cancel"
+		? "Cancel"
+		: action?.requiresDuplicateRiskConfirmation
+			? "Retry anyway"
+			: "Retry";
 	return (
 		<div
 			className={`flex min-w-0 ${compact ? "max-w-full flex-col items-end gap-1 sm:flex-row sm:items-center" : "items-center justify-between gap-3"}`}
@@ -95,7 +107,7 @@ export default function OutboundDeliveryActions({
 				</span>
 				{providerError && (
 					<p
-						className="truncate text-xs text-kumo-danger"
+						className={`${compact ? "sr-only sm:not-sr-only sm:block" : ""} truncate text-xs text-kumo-danger`}
 						title={providerError}
 					>
 						{providerError}
@@ -124,8 +136,8 @@ export default function OutboundDeliveryActions({
 						? action.kind === "cancel"
 							? "Cancelling..."
 							: "Retrying..."
-						: compact && action.kind === "cancel"
-							? "Cancel"
+						: compact
+							? compactActionLabel
 							: action.label}
 				</button>
 			)}

@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import { Folders } from "../../shared/folders.ts";
 import { actorFromSession } from "../lib/activity.ts";
 import {
+	classifyAttachmentPreparationFailure,
 	cleanupStoredAttachmentObjects,
 	completeAttachmentPromotion,
 	resolveAndPromoteAttachments,
@@ -86,10 +87,12 @@ export async function handleSaveDraft(c: AppContext) {
 			);
 		}
 		if (replay.status === "replay") {
-			const attachmentIdentityScope = await stub.getCommittedDraftAttachmentScope(
-				replay.draftId,
-				replay.draft.draft_version,
-			);
+			const attachmentIdentityScope = await stub
+				.getCommittedDraftAttachmentScope(
+					replay.draftId,
+					replay.draft.draft_version,
+				)
+				.catch(() => null);
 			return c.json({
 				...replay.draft,
 				replayed: true,
@@ -113,7 +116,7 @@ export async function handleSaveDraft(c: AppContext) {
 		claimExpiresAt: Date.now() + 5 * 60_000,
 	});
 	if (claim.status === "committed") {
-		const committedDraft = await stub.getEmail(id);
+		const committedDraft = claim.draft ?? await stub.getEmail(id);
 		if (!committedDraft || committedDraft.folder_id !== Folders.DRAFT) {
 			return c.json(
 				{ error: "The committed draft save is no longer available." },
@@ -233,7 +236,11 @@ export async function handleSaveDraft(c: AppContext) {
 	).catch((error: Error) => error);
 	if (newPromotion instanceof Error) {
 		await stub.abortDraftSave(saveKey, saveFingerprint, claimToken);
-		return c.json({ error: newPromotion.message }, 400);
+		const failure = classifyAttachmentPreparationFailure(newPromotion);
+		return c.json(
+			{ error: failure.message, code: failure.code },
+			failure.status,
+		);
 	}
 	const promotion = {
 		...newPromotion,
@@ -271,6 +278,7 @@ export async function handleSaveDraft(c: AppContext) {
 				saveKey,
 				saveFingerprint,
 				saveClaimToken: claimToken,
+				stagingCleanupKeys: promotion.stagingKeys,
 			},
 			promotion.storedMetadata,
 			actor,
@@ -297,6 +305,23 @@ export async function handleSaveDraft(c: AppContext) {
 	}
 
 	if (result.status !== "saved") {
+		if (result.status === "creation_replay") {
+			await Promise.allSettled([
+				rollbackAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor),
+				stub.abortDraftSave(saveKey, saveFingerprint, claimToken),
+			]);
+			const attachmentIdentityScope = await stub
+				.getCommittedDraftAttachmentScope(
+					result.draftId,
+					result.draft.draft_version,
+				)
+				.catch(() => null);
+			return c.json({
+				...result.draft,
+				replayed: true,
+				attachment_save_scope: attachmentIdentityScope ?? saveKey,
+			});
+		}
 		await rollbackAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor);
 		await stub.abortDraftSave(saveKey, saveFingerprint, claimToken);
 		if (result.status === "creation_superseded") {
@@ -309,17 +334,6 @@ export async function handleSaveDraft(c: AppContext) {
 				},
 				409,
 			);
-		}
-		if (result.status === "creation_replay") {
-			const attachmentIdentityScope = await stub.getCommittedDraftAttachmentScope(
-				result.draftId,
-				result.draft.draft_version,
-			);
-			return c.json({
-				...result.draft,
-				replayed: true,
-				attachment_save_scope: attachmentIdentityScope ?? saveKey,
-			});
 		}
 		if (result.status === "creation_conflict") {
 			return c.json(
@@ -358,19 +372,21 @@ export async function handleSaveDraft(c: AppContext) {
 		return c.json({ error: "Only a draft can be overwritten" }, 409);
 	}
 
-	await completeAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor);
-	await cleanupStoredAttachmentObjects(
-		c.env.BUCKET,
-		stub,
-		id,
-		result.replacedAttachments.filter(
-			(attachment) => !retainedAttachmentIds.has(attachment.id),
+	await Promise.allSettled([
+		completeAttachmentPromotion(c.env.BUCKET, stub, id, promotion, actor),
+		cleanupStoredAttachmentObjects(
+			c.env.BUCKET,
+			stub,
+			id,
+			result.replacedAttachments.filter(
+				(attachment) => !retainedAttachmentIds.has(attachment.id),
+			),
+			actor,
 		),
-		actor,
-	);
-	const saved = await stub.getEmail(id);
-	if (!saved || saved.folder_id !== Folders.DRAFT) {
-		throw new Error(`Saved draft ${id} could not be read back`);
+	]);
+	const authoritativeDraft = result.draft ?? await stub.getEmail(id);
+	if (!authoritativeDraft || authoritativeDraft.folder_id !== Folders.DRAFT) {
+		throw new Error(`Saved draft ${id} could not be materialized`);
 	}
-	return c.json({ ...saved, attachment_save_scope: claimToken }, 201);
+	return c.json({ ...authoritativeDraft, attachment_save_scope: claimToken }, 201);
 }

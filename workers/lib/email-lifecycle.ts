@@ -4,7 +4,10 @@ import type { OutboundDeliveryStatus } from "./outbound-delivery-contract.ts";
 export function outboundDeliveryBlocksGenericLifecycle(
 	status: OutboundDeliveryStatus,
 ): boolean {
-	return status === "queued" || status === "sending" || status === "retrying";
+	return status === "queued" ||
+		status === "sending" ||
+		status === "retrying" ||
+		status === "cancelled";
 }
 
 export function planTrash(folderId: string) {

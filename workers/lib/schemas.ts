@@ -164,7 +164,7 @@ export const SendEmailRequestSchema = z
 		text: z.string().optional(),
 		attachments: z.array(AttachmentRefSchema).max(ATTACHMENT_LIMITS.maxFiles).optional(),
 		in_reply_to: z.string().optional(),
-		references: z.array(z.string()).optional(),
+		references: z.array(z.string().min(1)).optional(),
 		thread_id: z.string().optional(),
 		source_draft_id: z.string().optional(),
 		source_draft_version: z.number().int().min(1).optional(),

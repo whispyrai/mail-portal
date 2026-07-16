@@ -283,7 +283,7 @@ node scripts/import-zoho.mjs \
 unset IMPORT_PASSWORD
 ```
 
-Repeat for `contact@wiserchat.ai` and any approved `hesham@wiserchat.ai` history. Re-running the same export is safe; the importer is expected to skip duplicates. Reconcile counts by folder, spot-check attachments, and confirm Trash/Spam are excluded.
+Repeat for `contact@wiserchat.ai`. The approved history scope is only `hello@wiserchat.ai` and `contact@wiserchat.ai`; importing `hesham@wiserchat.ai` requires a new explicit product decision. Re-running the same export is safe; the importer is expected to skip duplicates. Reconcile counts by folder, spot-check attachments, and confirm Trash/Spam are excluded.
 
 ## Stage 2: Separately Approved Apex MX Cutover
 

@@ -5,6 +5,26 @@
 export interface Migration {
 	name: string;
 	sql: string;
+	classify?: (sql: SqlStorage) => "apply" | "satisfied" | "superseded" | "invalid";
+}
+
+function tableColumns(sql: SqlStorage, table: string): Set<string> {
+	return new Set(
+		[...sql.exec(`PRAGMA table_info(${table})`)].map((row) => String(row.name)),
+	);
+}
+
+function hasTable(sql: SqlStorage, table: string): boolean {
+	return [
+		...sql.exec(
+			"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+			table,
+		),
+	].length > 0;
+}
+
+function tablesPresent(sql: SqlStorage, tables: readonly string[]): boolean {
+	return tables.every((table) => hasTable(sql, table));
 }
 
 /**
@@ -26,14 +46,6 @@ export function applyMigrations(
 	)`);
 
 	for (const migration of migrations) {
-		const applied = [
-			...sql.exec(
-				`SELECT 1 FROM d1_migrations WHERE name = ?`,
-				migration.name,
-			),
-		];
-		if (applied.length > 0) continue;
-
 		// Strip any existing BEGIN/COMMIT wrapper from the migration SQL.
 		// Cloudflare's DO runtime forbids SQL-level transactions -- must use
 		// the JS storage.transactionSync() API instead.
@@ -43,7 +55,18 @@ export function applyMigrations(
 
 		const escapedName = migration.name.replace(/'/g, "''");
 		const run = () => {
-			sql.exec(migrationSql);
+			const applied = [
+				...sql.exec(
+					`SELECT 1 FROM d1_migrations WHERE name = ?`,
+					migration.name,
+				),
+			];
+			if (applied.length > 0) return;
+			const classification = migration.classify?.(sql) ?? "apply";
+			if (classification === "invalid") {
+				throw new Error(`Migration ${migration.name} found an unrecognized partial schema`);
+			}
+			if (classification === "apply") sql.exec(migrationSql);
 			sql.exec(
 				`INSERT INTO d1_migrations (name) VALUES ('${escapedName}')`,
 			);
@@ -1730,6 +1753,48 @@ export const mailboxMigrations: Migration[] = [
   },
   {
     name: "36_add_inbound_durability",
+	classify: (sql) => {
+		const attachmentColumns = tableColumns(sql, "attachments");
+		const deletionColumns = tableColumns(sql, "r2_deletion_outbox");
+		const finalTables = [
+			"inbound_derived_content_state",
+			"inbound_derived_content_repair_attempts",
+			"inbound_derived_content_retired_attempts",
+			"r2_retired_key_fences",
+			"import_promotion_intents",
+			"import_promotion_intent_objects",
+		] as const;
+		if (
+			attachmentColumns.has("r2_key") &&
+			deletionColumns.has("state") &&
+			deletionColumns.has("claim_generation") &&
+			tablesPresent(sql, finalTables)
+		) {
+			return "satisfied";
+		}
+		const deployedTables = [
+			"email_deletion_tombstones",
+			"inbound_terminal_failures",
+			"email_body_objects",
+			"r2_deletion_outbox",
+		] as const;
+		if (
+			attachmentColumns.has("r2_key") &&
+			tablesPresent(sql, deployedTables) &&
+			!deletionColumns.has("state") &&
+			tableColumns(sql, "inbound_terminal_failures").has("queue_message_id")
+		) {
+			return "superseded";
+		}
+		if (
+			!attachmentColumns.has("r2_key") &&
+			deployedTables.every((table) => !hasTable(sql, table)) &&
+			finalTables.every((table) => !hasTable(sql, table))
+		) {
+			return "apply";
+		}
+		return "invalid";
+	},
     sql: txn(`
 			ALTER TABLE attachments ADD COLUMN r2_key TEXT;
 
@@ -1957,6 +2022,83 @@ export const mailboxMigrations: Migration[] = [
 		`),
   },
 	{
+		name: "10_add_inbound_delivery_ledgers",
+		classify: (sql) => {
+			const names = [
+				"email_deletion_tombstones",
+				"inbound_push_claims",
+				"inbound_terminal_failures",
+			] as const;
+			const present = names.filter((name) => hasTable(sql, name)).length;
+			if (present === 0) return "apply";
+			if (present === names.length) return "satisfied";
+			if (
+				hasTable(sql, "email_deletion_tombstones") &&
+				hasTable(sql, "inbound_terminal_failures") &&
+				hasTable(sql, "inbound_derived_content_state")
+			) return "superseded";
+			return "invalid";
+		},
+		sql: `
+            CREATE TABLE IF NOT EXISTS email_deletion_tombstones (
+                id TEXT PRIMARY KEY,
+                deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS inbound_push_claims (
+                id TEXT PRIMARY KEY,
+                claimed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS inbound_terminal_failures (
+                id TEXT PRIMARY KEY,
+                queue_message_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                error_code TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `,
+	},
+	{
+		name: "11_add_external_email_bodies",
+		classify: (sql) => hasTable(sql, "email_body_objects") ? "satisfied" : "apply",
+		sql: `
+            CREATE TABLE IF NOT EXISTS email_body_objects (
+                id TEXT PRIMARY KEY,
+                email_id TEXT NOT NULL,
+                part_index INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                charset TEXT NOT NULL,
+                r2_key TEXT NOT NULL,
+                byte_length INTEGER NOT NULL,
+                FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_email_body_objects_email_id
+                ON email_body_objects(email_id, part_index);
+        `,
+	},
+	{
+		name: "12_add_r2_deletion_outbox",
+		classify: (sql) => hasTable(sql, "r2_deletion_outbox") ? "satisfied" : "apply",
+		sql: `
+			CREATE TABLE IF NOT EXISTS r2_deletion_outbox (
+				r2_key TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+				last_error TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+			CREATE INDEX IF NOT EXISTS idx_r2_deletion_outbox_due
+				ON r2_deletion_outbox(next_attempt_at);
+		`,
+	},
+	{
+		name: "13_add_attachment_object_key",
+		classify: (sql) => tableColumns(sql, "attachments").has("r2_key")
+			? "satisfied"
+			: "apply",
+		sql: `ALTER TABLE attachments ADD COLUMN r2_key TEXT;`,
+	},
+	{
 		name: "37_harden_outbound_reliability",
 		sql: txn(`
 			ALTER TABLE outbound_deliveries ADD COLUMN command_fingerprint TEXT;
@@ -1985,6 +2127,297 @@ export const mailboxMigrations: Migration[] = [
 			);
 			CREATE INDEX idx_outbound_provider_events_attempt
 				ON outbound_provider_events(attempt_id, occurred_at, id);
+		`),
+	},
+	{
+		name: "38_reconcile_deployed_inbound_durability",
+		classify: (sql) => {
+			const deletionColumns = tableColumns(sql, "r2_deletion_outbox");
+			const terminalColumns = tableColumns(sql, "inbound_terminal_failures");
+			const finalTables = [
+				"inbound_derived_content_state",
+				"inbound_derived_content_repair_attempts",
+				"inbound_derived_content_retired_attempts",
+				"r2_retired_key_fences",
+				"import_promotion_intents",
+				"import_promotion_intent_objects",
+			] as const;
+			if (
+				deletionColumns.has("state") &&
+				deletionColumns.has("claim_generation") &&
+				terminalColumns.has("queue_ref") &&
+				tablesPresent(sql, finalTables)
+			) {
+				return "satisfied";
+			}
+			if (
+				tableColumns(sql, "attachments").has("r2_key") &&
+				deletionColumns.has("attempts") &&
+				!deletionColumns.has("state") &&
+				terminalColumns.has("queue_message_id") &&
+				finalTables.every((table) => !hasTable(sql, table))
+			) {
+				return "apply";
+			}
+			return "invalid";
+		},
+		sql: txn(`
+			ALTER TABLE inbound_terminal_failures
+				RENAME TO _inbound_terminal_failures_deployed;
+			CREATE TABLE inbound_terminal_failures (
+				id TEXT PRIMARY KEY,
+				queue_ref TEXT NOT NULL,
+				attempts INTEGER NOT NULL,
+				error_code TEXT NOT NULL,
+				recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+			INSERT INTO inbound_terminal_failures (
+				id, queue_ref, attempts, error_code, recorded_at
+			)
+			SELECT id, lower(hex(randomblob(8))), attempts, error_code, recorded_at
+			FROM _inbound_terminal_failures_deployed;
+			DROP TABLE _inbound_terminal_failures_deployed;
+
+			ALTER TABLE r2_deletion_outbox ADD COLUMN projection_attempt_id TEXT;
+			ALTER TABLE r2_deletion_outbox
+				ADD COLUMN state TEXT NOT NULL DEFAULT 'pending';
+			ALTER TABLE r2_deletion_outbox
+				ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE r2_deletion_outbox ADD COLUMN lease_token TEXT;
+			ALTER TABLE r2_deletion_outbox ADD COLUMN lease_expires_at TEXT;
+			DROP INDEX IF EXISTS idx_r2_deletion_outbox_due;
+			CREATE INDEX idx_r2_deletion_outbox_pending
+				ON r2_deletion_outbox(state, next_attempt_at, r2_key);
+			CREATE INDEX idx_r2_deletion_outbox_lease
+				ON r2_deletion_outbox(state, lease_expires_at, r2_key);
+
+			CREATE TABLE inbound_derived_content_state (
+				email_id TEXT PRIMARY KEY REFERENCES emails(id) ON DELETE CASCADE,
+				generation INTEGER NOT NULL DEFAULT 1 CHECK(generation >= 1),
+				last_repair_marker_id TEXT,
+				last_repaired_at TEXT
+			);
+			INSERT INTO inbound_derived_content_state (email_id)
+				SELECT id FROM emails WHERE recipient_memory_origin = 'live_inbound';
+
+			CREATE TABLE inbound_derived_content_repair_attempts (
+				attempt_id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				expected_generation INTEGER NOT NULL CHECK(expected_generation >= 1),
+				marker_id TEXT NOT NULL,
+				command_fingerprint TEXT NOT NULL CHECK(length(command_fingerprint) = 64),
+				outcome TEXT NOT NULL CHECK(outcome IN ('committed', 'rejected', 'abandoned')),
+				result_generation INTEGER,
+				recorded_at TEXT NOT NULL,
+				CHECK(
+					(outcome = 'committed' AND result_generation IS NOT NULL AND result_generation >= 1)
+					OR (outcome <> 'committed' AND result_generation IS NULL)
+				)
+			);
+			CREATE INDEX idx_inbound_repair_attempts_email
+				ON inbound_derived_content_repair_attempts(email_id, recorded_at);
+
+			CREATE TABLE inbound_derived_content_retired_attempts (
+				attempt_id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				retired_at TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				reason TEXT NOT NULL CHECK(reason = 'r2_deletion_started')
+			);
+			CREATE INDEX idx_inbound_retired_attempts_expiry
+				ON inbound_derived_content_retired_attempts(expires_at, attempt_id);
+
+			CREATE TABLE r2_retired_key_fences (
+				r2_key TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				retired_at TEXT NOT NULL,
+				reason TEXT NOT NULL CHECK(reason = 'r2_deletion_started')
+			);
+
+			CREATE TABLE import_promotion_intents (
+				email_id TEXT NOT NULL,
+				claim_token TEXT NOT NULL,
+				object_count INTEGER NOT NULL CHECK(object_count >= 0),
+				total_byte_length INTEGER NOT NULL
+					CHECK(total_byte_length >= 0 AND total_byte_length <= 26214400),
+				recorded_count INTEGER NOT NULL DEFAULT 0
+					CHECK(recorded_count >= 0 AND recorded_count <= object_count),
+				recorded_byte_length INTEGER NOT NULL DEFAULT 0
+					CHECK(recorded_byte_length >= 0 AND recorded_byte_length <= total_byte_length),
+				rolling_fingerprint TEXT NOT NULL CHECK(
+					length(rolling_fingerprint) = 64
+					AND rolling_fingerprint NOT GLOB '*[^0-9a-f]*'
+				),
+				last_append_start INTEGER,
+				last_append_count INTEGER,
+				state TEXT NOT NULL CHECK(state IN (
+					'staging', 'recorded', 'reconciling', 'abandoned_watching',
+					'finalized', 'integrity_blocked'
+				)),
+				proof_fingerprint TEXT,
+				writer_closed INTEGER NOT NULL DEFAULT 0 CHECK(writer_closed IN (0, 1)),
+				claim_generation INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation >= 0),
+				reconciliation_phase TEXT,
+				reconciliation_cycle INTEGER NOT NULL DEFAULT 0 CHECK(reconciliation_cycle >= 0),
+				validation_cursor INTEGER NOT NULL DEFAULT 0,
+				settlement_cursor INTEGER NOT NULL DEFAULT 0,
+				lease_token TEXT,
+				lease_expires_at INTEGER,
+				next_reconcile_at INTEGER NOT NULL,
+				retained_count INTEGER,
+				outboxed_count INTEGER,
+				absent_count INTEGER,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				finalized_at INTEGER,
+				PRIMARY KEY(email_id, claim_token)
+			);
+			CREATE INDEX idx_import_promotion_intents_due
+				ON import_promotion_intents(state, next_reconcile_at, email_id, claim_token);
+			CREATE INDEX idx_import_promotion_intents_lease
+				ON import_promotion_intents(state, lease_expires_at, email_id, claim_token);
+
+			CREATE TABLE import_promotion_intent_objects (
+				email_id TEXT NOT NULL,
+				claim_token TEXT NOT NULL,
+				ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+				r2_key TEXT NOT NULL UNIQUE,
+				byte_length INTEGER NOT NULL
+					CHECK(byte_length >= 0 AND byte_length <= 26214400),
+				resolution TEXT NOT NULL CHECK(resolution IN (
+					'pending', 'retained', 'outboxed', 'absent', 'integrity_blocked'
+				)),
+				observation_state TEXT,
+				observation_cycle INTEGER,
+				observed_byte_length INTEGER,
+				last_observed_at INTEGER,
+				PRIMARY KEY(email_id, claim_token, ordinal),
+				FOREIGN KEY(email_id, claim_token)
+					REFERENCES import_promotion_intents(email_id, claim_token) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_import_promotion_objects_resolution
+				ON import_promotion_intent_objects(
+					email_id, claim_token, resolution, last_observed_at, ordinal
+				);
+		`),
+	},
+	{
+		name: "39_complete_outbound_reliability",
+		classify: (sql) => {
+			const delivery = tableColumns(sql, "outbound_deliveries");
+			const events = tableColumns(sql, "outbound_provider_events");
+			const cleanup = tableColumns(sql, "draft_save_cleanup_intents");
+			const complete =
+				delivery.has("cancellation_recovery_attempt_count") &&
+				delivery.has("retry_origin_status") &&
+				events.has("recipient_hashes_json") &&
+				cleanup.has("state") &&
+				cleanup.has("generation") &&
+				hasTable(sql, "outbound_acceptance_recovery");
+			if (complete) return "satisfied";
+			const untouched =
+				!delivery.has("cancellation_recovery_attempt_count") &&
+				!delivery.has("retry_origin_status") &&
+				!events.has("recipient_hashes_json") &&
+				!cleanup.has("state") &&
+				!hasTable(sql, "outbound_acceptance_recovery");
+			return untouched ? "apply" : "invalid";
+		},
+		sql: txn(`
+			ALTER TABLE outbound_deliveries
+				ADD COLUMN cancellation_recovery_attempt_count INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE outbound_deliveries ADD COLUMN retry_origin_status TEXT;
+			ALTER TABLE outbound_provider_events
+				ADD COLUMN recipient_hashes_json TEXT NOT NULL DEFAULT '[]';
+			CREATE INDEX idx_draft_save_operations_expiry
+				ON draft_save_operations(state, claim_expires_at, save_key);
+			ALTER TABLE draft_save_cleanup_intents
+				ADD COLUMN state TEXT NOT NULL DEFAULT 'pending';
+			ALTER TABLE draft_save_cleanup_intents
+				ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE draft_save_cleanup_intents ADD COLUMN last_error_code TEXT;
+			ALTER TABLE draft_save_cleanup_intents ADD COLUMN parked_at INTEGER;
+			DROP INDEX idx_draft_save_cleanup_due;
+			CREATE INDEX idx_draft_save_cleanup_due
+				ON draft_save_cleanup_intents(state, next_attempt_at, claim_token);
+
+			CREATE TABLE outbound_acceptance_recovery (
+				delivery_id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				attempt_id TEXT,
+				ses_message_id TEXT,
+				accepted_at TEXT,
+				source_draft_id TEXT,
+				source_draft_version INTEGER,
+				actor_kind TEXT NOT NULL,
+				actor_id TEXT,
+				state TEXT NOT NULL CHECK(state IN ('pending', 'retrying', 'parked', 'completed')),
+				generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+				attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+				next_attempt_at TEXT,
+				message_projected_at TEXT,
+				draft_consumed_at TEXT,
+				last_error_code TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				completed_at TEXT,
+				FOREIGN KEY(delivery_id) REFERENCES outbound_deliveries(id) ON DELETE CASCADE,
+				CHECK(
+					(source_draft_id IS NULL AND source_draft_version IS NULL)
+					OR (source_draft_id IS NOT NULL AND source_draft_version >= 1)
+				)
+			);
+			CREATE INDEX idx_outbound_acceptance_recovery_due
+				ON outbound_acceptance_recovery(state, next_attempt_at, delivery_id);
+			INSERT INTO outbound_acceptance_recovery (
+				delivery_id, email_id, attempt_id, ses_message_id, accepted_at,
+				source_draft_id, source_draft_version, actor_kind, actor_id,
+				state, next_attempt_at, last_error_code, created_at, updated_at
+			)
+			SELECT od.id, od.email_id,
+				(SELECT oda.id FROM outbound_delivery_attempts oda
+				 WHERE oda.delivery_id = od.id AND oda.status = 'accepted'
+				 ORDER BY oda.attempt_number ASC LIMIT 1),
+				od.ses_message_id, od.sent_at,
+				od.source_draft_id, od.source_draft_version,
+				CASE WHEN od.actor_kind IN ('user','mcp','agent','rule','system')
+					THEN od.actor_kind ELSE 'system' END,
+				CASE WHEN od.actor_kind IN ('user','mcp','agent','rule','system')
+					THEN od.actor_id ELSE NULL END,
+				CASE WHEN od.ses_message_id IS NOT NULL AND TRIM(od.ses_message_id) <> ''
+					AND od.sent_at IS NOT NULL
+					AND ((od.source_draft_id IS NULL AND od.source_draft_version IS NULL)
+						OR (od.source_draft_id IS NOT NULL AND od.source_draft_version >= 1))
+					THEN 'pending' ELSE 'parked' END,
+				CASE WHEN od.ses_message_id IS NOT NULL AND TRIM(od.ses_message_id) <> ''
+					AND od.sent_at IS NOT NULL THEN od.updated_at ELSE NULL END,
+				CASE WHEN od.ses_message_id IS NULL OR TRIM(od.ses_message_id) = ''
+					OR od.sent_at IS NULL THEN 'outbound_repair_evidence_insufficient'
+					ELSE NULL END,
+				od.created_at, od.updated_at
+			FROM outbound_deliveries od
+			JOIN emails e ON e.id = od.email_id
+			WHERE od.status IN ('sent', 'bounced')
+				AND (e.folder_id = 'outbox' OR EXISTS (
+					SELECT 1 FROM emails d
+					WHERE d.id = od.source_draft_id AND d.folder_id = 'draft'
+						AND d.draft_version = od.source_draft_version
+				));
+		`),
+	},
+	{
+		name: "40_add_cleanup_parking",
+		classify: (sql) => {
+			const columns = tableColumns(sql, "r2_deletion_outbox");
+			if (columns.has("parked_at") && columns.has("recovery_ref")) return "satisfied";
+			if (!columns.has("parked_at") && !columns.has("recovery_ref")) return "apply";
+			return "invalid";
+		},
+		sql: txn(`
+			ALTER TABLE r2_deletion_outbox ADD COLUMN parked_at TEXT;
+			ALTER TABLE r2_deletion_outbox ADD COLUMN recovery_ref TEXT;
+			CREATE INDEX idx_r2_deletion_outbox_parked
+				ON r2_deletion_outbox(parked_at, recovery_ref);
 		`),
 	},
 ];

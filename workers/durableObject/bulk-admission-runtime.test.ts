@@ -401,14 +401,21 @@ test(
 				attachmentKeyPrefix(crypto.randomUUID(), crypto.randomUUID()),
 			);
 			const innerBucket = await runtime.getR2Bucket("INNER", "flaky-r2");
+			const attachmentBytes = new TextEncoder().encode("attachment bytes");
+			const attachmentDigest = [...new Uint8Array(
+				await crypto.subtle.digest("SHA-256", attachmentBytes),
+			)]
+				.map((byte) => byte.toString(16).padStart(2, "0"))
+				.join("");
 			await innerBucket.put(
 				`uploads/${runtimeMailbox.mailboxId}/${uploadId}`,
-				new TextEncoder().encode("attachment bytes"),
+				attachmentBytes,
 				{
 					httpMetadata: { contentType: "text/plain" },
 					customMetadata: {
 						filename: uploadBudgetFilename,
 						type: "text/plain",
+						contentSha256: attachmentDigest,
 					},
 				},
 			);

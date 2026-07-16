@@ -38,6 +38,16 @@ export interface OutboundDeliveryActor {
 	id?: string;
 }
 
+export interface OutboundAttachmentByteIdentity {
+	id: string;
+	byteLength: number;
+	sha256: string;
+	filename: string;
+	mimetype: string;
+	disposition: "attachment" | "inline";
+	contentId?: string;
+}
+
 /**
  * Immutable snapshot accepted into the outbox. Implementations must resolve
  * attachment bytes before enqueueing and must never re-read mutable draft text
@@ -60,6 +70,8 @@ export interface OutboundMessageSnapshot {
 	references?: string[];
 	threadId: string;
 	attachmentIds: string[];
+	/** Required for v2 snapshots and authoritative for exact attachment bytes. */
+	attachmentByteIdentities?: OutboundAttachmentByteIdentity[];
 	/** Original source-draft attachment IDs represented by this exact send. */
 	sourceDraftAttachmentIds?: string[];
 }
@@ -127,6 +139,7 @@ const TRANSITIONS: Record<
 > = {
 	queued: {
 		start_sending: "sending",
+		definitive_failure: "failed",
 		cancel: "cancelled",
 	},
 	sending: {
@@ -141,6 +154,7 @@ const TRANSITIONS: Record<
 	},
 	retrying: {
 		retry_ready: "queued",
+		definitive_failure: "failed",
 		cancel: "cancelled",
 	},
 	failed: {
@@ -190,6 +204,21 @@ export function computeAvailableAt(
 /** A queued delivery remains cancellable until the worker claims it. */
 export function canCancelDelivery(status: OutboundDeliveryStatus): boolean {
 	return status === "queued" || status === "retrying";
+}
+
+const NON_RETRYABLE_LOCAL_FAILURE_CODES = new Set([
+	"attachment_integrity_unverifiable",
+	"attachment_metadata_mismatch",
+	"attachment_size_mismatch",
+	"attachment_content_mismatch",
+	"attachment_missing",
+	"snapshot_missing",
+	"outbound_snapshot_invalid",
+	"outbound_dispatch_metadata_invalid",
+]);
+
+export function canRetryFailedDelivery(errorCode?: string): boolean {
+	return !errorCode || !NON_RETRYABLE_LOCAL_FAILURE_CODES.has(errorCode);
 }
 
 /**
@@ -255,7 +284,17 @@ export function classifySesOutcome(
 				code: "invalid_success_response",
 			};
 		case "http_error": {
-			const retryable = outcome.status === 429 || outcome.status >= 500;
+			if (
+				outcome.status === 408 ||
+				(outcome.status >= 500 && outcome.status <= 599)
+			) {
+				return {
+					kind: "unknown",
+					automaticRetry: false,
+					code: `ses_http_${outcome.status}_acceptance_unknown`,
+				};
+			}
+			const retryable = outcome.status === 429;
 			return {
 				kind: "definitive_failure",
 				automaticRetry: retryable,

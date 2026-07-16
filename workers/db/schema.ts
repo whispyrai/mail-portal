@@ -161,6 +161,8 @@ export const draftSaveOperations = sqliteTable(
 		index("idx_draft_save_operations_retention")
 			.on(table.updated_at, table.save_key)
 			.where(sql`${table.state} IN ('committed', 'aborted')`),
+		index("idx_draft_save_operations_expiry")
+			.on(table.state, table.claim_expires_at, table.save_key),
 	],
 );
 
@@ -171,13 +173,20 @@ export const draftSaveCleanupIntents = sqliteTable(
 		draft_id: text("draft_id").notNull(),
 		destination_keys: text("destination_keys").notNull(),
 		next_attempt_at: integer("next_attempt_at").notNull(),
-		verify_until: integer("verify_until").notNull(),
-		attempts: integer("attempts").notNull().default(0),
-		updated_at: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_draft_save_cleanup_due").on(
-			table.next_attempt_at,
+			verify_until: integer("verify_until").notNull(),
+			attempts: integer("attempts").notNull().default(0),
+			state: text("state", { enum: ["pending", "parked"] })
+				.notNull()
+				.default("pending"),
+			generation: integer("generation").notNull().default(0),
+			last_error_code: text("last_error_code"),
+			parked_at: integer("parked_at"),
+			updated_at: text("updated_at").notNull(),
+		},
+		(table) => [
+			index("idx_draft_save_cleanup_due").on(
+				table.state,
+				table.next_attempt_at,
 			table.claim_token,
 		),
 	],
@@ -371,6 +380,8 @@ export const r2DeletionOutbox = sqliteTable(
 		attempts: integer("attempts").notNull().default(0),
 		next_attempt_at: text("next_attempt_at").notNull().default(sql`(datetime('now'))`),
 		last_error: text("last_error"),
+		parked_at: text("parked_at"),
+		recovery_ref: text("recovery_ref"),
 		created_at: text("created_at").notNull().default(sql`(datetime('now'))`),
 	},
 	(table) => [
@@ -383,6 +394,10 @@ export const r2DeletionOutbox = sqliteTable(
 			table.state,
 			table.lease_expires_at,
 			table.r2_key,
+		),
+		index("idx_r2_deletion_outbox_parked").on(
+			table.parked_at,
+			table.recovery_ref,
 		),
 		check(
 			"r2_deletion_outbox_state_valid",
@@ -803,6 +818,12 @@ export const outboundDeliveries = sqliteTable(
 		preflight_deferral_count: integer("preflight_deferral_count")
 			.notNull()
 			.default(0),
+		cancellation_recovery_attempt_count: integer(
+			"cancellation_recovery_attempt_count",
+		)
+			.notNull()
+			.default(0),
+		retry_origin_status: text("retry_origin_status"),
 		dispatch_phase: text("dispatch_phase"),
 		active_attempt_id: text("active_attempt_id"),
 		lease_token: text("lease_token"),
@@ -891,6 +912,7 @@ export const outboundProviderEvents = sqliteTable(
 			.references(() => outboundDeliveryAttempts.id, { onDelete: "cascade" }),
 		ses_message_id: text("ses_message_id").notNull(),
 		event_class: text("event_class").notNull(),
+		recipient_hashes_json: text("recipient_hashes_json").notNull().default("[]"),
 		occurred_at: text("occurred_at").notNull(),
 		received_at: text("received_at").notNull(),
 	},
@@ -899,6 +921,54 @@ export const outboundProviderEvents = sqliteTable(
 			table.attempt_id,
 			table.occurred_at,
 			table.id,
+		),
+	],
+);
+
+export const outboundAcceptanceRecovery = sqliteTable(
+	"outbound_acceptance_recovery",
+	{
+		delivery_id: text("delivery_id")
+			.primaryKey()
+			.references(() => outboundDeliveries.id, { onDelete: "cascade" }),
+		email_id: text("email_id").notNull(),
+		attempt_id: text("attempt_id"),
+		ses_message_id: text("ses_message_id"),
+		accepted_at: text("accepted_at"),
+		source_draft_id: text("source_draft_id"),
+		source_draft_version: integer("source_draft_version"),
+		actor_kind: text("actor_kind").notNull(),
+		actor_id: text("actor_id"),
+		state: text("state", {
+			enum: ["pending", "retrying", "parked", "completed"],
+		}).notNull(),
+		generation: integer("generation").notNull().default(0),
+		attempt_count: integer("attempt_count").notNull().default(0),
+		next_attempt_at: text("next_attempt_at"),
+		message_projected_at: text("message_projected_at"),
+		draft_consumed_at: text("draft_consumed_at"),
+		last_error_code: text("last_error_code"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+		completed_at: text("completed_at"),
+	},
+	(table) => [
+		index("idx_outbound_acceptance_recovery_due").on(
+			table.state,
+			table.next_attempt_at,
+			table.delivery_id,
+		),
+		check(
+			"outbound_acceptance_recovery_attempts_nonnegative",
+			sql`${table.attempt_count} >= 0`,
+		),
+		check(
+			"outbound_acceptance_recovery_generation_nonnegative",
+			sql`${table.generation} >= 0`,
+		),
+		check(
+			"outbound_acceptance_recovery_source_pair",
+			sql`(${table.source_draft_id} IS NULL AND ${table.source_draft_version} IS NULL) OR (${table.source_draft_id} IS NOT NULL AND ${table.source_draft_version} >= 1)`,
 		),
 	],
 );

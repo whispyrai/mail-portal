@@ -4,7 +4,9 @@
 
 import type { Context } from "hono";
 import {
+	classifyAttachmentPreparationFailure,
 	completeAttachmentPromotion,
+	outboundAttachmentByteIdentities,
 	resolveAndPromoteAttachments,
 	rollbackAttachmentPromotion,
 	sourceDraftAttachmentIds,
@@ -28,6 +30,7 @@ import {
 } from "../lib/outbound-delivery-service.ts";
 import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
 import {
+	outboundReplyIntentFingerprint,
 	stableOutboundAttachmentReferences,
 	withOutboundCommandFingerprint,
 } from "../lib/outbound-command-fingerprint.ts";
@@ -101,15 +104,6 @@ export async function handleReplyEmail(c: AppContext) {
 	} = body;
 
 	const stub = c.var.mailboxStub;
-	const rawOriginal = (await stub.getEmail(id)) as EmailFull | null;
-
-	if (!rawOriginal) {
-		return c.json({ error: "Original email not found" }, 404);
-	}
-
-	const originalEmail = await resolveOriginalEmail(stub, rawOriginal);
-	const { originalMsgId, references, threadId: thread_id } = buildReferencesChain(originalEmail);
-
 	let fromEmail: string, fromDomain: string;
 	try {
 		({ fromEmail, fromDomain } = validateSender(to, from, mailboxId));
@@ -121,15 +115,15 @@ export async function handleReplyEmail(c: AppContext) {
 		? { draftId: source_draft_id, draftVersion: source_draft_version! }
 		: undefined;
 	const actor = actorFromSession(c.get("session"));
-	const replayCommand = await withOutboundCommandFingerprint(
-		{
+	const attachmentReferences = stableOutboundAttachmentReferences(attachments);
+	const intentCommand = {
 			idempotencyKey: idempotency_key,
-			source: "ui",
+			source: "ui" as const,
 			actor,
 			snapshot: {
 				mailboxId: mailboxId.toLowerCase(),
 				...sourceDraft,
-				kind: "reply",
+				kind: "reply" as const,
 				to: recipientList(to),
 				cc: recipientList(cc),
 				bcc: recipientList(bcc),
@@ -137,10 +131,9 @@ export async function handleReplyEmail(c: AppContext) {
 				subject,
 				...(html !== undefined ? { html } : {}),
 				...(text !== undefined ? { text } : {}),
-				inReplyTo: originalMsgId,
-				references,
-				threadId: thread_id,
+				threadId: "",
 				attachmentIds: [],
+				attachmentByteIdentities: [],
 				...(source_draft_id
 					? {
 							sourceDraftAttachmentIds: sourceDraftAttachmentIds(
@@ -153,19 +146,56 @@ export async function handleReplyEmail(c: AppContext) {
 			requestedAt: "1970-01-01T00:00:00.000Z",
 			undoUntil: "1970-01-01T00:00:00.000Z",
 			...(scheduled_for ? { scheduledFor: scheduled_for } : {}),
-		},
-		stableOutboundAttachmentReferences(attachments),
-		{ sourceEmailId: id },
+		};
+	const intentFingerprint = await outboundReplyIntentFingerprint(
+		intentCommand,
+		attachmentReferences,
+		id,
 	);
 	const replay = await stub.resolveOutboundReplay({
 		idempotencyKey: idempotency_key,
-		commandFingerprint: replayCommand.commandFingerprint,
+		commandFingerprint: intentFingerprint,
 		...(sourceDraft ? { sourceDraft } : {}),
 	});
 	if (replay.status === "exact") {
 		return c.json(deliveryResponse(replay.delivery, true), 202);
 	}
+	const rawOriginal = (await stub.getEmail(id)) as EmailFull | null;
+	if (!rawOriginal) {
+		return c.json(
+			replay.status === "conflict"
+				? {
+						error: "This legacy send identity cannot be verified without its source message.",
+						code: "legacy_idempotency_unverifiable",
+					}
+				: { error: "Original email not found" },
+			replay.status === "conflict" ? 409 : 404,
+		);
+	}
+	const originalEmail = await resolveOriginalEmail(stub, rawOriginal);
+	const { originalMsgId, references, threadId: thread_id } = buildReferencesChain(originalEmail);
+	const legacyCommand = await withOutboundCommandFingerprint(
+		{
+			...intentCommand,
+			snapshot: {
+				...intentCommand.snapshot,
+				inReplyTo: originalMsgId,
+				references,
+				threadId: thread_id,
+			},
+		},
+		attachmentReferences,
+		{ sourceEmailId: id },
+	);
 	if (replay.status === "conflict") {
+		const legacyReplay = await stub.resolveOutboundReplay({
+			idempotencyKey: idempotency_key,
+			commandFingerprint: legacyCommand.commandFingerprint,
+			...(sourceDraft ? { sourceDraft } : {}),
+		});
+		if (legacyReplay.status === "exact") {
+			return c.json(deliveryResponse(legacyReplay.delivery, true), 202);
+		}
 		return c.json(
 			{
 				error: "This send identity is already bound to another command.",
@@ -174,6 +204,10 @@ export async function handleReplyEmail(c: AppContext) {
 			409,
 		);
 	}
+	const replayCommand = {
+		...legacyCommand,
+		commandFingerprint: intentFingerprint,
+	};
 	const schedulePreflight = validateOutboundSchedule(scheduled_for);
 	if (!schedulePreflight.ok) {
 		return c.json({ error: schedulePreflight.error }, 400);
@@ -194,12 +228,25 @@ export async function handleReplyEmail(c: AppContext) {
 		messageId,
 		attachments,
 		actor,
-		{ promotionOwner: messageId },
+		{
+			promotionOwner: messageId,
+			recordDestinationIntent: async (keys) => {
+				await stub.recordOutboundPromotionIntent(messageId, keys);
+			},
+		},
 	).then(
 		(r) => ({ ok: true as const, ...r }),
-		(e) => ({ ok: false as const, error: (e as Error).message }),
+		(error) => ({
+			ok: false as const,
+			failure: classifyAttachmentPreparationFailure(error),
+		}),
 	);
-	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	if (!resolved.ok) {
+		return c.json(
+			{ error: resolved.failure.message, code: resolved.failure.code },
+			resolved.failure.status,
+		);
+	}
 	const inlineMapping = validateResolvedInlineImages(html ?? "", resolved.storedMetadata);
 	if (!inlineMapping.ok) {
 		await rollbackAttachmentPromotion(
@@ -237,6 +284,9 @@ export async function handleReplyEmail(c: AppContext) {
 					attachmentIds: resolved.storedMetadata.map(
 						(attachment) => attachment.id,
 					),
+					attachmentByteIdentities: outboundAttachmentByteIdentities(
+						resolved.storedMetadata,
+					),
 				},
 				requestedAt,
 				undoUntil,
@@ -244,6 +294,7 @@ export async function handleReplyEmail(c: AppContext) {
 			},
 			resolved.storedMetadata,
 			messageId,
+			resolved.stagingKeys,
 		);
 	} catch (error) {
 		const reconciliation = await reconcileAmbiguousOutboundEnqueue({
@@ -280,10 +331,18 @@ export async function handleReplyEmail(c: AppContext) {
 		if (reconciliation.status === "not_committed") throw error;
 	}
 	if (!promotionFinalized) {
-		await completeAttachmentPromotion(c.env.BUCKET, stub, messageId, resolved, actor);
+		try {
+			await completeAttachmentPromotion(c.env.BUCKET, stub, messageId, resolved, actor);
+		} catch (error) {
+			console.error("Committed reply staging cleanup deferred", error);
+		}
 	}
 
-	await stub.markThreadRead(thread_id, actor);
+	try {
+		await stub.markThreadRead(thread_id, actor);
+	} catch (error) {
+		console.error("Committed reply thread read-state update deferred", error);
+	}
 
 	return c.json(
 		deliveryResponse(result.delivery, result.replayed, result.outcome),
@@ -347,6 +406,7 @@ export async function handleForwardEmail(c: AppContext) {
 				...(text !== undefined ? { text } : {}),
 				threadId: "generated",
 				attachmentIds: [],
+				attachmentByteIdentities: [],
 				...(source_draft_id
 					? {
 							sourceDraftAttachmentIds: sourceDraftAttachmentIds(
@@ -407,12 +467,25 @@ export async function handleForwardEmail(c: AppContext) {
 		messageId,
 		attachments,
 		actor,
-		{ promotionOwner: messageId },
+		{
+			promotionOwner: messageId,
+			recordDestinationIntent: async (keys) => {
+				await stub.recordOutboundPromotionIntent(messageId, keys);
+			},
+		},
 	).then(
 		(r) => ({ ok: true as const, ...r }),
-		(e) => ({ ok: false as const, error: (e as Error).message }),
+		(error) => ({
+			ok: false as const,
+			failure: classifyAttachmentPreparationFailure(error),
+		}),
 	);
-	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	if (!resolved.ok) {
+		return c.json(
+			{ error: resolved.failure.message, code: resolved.failure.code },
+			resolved.failure.status,
+		);
+	}
 	const inlineMapping = validateResolvedInlineImages(html ?? "", resolved.storedMetadata);
 	if (!inlineMapping.ok) {
 		await rollbackAttachmentPromotion(
@@ -449,6 +522,9 @@ export async function handleForwardEmail(c: AppContext) {
 					...replayCommand.snapshot,
 				threadId: messageId,
 				attachmentIds: resolved.storedMetadata.map((attachment) => attachment.id),
+				attachmentByteIdentities: outboundAttachmentByteIdentities(
+					resolved.storedMetadata,
+				),
 				},
 				requestedAt,
 				undoUntil,
@@ -456,6 +532,7 @@ export async function handleForwardEmail(c: AppContext) {
 			},
 			resolved.storedMetadata,
 			messageId,
+			resolved.stagingKeys,
 		);
 	} catch (error) {
 		const reconciliation = await reconcileAmbiguousOutboundEnqueue({
@@ -492,7 +569,11 @@ export async function handleForwardEmail(c: AppContext) {
 		if (reconciliation.status === "not_committed") throw error;
 	}
 	if (!promotionFinalized) {
-		await completeAttachmentPromotion(c.env.BUCKET, stub, messageId, resolved, actor);
+		try {
+			await completeAttachmentPromotion(c.env.BUCKET, stub, messageId, resolved, actor);
+		} catch (error) {
+			console.error("Committed forward staging cleanup deferred", error);
+		}
 	}
 
 	return c.json(

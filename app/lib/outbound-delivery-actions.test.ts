@@ -50,3 +50,26 @@ test("non-actionable delivery states do not offer unsafe controls", () => {
 		assert.equal(outboundDeliveryAction(status), null);
 	}
 });
+
+test("storage-integrity failures expose no unsafe retry action", () => {
+	assert.equal(
+		outboundDeliveryAction(
+			"unknown",
+			false,
+			"outbound_delivery_record_invalid",
+		),
+		null,
+	);
+});
+
+test("deterministic attachment failures require rebuilding the message", () => {
+	for (const code of [
+		"attachment_integrity_unverifiable",
+		"attachment_metadata_mismatch",
+		"attachment_size_mismatch",
+		"attachment_content_mismatch",
+		"attachment_missing",
+	]) {
+		assert.equal(outboundDeliveryAction("failed", false, undefined, code), null);
+	}
+});

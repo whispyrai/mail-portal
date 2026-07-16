@@ -639,6 +639,55 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
     return { scheduledAlarm };
   }
 
+	async queueLegacyCleanupForTest(input: { emailId: string; r2Key: string }) {
+		await this.env.BUCKET.put(input.r2Key, "body");
+		await this.queueAttachmentCleanup(input.emailId, [input.r2Key]);
+		return { status: "queued" as const };
+	}
+
+	async expireLegacyCleanupForTest(recoveryRef?: string) {
+		const queue = (await this.ctx.storage.get<Array<{
+			id: string;
+			state?: string;
+			nextAttemptAt?: number;
+		}>>("attachment-cleanup:queue")) ?? [];
+		for (const job of queue) {
+			if (!recoveryRef || job.id === recoveryRef) job.nextAttemptAt = Date.now() - 1;
+		}
+		await this.ctx.storage.put("attachment-cleanup:queue", queue);
+		return { status: "due" as const };
+	}
+
+	listParkedLegacyCleanupForTest() {
+		return this.listParkedAttachmentCleanupJobs(100);
+	}
+
+	repairLegacyCleanupForTest(input: {
+		recoveryRef: string;
+		expectedGeneration: number;
+	}) {
+		return this.repairParkedAttachmentCleanupJob(
+			input.recoveryRef,
+			{ operationKey: "repair-legacy-test", expectedGeneration: input.expectedGeneration },
+			{ kind: "user", id: "admin-1" },
+		);
+	}
+
+	listParkedR2DeletionForTest() {
+		return this.listParkedR2DeletionRecoveries(undefined, 100);
+	}
+
+	repairR2DeletionForTest(input: {
+		recoveryRef: string;
+		expectedGeneration: number;
+	}) {
+		return this.repairParkedR2Deletion(
+			input.recoveryRef,
+			{ operationKey: "repair-r2-test", expectedGeneration: input.expectedGeneration },
+			{ kind: "user", id: "admin-1" },
+		);
+	}
+
   clearAlarmForTest(): Promise<void> {
     return this.ctx.storage.deleteAlarm();
   }
@@ -805,6 +854,26 @@ export default {
       case "/alarm":
         value = await stub.runAlarmForTest();
         break;
+	  case "/legacy-cleanup-queue":
+		value = await stub.queueLegacyCleanupForTest(body as never);
+		break;
+	  case "/legacy-cleanup-expire":
+		value = await stub.expireLegacyCleanupForTest(
+		  (body as { recoveryRef?: string }).recoveryRef,
+		);
+		break;
+	  case "/legacy-cleanup-parked":
+		value = await stub.listParkedLegacyCleanupForTest();
+		break;
+	  case "/legacy-cleanup-repair":
+		value = await stub.repairLegacyCleanupForTest(body as never);
+		break;
+	  case "/r2-deletion-parked":
+		value = await stub.listParkedR2DeletionForTest();
+		break;
+	  case "/r2-deletion-repair":
+		value = await stub.repairR2DeletionForTest(body as never);
+		break;
       case "/clear-alarm":
         value = await stub.clearAlarmForTest();
         break;

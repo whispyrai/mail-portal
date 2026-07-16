@@ -345,7 +345,7 @@ function deliveryLabel(delivery: OutboundDelivery) {
 		sent: "Sent",
 		bounced: "Bounced",
 		failed: "Failed",
-		unknown: "Delivery uncertain",
+		unknown: "Uncertain",
 		cancelled: "Cancelled",
 	}[delivery.status];
 }

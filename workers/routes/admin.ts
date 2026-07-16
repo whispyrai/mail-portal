@@ -52,6 +52,7 @@ import { isSemanticSearchEnabled } from "../lib/features.ts";
 import { createAdminReadDisclosureGuard } from "./admin-read-disclosure-guard.ts";
 import { requireAgentConnectionReconciliation } from "../lib/agent-connection-revocation-outbox.ts";
 import { adminInboundRecoveryApp } from "./admin-inbound-recovery.ts";
+import { adminOutboundRecoveryApp } from "./admin-outbound-recovery.ts";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
@@ -120,6 +121,7 @@ adminApp.use(
 // inside adminApp so it inherits the ADMIN-only guard above.
 adminApp.route("/quizzes", adminQuizApp);
 adminApp.route("/", adminInboundRecoveryApp);
+adminApp.route("/", adminOutboundRecoveryApp);
 
 adminApp.get("/ai-cost", async (c) => {
   const config = resolveAiCostControlConfig(c.env);

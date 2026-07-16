@@ -8,7 +8,7 @@ import {
 } from "./email-lifecycle.ts";
 
 test("active Outbox deliveries require explicit cancellation before generic lifecycle changes", () => {
-	for (const status of ["queued", "sending", "retrying"] as const) {
+	for (const status of ["queued", "sending", "retrying", "cancelled"] as const) {
 		assert.equal(outboundDeliveryBlocksGenericLifecycle(status), true);
 	}
 	for (const status of [
@@ -16,7 +16,6 @@ test("active Outbox deliveries require explicit cancellation before generic life
 		"bounced",
 		"failed",
 		"unknown",
-		"cancelled",
 	] as const) {
 		assert.equal(outboundDeliveryBlocksGenericLifecycle(status), false);
 	}

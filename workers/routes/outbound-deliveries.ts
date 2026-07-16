@@ -48,6 +48,25 @@ function deliveryError(c: AppContext, error: unknown) {
 			429,
 		);
 	}
+	if (name === "OutboundDeliveryIntegrityError") {
+		return c.json(
+			{
+				error: "This delivery requires audited storage repair before another action is safe.",
+				code: "outbound_delivery_record_invalid",
+			},
+			409,
+		);
+	}
+	if (name === "OutboundDeliveryNotRetryableError") {
+		return c.json(
+			{
+				error:
+					"This message cannot be retried safely. Open its saved draft, re-attach the files, and send a new immutable copy.",
+				code: "outbound_delivery_requires_rebuild",
+			},
+			409,
+		);
+	}
 	throw error;
 }
 
@@ -90,9 +109,13 @@ export async function handleCancelOutboundDelivery(c: AppContext) {
 		);
 		return c.json({
 			delivery: result.delivery,
+			...(result.retryCancellationRestored
+				? { retryCancellationRestored: true as const }
+				: {}),
 			...(result.recoveredDraftId
 				? { recoveredDraftId: result.recoveredDraftId }
 				: {}),
+			...(result.recoveryPending ? { recoveryPending: true as const } : {}),
 		});
 	} catch (error) {
 		return deliveryError(c, error);
@@ -107,7 +130,12 @@ export async function handleRetryOutboundDelivery(c: AppContext) {
 			actorFromSession(c.get("session")),
 			acknowledgeDuplicateRisk,
 		);
-		return c.json({ delivery: result.delivery });
+		return c.json({
+			delivery: result.delivery,
+			...(result.alarmRecoveryPending
+				? { recoveryPending: true as const }
+				: {}),
+		});
 	} catch (error) {
 		return deliveryError(c, error);
 	}

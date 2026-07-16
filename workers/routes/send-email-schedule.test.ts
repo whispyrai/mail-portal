@@ -32,6 +32,7 @@ function fixture(
 		},
 		async getAttachment() { return storedAttachment; },
 		async checkSendRateLimit() { return rateLimitError; },
+		async recordOutboundPromotionIntent() { return true; },
 		async queueAttachmentCleanup() {},
 		async enqueueOutbound(
 			command: { undoUntil: string; scheduledFor?: string },

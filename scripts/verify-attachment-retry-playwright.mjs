@@ -1029,9 +1029,213 @@ async function verifyBulkRetryCapacity({ context, baseUrl, pressure }) {
 	}
 }
 
+async function verifyOutboundDeliveryActions({ context, baseUrl, name, viewport }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(12_000);
+	const browserEvents = observeBrowserErrors(page);
+	const now = "2026-07-16T08:00:00.000Z";
+	const email = (id, subject) => ({
+		id,
+		thread_id: `thread-${id}`,
+		folder_id: "outbox",
+		subject,
+		sender: mailboxId,
+		recipient: "recipient@example.com",
+		date: now,
+		read: true,
+		starred: false,
+		snippet: "Outbound delivery recovery state",
+		thread_count: 1,
+		thread_unread_count: 0,
+		labels: [],
+	});
+	const emails = [
+		email("outbound-queued", "Queued retry cancellation"),
+		email("outbound-failed", "Retryable provider rejection"),
+		email("outbound-unknown", "Ambiguous provider acceptance"),
+		email("outbound-integrity", "Attachment integrity failure"),
+	];
+	const delivery = (id, emailId, status, extra = {}) => ({
+		id,
+		emailId,
+		mailboxId,
+		status,
+		kind: "compose",
+		createdAt: now,
+		updatedAt: now,
+		availableAt: now,
+		undoUntil: now,
+		attemptCount: status === "queued" ? 1 : 2,
+		maxAttempts: 4,
+		...extra,
+	});
+	const deliveries = [
+		delivery("delivery-queued", "outbound-queued", "retrying", {
+			lastErrorCode: "ses_throttled",
+			lastErrorMessage: "The provider asked us to retry later.",
+		}),
+		delivery("delivery-failed", "outbound-failed", "failed", {
+			lastErrorCode: "ses_rejected",
+			lastErrorMessage: "The provider rejected this attempt.",
+			failedAt: now,
+		}),
+		delivery("delivery-unknown", "outbound-unknown", "unknown", {
+			lastErrorCode: "ses_transport_ambiguous",
+			lastErrorMessage: "The provider may already have accepted this email.",
+			unknownAt: now,
+		}),
+		delivery("delivery-integrity", "outbound-integrity", "failed", {
+			lastErrorCode: "attachment_content_mismatch",
+			lastErrorMessage: "Rebuild this message before sending it again.",
+			failedAt: now,
+		}),
+	];
+	const mutationRequests = [];
+	let duplicateRiskDialog;
+	page.on("dialog", async (dialog) => {
+		duplicateRiskDialog = dialog.message();
+		await dialog.accept();
+	});
+	await page.route("**/api/v1/mailboxes/*/emails?*", async (route) => {
+		if (route.request().method() !== "GET") {
+			await route.continue();
+			return;
+		}
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({ emails, totalCount: emails.length }),
+		});
+	});
+	const handleOutboundRoute = async (route) => {
+		const request = route.request();
+		const url = new URL(request.url());
+		if (request.method() === "GET") {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify({ deliveries }),
+			});
+			return;
+		}
+		const deliveryId = url.pathname.split("/").at(-2);
+		const action = url.pathname.split("/").at(-1);
+		mutationRequests.push({
+			deliveryId,
+			action,
+			body: request.postData() ? request.postDataJSON() : undefined,
+		});
+		const current = deliveries.find((item) => item.id === deliveryId);
+		assert.ok(current);
+		if (action === "cancel") {
+			Object.assign(current, {
+				status: "failed",
+				failedAt: now,
+				lastErrorCode: "ses_throttled",
+			});
+		} else {
+			Object.assign(current, {
+				status: "retrying",
+				nextAttemptAt: "2026-07-16T08:01:00.000Z",
+			});
+		}
+		await route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({
+				delivery: current,
+				...(action === "cancel" ? { retryCancellationRestored: true } : {}),
+			}),
+		});
+	};
+	await page.route(
+		"**/api/v1/mailboxes/*/outbound-deliveries*",
+		handleOutboundRoute,
+	);
+	await page.route(
+		"**/api/v1/mailboxes/*/outbound-deliveries/*/*",
+		handleOutboundRoute,
+	);
+	try {
+		await page.goto(
+			`${baseUrl}/mailbox/${encodeURIComponent(mailboxId)}/emails/outbox`,
+			{ waitUntil: "networkidle" },
+		);
+		const row = (id) => page.locator(`[data-email-id="${id}"]`);
+		for (const id of emails.map((item) => item.id)) await row(id).waitFor();
+
+		const cancel = row("outbound-queued").getByRole("button", { name: "Cancel send" });
+		const retry = row("outbound-failed").getByRole("button", { name: "Retry send" });
+		const retryUnknown = row("outbound-unknown").getByRole("button", {
+			name: "Retry with duplicate risk",
+		});
+		for (const control of [cancel, retry, retryUnknown]) {
+			await control.waitFor();
+			const box = await control.boundingBox();
+			assert.ok(box && box.height >= 44 && box.width >= 44, JSON.stringify(box));
+		}
+		assert.equal(
+			await row("outbound-integrity").getByRole("button", { name: /retry/i }).count(),
+			0,
+		);
+		await row("outbound-integrity").getByText(
+			"Rebuild this message before sending it again.",
+			{ exact: true },
+		).waitFor();
+		const initialGeometry = await assertNoHorizontalOverflow(page);
+		await page.screenshot({
+			path: join(logDirectory, `outbound-delivery-${runStamp}-${name}-states.png`),
+			fullPage: true,
+		});
+
+		await cancel.click();
+		await page.getByText(
+			"Retry cancelled; previous delivery state restored",
+			{ exact: true },
+		).waitFor();
+		await retry.click();
+		await page.getByText("Send queued for retry", { exact: true }).waitFor();
+		await retryUnknown.click();
+		await page.getByText("Send queued for retry", { exact: true }).waitFor();
+
+		assert.match(duplicateRiskDialog ?? "", /may already have accepted/i);
+		assert.deepEqual(mutationRequests, [
+			{ deliveryId: "delivery-queued", action: "cancel", body: undefined },
+			{
+				deliveryId: "delivery-failed",
+				action: "retry",
+				body: { acknowledgeDuplicateRisk: false },
+			},
+			{
+				deliveryId: "delivery-unknown",
+				action: "retry",
+				body: { acknowledgeDuplicateRisk: true },
+			},
+		]);
+		assert.deepEqual(browserEvents.pageErrors, []);
+		assert.deepEqual(browserEvents.requestFailures, []);
+		const unexpectedConsoleErrors = browserEvents.consoleErrors.filter(
+			(message) => !message.includes("Failed to fetch manifest patches"),
+		);
+		assert.deepEqual(unexpectedConsoleErrors, []);
+		const finalGeometry = await assertNoHorizontalOverflow(page);
+		detail(`${name} outbound delivery controls ${JSON.stringify({
+			initialGeometry,
+			finalGeometry,
+			mutationRequests,
+			duplicateRiskDialog,
+			viewport,
+		})}`);
+	} finally {
+		await page.unrouteAll({ behavior: "wait" });
+		await page.close();
+	}
+}
+
 async function verifyViewport({ browser, baseUrl, storageState, name, viewport }) {
 	const context = await browser.newContext({ viewport, storageState });
 	try {
+		await verifyOutboundDeliveryActions({ context, baseUrl, name, viewport });
 		await verifyCompose({ context, baseUrl, name, viewport });
 		await verifyComposeTerminalLock({ context, baseUrl, name, mode: "send" });
 		await verifyComposeTerminalLock({ context, baseUrl, name, mode: "save-and-close" });

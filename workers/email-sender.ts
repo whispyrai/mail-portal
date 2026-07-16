@@ -45,17 +45,14 @@ export interface SendEmailParams {
 	/** Extra headers to set on the message, e.g. In-Reply-To and References. */
 	headers?: Record<string, string>;
 	/** Correlation tags returned by SES event publishing for bounce handling. */
-	tracking?: { mailboxId: string; deliveryId: string };
+	tracking?: { mailboxId: string; deliveryId: string; attemptId: string };
 }
 
 /** Thrown when SES rejects or fails a send. `status` is the HTTP status if any. */
 export class SesSendError extends Error {
 	readonly status?: number;
 
-	constructor(
-		message: string,
-		status?: number,
-	) {
+	constructor(message: string, status?: number) {
 		super(message);
 		this.name = "SesSendError";
 		this.status = status;
@@ -70,7 +67,27 @@ export interface SesRequestTransport {
 export interface SesSendDependencies {
 	/** Creating the transport happens before dispatch and is therefore testable. */
 	createTransport?: (env: Env) => SesRequestTransport;
+	/** Test seam for the production sign-before-attempt boundary. */
+	signRequest?: (
+		env: Env,
+		url: string,
+		request: RequestInit,
+	) => Promise<Request>;
+	/** Test seam for the production single-fetch boundary. */
+	fetchRequest?: (request: Request) => Promise<Response>;
 }
+
+export type PreparedSesSend = {
+	dispatch: () => Promise<Response>;
+};
+
+export type SesPreparationResult =
+	| { ok: true; prepared: PreparedSesSend }
+	| {
+			ok: false;
+			stage: "request" | "transport";
+			outcome: Extract<SesObservedOutcome, { kind: "not_dispatched" }>;
+	  };
 
 /** Format an address as `Name <email>` or bare `email`. */
 function formatAddress(addr: string | { email: string; name: string }): string {
@@ -89,29 +106,43 @@ function toAddressArray(value: string | string[] | undefined): string[] {
 // keys internally, so re-instantiating per send would throw that work away.
 let signerCache: { key: string; client: AwsClient } | null = null;
 function getSigner(env: Env): AwsClient {
-	if (signerCache?.key === env.AWS_ACCESS_KEY_ID) return signerCache.client;
+	const signerKey = [
+		env.AWS_ACCESS_KEY_ID,
+		env.AWS_SECRET_ACCESS_KEY,
+		env.AWS_REGION,
+	].join("\0");
+	if (signerCache?.key === signerKey) return signerCache.client;
 	const client = new AwsClient({
 		accessKeyId: env.AWS_ACCESS_KEY_ID,
 		secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
 		region: env.AWS_REGION,
+		retries: 0,
 		// The SES endpoint host is email.<region>.amazonaws.com, but the SigV4
 		// signing service name is "ses". aws4fetch would otherwise infer "email"
 		// from the host and produce a signature SES rejects with 403.
 		service: "ses",
 	});
-	signerCache = { key: env.AWS_ACCESS_KEY_ID, client };
+	signerCache = { key: signerKey, client };
 	return client;
-}
-
-function createDefaultTransport(env: Env): SesRequestTransport {
-	const signer = getSigner(env);
-	return {
-		fetch: (input, init) => signer.fetch(input, init),
-	};
 }
 
 function errorDetail(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function preparedSend(dispatch: () => Promise<Response>): PreparedSesSend {
+	let dispatched = false;
+	return {
+		dispatch: () => {
+			if (dispatched) {
+				return Promise.reject(
+					new Error("The prepared SES request was already dispatched"),
+				);
+			}
+			dispatched = true;
+			return dispatch();
+		},
+	};
 }
 
 function base64UrlText(value: string): string {
@@ -156,7 +187,9 @@ function buildSimpleContent(params: SendEmailParams): Record<string, unknown> {
 				att.contentId &&
 				!isSesAttachmentContentId(att.contentId)
 			) {
-				throw new Error("Attachment Content-ID exceeds the SES delivery boundary.");
+				throw new Error(
+					"Attachment Content-ID exceeds the SES delivery boundary.",
+				);
 			}
 			return {
 				RawContent: att.content, // base64 over the wire (HTTPS interface); SES decodes it
@@ -164,7 +197,8 @@ function buildSimpleContent(params: SendEmailParams): Record<string, unknown> {
 				ContentType: safeSesAttachmentMimeType(att.type),
 				// SES's enum is UPPERCASE (`ATTACHMENT | INLINE`); a lowercase value is
 				// not a valid enum and is rejected/ignored.
-				ContentDisposition: att.disposition === "inline" ? "INLINE" : "ATTACHMENT",
+				ContentDisposition:
+					att.disposition === "inline" ? "INLINE" : "ATTACHMENT",
 				// Force base64 in the MIME SES assembles. The default (SEVEN_BIT) mangles
 				// any non-7-bit payload — i.e. every PDF, image, or office document.
 				ContentTransferEncoding: "BASE64",
@@ -221,6 +255,16 @@ export async function sendEmailWithOutcome(
 	params: SendEmailParams,
 	dependencies: SesSendDependencies = {},
 ): Promise<SesObservedOutcome> {
+	const preparation = await prepareSesSend(env, params, dependencies);
+	if (!preparation.ok) return preparation.outcome;
+	return dispatchPreparedSesSend(preparation.prepared);
+}
+
+export async function prepareSesSend(
+	env: Env,
+	params: SendEmailParams,
+	dependencies: SesSendDependencies = {},
+): Promise<SesPreparationResult> {
 	const destination: Record<string, string[]> = {
 		ToAddresses: toAddressArray(params.to),
 	};
@@ -229,7 +273,6 @@ export async function sendEmailWithOutcome(
 	if (cc.length > 0) destination.CcAddresses = cc;
 	if (bcc.length > 0) destination.BccAddresses = bcc;
 
-	let transport: SesRequestTransport;
 	let url: string;
 	let request: RequestInit;
 	try {
@@ -254,6 +297,10 @@ export async function sendEmailWithOutcome(
 								Name: "DeliveryId",
 								Value: params.tracking.deliveryId,
 							},
+							{
+								Name: "AttemptId",
+								Value: params.tracking.attemptId,
+							},
 						],
 					}
 				: {}),
@@ -261,24 +308,56 @@ export async function sendEmailWithOutcome(
 		url = `https://email.${env.AWS_REGION}.amazonaws.com/v2/email/outbound-emails`;
 		request = {
 			method: "POST",
+			redirect: "manual",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(payload),
 		};
-		transport = (dependencies.createTransport ?? createDefaultTransport)(env);
 	} catch (error) {
-		return { kind: "not_dispatched", detail: errorDetail(error) };
+		return {
+			ok: false,
+			stage: "request",
+			outcome: { kind: "not_dispatched", detail: errorDetail(error) },
+		};
 	}
+	try {
+		if (dependencies.createTransport) {
+			const transport = dependencies.createTransport(env);
+			return {
+				ok: true,
+				prepared: preparedSend(() => transport.fetch(url, request)),
+			};
+		}
+		const signedRequest = await (
+			dependencies.signRequest ??
+			((signingEnv, signingUrl, signingRequest) =>
+				getSigner(signingEnv).sign(signingUrl, signingRequest))
+		)(env, url, request);
+		const fetchRequest = dependencies.fetchRequest ?? fetch;
+		return {
+			ok: true,
+			prepared: preparedSend(() => fetchRequest(signedRequest)),
+		};
+	} catch (error) {
+		return {
+			ok: false,
+			stage: "transport",
+			outcome: { kind: "not_dispatched", detail: errorDetail(error) },
+		};
+	}
+}
 
+export async function dispatchPreparedSesSend(
+	prepared: PreparedSesSend,
+): Promise<SesObservedOutcome> {
 	let res: Response;
 	try {
-		res = await transport.fetch(url, request);
+		res = await prepared.dispatch();
 	} catch (error) {
 		return { kind: "transport_ambiguous", detail: errorDetail(error) };
 	}
 
 	if (!res.ok) {
-		const detail = await res.text().catch(() => "");
-		return { kind: "http_error", status: res.status, detail };
+		return { kind: "http_error", status: res.status };
 	}
 
 	let result: unknown;

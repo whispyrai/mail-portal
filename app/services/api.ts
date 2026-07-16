@@ -300,7 +300,10 @@ const api = {
 			},
 		),
 	cancelOutboundDelivery: (mailboxId: string, deliveryId: string) =>
-		post<{ delivery: OutboundDelivery }>(
+		post<{
+			delivery: OutboundDelivery;
+			retryCancellationRestored?: boolean;
+		}>(
 			`/api/v1/mailboxes/${mailboxId}/outbound-deliveries/${deliveryId}/cancel`,
 		),
 	retryOutboundDelivery: (

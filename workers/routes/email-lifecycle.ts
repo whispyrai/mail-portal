@@ -1,6 +1,5 @@
 import type { Context } from "hono";
 import type { MailboxContext } from "../lib/mailbox.ts";
-import { storedAttachmentKey } from "../lib/attachments.ts";
 import { actorFromSession } from "../lib/activity.ts";
 
 type AppContext = Context<MailboxContext>;
@@ -78,20 +77,6 @@ export async function handleDiscardDraft(c: AppContext) {
 			},
 			409,
 		);
-	}
-	if (result.attachments.length > 0) {
-		const keys = result.attachments.map((attachment) =>
-			storedAttachmentKey({ ...attachment, email_id: id }),
-		);
-		try {
-			await c.env.BUCKET.delete(keys);
-		} catch (error) {
-			console.error("[draft-discard] failed to remove orphaned attachment objects", {
-				draftId: id,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			await c.var.mailboxStub.queueAttachmentCleanup(id, keys, actor);
-		}
 	}
 	return c.json({ status: result.status });
 }

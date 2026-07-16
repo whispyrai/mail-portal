@@ -14,7 +14,10 @@
  */
 import type { Env } from "../types";
 import type { ActivityActor } from "./activity.ts";
-import { ATTACHMENT_LIMITS, validateAttachmentSet } from "../../shared/attachments.ts";
+import {
+	ATTACHMENT_LIMITS,
+	validateAttachmentSet,
+} from "../../shared/attachments.ts";
 import {
 	contentIdForDisposition,
 	isInlineImageMimeType,
@@ -26,6 +29,7 @@ import {
 	attachmentStorageSourceIdentity,
 	safeAttachmentStorageFilename,
 } from "../../shared/attachment-filename.ts";
+import type { OutboundAttachmentByteIdentity } from "./outbound-delivery-contract.ts";
 
 /** Metadata for one stored attachment, shaped for the DO `attachments` table. */
 export type StoredAttachment = {
@@ -37,7 +41,105 @@ export type StoredAttachment = {
 	content_id: string | null;
 	disposition: string;
 	r2_key?: string | null;
+	/** Transient exact-byte proof for a new immutable outbound snapshot. */
+	content_sha256?: string;
 };
+
+export class AttachmentPreparationError extends Error {
+	readonly code:
+		| "attachment_request_invalid"
+		| "attachment_source_unavailable"
+		| "attachment_destination_conflict";
+	readonly status: 400 | 409;
+
+	constructor(
+		code:
+			| "attachment_request_invalid"
+			| "attachment_source_unavailable"
+			| "attachment_destination_conflict",
+		status: 400 | 409,
+		message: string,
+	) {
+		super(message);
+		this.name = "AttachmentPreparationError";
+		this.code = code;
+		this.status = status;
+	}
+}
+
+export function classifyAttachmentPreparationFailure(error: unknown): {
+	status: 400 | 409 | 503;
+	code: string;
+	message: string;
+} {
+	if (error instanceof AttachmentPreparationError) {
+		return { status: error.status, code: error.code, message: error.message };
+	}
+	return {
+		status: 503,
+		code: "attachment_preparation_unavailable",
+		message: "Attachments could not be prepared right now. Retry this exact send.",
+	};
+}
+
+function bytesToHex(bytes: ArrayBuffer): string {
+	return [...new Uint8Array(bytes)]
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
+export async function attachmentSha256(bytes: ArrayBuffer): Promise<{
+	binary: ArrayBuffer;
+	hex: string;
+}> {
+	const binary = await crypto.subtle.digest("SHA-256", bytes);
+	return { binary, hex: bytesToHex(binary) };
+}
+
+export function outboundAttachmentByteIdentities(
+	attachments: readonly {
+		id: string;
+		size: number;
+		content_sha256?: string;
+		filename: string;
+		mimetype: string;
+		disposition?: string;
+		contentId?: string | null;
+		content_id?: string | null;
+	}[],
+): OutboundAttachmentByteIdentity[] {
+	return attachments.map((attachment) => {
+		if (
+			!attachment.content_sha256 ||
+			!/^[a-f0-9]{64}$/.test(attachment.content_sha256)
+		) {
+			throw new Error("Promoted attachment is missing its exact byte identity");
+		}
+		const disposition =
+			attachment.disposition === "inline" ? "inline" : "attachment";
+		const contentId = contentIdForDisposition(
+			disposition,
+			attachment.contentId ?? attachment.content_id,
+		);
+		return {
+			id: attachment.id,
+			byteLength: attachment.size,
+			sha256: attachment.content_sha256,
+			filename: attachment.filename,
+			mimetype: attachment.mimetype,
+			disposition,
+			...(contentId ? { contentId } : {}),
+		};
+	});
+}
+
+export async function outboundAttachmentBytesMatch(
+	bytes: ArrayBuffer,
+	identity: OutboundAttachmentByteIdentity,
+): Promise<boolean> {
+	if (bytes.byteLength !== identity.byteLength) return false;
+	return (await attachmentSha256(bytes)).hex === identity.sha256;
+}
 
 /** An attachment shaped for `sendEmail` (SES inline delivery). */
 type SesAttachmentInput = {
@@ -91,12 +193,19 @@ export function uploadKey(mailboxId: string, uploadId: string): string {
 }
 
 /** R2 prefix preceding the storage-normalized filename. */
-export function attachmentKeyPrefix(emailId: string, attachmentId: string): string {
+export function attachmentKeyPrefix(
+	emailId: string,
+	attachmentId: string,
+): string {
 	return attachmentStorageKeyPrefix(emailId, attachmentId);
 }
 
 /** R2 key for an attachment permanently stored against an email. */
-export function attachmentKey(emailId: string, attachmentId: string, filename: string): string {
+export function attachmentKey(
+	emailId: string,
+	attachmentId: string,
+	filename: string,
+): string {
 	return `${attachmentKeyPrefix(emailId, attachmentId)}${filename}`;
 }
 
@@ -107,10 +216,9 @@ export function storedAttachmentKey(attachment: {
 	filename: string;
 	r2_key?: string | null;
 }): string {
-	return attachment.r2_key ?? attachmentKey(
-		attachment.email_id,
-		attachment.id,
-		attachment.filename,
+	return (
+		attachment.r2_key ??
+		attachmentKey(attachment.email_id, attachment.id, attachment.filename)
 	);
 }
 
@@ -142,7 +250,9 @@ export function truncateUtf8Bytes(value: string, maxBytes: number): string {
 export function boundedAttachmentStorageFilename(name: string): string {
 	const cleaned = sanitizeFilename(name);
 	const encoder = new TextEncoder();
-	if (encoder.encode(cleaned).byteLength <= MAX_ATTACHMENT_STORAGE_FILENAME_BYTES)
+	if (
+		encoder.encode(cleaned).byteLength <= MAX_ATTACHMENT_STORAGE_FILENAME_BYTES
+	)
 		return cleaned;
 	const dot = cleaned.lastIndexOf(".");
 	const hasExtension = dot > 0 && dot < cleaned.length - 1;
@@ -153,7 +263,8 @@ export function boundedAttachmentStorageFilename(name: string): string {
 			)
 		: "";
 	const baseLimit =
-		MAX_ATTACHMENT_STORAGE_FILENAME_BYTES - encoder.encode(extension).byteLength;
+		MAX_ATTACHMENT_STORAGE_FILENAME_BYTES -
+		encoder.encode(extension).byteLength;
 	const rawBase = hasExtension ? cleaned.slice(0, dot) : cleaned;
 	return `${truncateUtf8Bytes(rawBase, baseLimit) || "attachment"}${extension}`;
 }
@@ -181,9 +292,7 @@ function equalAttachmentBytes(left: ArrayBuffer, right: ArrayBuffer): boolean {
 
 /** Minimal DO-stub surface needed to resolve `existing` references. */
 type StubForResolve = {
-	getAttachment: (
-		id: string,
-	) => Promise<{
+	getAttachment: (id: string) => Promise<{
 		filename: string;
 		mimetype: string;
 		size: number;
@@ -334,7 +443,11 @@ export async function resolveAndPromoteAttachments(
 		};
 	}
 	if (refs.length > ATTACHMENT_LIMITS.maxFiles) {
-		throw new Error(`Too many files: max ${ATTACHMENT_LIMITS.maxFiles} per message.`);
+		throw new AttachmentPreparationError(
+			"attachment_request_invalid",
+			400,
+			`Too many files: max ${ATTACHMENT_LIMITS.maxFiles} per message.`,
+		);
 	}
 
 	// Pass 1: locate each source and pull its bytes + metadata.
@@ -356,15 +469,23 @@ export async function resolveAndPromoteAttachments(
 			const key = uploadKey(mailboxId, ref.uploadId);
 			const obj = await bucket.get(key);
 			if (!obj) {
-				throw new Error(
+				throw new AttachmentPreparationError(
+					"attachment_source_unavailable",
+					409,
 					"An attachment upload was not found or has expired. Re-attach the file and try again.",
 				);
 			}
 			const meta = obj.customMetadata ?? {};
 			const mimetype =
-				meta.type || obj.httpMetadata?.contentType || "application/octet-stream";
+				meta.type ||
+				obj.httpMetadata?.contentType ||
+				"application/octet-stream";
 			if (disposition === "inline" && !isInlineImageMimeType(mimetype)) {
-				throw new Error("Fresh inline attachments must use an image MIME type.");
+				throw new AttachmentPreparationError(
+					"attachment_request_invalid",
+					400,
+					"Fresh inline attachments must use an image MIME type.",
+				);
 			}
 			sources.push({
 				attachmentId,
@@ -377,9 +498,17 @@ export async function resolveAndPromoteAttachments(
 			});
 		} else {
 			const att = await stub.getAttachment(ref.attachmentId);
-			if (!att) throw new Error("A referenced attachment no longer exists.");
+			if (!att) {
+				throw new AttachmentPreparationError(
+					"attachment_source_unavailable",
+					409,
+					"A referenced attachment no longer exists.",
+				);
+			}
 			if (att.email_id !== ref.emailId) {
-				throw new Error(
+				throw new AttachmentPreparationError(
+					"attachment_request_invalid",
+					400,
 					"A referenced attachment does not belong to the referenced email.",
 				);
 			}
@@ -389,7 +518,13 @@ export async function resolveAndPromoteAttachments(
 			const obj = await bucket.get(
 				storedAttachmentKey({ ...att, id: ref.attachmentId, filename: safe }),
 			);
-			if (!obj) throw new Error("A referenced attachment file is missing.");
+			if (!obj) {
+				throw new AttachmentPreparationError(
+					"attachment_source_unavailable",
+					409,
+					"A referenced attachment file is missing.",
+				);
+			}
 			sources.push({
 				attachmentId,
 				bytes: await obj.arrayBuffer(),
@@ -406,7 +541,9 @@ export async function resolveAndPromoteAttachments(
 			source.contentId &&
 			!isSesAttachmentContentId(source.contentId)
 		) {
-			throw new Error(
+			throw new AttachmentPreparationError(
+				"attachment_request_invalid",
+				400,
 				"An inline attachment has a Content-ID that SES cannot deliver.",
 			);
 		}
@@ -416,10 +553,22 @@ export async function resolveAndPromoteAttachments(
 	const setError = validateAttachmentSet(
 		sources.map((s) => ({ filename: s.filename, size: s.bytes.byteLength })),
 	);
-	if (setError) throw new Error(setError);
+	if (setError) {
+		throw new AttachmentPreparationError(
+			"attachment_request_invalid",
+			400,
+			setError,
+		);
+	}
 
 	// Pass 2: promote to permanent storage + build the SES + DB payloads.
-	const destinations = sources.map((source) => {
+	const digestedSources = await Promise.all(
+		sources.map(async (source) => ({
+			...source,
+			digest: await attachmentSha256(source.bytes),
+		})),
+	);
+	const destinations = digestedSources.map((source) => {
 		const filename = safeAttachmentStorageFilename(
 			source.filename,
 			attachmentKeyPrefix(newEmailId, source.attachmentId),
@@ -447,9 +596,13 @@ export async function resolveAndPromoteAttachments(
 			try {
 				created = await bucket.put(destinationKey, s.bytes, {
 					onlyIf: { etagDoesNotMatch: "*" },
+					customMetadata: {
+						contentSha256: s.digest.hex,
 					...(options.promotionOwner
-						? { customMetadata: { promotionOwner: options.promotionOwner } }
+							? { promotionOwner: options.promotionOwner }
 						: {}),
+					},
+					sha256: s.digest.binary,
 				});
 			} catch (error) {
 				if (!options.promotionOwner) throw error;
@@ -472,10 +625,13 @@ export async function resolveAndPromoteAttachments(
 				if (
 					!existing ||
 					(options.promotionOwner &&
-						existing.customMetadata?.promotionOwner !== options.promotionOwner) ||
+						existing.customMetadata?.promotionOwner !==
+							options.promotionOwner) ||
 					!equalAttachmentBytes(await existing.arrayBuffer(), s.bytes)
 				) {
-					throw new Error(
+					throw new AttachmentPreparationError(
+						"attachment_destination_conflict",
+						409,
 						"A permanent attachment identity already contains different bytes.",
 					);
 				}
@@ -498,6 +654,7 @@ export async function resolveAndPromoteAttachments(
 				size: s.bytes.byteLength,
 					content_id: s.contentId,
 					disposition: s.disposition,
+				content_sha256: s.digest.hex,
 					r2_key: destinationKey,
 				});
 		}

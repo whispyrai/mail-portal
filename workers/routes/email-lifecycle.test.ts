@@ -21,22 +21,16 @@ function testApp(
 		| { status: "not_trashed" }
 		| null = null,
 	discardResult:
-		| {
-				status: "discarded";
-				attachments: Array<{ id: string; filename: string }>;
-			  }
+			| { status: "discarded" }
 			| { status: "not_draft" }
 			| { status: "version_conflict"; currentVersion: number }
 			| null = null,
 	moveResult:
 		| boolean
 		| { status: "outbound_delivery_active"; deliveryId: string }
-		| { status: "snoozed_state_requires_unsnooze" }
-		| { status: "snoozed_state_requires_explicit_action" } = true,
-	bucketDeleteFails = false,
+			| { status: "snoozed_state_requires_unsnooze" }
+			| { status: "snoozed_state_requires_explicit_action" } = true,
 ) {
-	const deletedObjects: string[][] = [];
-	const cleanupJobs: Array<{ id: string; keys: string[]; actor: unknown }> = [];
 	const stub = {
 		async trashEmail(id: string, actor: unknown) {
 			assert.equal(id, "email-1");
@@ -60,18 +54,8 @@ function testApp(
 			assert.deepEqual(actor, { kind: "user", id: "user-1" });
 			return moveResult;
 		},
-		async queueAttachmentCleanup(id: string, keys: string[], actor: unknown) {
-			cleanupJobs.push({ id, keys, actor });
-		},
 	};
-	const env = {
-		BUCKET: {
-			async delete(keys: string[]) {
-				if (bucketDeleteFails) throw new Error("R2 unavailable");
-				deletedObjects.push(keys);
-			},
-		},
-	};
+	const env = {};
 
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
@@ -98,7 +82,7 @@ function testApp(
 		handleMoveEmail,
 	);
 
-	return { app, env, deletedObjects, cleanupJobs };
+	return { app, env };
 }
 
 test("deleting an email outside Trash moves it to Trash without deleting attachments", async () => {
@@ -197,13 +181,12 @@ test("restoring an email outside Trash is rejected", async () => {
 	assert.deepEqual(await response.json(), { error: "Email is not in Trash" });
 });
 
-test("discarding a draft permanently removes its stored attachment objects", async () => {
-	const { app, env, deletedObjects } = testApp(
+test("discarding a draft trusts the Durable Object's atomic cleanup ownership", async () => {
+	const { app, env } = testApp(
 		{ status: "trashed" },
 		null,
 		{
 			status: "discarded",
-			attachments: [{ id: "attachment-1", filename: "brief.pdf" }],
 		},
 	);
 
@@ -219,13 +202,10 @@ test("discarding a draft permanently removes its stored attachment objects", asy
 
 	assert.equal(response.status, 200);
 	assert.deepEqual(await response.json(), { status: "discarded" });
-	assert.deepEqual(deletedObjects, [
-		["attachments/email-1/attachment-1/brief.pdf"],
-	]);
 });
 
 test("discarding a non-draft is rejected without deleting attachment objects", async () => {
-	const { app, env, deletedObjects } = testApp(
+	const { app, env } = testApp(
 		{ status: "trashed" },
 		null,
 		{ status: "not_draft" },
@@ -243,11 +223,10 @@ test("discarding a non-draft is rejected without deleting attachment objects", a
 
 	assert.equal(response.status, 409);
 	assert.deepEqual(await response.json(), { error: "Email is not a draft" });
-	assert.deepEqual(deletedObjects, []);
 });
 
 test("discarding a stale shared draft revision preserves the newer draft", async () => {
-	const { app, env, deletedObjects } = testApp(
+	const { app, env } = testApp(
 		{ status: "trashed" },
 		null,
 		{ status: "version_conflict", currentVersion: 8 },
@@ -268,44 +247,28 @@ test("discarding a stale shared draft revision preserves the newer draft", async
 		code: "draft_version_conflict",
 		currentVersion: 8,
 	});
-	assert.deepEqual(deletedObjects, []);
 });
 
-test("failed draft attachment cleanup is persisted for retry without misreporting discard", async () => {
-	const { app, env, cleanupJobs } = testApp(
+test("discard route requires no R2 binding or route-level cleanup", async () => {
+	const { app, env } = testApp(
 		{ status: "trashed" },
 		null,
 		{
 			status: "discarded",
-			attachments: [{ id: "attachment-1", filename: "brief.pdf" }],
 		},
-		true,
 		true,
 	);
-	const originalConsoleError = console.error;
-	console.error = () => {};
-	try {
-		const response = await app.request(
-			`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/drafts/email-1`,
-			{
-				method: "DELETE",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ draft_version: 7 }),
-			},
-			env as never,
-		);
-		assert.equal(response.status, 200);
-		assert.deepEqual(await response.json(), { status: "discarded" });
-	} finally {
-		console.error = originalConsoleError;
-	}
-	assert.deepEqual(cleanupJobs, [
+	const response = await app.request(
+		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/drafts/email-1`,
 		{
-			id: "email-1",
-			keys: ["attachments/email-1/attachment-1/brief.pdf"],
-			actor: { kind: "user", id: "user-1" },
+			method: "DELETE",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ draft_version: 7 }),
 		},
-	]);
+		env as never,
+	);
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), { status: "discarded" });
 });
 
 test("moving mail carries the signed-in actor into the authoritative lifecycle", async () => {

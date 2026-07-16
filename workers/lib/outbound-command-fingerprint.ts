@@ -62,6 +62,26 @@ export async function outboundCommandFingerprint(
 		.join("");
 }
 
+export async function outboundReplyIntentFingerprint(
+	command: FingerprintCommand,
+	stableAttachmentReferences: readonly string[],
+	sourceEmailId: string,
+): Promise<string> {
+	return outboundCommandFingerprint(
+		{
+			...command,
+			snapshot: {
+				...command.snapshot,
+				inReplyTo: undefined,
+				references: undefined,
+				threadId: "",
+			},
+		},
+		stableAttachmentReferences,
+		{ sourceEmailId },
+	);
+}
+
 export function stableOutboundAttachmentReferences(
 	refs: readonly AttachmentRef[] | undefined,
 ): string[] {

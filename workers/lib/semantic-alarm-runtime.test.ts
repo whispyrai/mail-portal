@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { mailboxMigrations } from "../durableObject/migrations.ts";
+import { applySqliteMigrations } from "../testing/sqlite-migrations.test.ts";
 import { attachmentKey } from "./attachments.ts";
 import { createSemanticIndex } from "./semantic-index.ts";
 import {
@@ -13,7 +14,7 @@ import {
 test("the production semantic alarm turn composes extraction through final vector visibility", async () => {
 	const database = new DatabaseSync(":memory:");
 	database.exec("PRAGMA foreign_keys = ON");
-	for (const migration of mailboxMigrations) database.exec(migration.sql);
+	applySqliteMigrations(database, mailboxMigrations);
 	const pdfHeader = "%PDF-1.7\n";
 	const pdfObject = "1 0 obj\n<< /Type /Catalog >>\nendobj\n";
 	const xrefOffset = pdfHeader.length + pdfObject.length;

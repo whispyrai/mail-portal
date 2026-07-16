@@ -6,6 +6,8 @@ const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 const deleteStart = source.indexOf("async deleteEmail(id: string)");
 const deleteEnd = source.indexOf("async discardDraft(", deleteStart);
 const deleteEmail = source.slice(deleteStart, deleteEnd);
+const discardEnd = source.indexOf("#applyDraftUpdate(", deleteEnd);
+const discardDraft = source.slice(deleteEnd, discardEnd);
 const cleanupStart = source.indexOf("async #processR2DeletionOutbox(");
 const cleanupEnd = source.indexOf("async alarm(): Promise<void>", cleanupStart);
 const cleanup = source.slice(cleanupStart, cleanupEnd);
@@ -39,6 +41,27 @@ test("live-inbound deletion cannot mutate tombstone or outbox when alarm schedul
   assert.ok(transaction < tombstone);
   assert.ok(transaction < outbox);
   assert.doesNotMatch(deleteEmail.slice(alarm, transaction), /catch/);
+});
+
+test("draft discard commits authoritative deletion and R2 cleanup ownership atomically", () => {
+  const transaction = discardDraft.indexOf("this.ctx.storage.transactionSync");
+  const operation = discardDraft.indexOf("this.#markDraftCreateOperation(");
+  const retention = discardDraft.indexOf("this.#refreshTerminalDraftSaveRetention(");
+  const outbox = discardDraft.indexOf("this.#enqueueR2DeletionSync({");
+  const emailDelete = discardDraft.indexOf(".delete(schema.emails)");
+  const activity = discardDraft.indexOf('"draft_discarded"');
+  const transactionEnd = discardDraft.indexOf("});", activity);
+  const alarm = discardDraft.indexOf("await this.#scheduleAlarmAt", transactionEnd);
+  const alarmCatch = discardDraft.indexOf("catch (error)", alarm);
+
+  assert.ok(transaction >= 0);
+  for (const boundary of [operation, retention, outbox, emailDelete, activity]) {
+    assert.ok(boundary > transaction && boundary < transactionEnd);
+  }
+  assert.ok(alarm > transactionEnd);
+  assert.ok(alarmCatch > alarm);
+  assert.match(discardDraft.slice(alarmCatch), /durable attachment cleanup pending/);
+  assert.match(discardDraft, /return \{ status: "discarded" as const \}/);
 });
 
 test("deletion-outbox failures persist and log only bounded error codes", () => {

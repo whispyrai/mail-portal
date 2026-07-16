@@ -29,14 +29,16 @@ import { verifyDraft } from "./ai.ts";
 import { Folders } from "../../shared/folders.ts";
 import type { Env } from "../types.ts";
 import type { ActivityActor } from "./activity.ts";
-import { storedAttachmentKey } from "./attachments.ts";
 import type {
 	EnqueueOutboundCommand,
 	OutboundDeliveryStatus,
 	OutboundDeliverySource,
 } from "./outbound-delivery-contract.ts";
 import { validateResolvedInlineImages } from "./inline-image-authority.ts";
-import { withOutboundCommandFingerprint } from "./outbound-command-fingerprint.ts";
+import {
+	outboundReplyIntentFingerprint,
+	withOutboundCommandFingerprint,
+} from "./outbound-command-fingerprint.ts";
 import {
 	draftCreateFingerprint,
 	draftToolCreateKey,
@@ -801,20 +803,6 @@ export async function toolDiscardDraft(
 			currentVersion: result.currentVersion,
 		};
 	}
-	if (result.attachments.length > 0) {
-		const keys = result.attachments.map((attachment) =>
-			storedAttachmentKey({ ...attachment, email_id: draftId }),
-		);
-		try {
-			await env.BUCKET.delete(keys);
-		} catch (error) {
-			console.error("[draft-discard] failed to remove orphaned attachment objects", {
-				draftId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			await stub.queueAttachmentCleanup(draftId, keys, actor);
-		}
-	}
 	return { status: "discarded", draftId };
 }
 
@@ -860,15 +848,51 @@ export async function toolSendReply(
 	| { error: string; code?: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
+	const fromDomain = mailboxId.split("@")[1];
+	if (!fromDomain) throw new Error("Invalid mailbox email address");
+	const { requestedAt, undoUntil } = outboundTiming();
+	const intentCommand = {
+		idempotencyKey: params.idempotencyKey,
+		source: outboundSource(actor),
+		actor,
+		snapshot: {
+			mailboxId: mailboxId.toLowerCase(),
+			kind: "reply" as const,
+			to: [params.to.toLowerCase()],
+			cc: [],
+			bcc: [],
+			from: mailboxId.toLowerCase(),
+			subject: params.subject,
+			html: params.bodyHtml,
+			threadId: "",
+			attachmentIds: [],
+			attachmentByteIdentities: [],
+		},
+		requestedAt,
+		undoUntil,
+	};
+	const intentFingerprint = await outboundReplyIntentFingerprint(
+		intentCommand,
+		[],
+		params.originalEmailId,
+	);
+	const replay = await (stub as unknown as OutboundEnqueueStub).resolveOutboundReplay({
+		idempotencyKey: params.idempotencyKey,
+		commandFingerprint: intentFingerprint,
+	});
+	if (replay.status === "exact") return replayedOutboundResult(replay.delivery);
 
 	const originalEmail = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
 	if (!originalEmail) {
-		return { error: "Original email not found" };
+		return replay.status === "conflict"
+			? {
+					error: "This legacy send identity cannot be verified without its source message.",
+					code: "legacy_idempotency_unverifiable",
+				}
+			: { error: "Original email not found" };
 	}
 
 	const { originalMsgId, references, threadId } = buildReferencesChain(originalEmail);
-	const fromDomain = mailboxId.split("@")[1];
-	if (!fromDomain) throw new Error("Invalid mailbox email address");
 
 	// Verify and append quoted original message
 	const sanitizedBody = await verifyDraft(params.bodyHtml);
@@ -884,8 +908,7 @@ export async function toolSendReply(
 	});
 	const fullBodyHtml = sanitizedBody + quotedBlock;
 
-	const { requestedAt, undoUntil } = outboundTiming();
-	const command = await withOutboundCommandFingerprint({
+	const legacyCommand = await withOutboundCommandFingerprint({
 		idempotencyKey: params.idempotencyKey,
 		source: outboundSource(actor),
 		actor,
@@ -902,20 +925,24 @@ export async function toolSendReply(
 			references,
 			threadId,
 			attachmentIds: [],
+			attachmentByteIdentities: [],
 		},
 		requestedAt,
 		undoUntil,
 	}, [], { sourceEmailId: params.originalEmailId });
-	const replay = await (
-		stub as unknown as OutboundEnqueueStub
-	).resolveOutboundReplay({
-		idempotencyKey: params.idempotencyKey,
-		commandFingerprint: command.commandFingerprint,
-	});
-	if (replay.status === "exact") return replayedOutboundResult(replay.delivery);
 	if (replay.status === "conflict") {
+		const legacyReplay = await (
+			stub as unknown as OutboundEnqueueStub
+		).resolveOutboundReplay({
+			idempotencyKey: params.idempotencyKey,
+			commandFingerprint: legacyCommand.commandFingerprint,
+		});
+		if (legacyReplay.status === "exact") {
+			return replayedOutboundResult(legacyReplay.delivery);
+		}
 		return outboundConflictResult(replay.reason);
 	}
+	const command = { ...legacyCommand, commandFingerprint: intentFingerprint };
 	const rateLimitError = await (stub as unknown as RateLimitStub)
 		.checkSendRateLimit();
 	if (rateLimitError) return { error: rateLimitError };
@@ -988,6 +1015,7 @@ export async function toolSendEmail(
 			html: sanitizedBody,
 			threadId: "generated",
 			attachmentIds: [],
+			attachmentByteIdentities: [],
 		},
 		requestedAt,
 		undoUntil,

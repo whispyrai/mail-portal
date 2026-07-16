@@ -138,6 +138,8 @@ export async function reconcileAmbiguousOutboundEnqueue(input: {
 			input.attemptedEmailId,
 			input.promotion,
 			input.actor,
+		).catch((error) =>
+			console.error("Committed replay orphan cleanup deferred", error),
 		);
 	}
 	if (resolution.status === "conflict") {
@@ -149,6 +151,8 @@ export async function reconcileAmbiguousOutboundEnqueue(input: {
 		input.attemptedEmailId,
 		input.promotion,
 		input.actor,
+	).catch((error) =>
+		console.error("Committed enqueue staging cleanup deferred", error),
 	);
 	return {
 		status: "committed",

@@ -1,6 +1,8 @@
 import type { Context } from "hono";
 import {
+	classifyAttachmentPreparationFailure,
 	completeAttachmentPromotion,
+	outboundAttachmentByteIdentities,
 	resolveAndPromoteAttachments,
 	rollbackAttachmentPromotion,
 	sourceDraftAttachmentIds,
@@ -99,6 +101,7 @@ export async function handleSendEmail(c: AppContext) {
 				...(references ? { references } : {}),
 				threadId: thread_id || in_reply_to || "generated",
 				attachmentIds: [],
+				attachmentByteIdentities: [],
 				...(source_draft_id
 					? {
 							sourceDraftAttachmentIds: sourceDraftAttachmentIds(
@@ -161,12 +164,25 @@ export async function handleSendEmail(c: AppContext) {
 		messageId,
 		attachments,
 		actor,
-		{ promotionOwner: messageId },
+		{
+			promotionOwner: messageId,
+			recordDestinationIntent: async (keys) => {
+				await stub.recordOutboundPromotionIntent(messageId, keys);
+			},
+		},
 	).then(
 		(result) => ({ ok: true as const, ...result }),
-		(error) => ({ ok: false as const, error: (error as Error).message }),
+		(error) => ({
+			ok: false as const,
+			failure: classifyAttachmentPreparationFailure(error),
+		}),
 	);
-	if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+	if (!resolved.ok) {
+		return c.json(
+			{ error: resolved.failure.message, code: resolved.failure.code },
+			resolved.failure.status,
+		);
+	}
 	const inlineMapping = validateResolvedInlineImages(html ?? "", resolved.storedMetadata);
 	if (!inlineMapping.ok) {
 		await rollbackAttachmentPromotion(
@@ -205,6 +221,9 @@ export async function handleSendEmail(c: AppContext) {
 					attachmentIds: resolved.storedMetadata.map(
 						(attachment) => attachment.id,
 					),
+					attachmentByteIdentities: outboundAttachmentByteIdentities(
+						resolved.storedMetadata,
+					),
 				},
 				requestedAt: timing.requestedAt,
 				undoUntil: timing.undoUntil,
@@ -214,6 +233,7 @@ export async function handleSendEmail(c: AppContext) {
 			},
 			resolved.storedMetadata,
 			messageId,
+			resolved.stagingKeys,
 		);
 	} catch (error) {
 		const reconciliation = await reconcileAmbiguousOutboundEnqueue({
@@ -255,13 +275,17 @@ export async function handleSendEmail(c: AppContext) {
 		if (reconciliation.status === "not_committed") throw error;
 	}
 	if (!promotionFinalized) {
-		await completeAttachmentPromotion(
-			c.env.BUCKET,
-			stub,
-			messageId,
-			resolved,
-			actor,
-		);
+		try {
+			await completeAttachmentPromotion(
+				c.env.BUCKET,
+				stub,
+				messageId,
+				resolved,
+				actor,
+			);
+		} catch (error) {
+			console.error("Committed send staging cleanup deferred", error);
+		}
 	}
 
 	return c.json(

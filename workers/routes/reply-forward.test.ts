@@ -16,14 +16,24 @@ function testApp(options: {
 		status: string;
 		undoUntil: string;
 	};
+	initialReplay?: {
+		id: string;
+		emailId: string;
+		status: string;
+		undoUntil: string;
+	};
+	originalMissing?: boolean;
 } = {}) {
 	const enqueued: EnqueueOutboundCommand[] = [];
 	const markedThreads: string[] = [];
 	let idempotencyLookups = 0;
+	let originalLookups = 0;
 	const stub = {
 		async getAttachment() { return null; },
 		async getEmail(id: string) {
 			if (id === "original-1") {
+				originalLookups += 1;
+				if (options.originalMissing) return null;
 				return {
 					id,
 					subject: "Original",
@@ -52,6 +62,9 @@ function testApp(options: {
 		},
 		async resolveOutboundReplay() {
 			idempotencyLookups += 1;
+			if (idempotencyLookups === 1 && options.initialReplay) {
+				return { status: "exact" as const, delivery: options.initialReplay };
+			}
 			return idempotencyLookups > 1 && options.authoritativeAfterError
 				? {
 						status: "exact" as const,
@@ -77,6 +90,7 @@ function testApp(options: {
 			markedThreads.push(threadId);
 		},
 		async queueAttachmentCleanup() {},
+		async recordOutboundPromotionIntent() { return true; },
 	};
 	const app = new Hono<MailboxContext>();
 	app.use("*", async (c, next) => {
@@ -99,8 +113,39 @@ function testApp(options: {
 		handleForwardEmail,
 	);
 
-	return { app, enqueued, markedThreads };
+	return { app, enqueued, markedThreads, getOriginalLookups: () => originalLookups };
 }
+
+test("an exact reply replay does not depend on the mutable original message", async () => {
+	const { app, enqueued, getOriginalLookups } = testApp({
+		originalMissing: true,
+		initialReplay: {
+			id: "delivery-existing",
+			emailId: "email-existing",
+			status: "sent",
+			undoUntil: "2026-07-11T10:00:00.000Z",
+		},
+	});
+	const response = await app.request(
+		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails/original-1/reply`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				to: "customer@example.com",
+				from: mailboxId,
+				subject: "Re: Original",
+				html: "<p>Reply</p>",
+				idempotency_key: "reply-replay-1",
+			}),
+		},
+		{ BUCKET: {} } as never,
+	);
+
+	assert.equal(response.status, 202);
+	assert.equal(getOriginalLookups(), 0);
+	assert.equal(enqueued.length, 0);
+});
 
 test("reply snapshots the message and source draft into the truthful outbox", async () => {
 	const { app, enqueued, markedThreads } = testApp();
@@ -158,6 +203,7 @@ test("reply snapshots the message and source draft into the truthful outbox", as
 		references: ["root@example.com", "customer-message@example.com"],
 		threadId: "thread-1",
 		attachmentIds: [],
+		attachmentByteIdentities: [],
 		sourceDraftAttachmentIds: [],
 	});
 	assert.deepEqual(markedThreads, ["thread-1"]);

@@ -16,6 +16,8 @@ test("Outbox controls expose keyboard and touch accessible action state", () => 
 	assert.match(component, /aria-busy=\{isPending\}/);
 	assert.match(component, /role="alert"/);
 	assert.match(component, /lastErrorCode/);
+	assert.match(component, /sr-only sm:not-sr-only sm:block/);
+	assert.match(component, /Retry anyway/);
 });
 
 test("unknown delivery retry requires explicit duplicate-risk confirmation", () => {
@@ -29,6 +31,7 @@ test("Outbox controls are persistent in list and detail renderers", () => {
 	const detail = readFileSync(new URL("./EmailPanel.tsx", import.meta.url), "utf8");
 	assert.match(list, /<OutboundDeliveryActions[\s\S]*?compact/);
 	assert.doesNotMatch(list, /group-hover:flex[\s\S]*?<OutboundDeliveryActions/);
+	assert.match(list, /unknown: "Uncertain"/);
 	assert.match(detail, /<OutboundDeliveryActions/);
 	assert.match(detail, /useOutboundDeliveries/);
 });

@@ -159,6 +159,7 @@ export interface OutboundDelivery {
 	unknownAt?: string;
 	cancelledAt?: string;
 	cancelRecoveryPending?: boolean;
+	storageIntegrityCode?: "outbound_delivery_record_invalid";
 }
 
 export interface OutboundEnqueueResponse {

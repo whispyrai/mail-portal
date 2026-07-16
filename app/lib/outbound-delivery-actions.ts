@@ -9,7 +9,26 @@ export type OutboundDeliveryAction = {
 export function outboundDeliveryAction(
 	status: OutboundDeliveryStatus,
 	cancelRecoveryPending = false,
+	storageIntegrityCode?: string,
+	lastErrorCode?: string,
 ): OutboundDeliveryAction | null {
+	if (storageIntegrityCode) return null;
+	if (
+		status === "failed" &&
+		lastErrorCode &&
+		new Set([
+			"attachment_integrity_unverifiable",
+			"attachment_metadata_mismatch",
+			"attachment_size_mismatch",
+			"attachment_content_mismatch",
+			"attachment_missing",
+			"snapshot_missing",
+			"outbound_snapshot_invalid",
+			"outbound_dispatch_metadata_invalid",
+		]).has(lastErrorCode)
+	) {
+		return null;
+	}
 	if (
 		status === "queued" ||
 		status === "retrying" ||
