@@ -324,15 +324,29 @@ Raw R2 is the receipt source of truth. Receipt sidecars live at
 message. Exact R2 keys and provider details stay internal and never appear in
 structured logs. Queue and Mailbox storage are projections.
 
+After exact raw MIME persistence succeeds, the Email Worker may return normally
+only after one of four outcomes: a durable admitted receipt and successful Queue
+send, an idempotent projection of the same `ingressId` into the verified active
+Mailbox, a resolved Cloudflare `forward()` of the original inbound Message to
+`EMERGENCY_FORWARD_TO` whose result contains a usable, nonblank string
+`messageId`, or
+`setReject()` so SMTP reports failure and the sender can resend. This applies to
+archived-receipt, Mailbox-marker, active-state, admitted-receipt, and Queue-send
+failures. A successful Queue send remains a successful handoff if the
+best-effort `enqueued` receipt advancement loses its conditional race. Invalid,
+disallowed, unprovisioned, and inactive recipients must reject even when the
+rejected receipt sidecar cannot commit; they must never be projected or
+emergency-forwarded.
+
 During proof and cutover, monitor these conditions:
 
 - Any `RAW_ARCHIVE_FAILED`, `RAW_ARCHIVE_SIZE_MISMATCH`, `RAW_ARCHIVE_CHECKSUM_UNAVAILABLE`, `RAW_ARCHIVE_CHECKSUM_MISMATCH`, or `RAW_ARCHIVE_CHECKSUM_PREPARATION_FAILED`: page immediately. Confirm the same `ingressId` then records either `direct_mailbox_fallback` status `succeeded`, or `emergency_forward` status `succeeded`. If neither exists, confirm `smtp_rejection` status `rejected` and investigate all three failed paths.
-- Any `dead_letter_pending`, `dead_lettered`, `quarantined`, `STORED_PROJECTION_MISSING`, `ADMISSION_DECISION_MISSING`, `TERMINAL_FALLBACK_LEDGER_FAILED`, `RECONCILIATION_RUN_FAILED`, or `ARCHIVE_RECONCILIATION_FAILED`: investigate the same day. `dead_letter_pending` means Cloudflare has not yet confirmed the DLQ consumer. `dead_lettered` means the DLQ consumer or reconciler durably recorded the terminal failure. The DLQ consumer records that failure in both the R2 receipt and an independent Mailbox Durable Object ledger when available; either durable commit prevents the failure from disappearing. Neither state is automatically re-enqueued.
-- Any `QUEUE_ENQUEUE_FAILED`: confirm a later `archive re-enqueued` and then `message acknowledged` for the same `ingressId`.
+- Any `dead_letter_pending`, `dead_lettered`, `quarantined`, `RECEIPT_STATE_UNKNOWN`, `STORED_PROJECTION_MISSING`, `ADMISSION_DECISION_MISSING`, `TERMINAL_FALLBACK_LEDGER_FAILED`, `RECONCILIATION_RUN_FAILED`, or `ARCHIVE_RECONCILIATION_FAILED`: investigate the same day. `dead_letter_pending` means Cloudflare has not yet confirmed the DLQ consumer. `dead_lettered` means the DLQ consumer or reconciler durably recorded the terminal failure. `RECEIPT_STATE_UNKNOWN` means a receipt object exists but its pointer, timestamp, state-specific fields, or R2 identity cannot be trusted. The DLQ consumer records terminal failure in both the R2 receipt and an independent Mailbox Durable Object ledger when available; either durable commit prevents the failure from disappearing. Neither dead-letter state is automatically re-enqueued.
+- Any `QUEUE_ENQUEUE_FAILED`: confirm the same `ingressId` immediately records `direct_mailbox_fallback` status `succeeded`, `emergency_forward` status `succeeded`, or `smtp_rejection` status `rejected`. A later reconciliation pass may still repair the admitted receipt, but it is not the SMTP acceptance guarantee.
 - Any `R2_DERIVED_UPLOAD_INTEGRITY_FAILED`: page the mail operator. The exact raw MIME remains authoritative, but the Mailbox projection needs retry or audited replay.
 - Any `R2_DELETION_OUTBOX_FAILED`: investigate until a later `R2 deletion batch completed` proves cleanup. Mail is already deleted from the user view, but superseded attachment/body objects remain pending in the Mailbox Durable Object outbox.
 - Non-zero backlog in either primary Queue or DLQ must be explained before declaring inbound healthy. Any message in a parking Queue is an immediate incident. Wiser uses `wiser-mail-inbound`, `wiser-mail-inbound-dlq`, and `wiser-mail-inbound-parking`. Whispyr uses `sales-mail-inbound`, `sales-mail-inbound-dlq`, and `sales-mail-inbound-parking`. Parking consumers retry terminal ledger persistence up to the platform maximum 100 times with an hourly delay.
-- Normal-path success is proved by `raw_archive` status `succeeded`, followed by either `queue_enqueue` status `succeeded` or `archive_reconcile` status `reenqueued`, and finally `mailbox_projection` status `succeeded` or `duplicate`. A raw-archive incident is recovered only by a successful direct Mailbox fallback or successful emergency forwarding for the same `ingressId`.
+- Normal-path success is proved by `raw_archive` status `succeeded`, a durable admitted receipt, `queue_enqueue` status `succeeded` or `archive_reconcile` status `reenqueued`, and finally `mailbox_projection` status `succeeded` or `duplicate`. Any post-archive ingress failure is recovered only by a successful direct Mailbox fallback, successful emergency forwarding, or explicit SMTP rejection for the same `ingressId`.
 
 The reconciler walks the raw archive with a conditionally updated continuation
 cursor so old pages cannot starve and overlapping cron runs cannot move the
@@ -352,7 +366,36 @@ another worker. An object-level failure is written to a durable failure ledger
 before the main cursor advances. If the ledger write also fails, the cursor
 stays on the page.
 
-Raw objects without a receipt are never auto-admitted. Reconciliation writes `system/reconciliation-anomalies/<encoded-raw-key>.json` and a server-derived `system/inbound-recovery-pointers/<ingressId>.json`. The recovery pointer contains the immutable R2 identity validated from raw-object metadata and lets an operator use the normal audited recovery command without supplying a raw key. Do not manufacture or edit recovery pointers manually.
+Reconciliation trusts a present receipt only when it has a usable R2 ETag, a
+canonical timestamp, a complete archived pointer that exactly matches the raw
+object, and the closed field set written for its state. A present but malformed,
+partial, mismatched, or otherwise invalid receipt is never treated as missing.
+The reconciler writes durable `RECEIPT_STATE_UNKNOWN` operator-review evidence
+without reading Mailbox truth, reconstructing the receipt, creating an
+admission-missing recovery pointer, or enqueuing the message. If that evidence
+cannot commit, the normal reconciliation failure ledger must commit before the
+cursor advances; otherwise the cursor remains on the page for retry.
+The same fail-closed path applies when an `archived` receipt is conditionally
+advanced to `admitted` but its immediate reread is absent or invalid. A valid
+concurrent forward or terminal state remains authoritative and is never
+overwritten or enqueued by that admission attempt.
+
+Raw objects without a receipt are never auto-admitted. Before creating
+`ADMISSION_DECISION_MISSING` evidence, reconciliation checks authoritative
+Mailbox truth for the exact `ingressId` in this order: deletion tombstone,
+existing Message projection through `hasEmail` or `getEmail`, then a valid
+independent terminal-failure ledger. It reconstructs `deleted`, `stored`, or
+`dead_lettered` with create-only receipt semantics and resolves any pending
+anomaly only when that reconstruction commits. A conditional-write loser
+preserves the concurrent receipt winner and does not claim terminalization.
+Malformed terminal-ledger values remain operator-visible and fail closed. Only
+when no authoritative Mailbox truth exists does reconciliation write
+`ADMISSION_DECISION_MISSING` plus
+`system/inbound-recovery-pointers/<ingressId>.json`. The pointer contains the
+immutable R2 identity validated from raw-object metadata and lets an operator
+use the normal audited recovery command without supplying a raw key. Raw
+metadata alone never authorizes admission or Queue enqueue. Do not manufacture
+or edit recovery pointers manually.
 
 Messages whose selected body exceeds 512 KiB keep a bounded preview in the Mailbox Durable Object and store the complete UTF-8 body in attempt-scoped R2 objects. Attachment objects are also attempt-scoped. Unknown-length decoded streams use R2 multipart upload with one bounded 5 MiB part buffer because workerd requires a declared length for a one-shot R2 stream. Every derived R2 write verifies the returned byte length before the SQL projection can commit.
 

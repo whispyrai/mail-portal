@@ -84,6 +84,14 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 	for (let index = 0; index < 7; index += 1) {
 		stored.set(`receipts/archive-${index}.json`, {
 			value: JSON.stringify({
+				schemaVersion: 1,
+				ingressId: `archive-${index}`,
+				rawKey: archiveKeys[index],
+				mailboxId,
+				rawSize: 1,
+				archivedAt: "2026-07-15T09:00:00.000Z",
+				etag: `raw-archive-${index}`,
+				version: "raw-version",
 				state: "stored",
 				updatedAt: "2026-07-15T09:00:00.000Z",
 			}),

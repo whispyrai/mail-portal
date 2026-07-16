@@ -352,7 +352,7 @@ async function recordDurableRejection(
   archivedReceipt: R2Object,
   errorCode: InboundSmtpRejectionErrorCode,
   runtime: InboundRuntime,
-): Promise<boolean> {
+): Promise<void> {
   const rejectedReceipt = await recordReceiptState(
     env,
     pointer,
@@ -361,21 +361,20 @@ async function recordDurableRejection(
     runtime,
     archivedReceipt.etag,
   );
-  if (rejectedReceipt) return true;
+  if (rejectedReceipt) return;
 
   const [ingressRef, objectRef] = await Promise.all([
     mailTelemetryLogRef("ingress", pointer.ingressId),
     mailTelemetryLogRef("object", pointer.rawKey),
   ]);
-  console.error("[mail-ingress] permanent rejection deferred", {
+  console.error("[mail-ingress] rejection receipt unavailable", {
     errorCode,
     ingressRef,
     objectRef,
     operation: "smtp_rejection",
     recoveryAction: "scheduled_reconciliation",
-    status: "preserved",
+    status: "degraded",
   });
-  return false;
 }
 
 function envelopeMailboxId(
@@ -500,6 +499,32 @@ async function storeDirectlyInMailbox(
     if (!existing) {
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
+          if (!(await isActiveMailbox(env, mailboxId))) {
+            console.error("[mail-ingress] direct mailbox fallback unavailable", {
+              attempt,
+              durationMs: durationMs(runtime, startedAt),
+              errorCode: "MAILBOX_INACTIVE",
+              ingressRef,
+              operation: "direct_mailbox_fallback",
+              status: "unprovisioned",
+            });
+            return "unprovisioned";
+          }
+        } catch {
+          console.error(
+            "[mail-ingress] direct mailbox fallback could not reverify active state",
+            {
+              attempt,
+              durationMs: durationMs(runtime, startedAt),
+              errorCode: "MAILBOX_ACTIVE_RECHECK_FAILED",
+              ingressRef,
+              operation: "direct_mailbox_fallback",
+              status: "unverified",
+            },
+          );
+          return "unverified";
+        }
+        try {
           // Test seam only. Production omits parse so normal delivery uses the streamed path.
           if (runtime.parse) {
             const parsed = await runtime.parse(rawBytes);
@@ -602,7 +627,21 @@ async function forwardEmergencyOrReject(
   });
   try {
     const result = await event.forward(env.EMERGENCY_FORWARD_TO);
-    const messageRef = await mailTelemetryLogRef("message", result.messageId);
+    const untrustedResult: unknown = result;
+    if (
+      !untrustedResult ||
+      typeof untrustedResult !== "object" ||
+      Array.isArray(untrustedResult) ||
+      !("messageId" in untrustedResult) ||
+      typeof untrustedResult.messageId !== "string" ||
+      untrustedResult.messageId.trim().length === 0
+    ) {
+      throw new Error("Emergency forwarding returned an invalid result");
+    }
+    const messageRef = await mailTelemetryLogRef(
+      "message",
+      untrustedResult.messageId,
+    );
     console.log("[mail-ingress] emergency forwarding completed", {
       durationMs: durationMs(runtime, forwardStartedAt),
       ingressRef,
@@ -630,7 +669,7 @@ async function forwardEmergencyOrReject(
   });
 }
 
-async function recoverFromRawArchiveFailure(
+async function recoverWithDirectMailboxOrSmtpAction(
   event: InboundEmailEvent,
   env: InboundEnvironment,
   rawBytes: ArrayBuffer,
@@ -870,7 +909,7 @@ export async function receiveEmail(
       operation: "raw_archive_checksum",
       status: "failed",
     });
-    await recoverFromRawArchiveFailure(
+    await recoverWithDirectMailboxOrSmtpAction(
       event,
       env,
       rawBytes,
@@ -904,7 +943,7 @@ export async function receiveEmail(
       runtime,
     );
   } catch {
-    await recoverFromRawArchiveFailure(
+    await recoverWithDirectMailboxOrSmtpAction(
       event,
       env,
       rawBytes,
@@ -953,16 +992,27 @@ export async function receiveEmail(
       recoveryAction: "scheduled_reconciliation",
       status: "preserved",
     });
+    // Cloudflare Email handlers must explicitly forward or reject when durable
+    // processing cannot complete; a verified Mailbox projection is also durable.
+    await recoverWithDirectMailboxOrSmtpAction(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
+    );
     return;
   }
   if (!mailboxId || !isAddressInConfiguredMailDomains(mailboxId, env.DOMAINS)) {
-    if (!(await recordDurableRejection(
+    await recordDurableRejection(
       env,
       pointer,
       archivedReceipt,
       "RECIPIENT_DOMAIN_INVALID",
       runtime,
-    ))) return;
+    );
     console.log("[mail-ingress] message rejected", {
       durationMs: durationMs(runtime, handlerStartedAt),
       errorCode: "RECIPIENT_DOMAIN_INVALID",
@@ -982,13 +1032,13 @@ export async function receiveEmail(
     address.toLowerCase(),
   );
   if (allowedAddresses.length > 0 && !allowedAddresses.includes(mailboxId)) {
-    if (!(await recordDurableRejection(
+    await recordDurableRejection(
       env,
       pointer,
       archivedReceipt,
       "RECIPIENT_NOT_ALLOWED",
       runtime,
-    ))) return;
+    );
     console.log("[mail-ingress] message rejected", {
       durationMs: durationMs(runtime, handlerStartedAt),
       errorCode: "RECIPIENT_NOT_ALLOWED",
@@ -1009,13 +1059,13 @@ export async function receiveEmail(
     rawBytes.byteLength > MAX_EMAIL_SIZE ||
     event.rawSize !== rawBytes.byteLength
   ) {
-    if (!(await recordDurableRejection(
+    await recordDurableRejection(
       env,
       pointer,
       archivedReceipt,
       "RAW_SIZE_INVALID",
       runtime,
-    ))) return;
+    );
     console.error("[mail-ingress] message rejected", {
       actualRawSize: rawBytes.byteLength,
       declaredRawSize: event.rawSize,
@@ -1051,19 +1101,28 @@ export async function receiveEmail(
       durationMs: durationMs(runtime, admissionStartedAt),
       errorCode: "MAILBOX_ADMISSION_CHECK_FAILED",
       operation: "mailbox_admission_check",
-      recoveryAction: "queue_consumer_recheck",
+      recoveryAction: "direct_mailbox_then_forward_or_reject",
       status: "degraded",
     });
+    await recoverWithDirectMailboxOrSmtpAction(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
+    );
     return;
   }
   if (mailboxProvisioned === false) {
-    if (!(await recordDurableRejection(
+    await recordDurableRejection(
       env,
       pointer,
       archivedReceipt,
       "MAILBOX_UNAVAILABLE",
       runtime,
-    ))) return;
+    );
     console.log("[mail-ingress] message rejected", {
       durationMs: durationMs(runtime, handlerStartedAt),
       errorCode: "MAILBOX_UNAVAILABLE",
@@ -1098,20 +1157,29 @@ export async function receiveEmail(
       ingressRef,
       objectRef,
       operation: "mailbox_admission_check",
-      recoveryAction: "scheduled_reconciliation",
-      status: "preserved",
+      recoveryAction: "direct_mailbox_then_forward_or_reject",
+      status: "degraded",
       target: "d1",
     });
+    await recoverWithDirectMailboxOrSmtpAction(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
+    );
     return;
   }
   if (!mailboxActive) {
-    if (!(await recordDurableRejection(
+    await recordDurableRejection(
       env,
       pointer,
       archivedReceipt,
       "MAILBOX_INACTIVE",
       runtime,
-    ))) return;
+    );
     rejectMessage(event, {
       errorCode: "MAILBOX_INACTIVE",
       smtpMessage: "Mailbox unavailable",
@@ -1135,9 +1203,18 @@ export async function receiveEmail(
         ingressRef,
         objectRef,
         operation: "queue_enqueue",
-        recoveryAction: "operator_review",
-        status: "preserved",
+        recoveryAction: "direct_mailbox_then_forward_or_reject",
+        status: "degraded",
       },
+    );
+    await recoverWithDirectMailboxOrSmtpAction(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
     );
     return;
   }
@@ -1158,9 +1235,18 @@ export async function receiveEmail(
       ingressRef,
       objectRef,
       operation: "queue_enqueue",
-      recoveryAction: "scheduled_reconciliation",
-      status: "deferred",
+      recoveryAction: "direct_mailbox_then_forward_or_reject",
+      status: "degraded",
     });
+    await recoverWithDirectMailboxOrSmtpAction(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
+    );
     return;
   }
   await recordReceiptState(

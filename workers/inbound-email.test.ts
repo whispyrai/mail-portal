@@ -492,27 +492,53 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
   ]);
 });
 
-test("inbound delivery never enqueues before the durable admission decision commits", async () => {
+test("inbound delivery directly projects exact archived bytes when the archived receipt cannot commit", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  const expectedRaw = new Uint8Array(
+    await new Response(
+      rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`).raw,
+    ).arrayBuffer(),
+  );
+  let receiptAttempts = 0;
   let queued = false;
+  let forwarded = false;
+  let rejected = false;
+  let projectedRaw: Uint8Array | undefined;
+  let projection:
+    | {
+        folder: string;
+        email: Record<string, unknown>;
+        allowTerminalRecovery: boolean;
+      }
+    | undefined;
   await receiveEmail(
     {
       from: "sender@example.com",
       to: mailboxAddress,
       ...raw,
-      setReject(reason: string) {
-        assert.fail(`valid preserved mail must not be rejected: ${reason}`);
+      async forward() {
+        forwarded = true;
+        return { messageId: "must-not-forward" };
+      },
+      setReject() {
+        rejected = true;
       },
     },
     {
+      BRAND: "wiser",
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
       EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      DB: mailboxDb(),
       BUCKET: {
         async head() {
           return {};
         },
+        async put() {
+          assert.fail("plain direct projection must not create derived objects");
+        },
+        async delete() {},
       },
       RAW_MAIL_BUCKET: {
         async put(
@@ -521,6 +547,7 @@ test("inbound delivery never enqueues before the durable admission decision comm
           options?: R2PutTestOptions,
         ) {
           if (key.startsWith("receipts/")) {
+            receiptAttempts += 1;
             throw new Error("simulated receipt outage");
           }
           assert.ok(value instanceof ArrayBuffer);
@@ -532,19 +559,506 @@ test("inbound delivery never enqueues before the durable admission decision comm
           queued = true;
         },
       },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return projection?.email ?? null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail(command: {
+              folder: string;
+              email: Record<string, unknown>;
+              allowTerminalRecovery: boolean;
+            }) {
+              projection = command;
+              return { status: "stored", cleanupKeys: [] };
+            },
+          };
+        },
+      },
     },
     { waitUntil() {} },
     {
       now: () => new Date("2026-07-13T09:30:00.000Z"),
       randomUUID: () => "admission-write-failure",
       sleep: () => Promise.resolve(),
+      async parse(rawBytes: ArrayBuffer) {
+        projectedRaw = new Uint8Array(rawBytes);
+        return {
+          headers: [],
+          headerLines: [],
+          from: { name: "Sender", address: "sender@example.com" },
+          to: [{ name: "Mailbox", address: mailboxAddress }],
+          subject: "Archived receipt recovery",
+          text: "Exact archived body",
+          attachments: [],
+        };
+      },
     },
   );
 
+  assert.equal(receiptAttempts, 10);
   assert.equal(queued, false);
+  assert.equal(forwarded, false);
+  assert.equal(rejected, false);
+  assert.deepEqual(projectedRaw, expectedRaw);
+  assert.equal(projection?.email.id, "admission-write-failure");
+  assert.equal(projection?.email.date, "2026-07-13T09:30:00.000Z");
+  assert.equal(projection?.folder, "inbox");
+  assert.equal(projection?.allowTerminalRecovery, false);
 });
 
-test("inbound delivery never regresses a receipt state advanced by the Queue consumer", async () => {
+for (const scenario of [
+  { name: "emergency-forwards once when direct projection fails", forwardSucceeds: true },
+  { name: "rejects SMTP when direct projection and emergency forwarding fail", forwardSucceeds: false },
+]) {
+  test(`inbound delivery ${scenario.name} after the archived receipt cannot commit`, async () => {
+    const mailboxAddress = "hello@wiserchat.ai";
+    const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+    let forwardCalls = 0;
+    let rejection: string | undefined;
+
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...raw,
+        async forward(recipient: string, headers?: Headers) {
+          forwardCalls += 1;
+          assert.equal(recipient, "verified-backup@example.com");
+          assert.equal(headers, undefined);
+          if (!scenario.forwardSucceeds)
+            throw new Error("simulated emergency forwarding outage");
+          return { messageId: "archived-receipt-emergency-forward" };
+        },
+        setReject(reason: string) {
+          rejection = reason;
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        DB: mailboxDb(),
+        BUCKET: {
+          async head() {
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put(
+            key: string,
+            value: ArrayBuffer | string,
+            options?: R2PutTestOptions,
+          ) {
+            if (key.startsWith("receipts/"))
+              throw new Error("simulated receipt outage");
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          },
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            assert.fail("mail without a durable admission receipt must not enqueue");
+          },
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            throw new Error("simulated direct Mailbox outage");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-13T09:30:00.000Z"),
+        randomUUID: () => `archived-receipt-${scenario.forwardSucceeds}`,
+        sleep: () => Promise.resolve(),
+      },
+    );
+
+    assert.equal(forwardCalls, 1);
+    if (scenario.forwardSucceeds) assert.equal(rejection, undefined);
+    else assert.match(rejection ?? "", /could not be stored.*resend later/i);
+  });
+}
+
+for (const deactivationCase of [
+  {
+    name: "immediately before direct projection",
+    activeThroughCheck: 1,
+    expectedActiveChecks: 2,
+    expectedProjectionCalls: 0,
+  },
+  {
+    name: "before a direct projection retry",
+    activeThroughCheck: 2,
+    expectedActiveChecks: 3,
+    expectedProjectionCalls: 1,
+  },
+]) {
+  test(`inbound delivery rejects when a mailbox becomes inactive ${deactivationCase.name}`, async () => {
+    const mailboxAddress = "hello@wiserchat.ai";
+    const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+    let activeChecks = 0;
+    let forwardCalls = 0;
+    let projectionCalls = 0;
+    let queueCalls = 0;
+    let rejection: string | undefined;
+
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...raw,
+        async forward() {
+          forwardCalls += 1;
+          return { messageId: "must-not-forward" };
+        },
+        setReject(reason: string) {
+          rejection = reason;
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        DB: {
+          prepare(query: string) {
+            assert.match(query, /FROM mailboxes/);
+            return {
+              bind(mailboxId: string) {
+                assert.equal(mailboxId, mailboxAddress);
+                return {
+                  async first() {
+                    activeChecks += 1;
+                    return activeChecks <= deactivationCase.activeThroughCheck
+                      ? { id: mailboxId }
+                      : null;
+                  },
+                };
+              },
+            };
+          },
+        },
+        BUCKET: {
+          async head() {
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put(
+            key: string,
+            value: ArrayBuffer | string,
+            options?: R2PutTestOptions,
+          ) {
+            if (key.startsWith("receipts/"))
+              throw new Error("simulated receipt outage");
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          },
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            queueCalls += 1;
+          },
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            return {
+              async isEmailDeleted() {
+                return false;
+              },
+              async getEmail() {
+                return false;
+              },
+              async findThreadBySubject() {
+                return null;
+              },
+              async createInboundEmail() {
+                projectionCalls += 1;
+                if (deactivationCase.expectedProjectionCalls === 1)
+                  throw new Error("simulated first projection failure");
+                return { status: "stored", cleanupKeys: [] };
+              },
+            };
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-15T10:00:00.000Z"),
+        randomUUID: () => "direct-projection-deactivation",
+        sleep: () => Promise.resolve(),
+        async parse() {
+          return {
+            headers: [],
+            headerLines: [],
+            from: { name: "Sender", address: "sender@example.com" },
+            to: [{ name: "Mailbox", address: mailboxAddress }],
+            text: "Must not project",
+            attachments: [],
+          };
+        },
+      },
+    );
+
+    assert.equal(activeChecks, deactivationCase.expectedActiveChecks);
+    assert.equal(projectionCalls, deactivationCase.expectedProjectionCalls);
+    assert.equal(queueCalls, 0);
+    assert.equal(forwardCalls, 0);
+    assert.match(rejection ?? "", /mailbox unavailable/i);
+  });
+}
+
+test("inbound delivery emergency-forwards once when the per-attempt active recheck is unavailable", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let activeChecks = 0;
+  let forwardCalls = 0;
+  let projectionCalls = 0;
+  let queueCalls = 0;
+  let rejection: string | undefined;
+  const receiptStates: string[] = [];
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward(recipient: string) {
+        forwardCalls += 1;
+        assert.equal(recipient, "verified-backup@example.com");
+        return { messageId: "per-attempt-recheck-forward" };
+      },
+      setReject(reason: string) {
+        rejection = reason;
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      DB: {
+        prepare(query: string) {
+          assert.match(query, /FROM mailboxes/);
+          return {
+            bind(mailboxId: string) {
+              assert.equal(mailboxId, mailboxAddress);
+              return {
+                async first() {
+                  activeChecks += 1;
+                  if (activeChecks === 3)
+                    throw new Error("simulated per-attempt active lookup outage");
+                  return { id: mailboxId };
+                },
+              };
+            },
+          };
+        },
+      },
+      BUCKET: {
+        async head() {
+          return {};
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (!key.startsWith("receipts/")) {
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          }
+          const state = JSON.parse(String(value)).state as string;
+          receiptStates.push(state);
+          if (state === "admitted")
+            throw new Error("simulated admitted receipt outage");
+          return r2Object(key, String(value).length, options, "archived-etag");
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          queueCalls += 1;
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async isEmailDeleted() {
+              return false;
+            },
+            async getEmail() {
+              return null;
+            },
+            async createInboundEmail() {
+              projectionCalls += 1;
+              return { status: "stored", cleanupKeys: [] };
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-15T10:00:00.000Z"),
+      randomUUID: () => "per-attempt-active-recheck",
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(activeChecks, 3);
+  assert.deepEqual(receiptStates, ["archived", ...Array(10).fill("admitted")]);
+  assert.equal(projectionCalls, 0);
+  assert.equal(queueCalls, 0);
+  assert.equal(forwardCalls, 1);
+  assert.equal(rejection, undefined);
+});
+
+async function assertEmergencyForwardResultRejected(
+  forwardResult: unknown,
+): Promise<void> {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let forwardCalls = 0;
+  let rejection: string | undefined;
+  const logs: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+  const originalConsoleLog = console.log;
+  const originalConsoleError = console.error;
+  const capture = (message: string, fields?: Record<string, unknown>) => {
+    logs.push({ message, fields });
+  };
+  console.log = capture;
+  console.error = capture;
+  try {
+    const message = {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward() {
+        forwardCalls += 1;
+        return { messageId: "valid-test-fixture" };
+      },
+      setReject(reason: string) {
+        rejection = reason;
+      },
+    };
+    Object.defineProperty(message, "forward", {
+      value: async () => {
+        forwardCalls += 1;
+        return forwardResult;
+      },
+    });
+
+    await receiveEmail(
+      message,
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        DB: mailboxDb(),
+        BUCKET: {
+          async head() {
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put(
+            key: string,
+            value: ArrayBuffer | string,
+            options?: R2PutTestOptions,
+          ) {
+            if (key.startsWith("receipts/"))
+              throw new Error("simulated receipt outage");
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          },
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            assert.fail("mail without a durable admission receipt must not enqueue");
+          },
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            throw new Error("simulated direct Mailbox outage");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-15T10:00:00.000Z"),
+        randomUUID: () => "missing-forward-message-id",
+        sleep: () => Promise.resolve(),
+      },
+    );
+  } finally {
+    console.log = originalConsoleLog;
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(forwardCalls, 1);
+  assert.match(rejection ?? "", /could not be stored.*resend later/i);
+  assert.equal(
+    logs.some(
+      (entry) =>
+        entry.fields?.operation === "emergency_forward" &&
+        entry.fields?.status === "succeeded",
+    ),
+    false,
+  );
+  if (
+    forwardResult &&
+    typeof forwardResult === "object" &&
+    "messageId" in forwardResult &&
+    typeof forwardResult.messageId === "string"
+  ) {
+    assert.equal(
+      logs.some((entry) =>
+        Object.values(entry.fields ?? {}).some(
+          (value) => value === forwardResult.messageId,
+        ),
+      ),
+      false,
+    );
+  }
+  assert.doesNotMatch(JSON.stringify(logs), /provider-message-id-poison/);
+}
+
+test("inbound delivery rejects SMTP when emergency forwarding resolves without a message ID", async () => {
+  await assertEmergencyForwardResultRejected({});
+});
+
+test("inbound delivery rejects SMTP when emergency forwarding resolves with a non-string message ID", async () => {
+  await assertEmergencyForwardResultRejected({
+    messageId: { privatePayload: "provider-message-id-poison" },
+  });
+});
+
+test("inbound delivery rejects SMTP when emergency forwarding resolves with a whitespace-only message ID", async () => {
+  await assertEmergencyForwardResultRejected({ messageId: " \t\n" });
+});
+
+test("inbound delivery keeps a successful Queue handoff when enqueued receipt advancement loses CAS", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
   let receiptState: string | undefined;
@@ -622,6 +1136,9 @@ test("inbound delivery never regresses a receipt state advanced by the Queue con
       from: "sender@example.com",
       to: mailboxAddress,
       ...raw,
+      async forward() {
+        assert.fail("successful Queue handoff must not emergency-forward");
+      },
       setReject(reason: string) {
         assert.fail(`known mailbox was rejected: ${reason}`);
       },
@@ -636,6 +1153,202 @@ test("inbound delivery never regresses a receipt state advanced by the Queue con
 
   assert.equal(enqueuedCondition, "admitted-receipt-etag");
   assert.equal(receiptState, "stored");
+});
+
+test("inbound delivery directly projects when the admitted receipt cannot commit", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  const receiptStates: string[] = [];
+  let queued = false;
+  let forwarded = false;
+  let rejected = false;
+  let projectedId: unknown;
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward() {
+        forwarded = true;
+        return { messageId: "must-not-forward" };
+      },
+      setReject() {
+        rejected = true;
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain direct projection must not create derived objects");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (!key.startsWith("receipts/")) {
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          }
+          const state: unknown = JSON.parse(String(value)).state;
+          assert.equal(typeof state, "string");
+          receiptStates.push(state);
+          if (state === "archived")
+            return r2Object(
+              key,
+              String(value).length,
+              options,
+              "archived-receipt-etag",
+            );
+          throw new Error("simulated admitted receipt outage");
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          queued = true;
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return projectedId ? {} : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail(command: {
+              email: Record<string, unknown>;
+            }) {
+              projectedId = command.email.id;
+              return { status: "stored", cleanupKeys: [] };
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-15T10:00:00.000Z"),
+      randomUUID: () => "admitted-receipt-failure",
+      sleep: () => Promise.resolve(),
+      async parse() {
+        return {
+          headers: [],
+          headerLines: [],
+          from: { name: "Sender", address: "sender@example.com" },
+          to: [{ name: "Mailbox", address: mailboxAddress }],
+          text: "Recovered admitted body",
+          attachments: [],
+        };
+      },
+    },
+  );
+
+  assert.equal(receiptStates[0], "archived");
+  assert.equal(receiptStates.filter((state) => state === "admitted").length, 10);
+  assert.equal(queued, false);
+  assert.equal(forwarded, false);
+  assert.equal(rejected, false);
+  assert.equal(projectedId, "admitted-receipt-failure");
+});
+
+test("inbound delivery preserves a concurrent terminal winner when admitted receipt CAS loses", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let receiptState = "missing";
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward() {
+        assert.fail("a terminal Mailbox winner must not emergency-forward");
+      },
+      setReject(reason: string) {
+        assert.fail(`a terminal Mailbox winner must not reject: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (!key.startsWith("receipts/")) {
+            assert.ok(value instanceof ArrayBuffer);
+            return r2Object(key, value.byteLength, options);
+          }
+          const nextState: unknown = JSON.parse(String(value)).state;
+          if (nextState === "archived") {
+            receiptState = "archived";
+            return r2Object(
+              key,
+              String(value).length,
+              options,
+              "archived-receipt-etag",
+            );
+          }
+          assert.equal(nextState, "admitted");
+          assert.equal(options?.onlyIf?.etagMatches, "archived-receipt-etag");
+          receiptState = "deleted";
+          return null;
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("an admitted receipt CAS loser must not enqueue");
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async isEmailDeleted() {
+              return true;
+            },
+            async getEmail() {
+              assert.fail("deletion truth must be checked before projection lookup");
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-15T10:00:00.000Z"),
+      randomUUID: () => "admitted-receipt-cas-loss",
+    },
+  );
+
+  assert.equal(receiptState, "deleted");
 });
 
 test("attachment fallback never uploads without a cleanup ledger and forwards once", async () => {
@@ -1417,10 +2130,14 @@ test("inbound delivery refuses handoff when the persisted raw size does not matc
   }
 });
 
-test("inbound delivery preserves the raw archive when Queue enqueue fails", async () => {
+test("inbound delivery directly projects when Queue enqueue fails", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const archivedKeys: string[] = [];
   const receiptStates: string[] = [];
+  let queueCalls = 0;
+  let forwarded = false;
+  let rejected = false;
+  let projectedId: unknown;
   const errors: Array<{ message: string; fields?: Record<string, unknown> }> =
     [];
   const originalConsoleError = console.error;
@@ -1428,34 +2145,20 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
     errors.push({ message, fields });
   };
   try {
-    const raw = rawEmail(
-      [
-        "From: sender@example.com",
-        `To: ${mailboxAddress}`,
-        'Content-Type: multipart/mixed; boundary="direct-boundary"',
-      ].join("\r\n"),
-      [
-        "--direct-boundary",
-        "Content-Type: text/plain",
-        "",
-        "Direct fallback body.",
-        "--direct-boundary",
-        'Content-Type: application/octet-stream; name="fallback.txt"',
-        'Content-Disposition: attachment; filename="fallback.txt"',
-        "Content-Transfer-Encoding: base64",
-        "",
-        "RGlyZWN0IGZhbGxiYWNr",
-        "--direct-boundary--",
-      ].join("\r\n"),
-    );
+    const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
           return {};
         },
+        async put() {
+          assert.fail("plain direct projection must not create derived objects");
+        },
+        async delete() {},
       },
       RAW_MAIL_BUCKET: {
         async put(
@@ -1482,7 +2185,29 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
       },
       INBOUND_QUEUE: {
         async send() {
+          queueCalls += 1;
           throw new Error("simulated Queue outage");
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return projectedId ? {} : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail(command: {
+              email: Record<string, unknown>;
+            }) {
+              projectedId = command.email.id;
+              return { status: "stored", cleanupKeys: [] };
+            },
+          };
         },
       },
     };
@@ -1490,8 +2215,12 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
       from: "sender@example.com",
       to: mailboxAddress,
       ...raw,
-      setReject(reason: string) {
-        assert.fail(`known mailbox was rejected: ${reason}`);
+      async forward() {
+        forwarded = true;
+        return { messageId: "must-not-forward" };
+      },
+      setReject() {
+        rejected = true;
       },
     };
 
@@ -1502,25 +2231,27 @@ test("inbound delivery preserves the raw archive when Queue enqueue fails", asyn
       {
         now: () => new Date("2026-07-13T09:30:00.000Z"),
         randomUUID: () => "queue-failure",
+        async parse() {
+          return {
+            headers: [],
+            headerLines: [],
+            from: { name: "Sender", address: "sender@example.com" },
+            to: [{ name: "Mailbox", address: mailboxAddress }],
+            text: "Queue failure recovery",
+            attachments: [],
+          };
+        },
       },
     );
 
     assert.deepEqual(archivedKeys, ["raw/2026/07/13/queue-failure.eml"]);
     assert.deepEqual(receiptStates, ["archived", "admitted"]);
-    assert.deepEqual(errors, [
-      {
-        message: "[mail-ingress] boundary failed",
-        fields: {
-          durationMs: 0,
-          errorCode: "QUEUE_ENQUEUE_FAILED",
-          ingressRef: errors[0]?.fields?.ingressRef,
-          objectRef: errors[0]?.fields?.objectRef,
-          operation: "queue_enqueue",
-          recoveryAction: "scheduled_reconciliation",
-          status: "deferred",
-        },
-      },
-    ]);
+    assert.equal(queueCalls, 1);
+    assert.equal(projectedId, "queue-failure");
+    assert.equal(forwarded, false);
+    assert.equal(rejected, false);
+    assert.equal(errors[0]?.message, "[mail-ingress] boundary failed");
+    assert.equal(errors[0]?.fields?.errorCode, "QUEUE_ENQUEUE_FAILED");
     assertTelemetryRef(errors[0]?.fields?.ingressRef);
     assertTelemetryRef(errors[0]?.fields?.objectRef);
     assert.doesNotMatch(
@@ -1589,11 +2320,15 @@ test("inbound delivery uses the SMTP envelope recipient when the visible To head
   assert.notEqual(queuedPointer?.mailboxId, "someone-else@example.com");
 });
 
-test("inbound delivery preserves archived mail when the mailbox marker lookup is transiently unavailable", async () => {
+test("inbound delivery directly projects archived mail when the mailbox marker lookup transiently fails", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
   let rawArchived = false;
+  let markerChecks = 0;
   let queued = false;
+  let forwarded = false;
+  let rejected = false;
+  let projectedId: unknown;
   const errors: Array<{ message: string; fields?: Record<string, unknown> }> =
     [];
   const originalConsoleError = console.error;
@@ -1604,10 +2339,19 @@ test("inbound delivery preserves archived mail when the mailbox marker lookup is
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      DB: mailboxDb(),
       BUCKET: {
         async head() {
-          throw new Error("simulated mailbox marker outage");
+          markerChecks += 1;
+          if (markerChecks === 1)
+            throw new Error("simulated mailbox marker outage");
+          return {};
         },
+        async put() {
+          assert.fail("plain direct projection must not create derived objects");
+        },
+        async delete() {},
       },
       RAW_MAIL_BUCKET: {
         async put(
@@ -1636,15 +2380,38 @@ test("inbound delivery preserves archived mail when the mailbox marker lookup is
           queued = true;
         },
       },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return projectedId ? {} : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail(command: {
+              email: Record<string, unknown>;
+            }) {
+              projectedId = command.email.id;
+              return { status: "stored", cleanupKeys: [] };
+            },
+          };
+        },
+      },
     };
     const message = {
       from: "sender@example.com",
       to: mailboxAddress,
       ...raw,
-      setReject(reason: string) {
-        assert.fail(
-          `transient lookup outage must not permanently reject: ${reason}`,
-        );
+      async forward() {
+        forwarded = true;
+        return { messageId: "must-not-forward" };
+      },
+      setReject() {
+        rejected = true;
       },
     };
 
@@ -1655,11 +2422,25 @@ test("inbound delivery preserves archived mail when the mailbox marker lookup is
       {
         now: () => new Date("2026-07-13T09:30:00.000Z"),
         randomUUID: () => "admission-lookup-outage",
+        async parse() {
+          return {
+            headers: [],
+            headerLines: [],
+            from: { name: "Sender", address: "sender@example.com" },
+            to: [{ name: "Mailbox", address: mailboxAddress }],
+            text: "Recovered body",
+            attachments: [],
+          };
+        },
       },
     );
 
     assert.equal(rawArchived, true);
+    assert.equal(markerChecks, 2);
     assert.equal(queued, false);
+    assert.equal(forwarded, false);
+    assert.equal(rejected, false);
+    assert.equal(projectedId, "admission-lookup-outage");
     assert.equal(errors.length, 1);
     assert.equal(errors[0].fields?.errorCode, "MAILBOX_ADMISSION_CHECK_FAILED");
     assert.equal(errors[0].fields?.status, "degraded");
@@ -1668,28 +2449,45 @@ test("inbound delivery preserves archived mail when the mailbox marker lookup is
   }
 });
 
-for (const testCase of [
+const d1AdmissionCases: Array<{
+  name: string;
+  dbState: "inactive" | "unavailable";
+  expectedReceipts: string[];
+  expectedRejection: boolean;
+  expectedForward: boolean;
+}> = [
   {
     name: "rejects an archived delivery when D1 says the mailbox is inactive",
-    dbState: "inactive" as const,
+    dbState: "inactive",
     expectedReceipts: ["archived", "rejected"],
     expectedRejection: true,
+    expectedForward: false,
   },
   {
-    name: "preserves an archived delivery when the D1 active lookup is transiently unavailable",
-    dbState: "unavailable" as const,
+    name: "emergency-forwards an archived delivery when the D1 active lookup remains unavailable",
+    dbState: "unavailable",
     expectedReceipts: ["archived"],
     expectedRejection: false,
+    expectedForward: true,
   },
-]) {
+];
+
+for (const testCase of d1AdmissionCases) {
   test(`inbound delivery ${testCase.name}`, async () => {
     const mailboxAddress = "hello@wiserchat.ai";
     const receiptStates: string[] = [];
+    let forwarded = false;
+    let projected = false;
     let rejection: string | undefined;
     const message = {
       from: "sender@example.com",
       to: mailboxAddress,
       ...rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`),
+      async forward(recipient: string) {
+        forwarded = true;
+        assert.equal(recipient, "verified-backup@example.com");
+        return { messageId: "d1-admission-emergency-forward" };
+      },
       setReject(reason: string) {
         rejection = reason;
       },
@@ -1732,6 +2530,15 @@ for (const testCase of [
             assert.fail("unadmitted archived mail must not enqueue");
           },
         },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            projected = true;
+            throw new Error("unverified recipients must not reach projection");
+          },
+        },
       },
       { waitUntil() {} },
       {
@@ -1742,6 +2549,8 @@ for (const testCase of [
 
     assert.deepEqual(receiptStates, testCase.expectedReceipts);
     assert.equal(Boolean(rejection), testCase.expectedRejection);
+    assert.equal(forwarded, testCase.expectedForward);
+    assert.equal(projected, false);
   });
 }
 
@@ -1804,63 +2613,118 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
   assert.equal(rawWasArchived, true);
 });
 
-test("inbound delivery never issues SMTP rejection until the rejected receipt is durable", async () => {
-  const mailboxAddress = "missing@wiserchat.ai";
-  const states: string[] = [];
-  let rejected = false;
-  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+for (const recipientCase of [
+  {
+    name: "statically invalid",
+    mailboxAddress: "blocked@wiserchat.ai",
+    allowedAddresses: ["hello@wiserchat.ai"],
+    mailboxProvisioned: true,
+    mailboxState: "active",
+  },
+  {
+    name: "unprovisioned",
+    mailboxAddress: "missing@wiserchat.ai",
+    allowedAddresses: [],
+    mailboxProvisioned: false,
+    mailboxState: "active",
+  },
+  {
+    name: "inactive",
+    mailboxAddress: "inactive@wiserchat.ai",
+    allowedAddresses: [],
+    mailboxProvisioned: true,
+    mailboxState: "inactive",
+  },
+]) {
+  test(`inbound delivery rejects a proven ${recipientCase.name} recipient when rejection receipt persistence fails`, async () => {
+    const receiptStates: string[] = [];
+    let forwarded = false;
+    let projected = false;
+    let rejection: string | undefined;
+    const raw = rawEmail(
+      `From: sender@example.com\r\nTo: ${recipientCase.mailboxAddress}`,
+    );
 
-  await receiveEmail(
-    {
-      from: "sender@example.com",
-      to: mailboxAddress,
-      ...raw,
-      setReject() {
-        rejected = true;
-      },
-    },
-    {
-      DOMAINS: "wiserchat.ai",
-      EMAIL_ADDRESSES: [],
-      DB: mailboxDb(),
-      BUCKET: {
-        async head() {
-          return null;
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: recipientCase.mailboxAddress,
+        ...raw,
+        async forward() {
+          forwarded = true;
+          return { messageId: "must-not-forward" };
+        },
+        setReject(reason: string) {
+          rejection = reason;
         },
       },
-      RAW_MAIL_BUCKET: {
-        async put(
-          key: string,
-          value: ArrayBuffer | string,
-          options?: R2PutTestOptions,
-        ) {
-          if (!key.startsWith("receipts/")) {
-            assert.ok(value instanceof ArrayBuffer);
-            return r2Object(key, value.byteLength, options);
-          }
-          const state = JSON.parse(String(value)).state as string;
-          states.push(state);
-          return state === "archived"
-            ? r2Object(key, String(value).length, options, "archived-etag")
-            : null;
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: recipientCase.allowedAddresses,
+        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        DB: mailboxDb(
+          recipientCase.mailboxState === "inactive" ? "inactive" : "active",
+        ),
+        BUCKET: {
+          async head() {
+            if (recipientCase.name === "statically invalid")
+              assert.fail("statically invalid recipients must not reach Mailbox markers");
+            return recipientCase.mailboxProvisioned ? {} : null;
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async put(
+            key: string,
+            value: ArrayBuffer | string,
+            options?: R2PutTestOptions,
+          ) {
+            if (!key.startsWith("receipts/")) {
+              assert.ok(value instanceof ArrayBuffer);
+              return r2Object(key, value.byteLength, options);
+            }
+            const state: unknown = JSON.parse(String(value)).state;
+            assert.equal(typeof state, "string");
+            receiptStates.push(state);
+            if (state === "archived")
+              return r2Object(
+                key,
+                String(value).length,
+                options,
+                "archived-etag",
+              );
+            throw new Error("simulated rejected receipt outage");
+          },
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            assert.fail("rejected recipients must not enqueue");
+          },
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            projected = true;
+            throw new Error("rejected recipients must not reach Mailbox projection");
+          },
         },
       },
-      INBOUND_QUEUE: {
-        async send() {
-          assert.fail("unprovisioned mail must not enqueue");
-        },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-15T10:00:00.000Z"),
+        randomUUID: () => `rejection-receipt-${recipientCase.name}`,
+        sleep: () => Promise.resolve(),
       },
-    },
-    { waitUntil() {} },
-    {
-      now: () => new Date("2026-07-15T10:00:00.000Z"),
-      randomUUID: () => "rejection-receipt-race",
-    },
-  );
+    );
 
-  assert.deepEqual(states, ["archived", "rejected"]);
-  assert.equal(rejected, false);
-});
+    assert.equal(receiptStates[0], "archived");
+    assert.equal(receiptStates.filter((state) => state === "rejected").length, 10);
+    assert.match(rejection ?? "", /mailbox unavailable/i);
+    assert.equal(forwarded, false);
+    assert.equal(projected, false);
+  });
+}
 
 test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", async () => {
   let rejection: string | undefined;

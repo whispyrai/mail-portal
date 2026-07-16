@@ -45,6 +45,248 @@ function mailboxDb(
   };
 }
 
+function inboundReceiptBody(
+  pointer: {
+    ingressId: string;
+    rawKey: string;
+    rawSize: number;
+    archivedAt: string;
+    etag?: string;
+    version?: string;
+    mailboxId?: string;
+    rawSha256?: string;
+  },
+  state: string,
+  updatedAt: string,
+  details: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    schemaVersion: 1,
+    ingressId: pointer.ingressId,
+    rawKey: pointer.rawKey,
+    mailboxId: pointer.mailboxId ?? "hello@wiserchat.ai",
+    rawSize: pointer.rawSize,
+    ...(pointer.rawSha256 === undefined
+      ? {}
+      : { rawSha256: pointer.rawSha256 }),
+    archivedAt: pointer.archivedAt,
+    etag: pointer.etag ?? "archive-etag",
+    version: pointer.version ?? "archive-version",
+    state,
+    updatedAt,
+    ...details,
+  });
+}
+
+type MissingReceiptMailboxTruth =
+  | "stored"
+  | "deleted"
+  | "dead_lettered"
+  | "malformed_terminal"
+  | "none";
+
+function missingReceiptTruthFixture(
+  truth: MissingReceiptMailboxTruth,
+  options: {
+    anomalyProofFails?: boolean;
+    concurrentReceiptText?: string | null;
+    failureLedgerWriteFails?: boolean;
+    receiptCommits?: boolean;
+    startWithPendingAnomaly?: boolean;
+  } = {},
+) {
+  const ingressId = `missing-receipt-${truth}`;
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  const truthReads: string[] = [];
+  let reconstructedReceipt: Record<string, unknown> | undefined;
+  let receiptCreateCondition: string | undefined;
+  let pendingAnomaly: Record<string, unknown> | undefined =
+    options.startWithPendingAnomaly === false
+      ? undefined
+      : JSON.parse(pendingReconciliationAnomaly(ingressId, rawKey));
+  let resolvedAnomaly: Record<string, unknown> | undefined;
+  let recoveryPointer: Record<string, unknown> | undefined;
+  let queueCalls = 0;
+  let receiptReads = 0;
+  let cursorPersisted = false;
+  let failureLedger: Record<string, unknown> | undefined;
+
+  const env = {
+    DOMAINS: "wiserchat.ai",
+    EMAIL_ADDRESSES: [],
+    DB: mailboxDb(),
+    BUCKET: derivedBucketWithoutDelete,
+    RAW_MAIL_BUCKET: {
+      async list(options: { prefix: string }) {
+        return {
+          objects: options.prefix === "raw/" ? [{ key: rawKey }] : [],
+          truncated: false,
+        };
+      },
+      async head(key: string) {
+        assert.equal(key, rawKey);
+        return {
+          key: rawKey,
+          size: 321,
+          etag: "archive-etag",
+          version: "archive-version",
+          customMetadata: {
+            archivedAt: "2026-07-15T09:00:00.000Z",
+            ingressId,
+            mailboxId: "hello@wiserchat.ai",
+            rawSize: "321",
+            rawSha256: "a".repeat(64),
+            schemaVersion: "1",
+          },
+        };
+      },
+      async get(key: string) {
+        if (key === "system/reconciliation-cursor.json") return null;
+        if (key === `receipts/${ingressId}.json`) {
+          receiptReads += 1;
+          if (receiptReads === 1 || options.concurrentReceiptText === undefined)
+            return null;
+          if (options.concurrentReceiptText === null) return null;
+          return {
+            etag: "concurrent-receipt-etag",
+            async text() {
+              return options.concurrentReceiptText ?? "";
+            },
+          };
+        }
+        if (key.startsWith("system/reconciliation-anomalies/")) {
+          if (!pendingAnomaly) return null;
+          return {
+            etag: "pending-anomaly-etag",
+            async text() {
+              return JSON.stringify(pendingAnomaly);
+            },
+          };
+        }
+        return null;
+      },
+      async put(
+        key: string,
+        value: string,
+        putOptions?: {
+          onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+        },
+      ) {
+        if (key === `receipts/${ingressId}.json`) {
+          reconstructedReceipt = JSON.parse(value);
+          receiptCreateCondition = putOptions?.onlyIf?.etagDoesNotMatch;
+          return options.receiptCommits === false
+            ? null
+            : { etag: "reconstructed-receipt-etag" };
+        }
+        if (key.startsWith("system/reconciliation-anomalies/")) {
+          if (options.anomalyProofFails) return null;
+          const anomaly: Record<string, unknown> = JSON.parse(value);
+          if (anomaly.status === "resolved") {
+            resolvedAnomaly = anomaly;
+            pendingAnomaly = undefined;
+          } else {
+            pendingAnomaly = anomaly;
+          }
+          return {};
+        }
+        if (key.startsWith("system/inbound-recovery-pointers/")) {
+          recoveryPointer = JSON.parse(value);
+          return {};
+        }
+        if (key.startsWith("system/reconciliation-failures/")) {
+          if (options.failureLedgerWriteFails)
+            throw new Error("simulated reconciliation failure-ledger outage");
+          failureLedger = JSON.parse(value);
+          return {};
+        }
+        if (key === "system/reconciliation-cursor.json") {
+          cursorPersisted = true;
+          return {};
+        }
+        return {};
+      },
+      async delete() {},
+    },
+    INBOUND_QUEUE: {
+      async send() {
+        queueCalls += 1;
+      },
+    },
+    MAILBOX: {
+      idFromName(mailboxId: string) {
+        return mailboxId;
+      },
+      get() {
+        return {
+          async getEmail() {
+            assert.fail("hasEmail is the available projection truth seam");
+          },
+          async isEmailDeleted() {
+            truthReads.push("deleted");
+            return truth === "deleted";
+          },
+          async hasEmail() {
+            truthReads.push("stored");
+            return truth === "stored";
+          },
+          async getInboundTerminalFailure() {
+            truthReads.push("terminal");
+            if (truth === "malformed_terminal") {
+              return {
+                queueRef: "provider-message-id",
+                attempts: 10,
+                errorCode: "QUEUE_RETRY_EXHAUSTED",
+                recordedAt: "2026-07-15T09:45:00.000Z",
+              };
+            }
+            if (truth !== "dead_lettered") return null;
+            return {
+              queueRef: "d06683c38d7755ce",
+              attempts: 10,
+              errorCode: "QUEUE_RETRY_EXHAUSTED",
+              recordedAt: "2026-07-15T09:45:00.000Z",
+            };
+          },
+        };
+      },
+    },
+  };
+
+  return {
+    env,
+    ingressId,
+    rawKey,
+    observations: {
+      get pendingAnomaly() {
+        return pendingAnomaly;
+      },
+      get queueCalls() {
+        return queueCalls;
+      },
+      get cursorPersisted() {
+        return cursorPersisted;
+      },
+      get failureLedger() {
+        return failureLedger;
+      },
+      get receiptCreateCondition() {
+        return receiptCreateCondition;
+      },
+      get reconstructedReceipt() {
+        return reconstructedReceipt;
+      },
+      get recoveryPointer() {
+        return recoveryPointer;
+      },
+      get resolvedAnomaly() {
+        return resolvedAnomaly;
+      },
+      truthReads,
+    },
+  };
+}
+
 test("reconciliation generation-fences a content-free marker for missing derived objects", async () => {
   const ingressId = "derived-anomaly";
   const rawKey = `raw/2026/07/15/${ingressId}.eml`;
@@ -86,10 +328,18 @@ test("reconciliation generation-fences a content-free marker for missing derived
           return {
             etag: "receipt-etag",
             async text() {
-              return JSON.stringify({
-                state: "stored",
-                updatedAt: "2026-07-15T09:00:00.000Z",
-              });
+              return inboundReceiptBody(
+                {
+                  ingressId,
+                  rawKey,
+                  rawSize: 123,
+                  archivedAt: "2026-07-15T09:00:00.000Z",
+                  etag: "raw-etag",
+                  version: "raw-version",
+                },
+                "stored",
+                "2026-07-15T09:00:00.000Z",
+              );
             },
           };
         }
@@ -223,10 +473,18 @@ test("reconciliation rejects poisoned Mailbox manifests before R2 inspection or 
             return {
               etag: "receipt-etag",
               async text() {
-                return JSON.stringify({
-                  state: "stored",
-                  updatedAt: "2026-07-15T09:00:00.000Z",
-                });
+                return inboundReceiptBody(
+                  {
+                    ingressId,
+                    rawKey,
+                    rawSize: 123,
+                    archivedAt: "2026-07-15T09:00:00.000Z",
+                    etag: "raw-etag",
+                    version: "raw-version",
+                  },
+                  "stored",
+                  "2026-07-15T09:00:00.000Z",
+                );
               },
             };
           }
@@ -280,6 +538,273 @@ test("reconciliation rejects poisoned Mailbox manifests before R2 inspection or 
   assert.equal(JSON.stringify(logs).includes(poison), false);
 });
 
+test("reconciliation reconstructs a missing stored receipt from Mailbox truth before admission review", async () => {
+  const fixture = missingReceiptTruthFixture("stored");
+
+  const result = await reconcileInboundArchives(fixture.env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.terminalized, 1);
+  assert.equal(result.pendingReview, 0);
+  assert.equal(result.reenqueued, 0);
+  assert.equal(fixture.observations.reconstructedReceipt?.state, "stored");
+  assert.equal(
+    fixture.observations.reconstructedReceipt?.errorCode,
+    "MAILBOX_PROJECTION_RECOVERED",
+  );
+  assert.equal(fixture.observations.receiptCreateCondition, "*");
+  assert.equal(fixture.observations.resolvedAnomaly?.status, "resolved");
+  assert.equal(
+    fixture.observations.resolvedAnomaly?.resolution,
+    "mailbox_projection_stored",
+  );
+  assert.equal(fixture.observations.recoveryPointer, undefined);
+  assert.equal(fixture.observations.queueCalls, 0);
+  assert.deepEqual(fixture.observations.truthReads, ["deleted", "stored"]);
+});
+
+test("reconciliation reconstructs a missing deleted receipt from the Mailbox tombstone first", async () => {
+  const fixture = missingReceiptTruthFixture("deleted");
+
+  const result = await reconcileInboundArchives(fixture.env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.terminalized, 1);
+  assert.equal(result.reenqueued, 0);
+  assert.equal(fixture.observations.reconstructedReceipt?.state, "deleted");
+  assert.equal(
+    fixture.observations.reconstructedReceipt?.errorCode,
+    "MAILBOX_PROJECTION_DELETED",
+  );
+  assert.equal(fixture.observations.receiptCreateCondition, "*");
+  assert.equal(
+    fixture.observations.resolvedAnomaly?.resolution,
+    "mailbox_projection_deleted",
+  );
+  assert.equal(fixture.observations.recoveryPointer, undefined);
+  assert.equal(fixture.observations.queueCalls, 0);
+  assert.deepEqual(fixture.observations.truthReads, ["deleted"]);
+});
+
+test("reconciliation reconstructs a missing dead-lettered receipt from the valid Mailbox terminal ledger", async () => {
+  const fixture = missingReceiptTruthFixture("dead_lettered");
+
+  const result = await reconcileInboundArchives(fixture.env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.terminalized, 1);
+  assert.equal(result.reenqueued, 0);
+  assert.equal(
+    fixture.observations.reconstructedReceipt?.state,
+    "dead_lettered",
+  );
+  assert.deepEqual(
+    fixture.observations.reconstructedReceipt?.terminalFailure,
+    {
+      queueRef: "d06683c38d7755ce",
+      attempts: 10,
+      errorCode: "QUEUE_RETRY_EXHAUSTED",
+      recordedAt: "2026-07-15T09:45:00.000Z",
+    },
+  );
+  assert.equal(fixture.observations.receiptCreateCondition, "*");
+  assert.equal(
+    fixture.observations.resolvedAnomaly?.resolution,
+    "terminal_failure_ledger_recovered",
+  );
+  assert.equal(fixture.observations.recoveryPointer, undefined);
+  assert.equal(fixture.observations.queueCalls, 0);
+  assert.deepEqual(fixture.observations.truthReads, [
+    "deleted",
+    "stored",
+    "terminal",
+  ]);
+});
+
+test("reconciliation keeps malformed missing-receipt terminal truth operator-visible", async () => {
+  const fixture = missingReceiptTruthFixture("malformed_terminal");
+
+  const result = await reconcileInboundArchives(fixture.env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.pendingReview, 1);
+  assert.equal(result.terminalized, 0);
+  assert.equal(result.reenqueued, 0);
+  assert.equal(fixture.observations.reconstructedReceipt, undefined);
+  assert.equal(
+    fixture.observations.pendingAnomaly?.errorCode,
+    "DLQ_TERMINAL_LEDGER_MISSING",
+  );
+  assert.equal(fixture.observations.recoveryPointer, undefined);
+  assert.equal(fixture.observations.queueCalls, 0);
+  assert.deepEqual(fixture.observations.truthReads, [
+    "deleted",
+    "stored",
+    "terminal",
+  ]);
+});
+
+test("reconciliation preserves the concurrent receipt winner when missing-receipt reconstruction loses CAS", async () => {
+  const fixture = missingReceiptTruthFixture("stored", {
+    receiptCommits: false,
+    concurrentReceiptText: inboundReceiptBody(
+      {
+        ingressId: "missing-receipt-stored",
+        rawKey: "raw/2026/07/15/missing-receipt-stored.eml",
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "stored",
+      "2026-07-15T09:59:00.000Z",
+    ),
+  });
+
+  const result = await reconcileInboundArchives(fixture.env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.skipped, 1);
+  assert.equal(result.terminalized, 0);
+  assert.equal(result.pendingReview, 0);
+  assert.equal(result.reenqueued, 0);
+  assert.equal(fixture.observations.receiptCreateCondition, "*");
+  assert.equal(fixture.observations.resolvedAnomaly, undefined);
+  assert.equal(fixture.observations.pendingAnomaly?.status, "pending_operator_review");
+  assert.equal(fixture.observations.recoveryPointer, undefined);
+  assert.equal(fixture.observations.queueCalls, 0);
+});
+
+for (const compatibleWinner of [
+  {
+    truth: "deleted" as const,
+    details: { errorCode: "MAILBOX_PROJECTION_DELETED", reconciled: true },
+  },
+  {
+    truth: "dead_lettered" as const,
+    details: {
+      errorCode: "DLQ_TERMINAL_LEDGER_RECOVERED",
+      reconciled: true,
+      terminalFailure: {
+        queueRef: "d06683c38d7755ce",
+        attempts: 10,
+        errorCode: "QUEUE_RETRY_EXHAUSTED",
+        recordedAt: "2026-07-15T09:45:00.000Z",
+      },
+    },
+  },
+]) {
+  test(`reconciliation preserves an exact ${compatibleWinner.truth} winner when missing-receipt reconstruction loses CAS`, async () => {
+    const ingressId = `missing-receipt-${compatibleWinner.truth}`;
+    const fixture = missingReceiptTruthFixture(compatibleWinner.truth, {
+      receiptCommits: false,
+      concurrentReceiptText: inboundReceiptBody(
+        {
+          ingressId,
+          rawKey: `raw/2026/07/15/${ingressId}.eml`,
+          rawSize: 321,
+          rawSha256: "a".repeat(64),
+          archivedAt: "2026-07-15T09:00:00.000Z",
+        },
+        compatibleWinner.truth,
+        "2026-07-15T09:59:00.000Z",
+        compatibleWinner.details,
+      ),
+    });
+
+    const result = await reconcileInboundArchives(fixture.env, {
+      now: () => new Date("2026-07-15T10:00:00.000Z"),
+    });
+
+    assert.equal(result.skipped, 1);
+    assert.equal(result.pendingReview, 0);
+    assert.equal(fixture.observations.pendingAnomaly?.status, "pending_operator_review");
+    assert.equal(fixture.observations.resolvedAnomaly, undefined);
+    assert.equal(fixture.observations.queueCalls, 0);
+  });
+}
+
+for (const concurrentWinner of [
+  { name: "malformed", body: "not-json-provider-poison" },
+  {
+    name: "pointer-mismatched",
+    body: inboundReceiptBody(
+      {
+        ingressId: "missing-receipt-stored",
+        rawKey: "raw/2026/07/15/different-private-object.eml",
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "stored",
+      "2026-07-15T09:59:00.000Z",
+    ),
+  },
+  {
+    name: "valid but backward",
+    body: inboundReceiptBody(
+      {
+        ingressId: "missing-receipt-stored",
+        rawKey: "raw/2026/07/15/missing-receipt-stored.eml",
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "archived",
+      "2026-07-15T09:59:00.000Z",
+    ),
+  },
+  { name: "post-CAS-loss absence", body: null },
+]) {
+  test(`reconciliation records receipt uncertainty when a ${concurrentWinner.name} winner beats stored reconstruction`, async () => {
+    const fixture = missingReceiptTruthFixture("stored", {
+      receiptCommits: false,
+      concurrentReceiptText: concurrentWinner.body,
+      startWithPendingAnomaly: false,
+    });
+
+    const result = await reconcileInboundArchives(fixture.env, {
+      now: () => new Date("2026-07-15T10:00:00.000Z"),
+    });
+
+    assert.equal(result.pendingReview, 1);
+    assert.equal(result.skipped, 0);
+    assert.equal(result.failed, 0);
+    assert.equal(result.reenqueued, 0);
+    assert.equal(fixture.observations.pendingAnomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+    assert.equal(fixture.observations.resolvedAnomaly, undefined);
+    assert.equal(fixture.observations.recoveryPointer, undefined);
+    assert.equal(fixture.observations.queueCalls, 0);
+    assert.equal(fixture.observations.cursorPersisted, true);
+  });
+}
+
+test("reconciliation uses the normal failure ledger when concurrent-winner uncertainty cannot be proven", async () => {
+  const fixture = missingReceiptTruthFixture("stored", {
+    anomalyProofFails: true,
+    concurrentReceiptText: null,
+    receiptCommits: false,
+    startWithPendingAnomaly: false,
+  });
+
+  const result = await reconcileInboundArchives(fixture.env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.pendingReview, 0);
+  assert.equal(result.failed, 1);
+  assert.equal(result.failureLedgered, 1);
+  assert.equal(fixture.observations.failureLedger?.errorCode, "ARCHIVE_RECONCILIATION_FAILED");
+  assert.equal(fixture.observations.resolvedAnomaly, undefined);
+  assert.equal(fixture.observations.recoveryPointer, undefined);
+  assert.equal(fixture.observations.queueCalls, 0);
+  assert.equal(fixture.observations.cursorPersisted, true);
+});
+
 test("reconciliation preserves but never enqueues raw mail without a durable admission decision", async () => {
   const rawKey = "raw/2026/07/13/reconcile-missing-receipt.eml";
   const queued: InboundArchivePointer[] = [];
@@ -287,6 +812,7 @@ test("reconciliation preserves but never enqueues raw mail without a durable adm
   let sweepCursor: Record<string, unknown> | undefined;
   let anomaly: Record<string, unknown> | undefined;
   let recoveryPointer: Record<string, unknown> | undefined;
+  const mailboxTruthReads: string[] = [];
   const env = {
     DOMAINS: "wiserchat.ai",
     EMAIL_ADDRESSES: [],
@@ -361,6 +887,15 @@ test("reconciliation preserves but never enqueues raw mail without a durable adm
       get() {
         return {
           async getEmail() {
+            mailboxTruthReads.push("stored");
+            return null;
+          },
+          async isEmailDeleted() {
+            mailboxTruthReads.push("deleted");
+            return false;
+          },
+          async getInboundTerminalFailure() {
+            mailboxTruthReads.push("terminal");
             return null;
           },
         };
@@ -390,6 +925,1237 @@ test("reconciliation preserves but never enqueues raw mail without a durable adm
   assert.equal(recoveryPointer?.ingressId, "reconcile-missing-receipt");
   assert.equal(recoveryPointer?.rawSha256, "a".repeat(64));
   assert.equal(sweepCursor?.cursor, null);
+  assert.deepEqual(mailboxTruthReads, ["deleted", "stored", "terminal"]);
+});
+
+async function invalidPresentReceiptFixture(
+  receiptText: (pointer: InboundArchivePointer) => string,
+  options: {
+    anomalyWriteFails?: boolean;
+    anomalyWriteReturnsNull?: boolean;
+    failureLedgerWriteFails?: boolean;
+    receiptEtag?: string;
+  } = {},
+) {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "invalid-present-receipt",
+    rawKey: "raw/2026/07/15/invalid-present-receipt.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 321,
+    rawSha256: "a".repeat(64),
+    archivedAt: "2026-07-15T09:00:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  let anomaly: Record<string, unknown> | undefined;
+  let failureLedger: Record<string, unknown> | undefined;
+  let cursorPersisted = false;
+  let receiptWrites = 0;
+  let recoveryPointerWrites = 0;
+  let queueCalls = 0;
+  const logs: unknown[][] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  const capture = (...args: unknown[]) => logs.push(args);
+  console.log = capture;
+  console.error = capture;
+  const result = await (async () => {
+    try {
+      return await reconcileInboundArchives(
+      {
+        DOMAINS: "wiserchat.ai",
+        DB: mailboxDb(),
+        BUCKET: derivedBucketWithoutDelete,
+        RAW_MAIL_BUCKET: {
+          async list(options: { prefix: string }) {
+            return {
+              objects:
+                options.prefix === "raw/" ? [{ key: pointer.rawKey }] : [],
+              truncated: false,
+            };
+          },
+          async head(key: string) {
+            assert.equal(key, pointer.rawKey);
+            return {
+              key: pointer.rawKey,
+              size: pointer.rawSize,
+              etag: pointer.etag,
+              version: pointer.version,
+              customMetadata: {
+                archivedAt: pointer.archivedAt,
+                ingressId: pointer.ingressId,
+                mailboxId: pointer.mailboxId,
+                rawSize: String(pointer.rawSize),
+                rawSha256: pointer.rawSha256,
+                schemaVersion: "1",
+              },
+            };
+          },
+          async get(key: string) {
+            if (key === "system/reconciliation-cursor.json") return null;
+            if (key === `receipts/${pointer.ingressId}.json`) {
+              return {
+                etag: options.receiptEtag ?? "invalid-receipt-etag",
+                async text() {
+                  return receiptText(pointer);
+                },
+              };
+            }
+            return null;
+          },
+          async put(key: string, value: string) {
+            if (key.startsWith("system/reconciliation-anomalies/")) {
+              if (options.anomalyWriteFails)
+                throw new Error("simulated anomaly ledger outage");
+              if (options.anomalyWriteReturnsNull) return null;
+              anomaly = JSON.parse(value);
+            } else if (key.startsWith("system/reconciliation-failures/")) {
+              if (options.failureLedgerWriteFails)
+                throw new Error("simulated failure ledger outage");
+              failureLedger = JSON.parse(value);
+            } else if (key.startsWith("system/inbound-recovery-pointers/")) {
+              recoveryPointerWrites += 1;
+            } else if (key.startsWith("receipts/")) {
+              receiptWrites += 1;
+            } else if (key === "system/reconciliation-cursor.json") {
+              cursorPersisted = true;
+            }
+            return {};
+          },
+          async delete() {},
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            queueCalls += 1;
+          },
+        },
+        MAILBOX: {
+          idFromName() {
+            assert.fail("an invalid-present receipt must not trigger reconstruction");
+          },
+          get() {
+            assert.fail("an invalid-present receipt must not read Mailbox truth");
+          },
+        },
+      },
+      { now: () => new Date("2026-07-15T10:00:00.000Z") },
+    );
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+    }
+  })();
+
+  return {
+    anomaly,
+    cursorPersisted,
+    failureLedger,
+    logs,
+    pointer,
+    queueCalls,
+    receiptWrites,
+    recoveryPointerWrites,
+    result,
+  };
+}
+
+test("reconciliation fails closed when a present receipt contains malformed JSON", async () => {
+  const fixture = await invalidPresentReceiptFixture(
+    () => "not-json-provider-poison",
+  );
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.failureLedgered, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+  assert.equal(fixture.anomaly?.status, "pending_operator_review");
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    /not-json-provider-poison/,
+  );
+});
+
+test("reconciliation fails closed when a present enqueued receipt omits its archive pointer", async () => {
+  const fixture = await invalidPresentReceiptFixture(() =>
+    JSON.stringify({
+      state: "enqueued",
+      updatedAt: "2026-07-15T09:00:00.000Z",
+    }),
+  );
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+});
+
+test("reconciliation fails closed when a full receipt points at a different raw archive", async () => {
+  const fixture = await invalidPresentReceiptFixture((pointer) =>
+    JSON.stringify({
+      ...pointer,
+      rawKey: "raw/2026/07/15/different-private-object.eml",
+      state: "enqueued",
+      updatedAt: "2026-07-15T09:00:00.000Z",
+    }),
+  );
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    /different-private-object/,
+  );
+});
+
+test("reconciliation fails closed when a retrying receipt omits its retry details", async () => {
+  const fixture = await invalidPresentReceiptFixture((pointer) =>
+    JSON.stringify({
+      ...pointer,
+      state: "retrying",
+      updatedAt: "2026-07-15T09:00:00.000Z",
+    }),
+  );
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+});
+
+test("reconciliation fails closed when a full receipt has an invalid update timestamp", async () => {
+  const fixture = await invalidPresentReceiptFixture((pointer) =>
+    JSON.stringify({
+      ...pointer,
+      state: "enqueued",
+      updatedAt: "not-a-timestamp",
+    }),
+  );
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+});
+
+test("reconciliation fails closed when a full receipt has no usable R2 ETag", async () => {
+  const fixture = await invalidPresentReceiptFixture(
+    (pointer) =>
+      JSON.stringify({
+        ...pointer,
+        state: "enqueued",
+        updatedAt: "2026-07-15T09:00:00.000Z",
+      }),
+    { receiptEtag: "" },
+  );
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly?.errorCode, "RECEIPT_STATE_UNKNOWN");
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+});
+
+test("reconciliation holds its cursor when invalid-receipt evidence and the failure ledger cannot commit", async () => {
+  const fixture = await invalidPresentReceiptFixture(
+    () => "not-json",
+    {
+      anomalyWriteReturnsNull: true,
+      failureLedgerWriteFails: true,
+    },
+  );
+
+  assert.equal(fixture.result.pendingReview, 0);
+  assert.equal(fixture.result.failed, 1);
+  assert.equal(fixture.result.failureLedgered, 0);
+  assert.equal(fixture.anomaly, undefined);
+  assert.equal(fixture.failureLedger, undefined);
+  assert.equal(fixture.cursorPersisted, false);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+});
+
+test("reconciliation advances only after an invalid-receipt evidence failure is durably ledgered", async () => {
+  const fixture = await invalidPresentReceiptFixture(
+    () => "not-json",
+    { anomalyWriteFails: true },
+  );
+
+  assert.equal(fixture.result.pendingReview, 0);
+  assert.equal(fixture.result.failed, 1);
+  assert.equal(fixture.result.failureLedgered, 1);
+  assert.equal(
+    fixture.failureLedger?.errorCode,
+    "ARCHIVE_RECONCILIATION_FAILED",
+  );
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.receiptWrites, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.equal(fixture.queueCalls, 0);
+});
+
+async function postAdmissionRereadFixture(input: {
+  admissionWriteOutcome: "committed" | "cas_lost";
+  anomalyWriteLosesCas?: boolean;
+  anomalyWriteFails?: boolean;
+  allowAdmittedContinuation?: boolean;
+  failureLedgerWriteFails?: boolean;
+  ingressId: string;
+  refreshedReceiptText: string | null;
+}) {
+  const ingressId = input.ingressId;
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  const mailboxId = "hello@wiserchat.ai";
+  let receiptReads = 0;
+  let anomaly: Record<string, unknown> | undefined;
+  let anomalyReadAfterCasLoss = false;
+  let failureLedger: Record<string, unknown> | undefined;
+  let failureLedgerDeletes = 0;
+  let cursorPersisted = false;
+  let recoveryPointerWrites = 0;
+  let queueCalls = 0;
+  let mailboxTruthReads = 0;
+  let enqueueReceiptEtag: string | undefined;
+  let admissionWriteCommitted = false;
+  const writes: string[] = [];
+  const logs: unknown[][] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  const capture = (...args: unknown[]) => logs.push(args);
+  console.log = capture;
+  console.error = capture;
+  let result;
+  try {
+    result = await reconcileInboundArchives(
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        DB: mailboxDb(),
+        BUCKET: {
+          async head(key: string) {
+            assert.equal(key, `mailboxes/${mailboxId}.json`);
+            return {};
+          },
+        },
+        RAW_MAIL_BUCKET: {
+          async list(options: { prefix: string }) {
+            return {
+              objects: options.prefix === "raw/" ? [{ key: rawKey }] : [],
+              truncated: false,
+            };
+          },
+          async head(key: string) {
+            assert.equal(key, rawKey);
+            return {
+              key: rawKey,
+              size: 321,
+              etag: "archive-etag",
+              version: "archive-version",
+              customMetadata: {
+                archivedAt: "2026-07-15T09:00:00.000Z",
+                ingressId,
+                mailboxId,
+                rawSize: "321",
+                rawSha256: "a".repeat(64),
+                schemaVersion: "1",
+              },
+            };
+          },
+          async get(key: string) {
+            if (key === "system/reconciliation-cursor.json") return null;
+            if (key === `receipts/${ingressId}.json`) {
+              receiptReads += 1;
+              if (receiptReads === 2) {
+                if (input.refreshedReceiptText === null) return null;
+                return {
+                  etag: "refreshed-receipt-etag",
+                  async text() {
+                    return input.refreshedReceiptText ?? "";
+                  },
+                };
+              }
+              return {
+                etag: "archived-receipt-etag",
+                async text() {
+                  return inboundReceiptBody(
+                    {
+                      ingressId,
+                      rawKey,
+                      rawSize: 321,
+                      rawSha256: "a".repeat(64),
+                      archivedAt: "2026-07-15T09:00:00.000Z",
+                    },
+                    "archived",
+                    "2026-07-15T09:00:00.000Z",
+                  );
+                },
+              };
+            }
+            if (key.startsWith("system/reconciliation-anomalies/")) {
+              if (input.anomalyWriteLosesCas) {
+                anomalyReadAfterCasLoss = true;
+                return {
+                  etag: "concurrent-anomaly-etag",
+                  async text() {
+                    return JSON.stringify({
+                      detectedAt: "2026-07-15T09:59:59.000Z",
+                      errorCode: "RECEIPT_STATE_UNKNOWN",
+                      ingressId,
+                      mailboxId,
+                      rawKey,
+                      status: "pending_operator_review",
+                    });
+                  },
+                };
+              }
+              return null;
+            }
+            return null;
+          },
+          async put(
+            key: string,
+            value: string,
+            options?: {
+              customMetadata?: Record<string, string>;
+              onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+            },
+          ) {
+            if (key === `receipts/${ingressId}.json`) {
+              const state = JSON.parse(value).state;
+              writes.push(state);
+              if (state === "enqueued") {
+                enqueueReceiptEtag = options?.onlyIf?.etagMatches;
+                return { etag: "enqueued-receipt-etag" };
+              }
+              assert.equal(state, "admitted");
+              assert.equal(options?.onlyIf?.etagMatches, "archived-receipt-etag");
+              const result = input.admissionWriteOutcome === "committed"
+                ? { etag: "admitted-receipt-etag" }
+                : null;
+              admissionWriteCommitted = result !== null;
+              return result;
+            }
+            if (key.startsWith("system/reconciliation-anomalies/")) {
+              writes.push("anomaly");
+              if (input.anomalyWriteFails) {
+                throw new Error("simulated post-admission anomaly outage");
+              }
+              assert.deepEqual(options, {
+                customMetadata: {
+                  errorCode: "RECEIPT_STATE_UNKNOWN",
+                  status: "pending_operator_review",
+                },
+                onlyIf: { etagDoesNotMatch: "*" },
+              });
+              if (input.anomalyWriteLosesCas) return null;
+              anomaly = JSON.parse(value);
+              return { etag: "anomaly-etag" };
+            }
+            if (key.startsWith("system/reconciliation-failures/")) {
+              writes.push("failure-ledger");
+              if (input.failureLedgerWriteFails) {
+                throw new Error("simulated reconciliation failure-ledger outage");
+              }
+              failureLedger = JSON.parse(value);
+              return { etag: "failure-ledger-etag" };
+            }
+            if (key.startsWith("system/inbound-recovery-pointers/")) {
+              recoveryPointerWrites += 1;
+              return { etag: "recovery-pointer-etag" };
+            }
+            if (key === "system/reconciliation-cursor.json") {
+              writes.push("cursor");
+              cursorPersisted = true;
+              return { etag: "cursor-etag" };
+            }
+            return {};
+          },
+          async delete(key: string) {
+            if (key.startsWith("system/reconciliation-failures/")) {
+              failureLedgerDeletes += 1;
+            }
+          },
+        },
+        INBOUND_QUEUE: {
+          async send() {
+            queueCalls += 1;
+          },
+        },
+        MAILBOX: {
+          idFromName() {
+            mailboxTruthReads += 1;
+            return mailboxId;
+          },
+          get() {
+            mailboxTruthReads += 1;
+            if (input.allowAdmittedContinuation) {
+              return {
+                async getEmail() { return null; },
+                async hasEmail() { return false; },
+                async isEmailDeleted() { return false; },
+                async getInboundTerminalFailure() { return null; },
+              };
+            }
+            throw new Error("receipt uncertainty must not read Mailbox truth");
+          },
+        },
+      },
+      { now: () => new Date("2026-07-15T10:00:00.000Z") },
+    );
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+
+  return {
+    anomaly,
+    anomalyReadAfterCasLoss,
+    admissionWriteCommitted,
+    cursorPersisted,
+    failureLedger,
+    failureLedgerDeletes,
+    ingressId,
+    enqueueReceiptEtag,
+    logs,
+    mailboxId,
+    mailboxTruthReads,
+    queueCalls,
+    rawKey,
+    recoveryPointerWrites,
+    result,
+    writes,
+  };
+}
+
+function assertPostAdmissionRereadFailedClosed(
+  fixture: Awaited<ReturnType<typeof postAdmissionRereadFixture>>,
+): void {
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.failureLedgered, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.deepEqual(fixture.anomaly, {
+    detectedAt: "2026-07-15T10:00:00.000Z",
+    errorCode: "RECEIPT_STATE_UNKNOWN",
+    ingressId: fixture.ingressId,
+    mailboxId: fixture.mailboxId,
+    rawKey: fixture.rawKey,
+    status: "pending_operator_review",
+  });
+  assert.deepEqual(fixture.writes, ["admitted", "anomaly", "cursor"]);
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    new RegExp(
+      `${fixture.ingressId}|${fixture.rawKey}|${fixture.mailboxId}|provider-id-poison`,
+    ),
+  );
+}
+
+test("reconciliation records operator-review evidence when an admitted receipt reread is absent", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    ingressId: "post-admission-absent-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assert.equal(fixture.admissionWriteCommitted, true);
+  assertPostAdmissionRereadFailedClosed(fixture);
+});
+
+test("reconciliation records operator-review evidence when archived admission loses CAS to an absent winner", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "cas_lost",
+    ingressId: "admission-cas-absent-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assertPostAdmissionRereadFailedClosed(fixture);
+});
+
+for (const uncertainWinner of [
+  {
+    name: "invalid",
+    body: JSON.stringify({
+      state: "admitted",
+      updatedAt: "2026-07-15T10:00:00.000Z",
+      privatePayload: "provider-id-poison",
+    }),
+  },
+  {
+    name: "backward archived",
+    body: inboundReceiptBody(
+      {
+        ingressId: "admission-cas-backward-private-ingress",
+        rawKey: "raw/2026/07/15/admission-cas-backward-private-ingress.eml",
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "archived",
+      "2026-07-15T10:00:00.000Z",
+    ),
+  },
+]) {
+  test(`reconciliation records operator-review evidence when archived admission loses CAS to an ${uncertainWinner.name} winner`, async () => {
+    const fixture = await postAdmissionRereadFixture({
+      admissionWriteOutcome: "cas_lost",
+      ingressId: uncertainWinner.name === "invalid"
+        ? "admission-cas-invalid-private-ingress"
+        : "admission-cas-backward-private-ingress",
+      refreshedReceiptText: uncertainWinner.body,
+    });
+
+    assertPostAdmissionRereadFailedClosed(fixture);
+  });
+}
+
+test("reconciliation continues archived admission CAS loss from a valid admitted winner ETag", async () => {
+  const ingressId = "admission-cas-admitted-private-ingress";
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "cas_lost",
+    allowAdmittedContinuation: true,
+    ingressId,
+    refreshedReceiptText: inboundReceiptBody(
+      {
+        ingressId,
+        rawKey,
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "admitted",
+      "2026-07-15T09:59:00.000Z",
+      { reconciled: true },
+    ),
+  });
+
+  assert.equal(fixture.result.reenqueued, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.queueCalls, 1);
+  assert.equal(fixture.enqueueReceiptEtag, "refreshed-receipt-etag");
+  assert.deepEqual(fixture.writes, ["admitted", "enqueued", "cursor"]);
+});
+
+test("reconciliation records operator-review evidence when an admitted receipt reread is partial", async () => {
+  const receiptPayloadPoison = "post-admission-receipt-payload-poison";
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    ingressId: "post-admission-partial-private-ingress",
+    refreshedReceiptText: JSON.stringify({
+      state: "admitted",
+      updatedAt: "2026-07-15T10:00:00.000Z",
+      privatePayload: receiptPayloadPoison,
+    }),
+  });
+
+  assertPostAdmissionRereadFailedClosed(fixture);
+  assert.doesNotMatch(JSON.stringify(fixture.logs), new RegExp(receiptPayloadPoison));
+});
+
+test("reconciliation records operator-review evidence when an admitted receipt reread regresses to archived", async () => {
+  const ingressId = "post-admission-archived-private-ingress";
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    ingressId,
+    refreshedReceiptText: inboundReceiptBody(
+      {
+        ingressId,
+        rawKey,
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "archived",
+      "2026-07-15T10:00:00.000Z",
+    ),
+  });
+
+  assertPostAdmissionRereadFailedClosed(fixture);
+});
+
+test("reconciliation preserves a valid concurrent enqueued winner after admitting an archived receipt", async () => {
+  const ingressId = "post-admission-enqueued-private-ingress";
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    ingressId,
+    refreshedReceiptText: inboundReceiptBody(
+      {
+        ingressId,
+        rawKey,
+        rawSize: 321,
+        rawSha256: "a".repeat(64),
+        archivedAt: "2026-07-15T09:00:00.000Z",
+      },
+      "enqueued",
+      "2026-07-15T10:00:00.000Z",
+      { reconciled: true },
+    ),
+  });
+
+  assert.equal(fixture.result.skipped, 1);
+  assert.equal(fixture.result.pendingReview, 0);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly, undefined);
+  assert.deepEqual(fixture.writes, ["admitted", "cursor"]);
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+});
+
+test("reconciliation holds the cursor when post-admission receipt evidence and failure-ledger persistence both fail", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    anomalyWriteFails: true,
+    failureLedgerWriteFails: true,
+    ingressId: "post-admission-unledgered-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assert.equal(fixture.result.pendingReview, 0);
+  assert.equal(fixture.result.failed, 1);
+  assert.equal(fixture.result.failureLedgered, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly, undefined);
+  assert.equal(fixture.failureLedger, undefined);
+  assert.deepEqual(fixture.writes, [
+    "admitted",
+    "anomaly",
+    "failure-ledger",
+  ]);
+  assert.equal(fixture.cursorPersisted, false);
+  assert.equal(fixture.failureLedgerDeletes, 0);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    new RegExp(
+      `${fixture.ingressId}|${fixture.rawKey}|${fixture.mailboxId}|provider-id-poison|simulated post-admission anomaly outage|simulated reconciliation failure-ledger outage`,
+    ),
+  );
+});
+
+test("reconciliation holds the cursor and prior evidence when CAS-lost admission uncertainty cannot be ledgered", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "cas_lost",
+    anomalyWriteFails: true,
+    failureLedgerWriteFails: true,
+    ingressId: "admission-cas-unledgered-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assert.equal(fixture.result.failed, 1);
+  assert.equal(fixture.result.failureLedgered, 0);
+  assert.equal(fixture.cursorPersisted, false);
+  assert.equal(fixture.failureLedger, undefined);
+  assert.equal(fixture.failureLedgerDeletes, 0);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    /admission-cas-unledgered-private-ingress|provider-id-poison|simulated post-admission anomaly outage|simulated reconciliation failure-ledger outage/,
+  );
+});
+
+test("reconciliation advances after post-admission receipt evidence failure is durably ledgered", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    anomalyWriteFails: true,
+    ingressId: "post-admission-ledgered-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assert.equal(fixture.result.pendingReview, 0);
+  assert.equal(fixture.result.failed, 1);
+  assert.equal(fixture.result.failureLedgered, 1);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly, undefined);
+  assert.equal(
+    fixture.failureLedger?.errorCode,
+    "ARCHIVE_RECONCILIATION_FAILED",
+  );
+  assert.equal(fixture.failureLedger?.rawKey, fixture.rawKey);
+  assert.equal(fixture.failureLedgerDeletes, 0);
+  assert.deepEqual(fixture.writes, [
+    "admitted",
+    "anomaly",
+    "failure-ledger",
+    "cursor",
+  ]);
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    new RegExp(
+      `${fixture.ingressId}|${fixture.rawKey}|${fixture.mailboxId}|provider-id-poison|simulated post-admission anomaly outage`,
+    ),
+  );
+});
+
+test("reconciliation uses the normal failure ledger for CAS-lost admission uncertainty", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "cas_lost",
+    anomalyWriteFails: true,
+    ingressId: "admission-cas-ledgered-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assert.equal(fixture.result.failed, 1);
+  assert.equal(fixture.result.failureLedgered, 1);
+  assert.equal(fixture.failureLedger?.errorCode, "ARCHIVE_RECONCILIATION_FAILED");
+  assert.equal(fixture.failureLedger?.rawKey, fixture.rawKey);
+  assert.equal(fixture.failureLedgerDeletes, 0);
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+  assert.equal(fixture.recoveryPointerWrites, 0);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.logs),
+    /admission-cas-ledgered-private-ingress|provider-id-poison|simulated post-admission anomaly outage/,
+  );
+});
+
+test("reconciliation accepts a matching concurrent receipt-state anomaly after losing create-only CAS", async () => {
+  const fixture = await postAdmissionRereadFixture({
+    admissionWriteOutcome: "committed",
+    anomalyWriteLosesCas: true,
+    ingressId: "post-admission-anomaly-cas-private-ingress",
+    refreshedReceiptText: null,
+  });
+
+  assert.equal(fixture.result.pendingReview, 1);
+  assert.equal(fixture.result.failed, 0);
+  assert.equal(fixture.result.failureLedgered, 0);
+  assert.equal(fixture.result.reenqueued, 0);
+  assert.equal(fixture.anomaly, undefined);
+  assert.equal(fixture.anomalyReadAfterCasLoss, true);
+  assert.equal(fixture.failureLedger, undefined);
+  assert.deepEqual(fixture.writes, ["admitted", "anomaly", "cursor"]);
+  assert.equal(fixture.cursorPersisted, true);
+  assert.equal(fixture.queueCalls, 0);
+  assert.equal(fixture.mailboxTruthReads, 0);
+});
+
+type ExactWinnerBranch =
+  | "rejected_admission"
+  | "repair_state_deleted"
+  | "repair_state_stored"
+  | "terminal_ledger_dead_lettered"
+  | "handoff_deleted";
+
+async function exactConcurrentWinnerFixture(
+  branch: ExactWinnerBranch,
+  winner: "exact" | "absent" | "invalid",
+) {
+  const ingressId = `${branch}-${winner}-private-ingress`;
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  const mailboxId = "hello@wiserchat.ai";
+  const targetState = branch === "rejected_admission"
+    ? "rejected"
+    : branch === "repair_state_stored"
+      ? "stored"
+      : branch === "terminal_ledger_dead_lettered"
+        ? "dead_lettered"
+        : "deleted";
+  const initialState = branch === "rejected_admission"
+    ? "archived"
+    : branch === "handoff_deleted"
+      ? "stored"
+      : branch === "terminal_ledger_dead_lettered"
+        ? "dead_letter_pending"
+        : "rejected";
+  const initialDetails = initialState === "stored"
+    ? {}
+    : initialState === "rejected"
+      ? { errorCode: "MAILBOX_INACTIVE" }
+      : initialState === "dead_letter_pending"
+        ? {
+            attempt: 11,
+            delaySeconds: 300,
+            errorCode: "RAW_ARCHIVE_READ_FAILED",
+          }
+        : {};
+  const winnerDetails = targetState === "rejected"
+    ? { reconciled: true, errorCode: "MAILBOX_INACTIVE" }
+    : targetState === "stored"
+      ? { reconciled: true, errorCode: "MAILBOX_PROJECTION_RECOVERED" }
+      : targetState === "deleted"
+        ? { reconciled: true, errorCode: "MAILBOX_PROJECTION_DELETED" }
+        : {
+            reconciled: true,
+            errorCode: "DLQ_TERMINAL_LEDGER_RECOVERED",
+            terminalFailure: {
+              queueRef: "d06683c38d7755ce",
+              attempts: 10,
+              errorCode: "QUEUE_RETRY_EXHAUSTED",
+              recordedAt: "2026-07-15T09:45:00.000Z",
+            },
+          };
+  let receiptReads = 0;
+  let attemptedState: string | undefined;
+  let anomaly: Record<string, unknown> | undefined;
+  let cursorPersisted = false;
+  let queueCalls = 0;
+  let recoveryPointerWrites = 0;
+  let uncertaintyRecorded = false;
+  const downstreamReadsAfterUncertainty: string[] = [];
+  const branchReads: string[] = [];
+  const logs: unknown[][] = [];
+  const markRead = (name: string) => {
+    if (uncertaintyRecorded) downstreamReadsAfterUncertainty.push(name);
+    branchReads.push(name);
+  };
+  const originalLog = console.log;
+  const originalError = console.error;
+  const capture = (...args: unknown[]) => logs.push(args);
+  console.log = capture;
+  console.error = capture;
+  let result;
+  try {
+    result = await reconcileInboundArchives({
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      DB: mailboxDb(branch === "rejected_admission" ? "inactive" : "active"),
+      BUCKET: derivedBucketWithoutDelete,
+      RAW_MAIL_BUCKET: {
+        async list(options: { prefix: string }) {
+          return {
+            objects: options.prefix === "raw/" ? [{ key: rawKey }] : [],
+            truncated: false,
+          };
+        },
+        async head(key: string) {
+          assert.equal(key, rawKey);
+          return {
+            key: rawKey,
+            size: 321,
+            etag: "archive-etag",
+            version: "archive-version",
+            customMetadata: {
+              archivedAt: "2026-07-15T09:00:00.000Z",
+              ingressId,
+              mailboxId,
+              rawSize: "321",
+              schemaVersion: "1",
+            },
+          };
+        },
+        async get(key: string) {
+          if (key === "system/reconciliation-cursor.json") return null;
+          if (key.startsWith("system/reconciliation-anomalies/")) return null;
+          if (key === `receipts/${ingressId}.json`) {
+            receiptReads += 1;
+            if (receiptReads === 1) {
+              return {
+                etag: "initial-receipt-etag",
+                async text() {
+                  return inboundReceiptBody(
+                    { ingressId, rawKey, rawSize: 321, archivedAt: "2026-07-15T09:00:00.000Z" },
+                    initialState,
+                    "2026-07-15T09:00:00.000Z",
+                    initialDetails,
+                  );
+                },
+              };
+            }
+            if (winner === "absent") return null;
+            return {
+              etag: "winner-receipt-etag",
+              async text() {
+                return winner === "invalid"
+                  ? JSON.stringify({ state: targetState, privatePayload: "provider-id-poison" })
+                  : inboundReceiptBody(
+                      { ingressId, rawKey, rawSize: 321, archivedAt: "2026-07-15T09:00:00.000Z" },
+                      targetState,
+                      "2026-07-15T09:59:00.000Z",
+                      winnerDetails,
+                    );
+              },
+            };
+          }
+          return null;
+        },
+        async put(key: string, value: string) {
+          if (key === `receipts/${ingressId}.json`) {
+            attemptedState = JSON.parse(value).state;
+            return null;
+          }
+          if (key.startsWith("system/reconciliation-anomalies/")) {
+            anomaly = JSON.parse(value);
+            uncertaintyRecorded = true;
+            return { etag: "anomaly-etag" };
+          }
+          if (key.startsWith("system/inbound-recovery-pointers/")) {
+            recoveryPointerWrites += 1;
+            return {};
+          }
+          if (key === "system/reconciliation-cursor.json") {
+            cursorPersisted = true;
+            return {};
+          }
+          return {};
+        },
+        async delete() {},
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          queueCalls += 1;
+        },
+      },
+      MAILBOX: {
+        idFromName(value: string) {
+          markRead("mailbox_binding");
+          return value;
+        },
+        get() {
+          markRead("mailbox_stub");
+          return {
+            async isEmailDeleted() {
+              markRead("deleted");
+              return branch === "repair_state_deleted" || branch === "handoff_deleted";
+            },
+            async hasEmail() {
+              markRead("stored");
+              return branch === "repair_state_stored";
+            },
+            async getEmail() {
+              markRead("get_email");
+              return null;
+            },
+            async getInboundTerminalFailure() {
+              markRead("terminal");
+              return branch === "terminal_ledger_dead_lettered"
+                ? {
+                    queueRef: "d06683c38d7755ce",
+                    attempts: 10,
+                    errorCode: "QUEUE_RETRY_EXHAUSTED",
+                    recordedAt: "2026-07-15T09:45:00.000Z",
+                  }
+                : null;
+            },
+          };
+        },
+      },
+    }, { now: () => new Date("2026-07-15T10:00:00.000Z") });
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+  return {
+    anomaly,
+    attemptedState,
+    branchReads,
+    cursorPersisted,
+    downstreamReadsAfterUncertainty,
+    ingressId,
+    logs,
+    mailboxId,
+    queueCalls,
+    rawKey,
+    recoveryPointerWrites,
+    result,
+    targetState,
+  };
+}
+
+for (const branch of [
+  "rejected_admission",
+  "repair_state_deleted",
+  "repair_state_stored",
+  "terminal_ledger_dead_lettered",
+  "handoff_deleted",
+] satisfies ExactWinnerBranch[]) {
+  const expectedBranchReads: Record<ExactWinnerBranch, string[]> = {
+    rejected_admission: [],
+    repair_state_deleted: ["mailbox_binding", "mailbox_stub", "deleted"],
+    repair_state_stored: [
+      "mailbox_binding",
+      "mailbox_stub",
+      "deleted",
+      "stored",
+    ],
+    terminal_ledger_dead_lettered: [
+      "mailbox_binding",
+      "mailbox_stub",
+      "deleted",
+      "stored",
+      "terminal",
+    ],
+    handoff_deleted: ["mailbox_binding", "mailbox_stub", "deleted"],
+  };
+  test(`reconciliation preserves an exact ${branch} concurrent receipt winner`, async () => {
+    const fixture = await exactConcurrentWinnerFixture(branch, "exact");
+    assert.equal(fixture.attemptedState, fixture.targetState);
+    assert.deepEqual(fixture.branchReads, expectedBranchReads[branch]);
+    assert.equal(fixture.result.skipped, 1);
+    assert.equal(fixture.result.pendingReview, 0);
+    assert.equal(fixture.anomaly, undefined);
+    assert.equal(fixture.queueCalls, 0);
+  });
+
+  for (const winner of ["absent", "invalid"] as const) {
+    test(`reconciliation records uncertainty for a ${winner} ${branch} concurrent receipt winner`, async () => {
+      const fixture = await exactConcurrentWinnerFixture(branch, winner);
+      assert.equal(fixture.attemptedState, fixture.targetState);
+      assert.deepEqual(fixture.branchReads, expectedBranchReads[branch]);
+      assert.equal(fixture.result.pendingReview, 1);
+      assert.equal(fixture.result.skipped, 0);
+      assert.deepEqual(fixture.anomaly, {
+        detectedAt: "2026-07-15T10:00:00.000Z",
+        errorCode: "RECEIPT_STATE_UNKNOWN",
+        ingressId: fixture.ingressId,
+        mailboxId: fixture.mailboxId,
+        rawKey: fixture.rawKey,
+        status: "pending_operator_review",
+      });
+      assert.equal(fixture.cursorPersisted, true);
+      assert.equal(fixture.queueCalls, 0);
+      assert.equal(fixture.recoveryPointerWrites, 0);
+      assert.deepEqual(fixture.downstreamReadsAfterUncertainty, []);
+      assert.doesNotMatch(
+        JSON.stringify(fixture.logs),
+        new RegExp(`${fixture.ingressId}|${fixture.rawKey}|${fixture.mailboxId}|provider-id-poison`),
+      );
+    });
+  }
+}
+
+test("reconciliation accepts the full rejected receipt written by inbound SMTP rejection", async () => {
+  const ingressId = "legitimate-inbound-rejection";
+  const rawKey = `raw/2026/07/15/${ingressId}.eml`;
+  let anomalyWrites = 0;
+  let queueCalls = 0;
+  let receiptReads = 0;
+  const env = {
+    DOMAINS: "wiserchat.ai",
+    DB: mailboxDb(),
+    BUCKET: derivedBucketWithoutDelete,
+    RAW_MAIL_BUCKET: {
+      async list() {
+        return { objects: [{ key: rawKey }], truncated: false };
+      },
+      async head() {
+        return {
+          key: rawKey,
+          size: 321,
+          etag: "archive-etag",
+          version: "archive-version",
+          customMetadata: {
+            archivedAt: "2026-07-15T09:00:00.000Z",
+            ingressId,
+            mailboxId: "hello@wiserchat.ai",
+            rawSize: "321",
+            schemaVersion: "1",
+          },
+        };
+      },
+      async get(key: string) {
+        if (
+          key === "system/reconciliation-cursor.json" ||
+          key.startsWith("system/reconciliation-anomalies/")
+        ) {
+          return null;
+        }
+        assert.equal(key, `receipts/${ingressId}.json`);
+        return {
+          etag: "rejected-receipt-etag",
+          async text() {
+            return inboundReceiptBody(
+              {
+                ingressId,
+                rawKey,
+                rawSize: 321,
+                archivedAt: "2026-07-15T09:00:00.000Z",
+              },
+              "rejected",
+              "2026-07-15T09:01:00.000Z",
+            );
+          },
+        };
+      },
+      async put(key: string) {
+        if (key.startsWith("system/reconciliation-anomalies/")) {
+          anomalyWrites += 1;
+        }
+        return {};
+      },
+      async delete() {},
+    },
+    INBOUND_QUEUE: {
+      async send() {
+        queueCalls += 1;
+      },
+    },
+    MAILBOX: {
+      idFromName(mailboxId: string) {
+        return mailboxId;
+      },
+      get() {
+        return {
+          async getEmail() {
+            assert.fail("hasEmail is the available projection truth seam");
+          },
+          async hasEmail() {
+            return false;
+          },
+          async isEmailDeleted() {
+            return false;
+          },
+          async getInboundTerminalFailure() {
+            return null;
+          },
+        };
+      },
+    },
+  };
+
+  const result = await reconcileInboundArchives(env, {
+    now: () => new Date("2026-07-15T10:00:00.000Z"),
+  });
+
+  assert.equal(result.skipped, 1);
+  assert.equal(result.pendingReview, 0);
+  assert.equal(result.failed, 0);
+  assert.equal(anomalyWrites, 0);
+  assert.equal(queueCalls, 0);
 });
 
 test("reconciliation degrades the aggregate for an unknown receipt state", async () => {
@@ -421,9 +2187,21 @@ test("reconciliation degrades the aggregate for an unknown receipt state", async
         return {
           etag: "unknown-state-etag",
           async text() {
+            const receipt = JSON.parse(
+              inboundReceiptBody(
+                {
+                  ingressId: "unknown-state",
+                  rawKey,
+                  rawSize: 123,
+                  archivedAt: "2026-07-13T09:00:00.000Z",
+                },
+                "stored",
+                "2026-07-13T09:00:00.000Z",
+              ),
+            );
             return JSON.stringify({
+              ...receipt,
               state: { privatePayload: "poison" },
-              updatedAt: "2026-07-13T09:00:00.000Z",
             });
           },
         };
@@ -483,7 +2261,13 @@ test("reconciliation preserves dead-letter handoffs while repairing stale and ar
   const rawKeys = ingressIds.map((id) => `raw/2026/07/13/${id}.eml`);
   const states: Record<
     string,
-    { state: string; updatedAt: string; errorCode?: string }
+    {
+      state: string;
+      updatedAt: string;
+      attempt?: number;
+      delaySeconds?: number;
+      errorCode?: string;
+    }
   > = {
     stored: { state: "stored", updatedAt: "2026-07-13T09:00:00.000Z" },
     recent: { state: "enqueued", updatedAt: "2026-07-13T09:55:00.000Z" },
@@ -493,10 +2277,16 @@ test("reconciliation preserves dead-letter handoffs while repairing stale and ar
     "dead-letter-recent": {
       state: "dead_letter_pending",
       updatedAt: "2026-07-13T09:55:00.000Z",
+      attempt: 11,
+      delaySeconds: 300,
+      errorCode: "RAW_ARCHIVE_READ_FAILED",
     },
     "dead-letter-stale": {
       state: "dead_letter_pending",
       updatedAt: "2026-07-13T09:30:00.000Z",
+      attempt: 11,
+      delaySeconds: 300,
+      errorCode: "RAW_ARCHIVE_READ_FAILED",
     },
   };
   const queued: string[] = [];
@@ -544,7 +2334,18 @@ test("reconciliation preserves dead-letter handoffs while repairing stale and ar
           ? {
               etag: `${ingressId}-receipt-etag`,
               async text() {
-                return JSON.stringify(receipt);
+                const { state, updatedAt, ...details } = receipt;
+                return inboundReceiptBody(
+                  {
+                    ingressId,
+                    rawKey: `raw/2026/07/13/${ingressId}.eml`,
+                    rawSize: 123,
+                    archivedAt: "2026-07-13T09:00:00.000Z",
+                  },
+                  state,
+                  updatedAt,
+                  details,
+                );
               },
             }
           : null;
@@ -600,7 +2401,10 @@ test("reconciliation preserves dead-letter handoffs while repairing stale and ar
     failureLedgered: 0,
   });
   assert.equal(states["dead-letter-stale"].state, "dead_letter_pending");
-  assert.equal(states["dead-letter-stale"].errorCode, undefined);
+  assert.equal(
+    states["dead-letter-stale"].errorCode,
+    "RAW_ARCHIVE_READ_FAILED",
+  );
 });
 
 for (const testCase of [
@@ -659,10 +2463,16 @@ for (const testCase of [
           return {
             etag: "archived-receipt-etag",
             async text() {
-              return JSON.stringify({
-                state: "archived",
-                updatedAt: "2026-07-15T09:00:00.000Z",
-              });
+              return inboundReceiptBody(
+                {
+                  ingressId,
+                  rawKey,
+                  rawSize: 123,
+                  archivedAt: "2026-07-15T09:00:00.000Z",
+                },
+                "archived",
+                "2026-07-15T09:00:00.000Z",
+              );
             },
           };
         },
@@ -750,10 +2560,16 @@ test("reconciliation terminalizes an archived receipt whose declared size disagr
         return {
           etag: "archived-etag",
           async text() {
-            return JSON.stringify({
-              state: "archived",
-              updatedAt: "2026-07-15T09:00:00.000Z",
-            });
+            return inboundReceiptBody(
+              {
+                ingressId,
+                rawKey,
+                rawSize: 123,
+                archivedAt: "2026-07-15T09:00:00.000Z",
+              },
+              "archived",
+              "2026-07-15T09:00:00.000Z",
+            );
           },
         };
       },
@@ -795,6 +2611,32 @@ test("reconciliation heals stale terminal receipts from Mailbox truth", async ()
     "rejected-but-stored",
     "stored-and-stored",
   ];
+  const receiptVariants: Record<
+    string,
+    { state: string; details: Record<string, unknown> }
+  > = {
+    "pending-but-stored": {
+      state: "dead_letter_pending",
+      details: {
+        attempt: 11,
+        delaySeconds: 300,
+        errorCode: "RAW_ARCHIVE_READ_FAILED",
+      },
+    },
+    "terminal-but-stored": {
+      state: "dead_lettered",
+      details: { errorCode: "QUEUE_RETRY_EXHAUSTED" },
+    },
+    "quarantined-but-stored": {
+      state: "quarantined",
+      details: { errorCode: "MAILBOX_UNAVAILABLE" },
+    },
+    "rejected-but-stored": {
+      state: "rejected",
+      details: { errorCode: "MAILBOX_INACTIVE" },
+    },
+    "stored-and-stored": { state: "stored", details: {} },
+  };
   const finalStates: Record<string, string> = {};
   const resolvedAnomalies: Array<Record<string, unknown>> = [];
   const env = {
@@ -849,16 +2691,18 @@ test("reconciliation heals stale terminal receipts from Mailbox truth", async ()
         return {
           etag: `${ingressId}-receipt-etag`,
           async text() {
-            return JSON.stringify({
-              state: {
-                "pending-but-stored": "dead_letter_pending",
-                "terminal-but-stored": "dead_lettered",
-                "quarantined-but-stored": "quarantined",
-                "rejected-but-stored": "rejected",
-                "stored-and-stored": "stored",
-              }[ingressId],
-              updatedAt: "2026-07-13T09:00:00.000Z",
-            });
+            const variant = receiptVariants[ingressId];
+            return inboundReceiptBody(
+              {
+                ingressId,
+                rawKey: `raw/2026/07/13/${ingressId}.eml`,
+                rawSize: 321,
+                archivedAt: "2026-07-13T09:00:00.000Z",
+              },
+              variant.state,
+              "2026-07-13T09:00:00.000Z",
+              variant.details,
+            );
           },
         };
       },
@@ -966,10 +2810,17 @@ test("reconciliation restores a terminal receipt from the independent Mailbox le
         return {
           etag: "stale-receipt-etag",
           async text() {
-            return JSON.stringify({
-              state: "dead_lettered",
-              updatedAt: "2026-07-13T09:00:00.000Z",
-            });
+            return inboundReceiptBody(
+              {
+                ingressId,
+                rawKey,
+                rawSize: 321,
+                archivedAt: "2026-07-13T09:00:00.000Z",
+              },
+              "dead_lettered",
+              "2026-07-13T09:00:00.000Z",
+              { errorCode: "QUEUE_RETRY_EXHAUSTED" },
+            );
           },
         };
       },
@@ -1075,10 +2926,17 @@ test("reconciliation refuses malformed terminal-failure ledger fields", async ()
             return {
               etag: "stale-receipt-etag",
               async text() {
-                return JSON.stringify({
-                  state: "dead_lettered",
-                  updatedAt: "2026-07-13T09:00:00.000Z",
-                });
+                return inboundReceiptBody(
+                  {
+                    ingressId,
+                    rawKey,
+                    rawSize: 321,
+                    archivedAt: "2026-07-13T09:00:00.000Z",
+                  },
+                  "dead_lettered",
+                  "2026-07-13T09:00:00.000Z",
+                  { errorCode: "QUEUE_RETRY_EXHAUSTED" },
+                );
               },
             };
           },
@@ -1155,10 +3013,17 @@ test("reconciliation resolves a pending anomaly from an R2-only terminal receipt
         return {
           etag: "terminal-receipt-etag",
           async text() {
-            return JSON.stringify({
-              state: "dead_lettered",
-              updatedAt: "2026-07-13T09:45:00.000Z",
-            });
+            return inboundReceiptBody(
+              {
+                ingressId,
+                rawKey,
+                rawSize: 321,
+                archivedAt: "2026-07-13T09:00:00.000Z",
+              },
+              "dead_lettered",
+              "2026-07-13T09:45:00.000Z",
+              { errorCode: "QUEUE_RETRY_EXHAUSTED" },
+            );
           },
         };
       },
@@ -1204,11 +3069,23 @@ test("reconciliation resolves a pending anomaly from an R2-only terminal receipt
 test("reconciliation creates operator-review evidence for a fresh stale dead-letter intent without a Mailbox terminal ledger", async () => {
   const ingressId = "stale-dead-letter-without-ledger";
   const rawKey = `raw/2026/07/13/${ingressId}.eml`;
-  let receipt: Record<string, unknown> = {
-    state: "dead_letter_pending",
-    errorCode: "FORGED_UPPERCASE_CODE",
-    updatedAt: "2026-07-13T09:00:00.000Z",
-  };
+  let receipt: Record<string, unknown> = JSON.parse(
+    inboundReceiptBody(
+      {
+        ingressId,
+        rawKey,
+        rawSize: 321,
+        archivedAt: "2026-07-13T09:00:00.000Z",
+      },
+      "dead_letter_pending",
+      "2026-07-13T09:00:00.000Z",
+      {
+        attempt: 11,
+        delaySeconds: 300,
+        errorCode: "RAW_ARCHIVE_READ_FAILED",
+      },
+    ),
+  );
   let anomaly: Record<string, unknown> | undefined;
   let anomalyCreateCondition: string | undefined;
   let queueCalls = 0;
@@ -1309,11 +3186,11 @@ test("reconciliation creates operator-review evidence for a fresh stale dead-let
 
   assert.equal(result.terminalized, 0);
   assert.equal(result.pendingReview, 1);
-  assert.deepEqual(receipt, {
-    state: "dead_letter_pending",
-    errorCode: "FORGED_UPPERCASE_CODE",
-    updatedAt: "2026-07-13T09:00:00.000Z",
-  });
+  assert.equal(receipt.state, "dead_letter_pending");
+  assert.equal(receipt.attempt, 11);
+  assert.equal(receipt.delaySeconds, 300);
+  assert.equal(receipt.errorCode, "RAW_ARCHIVE_READ_FAILED");
+  assert.equal(receipt.updatedAt, "2026-07-13T09:00:00.000Z");
   assert.deepEqual(anomaly, {
     detectedAt: "2026-07-13T10:00:00.000Z",
     errorCode: "DLQ_TERMINAL_LEDGER_MISSING",
@@ -1333,6 +3210,7 @@ test("reconciliation preserves the concurrent winner when Mailbox-ledger reconst
   let receiptCondition: string | undefined;
   let anomalyWrites = 0;
   let queueCalls = 0;
+  let receiptReads = 0;
   const env = {
     BUCKET: derivedBucketWithoutDelete,
     RAW_MAIL_BUCKET: {
@@ -1361,13 +3239,38 @@ test("reconciliation preserves the concurrent winner when Mailbox-ledger reconst
         if (key.includes("cursor.json")) return null;
         if (key.startsWith("system/reconciliation-anomalies/")) return null;
         if (key === `receipts/${ingressId}.json`) {
+          receiptReads += 1;
           return {
-            etag: "stale-receipt-etag",
+            etag: receiptReads === 1 ? "stale-receipt-etag" : "winner-receipt-etag",
             async text() {
-              return JSON.stringify({
-                state: "dead_letter_pending",
-                updatedAt: "2026-07-13T09:00:00.000Z",
-              });
+              return inboundReceiptBody(
+                {
+                  ingressId,
+                  rawKey,
+                  rawSize: 321,
+                  archivedAt: "2026-07-13T09:00:00.000Z",
+                },
+                receiptReads === 1 ? "dead_letter_pending" : "dead_lettered",
+                receiptReads === 1
+                  ? "2026-07-13T09:00:00.000Z"
+                  : "2026-07-13T09:59:00.000Z",
+                receiptReads === 1
+                  ? {
+                      attempt: 11,
+                      delaySeconds: 300,
+                      errorCode: "RAW_ARCHIVE_READ_FAILED",
+                    }
+                  : {
+                      reconciled: true,
+                      errorCode: "DLQ_TERMINAL_LEDGER_RECOVERED",
+                      terminalFailure: {
+                        queueRef: "d06683c38d7755ce",
+                        attempts: 10,
+                        errorCode: "QUEUE_RETRY_EXHAUSTED",
+                        recordedAt: "2026-07-13T09:45:00.000Z",
+                      },
+                    },
+              );
             },
           };
         }
@@ -1466,10 +3369,21 @@ test("reconciliation gives a deletion tombstone priority over stale dead-letter 
         return {
           etag: "stale-receipt-etag",
           async text() {
-            return JSON.stringify({
-              state: "dead_letter_pending",
-              updatedAt: "2026-07-13T09:00:00.000Z",
-            });
+            return inboundReceiptBody(
+              {
+                ingressId,
+                rawKey,
+                rawSize: 321,
+                archivedAt: "2026-07-13T09:00:00.000Z",
+              },
+              "dead_letter_pending",
+              "2026-07-13T09:00:00.000Z",
+              {
+                attempt: 11,
+                delaySeconds: 300,
+                errorCode: "RAW_ARCHIVE_READ_FAILED",
+              },
+            );
           },
         };
       },
@@ -1607,10 +3521,16 @@ test("reconciliation reports a stored receipt whose Mailbox projection is missin
         return {
           etag: "stored-receipt-etag",
           async text() {
-            return JSON.stringify({
-              state: "stored",
-              updatedAt: "2026-07-13T09:01:00.000Z",
-            });
+            return inboundReceiptBody(
+              {
+                ingressId: "stored-but-missing",
+                rawKey,
+                rawSize: 123,
+                archivedAt: "2026-07-13T09:00:00.000Z",
+              },
+              "stored",
+              "2026-07-13T09:01:00.000Z",
+            );
           },
         };
       },
