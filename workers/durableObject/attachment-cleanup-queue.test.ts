@@ -57,3 +57,17 @@ test("mailbox reads restore a lost legacy attachment-cleanup alarm", async () =>
 		);
 	}
 });
+
+test("legacy attachment cleanup failure telemetry is content-free", async () => {
+	const source = await readFile(
+		new URL("./index.ts", import.meta.url),
+		"utf8",
+	);
+	const method = classMethodText(
+		parseTypescriptSource(source, "index.ts"),
+		"processAttachmentCleanup",
+	);
+	assert.match(method, /\[mail-cleanup\] legacy attachment deletion failed/);
+	assert.match(method, /errorCode: "R2_DELETION_FAILED"/);
+	assert.doesNotMatch(method, /error\.message|String\(error\)|emailId:/);
+});

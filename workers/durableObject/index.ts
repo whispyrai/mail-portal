@@ -4807,12 +4807,13 @@ export class MailboxDO extends DurableObject<Env> {
         job.emailId,
         { objectCount: job.keys.length, attempts: job.attempts + 1 },
       );
-    } catch (error) {
-      console.error("[attachment-cleanup] retry failed", {
-        emailId: job.emailId,
-        attempts: job.attempts + 1,
-        error: error instanceof Error ? error.message : String(error),
-      });
+	} catch {
+	  console.error("[mail-cleanup] legacy attachment deletion failed", {
+		count: 1,
+		operation: "legacy_attachment_cleanup",
+		status: "pending",
+		errorCode: "R2_DELETION_FAILED",
+	  });
     }
     // R2 I/O yields the input gate. Re-read before finalization so a cleanup
     // queued during that yield cannot be overwritten by this job's old snapshot.
