@@ -30,3 +30,37 @@ test("every email renderer passes explicit message identity", () => {
 	);
 	assert.match(sharedRenderer, /<EmailIframe[\s\S]*?messageId=\{email\.id\}/);
 });
+
+test("inline CID bytes cross only the nonce-bound opaque iframe bridge", () => {
+	assert.match(source, /api\.getAttachment\([\s\S]*?mailboxId,[\s\S]*?messageId,[\s\S]*?planned\.attachmentId,[\s\S]*?signal/);
+	assert.match(source, /event\.source !== frameWindow/);
+	assert.match(source, /event\.data\.nonce !== nonce/);
+	assert.match(source, /crypto\.randomUUID\(\)/);
+	assert.match(source, /URL\.revokeObjectURL/);
+	assert.match(source, /payloadAccepted/);
+	assert.match(source, /expectedManifest/);
+	assert.match(source, /payload\.blob\.size/);
+	assert.match(source, /image\.removeAttribute\("src"\)/);
+	assert.match(source, /data-email-inline-cid/);
+	assert.match(source, /img-src data: blob:/);
+	assert.doesNotMatch(source, /img-src data: cid:/);
+	const sandbox = source.match(/sandbox="([^"]+)"/)?.[1];
+	assert.ok(sandbox);
+	assert.equal(sandbox.includes("allow-same-origin"), false);
+	assert.doesNotMatch(source, /attachments\/\$\{.*attachmentId/);
+});
+
+test("a new render clears private content before parsing hostile metadata", () => {
+	const clearIndex = source.indexOf("iframe.srcdoc = EMPTY_EMAIL_IFRAME_DOCUMENT");
+	const sanitizeIndex = source.indexOf("DOMPurify.sanitize(body");
+	const planIndex = source.indexOf("planReferencedInlineImages(");
+	assert.ok(clearIndex > 0);
+	assert.ok(clearIndex < sanitizeIndex);
+	assert.ok(clearIndex < planIndex);
+});
+
+test("CID rendering neutralizes responsive candidates before remote opt-in", () => {
+	assert.match(source, /image\.removeAttribute\("srcset"\)/);
+	assert.match(source, /source\.removeAttribute\("srcset"\)/);
+	assert.match(source, /cidPictures/);
+});

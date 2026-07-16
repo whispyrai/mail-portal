@@ -1,7 +1,6 @@
 import { Button, Loader } from "@cloudflare/kumo";
 import { WarningCircleIcon } from "@phosphor-icons/react";
 import EmailIframe from "~/components/EmailIframe";
-import { rewriteInlineImages } from "~/lib/utils";
 import type { Email } from "~/types";
 
 export type EmailBodyLoadState = {
@@ -78,12 +77,9 @@ export default function EmailMessageBody({
 	return (
 		<EmailIframe
 			messageId={email.id}
-			body={rewriteInlineImages(
-				authoritativeBody ?? "",
-				mailboxId || "",
-				email.id,
-				email.attachments,
-			)}
+			body={authoritativeBody ?? ""}
+			mailboxId={mailboxId}
+			inlineAttachments={email.attachments}
 			autoSize={autoSize}
 		/>
 	);

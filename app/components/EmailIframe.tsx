@@ -3,7 +3,15 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import DOMPurify from "dompurify";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+	isExpectedInlineImageBlob,
+	normalizeInlineContentId,
+	planReferencedInlineImages,
+	type PlannedInlineImage,
+} from "~/lib/email-inline-images";
+import api from "~/services/api";
+import type { Attachment } from "~/types";
 
 // Force every link in rendered email HTML to open in a new tab. Email anchors
 // usually carry no `target`, so inside the sandboxed iframe a click would
@@ -26,8 +34,196 @@ function ensureLinkTargetHook() {
 interface EmailIframeProps {
 	messageId: string;
 	body: string;
+	mailboxId?: string;
+	inlineAttachments?: Attachment[];
 	/** When true, iframe auto-sizes to content height instead of filling parent */
 	autoSize?: boolean;
+}
+
+type InlineImagePayload = {
+	cid: string;
+	blob: Blob;
+};
+
+const INLINE_IMAGE_DOWNLOAD_CONCURRENCY = 4;
+const EMPTY_EMAIL_IFRAME_DOCUMENT = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';">
+</head>
+<body></body>
+</html>`;
+
+function sourceSetContainsCid(value: string): boolean {
+	return /(?:^|,)\s*cid:/i.test(value);
+}
+
+function sourceSetContainsRemoteImage(value: string): boolean {
+	return /(?:^|,)\s*https?:\/\//i.test(value);
+}
+
+async function downloadInlineImages(
+	plannedImages: readonly PlannedInlineImage[],
+	mailboxId: string,
+	messageId: string,
+	signal: AbortSignal,
+): Promise<InlineImagePayload[]> {
+	const results: Array<InlineImagePayload | null> = Array.from(
+		{ length: plannedImages.length },
+		() => null,
+	);
+	let nextIndex = 0;
+	async function worker() {
+		while (!signal.aborted) {
+			const index = nextIndex;
+			nextIndex += 1;
+			const planned = plannedImages[index];
+			if (!planned) return;
+			try {
+				const blob = await api.getAttachment(
+					mailboxId,
+					messageId,
+					planned.attachmentId,
+					{ signal },
+				);
+				if (!signal.aborted && isExpectedInlineImageBlob(planned, blob)) {
+					results[index] = { cid: planned.cid, blob };
+				}
+			} catch {
+				// A failed inline image stays broken without affecting the message body.
+			}
+		}
+	}
+	await Promise.all(
+		Array.from(
+			{ length: Math.min(INLINE_IMAGE_DOWNLOAD_CONCURRENCY, plannedImages.length) },
+			() => worker(),
+		),
+	);
+	return results.filter((result): result is InlineImagePayload => result !== null);
+}
+
+function iframeBridgeScript(
+	nonce: string,
+	plannedImages: readonly PlannedInlineImage[],
+): string {
+	const expectedManifest = plannedImages.map((planned) => ({
+		cid: planned.cid,
+		mimeType: planned.expectedMimeType,
+		size: planned.expectedSize,
+	}));
+	return `<script>
+(function () {
+	"use strict";
+	var nonce = ${JSON.stringify(nonce)};
+	var expectedManifest = ${JSON.stringify(expectedManifest)};
+	var maximumImageCount = 32;
+	var maximumAggregateBytes = 25 * 1024 * 1024;
+	var activeObjectUrls = [];
+	var inlineImageTargets = new Map();
+	var payloadAccepted = false;
+	var allowedMimeTypes = new Set(["image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"]);
+	function normalizeCid(value) {
+		if (typeof value !== "string" || value.length > 512) return null;
+		var normalized = value.trim();
+		if (/^cid:/i.test(normalized)) normalized = normalized.slice(4).trim();
+		if (normalized.startsWith("<") && normalized.endsWith(">")) {
+			normalized = normalized.slice(1, -1).trim();
+		}
+		if (!normalized || new TextEncoder().encode(normalized).byteLength > 512 || /[\\u0000-\\u0020\\u007f<>]/.test(normalized)) return null;
+		normalized = normalized.normalize("NFC").toLowerCase();
+		return normalized.length <= 512 && new TextEncoder().encode(normalized).byteLength <= 512 ? normalized : null;
+	}
+	var manifestByCid = new Map();
+	var manifestBytes = 0;
+	var manifestValid = Array.isArray(expectedManifest) && expectedManifest.length <= maximumImageCount;
+	if (manifestValid) {
+		for (var manifestIndex = 0; manifestIndex < expectedManifest.length; manifestIndex += 1) {
+			var expected = expectedManifest[manifestIndex];
+			var expectedCid = expected && normalizeCid(expected.cid);
+			var expectedMimeType = expected && typeof expected.mimeType === "string" ? expected.mimeType.trim().toLowerCase() : "";
+			var expectedSize = expected && expected.size;
+			if (!expectedCid || expectedCid !== expected.cid || !allowedMimeTypes.has(expectedMimeType) ||
+				!Number.isSafeInteger(expectedSize) || expectedSize <= 0 || expectedSize > maximumAggregateBytes ||
+				manifestByCid.has(expectedCid) || manifestBytes + expectedSize > maximumAggregateBytes) {
+				manifestValid = false;
+				break;
+			}
+			manifestByCid.set(expectedCid, { mimeType: expectedMimeType, size: expectedSize });
+			manifestBytes += expectedSize;
+		}
+	}
+	if (!manifestValid) manifestByCid.clear();
+	function reportHeight() {
+		var height = document.body.scrollHeight;
+		if (height > 0) parent.postMessage({ __emailIframeHeight: true, nonce: nonce, height: height }, "*");
+	}
+	function revokeObjectUrls() {
+		for (var index = 0; index < activeObjectUrls.length; index += 1) {
+			URL.revokeObjectURL(activeObjectUrls[index]);
+		}
+		activeObjectUrls = [];
+	}
+	function matchingImages(cid) {
+		var known = inlineImageTargets.get(cid) || [];
+		known = known.filter(function (image) { return image.isConnected; });
+		if (known.length > 0) return known;
+		var matches = [];
+		for (var imageIndex = 0; imageIndex < document.images.length; imageIndex += 1) {
+			var image = document.images[imageIndex];
+			if (normalizeCid(image.getAttribute("data-email-inline-cid") || image.getAttribute("src") || "") === cid) {
+				matches.push(image);
+			}
+		}
+		return matches;
+	}
+	window.addEventListener("message", function (event) {
+		if (event.source !== parent) return;
+		var data = event.data;
+		if (payloadAccepted || !manifestValid || !data || typeof data !== "object" || data.__emailIframeInlineImages !== true || data.nonce !== nonce || !Array.isArray(data.images) || data.images.length > maximumImageCount) return;
+		var preparedImages = [];
+		var seenCids = new Set();
+		var payloadBytes = 0;
+		for (var payloadIndex = 0; payloadIndex < data.images.length; payloadIndex += 1) {
+			var payload = data.images[payloadIndex];
+			if (!payload || typeof payload !== "object" || !(payload.blob instanceof Blob)) return;
+			var cid = normalizeCid(payload.cid);
+			var mimeType = payload.blob.type.split(";", 1)[0].trim().toLowerCase();
+			var expectedPayload = cid && manifestByCid.get(cid);
+			if (!cid || seenCids.has(cid) || !expectedPayload || mimeType !== expectedPayload.mimeType ||
+				payload.blob.size !== expectedPayload.size || payloadBytes + payload.blob.size > maximumAggregateBytes) return;
+			var matches = matchingImages(cid);
+			if (matches.length === 0) return;
+			seenCids.add(cid);
+			payloadBytes += payload.blob.size;
+			preparedImages.push({ blob: payload.blob, cid: cid, matches: matches });
+		}
+		payloadAccepted = true;
+		revokeObjectUrls();
+		for (var preparedIndex = 0; preparedIndex < preparedImages.length; preparedIndex += 1) {
+			var prepared = preparedImages[preparedIndex];
+			var objectUrl = URL.createObjectURL(prepared.blob);
+			activeObjectUrls.push(objectUrl);
+			inlineImageTargets.set(prepared.cid, prepared.matches);
+			for (var matchIndex = 0; matchIndex < prepared.matches.length; matchIndex += 1) {
+				prepared.matches[matchIndex].removeAttribute("data-email-inline-cid");
+				prepared.matches[matchIndex].addEventListener("load", reportHeight, { once: true });
+				prepared.matches[matchIndex].addEventListener("error", reportHeight, { once: true });
+				prepared.matches[matchIndex].src = objectUrl;
+			}
+		}
+		reportHeight();
+	});
+	window.addEventListener("pagehide", revokeObjectUrls, { once: true });
+	window.addEventListener("beforeunload", revokeObjectUrls, { once: true });
+	parent.postMessage({ __emailIframeReady: true, nonce: nonce }, "*");
+	reportHeight();
+	setTimeout(reportHeight, 50);
+	setTimeout(reportHeight, 150);
+	setTimeout(reportHeight, 400);
+})();
+<\/script>`;
 }
 
 /**
@@ -52,7 +248,13 @@ interface EmailIframeProps {
  *   affects newly-opened tabs; the email body itself stays fully
  *   sandboxed with no same-origin access to the parent page.
  */
-export default function EmailIframe({ messageId, body, autoSize }: EmailIframeProps) {
+export default function EmailIframe({
+	messageId,
+	body,
+	mailboxId,
+	inlineAttachments,
+	autoSize,
+}: EmailIframeProps) {
 	const iframeRef = useRef<HTMLIFrameElement>(null);
 	const [height, setHeight] = useState(autoSize ? 100 : 0);
 	const [remoteImagesForMessageId, setRemoteImagesForMessageId] = useState<
@@ -60,39 +262,22 @@ export default function EmailIframe({ messageId, body, autoSize }: EmailIframePr
 	>(null);
 	const loadRemoteImages = remoteImagesForMessageId === messageId;
 	const hasRemoteImages = useMemo(
-		() => /<img\b[^>]*\bsrc\s*=\s*["']?https?:\/\//i.test(body),
+		() => /<(?:img|source)\b[^>]*\b(?:src|srcset)\s*=\s*(?:["'][^"']*https?:\/\/|https?:\/\/)/i.test(body),
 		[body],
 	);
 
-	// Listen for height reports from the sandboxed iframe
-	const handleMessage = useCallback(
-		(event: MessageEvent) => {
-			if (!autoSize) return;
-			// Only accept messages from our own iframe
-			if (event.source !== iframeRef.current?.contentWindow) return;
-			if (
-				event.data &&
-				typeof event.data === "object" &&
-				event.data.__emailIframeHeight &&
-				typeof event.data.height === "number" &&
-				event.data.height > 0
-			) {
-				setHeight(event.data.height);
-			}
-		},
-		[autoSize],
-	);
-
-	useEffect(() => {
-		window.addEventListener("message", handleMessage);
-		return () => window.removeEventListener("message", handleMessage);
-	}, [handleMessage]);
-
 	useEffect(() => {
 		const iframe = iframeRef.current;
-		if (!iframe || !body) return;
+		const frameWindow = iframe?.contentWindow;
+		if (!iframe || !frameWindow) return;
 
+		iframe.srcdoc = EMPTY_EMAIL_IFRAME_DOCUMENT;
 		ensureLinkTargetHook();
+		const nonce = crypto.randomUUID();
+		const controller = new AbortController();
+		let iframeReady = false;
+		let payloads: InlineImagePayload[] | null = null;
+		let payloadPosted = false;
 
 		let cleanBody = DOMPurify.sanitize(body, {
 			USE_PROFILES: { html: true },
@@ -101,40 +286,96 @@ export default function EmailIframe({ messageId, body, autoSize }: EmailIframePr
 			FORCE_BODY: true,
 		});
 
-		if (!loadRemoteImages) {
-			const template = document.createElement("template");
-			template.innerHTML = cleanBody;
-			for (const image of template.content.querySelectorAll("img")) {
-				const source = image.getAttribute("src")?.trim() ?? "";
-				if (/^https?:\/\//i.test(source)) {
-					image.removeAttribute("src");
-					image.setAttribute("data-remote-image-blocked", "true");
-					image.setAttribute(
-						"alt",
-						image.getAttribute("alt") || "Remote image blocked for privacy",
-					);
-				}
+		const template = document.createElement("template");
+		template.innerHTML = cleanBody;
+		const referencedCids: string[] = [];
+		const cidPictures = new Set<Element>();
+		for (const image of template.content.querySelectorAll("img")) {
+			image.removeAttribute("data-email-inline-cid");
+			const source = image.getAttribute("src")?.trim() ?? "";
+			const sourceSet = image.getAttribute("srcset") ?? "";
+			const isCidSource = /^cid:/i.test(source);
+			const normalizedCid = isCidSource
+				? normalizeInlineContentId(source)
+				: null;
+			if (isCidSource) image.removeAttribute("src");
+			if (normalizedCid) {
+				referencedCids.push(source);
+				image.setAttribute("data-email-inline-cid", normalizedCid);
+				const picture = image.closest("picture");
+				if (picture) cidPictures.add(picture);
 			}
-			cleanBody = template.innerHTML;
+			if (isCidSource || sourceSetContainsCid(sourceSet)) {
+				image.removeAttribute("srcset");
+			}
+			if (!loadRemoteImages && /^https?:\/\//i.test(source)) {
+				image.removeAttribute("src");
+				image.setAttribute("data-remote-image-blocked", "true");
+				image.setAttribute(
+					"alt",
+					image.getAttribute("alt") || "Remote image blocked for privacy",
+				);
+			}
+			if (!loadRemoteImages && sourceSetContainsRemoteImage(sourceSet)) {
+				image.removeAttribute("srcset");
+			}
 		}
+		for (const source of template.content.querySelectorAll("source[srcset]")) {
+			const sourceSet = source.getAttribute("srcset") ?? "";
+			const picture = source.closest("picture");
+			if (
+				(picture && cidPictures.has(picture)) ||
+				sourceSetContainsCid(sourceSet) ||
+				(!loadRemoteImages && sourceSetContainsRemoteImage(sourceSet))
+			) {
+				source.removeAttribute("srcset");
+			}
+		}
+		cleanBody = template.innerHTML;
+		const plannedImages = planReferencedInlineImages(
+			referencedCids,
+			inlineAttachments,
+		);
 
 		const padding = autoSize ? "0" : "24px";
-
-		// Height-reporting script: sends body.scrollHeight to the parent.
-		// Runs inside the opaque-origin sandbox so it has zero access to
-		// the parent page — it can only postMessage.
-		const heightScript = autoSize
-			? `<script>
-				function reportHeight() {
-					var h = document.body.scrollHeight;
-					if (h > 0) parent.postMessage({ __emailIframeHeight: true, height: h }, "*");
-				}
-				reportHeight();
-				setTimeout(reportHeight, 50);
-				setTimeout(reportHeight, 150);
-				setTimeout(reportHeight, 400);
-			<\/script>`
-			: "";
+		const postInlineImages = () => {
+			if (
+				payloadPosted ||
+				!iframeReady ||
+				payloads === null ||
+				controller.signal.aborted
+			) return;
+			payloadPosted = true;
+			frameWindow.postMessage({
+				__emailIframeInlineImages: true,
+				nonce,
+				images: payloads,
+			}, "*");
+		};
+		const handleMessage = (event: MessageEvent) => {
+			if (event.source !== frameWindow) return;
+			if (
+				!event.data ||
+				typeof event.data !== "object" ||
+				event.data.nonce !== nonce
+			) return;
+			if (event.data.__emailIframeReady === true) {
+				iframeReady = true;
+				postInlineImages();
+				return;
+			}
+			if (
+				autoSize &&
+				event.data.__emailIframeHeight === true &&
+				typeof event.data.height === "number" &&
+				Number.isFinite(event.data.height) &&
+				event.data.height > 0 &&
+				event.data.height <= 1_000_000
+			) {
+				setHeight(Math.ceil(event.data.height));
+			}
+		};
+		window.addEventListener("message", handleMessage);
 
 		// Use srcdoc so the iframe is truly sandboxed (no same-origin access).
 		// We can't use doc.write() because that requires allow-same-origin.
@@ -144,7 +385,7 @@ export default function EmailIframe({ messageId, body, autoSize }: EmailIframePr
 <base target="_blank">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:${loadRemoteImages ? " https:" : ""}; script-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:${loadRemoteImages ? " https:" : ""}; script-src 'unsafe-inline';">
 <style>
 * { box-sizing: border-box; }
 html {
@@ -188,9 +429,31 @@ h1, h2, h3 { margin: 8px 0 4px; }
 ul, ol { padding-left: 20px; margin: 4px 0; }
 </style>
 </head>
-<body>${cleanBody}${heightScript}</body>
+<body>${cleanBody}${iframeBridgeScript(nonce, plannedImages)}</body>
 </html>`;
-	}, [body, autoSize, loadRemoteImages]);
+
+		if (mailboxId && plannedImages.length > 0) {
+			void Promise.resolve().then(() => controller.signal.aborted
+				? []
+				: downloadInlineImages(
+					plannedImages,
+					mailboxId,
+					messageId,
+					controller.signal,
+				)).then((downloaded) => {
+				if (controller.signal.aborted) return;
+				payloads = downloaded;
+				postInlineImages();
+			});
+		} else {
+			payloads = [];
+		}
+
+		return () => {
+			controller.abort();
+			window.removeEventListener("message", handleMessage);
+		};
+	}, [body, autoSize, inlineAttachments, loadRemoteImages, mailboxId, messageId]);
 
 	const frame = (
 		<iframe

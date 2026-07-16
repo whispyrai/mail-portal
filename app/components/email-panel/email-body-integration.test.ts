@@ -25,6 +25,12 @@ test("shared message body never falls back to an external preview and exposes ex
 	assert.match(singleMessage, /<EmailMessageBody/);
 });
 
+test("shared message body gives the opaque renderer only mailbox-scoped inline metadata", () => {
+	assert.match(messageBody, /mailboxId=\{mailboxId\}/);
+	assert.match(messageBody, /inlineAttachments=\{email\.attachments\}/);
+	assert.doesNotMatch(messageBody, /rewriteInlineImages/);
+});
+
 test("Forward is both disabled and handler-guarded until the selected body is authoritative", () => {
 	assert.match(panel, /if \(!authoritativeSelectedEmail\) return/);
 	assert.match(panel, /originalEmail: authoritativeSelectedEmail/);
