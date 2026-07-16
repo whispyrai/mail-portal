@@ -1,53 +1,118 @@
 import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
-import { applyMigrations, mailboxMigrations } from "./migrations.ts";
+import { Log, LogLevel, Miniflare } from "miniflare";
+import { mailboxMigrations } from "./migrations.ts";
 
-function sqlStorage(database: DatabaseSync): SqlStorage {
-	return {
-		exec(query: string, ...bindings: unknown[]) {
-			const trimmed = query.trim();
-			if (
-				bindings.length > 0 ||
-				(/^(SELECT|PRAGMA|WITH)\b/i.test(trimmed) && !trimmed.includes(";"))
-			) {
-				return database.prepare(query).all(...bindings) as never;
-			}
-			database.exec(query);
-			return [] as never;
-		},
-	} as SqlStorage;
-}
+const execFileAsync = promisify(execFile);
+const ROOT = process.cwd();
+const PRODUCTION_COMPATIBILITY_DATE = "2025-11-28";
+let outputDirectory: string | undefined;
+let runtime: Miniflare | undefined;
 
-function storage(database: DatabaseSync) {
-	return {
-		transactionSync<T>(closure: () => T): T {
-			database.exec("BEGIN");
-			try {
-				const result = closure();
-				database.exec("COMMIT");
-				return result;
-			} catch (error) {
-				database.exec("ROLLBACK");
-				throw error;
-			}
-		},
-	};
-}
-
-function apply(database: DatabaseSync, names?: Set<string>) {
-	applyMigrations(
-		sqlStorage(database),
-		names ? mailboxMigrations.filter((migration) => names.has(migration.name)) : mailboxMigrations,
-		storage(database),
+test.before(async () => {
+	outputDirectory = await mkdtemp(join(tmpdir(), "mail-migration-history-"));
+	const wranglerConfig = await readFile(join(ROOT, "wrangler.jsonc"), "utf8");
+	const configuredCompatibilityDate = wranglerConfig.match(
+		/^\s*"compatibility_date"\s*:\s*"(\d{4}-\d{2}-\d{2})"\s*,?\s*$/m,
+	)?.[1];
+	assert.equal(
+		configuredCompatibilityDate,
+		PRODUCTION_COMPATIBILITY_DATE,
+		"migration test compatibility date must match production wrangler.jsonc",
 	);
+	await execFileAsync(
+		join(ROOT, "node_modules/.bin/wrangler"),
+		[
+			"deploy",
+			"workers/testing/migration-history-integration-entry.ts",
+			"--dry-run",
+			"--outdir",
+			outputDirectory,
+			"--compatibility-date",
+			PRODUCTION_COMPATIBILITY_DATE,
+			"--compatibility-flag",
+			"nodejs_compat",
+			"--config",
+			"wrangler.jsonc",
+			"--env=",
+			"--upload-source-maps=false",
+		],
+		{
+			cwd: ROOT,
+			env: {
+				...process.env,
+				WRANGLER_LOG_PATH: join(outputDirectory, "wrangler.log"),
+			},
+		},
+	);
+	const bundle = await readFile(
+		join(outputDirectory, "migration-history-integration-entry.js"),
+		"utf8",
+	);
+	runtime = new Miniflare({
+		log: new Log(LogLevel.ERROR),
+		modules: true,
+		script: bundle,
+		compatibilityDate: PRODUCTION_COMPATIBILITY_DATE,
+		compatibilityFlags: ["nodejs_compat"],
+		durableObjects: {
+			MIGRATIONS: {
+				className: "MigrationHistoryTestDO",
+				useSQLite: true,
+			},
+		},
+	});
+});
+
+test.after(async () => {
+	await runtime?.dispose();
+	if (outputDirectory !== undefined) {
+		await rm(outputDirectory, { recursive: true, force: true });
+	}
+});
+
+async function request<T>(
+	database: string,
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	assert.ok(runtime, "migration-history workerd runtime is initialized");
+	const response = await runtime.dispatchFetch(
+		`http://migration.test${path}?database=${encodeURIComponent(database)}`,
+		body === undefined
+			? undefined
+			: {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(body),
+				},
+	);
+	const text = await response.text();
+	assert.equal(response.status, 200, text);
+	return JSON.parse(text) as T;
 }
 
-function columns(database: DatabaseSync, table: string) {
-	return database
-		.prepare(`PRAGMA table_info(${table})`)
-		.all()
-		.map((row) => (row as { name: string }).name);
+function apply(database: string, names?: Set<string>) {
+	return request<{ applied: true }>(database, "/apply", {
+		names: names === undefined ? undefined : [...names],
+	});
+}
+
+function execute(
+	database: string,
+	query: string,
+	bindings?: unknown[],
+): Promise<Record<string, unknown>[]> {
+	return request(database, "/execute", { query, bindings });
+}
+
+function columns(database: string, table: string) {
+	return request<string[]>(database, "/columns", { table });
 }
 
 const DEPLOYED_MAIN_MIGRATIONS = new Set([
@@ -66,11 +131,11 @@ const DEPLOYED_MAIN_MIGRATIONS = new Set([
 	"13_add_attachment_object_key",
 ]);
 
-test("exact deployed-main history upgrades without collisions or data loss", () => {
-	const database = new DatabaseSync(":memory:");
-	database.exec("PRAGMA foreign_keys = ON");
-	apply(database, DEPLOYED_MAIN_MIGRATIONS);
-	database.exec(`
+test("exact deployed-main history upgrades without collisions or data loss", async () => {
+	const database = "deployed-main";
+	await apply(database, DEPLOYED_MAIN_MIGRATIONS);
+	assert.equal((await execute(database, "PRAGMA foreign_keys"))[0]?.foreign_keys, 1);
+	await execute(database, `
 		INSERT INTO emails (id, folder_id, subject, sender, recipient, date, body)
 		VALUES ('email-1', 'inbox', 'Subject', 'sender@example.com',
 			'team@example.com', '2026-07-16T00:00:00.000Z', 'Body');
@@ -100,19 +165,19 @@ test("exact deployed-main history upgrades without collisions or data loss", () 
 		);
 	`);
 
-	apply(database);
-	apply(database);
+	await apply(database);
+	await apply(database);
 
 	assert.equal(
-		(database.prepare("SELECT r2_key FROM attachments WHERE id = 'attachment-1'").get() as { r2_key: string }).r2_key,
+		(await execute(database, "SELECT r2_key FROM attachments WHERE id = 'attachment-1'"))[0]?.r2_key,
 		"attachments/email-1/attachment-1/file.pdf",
 	);
 	assert.deepEqual(
-		{ ...database.prepare(`
+		(await execute(database, `
 			SELECT attempts, state, claim_generation, lease_token, lease_expires_at,
 				next_attempt_at, last_error, parked_at, recovery_ref
 			FROM r2_deletion_outbox WHERE r2_key = 'orphan/key'
-		`).get() },
+		`))[0],
 		{
 			attempts: 2,
 			state: "pending",
@@ -125,15 +190,18 @@ test("exact deployed-main history upgrades without collisions or data loss", () 
 			recovery_ref: null,
 		},
 	);
-	const terminal = database.prepare(`
+	const terminal = (await execute(database, `
 		SELECT queue_ref, attempts, error_code, recorded_at
 		FROM inbound_terminal_failures WHERE id = 'email-terminal'
-	`).get() as { queue_ref: string; attempts: number };
+	`))[0] as { queue_ref: string; attempts: number };
 	assert.match(terminal.queue_ref, /^[0-9a-f]{16}$/);
 	assert.equal(terminal.attempts, 11);
-	assert.equal(columns(database, "inbound_terminal_failures").includes("queue_message_id"), false);
 	assert.equal(
-		(database.prepare("SELECT COUNT(*) AS count FROM email_body_objects WHERE id = 'body-1'").get() as { count: number }).count,
+		(await columns(database, "inbound_terminal_failures")).includes("queue_message_id"),
+		false,
+	);
+	assert.equal(
+		(await execute(database, "SELECT COUNT(*) AS count FROM email_body_objects WHERE id = 'body-1'"))[0]?.count,
 		1,
 	);
 	for (const name of [
@@ -148,28 +216,25 @@ test("exact deployed-main history upgrades without collisions or data loss", () 
 		"40_add_cleanup_parking",
 	]) {
 		assert.equal(
-			(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations WHERE name = ?").get(name) as { count: number }).count,
+			(await execute(database, "SELECT COUNT(*) AS count FROM d1_migrations WHERE name = ?", [name]))[0]?.count,
 			1,
 		);
 	}
-	database.close();
 });
 
-test("fresh migration history converges to the same final contracts", () => {
-	const database = new DatabaseSync(":memory:");
-	database.exec("PRAGMA foreign_keys = ON");
-	apply(database);
-	assert.equal(columns(database, "r2_deletion_outbox").includes("parked_at"), true);
-	assert.equal(columns(database, "outbound_provider_events").includes("recipient_hashes_json"), true);
-	assert.equal(columns(database, "draft_save_cleanup_intents").includes("state"), true);
-	assert.equal(columns(database, "outbound_acceptance_recovery").includes("generation"), true);
-	apply(database);
-	database.close();
+test("fresh migration history converges to the same final contracts", async () => {
+	const database = "fresh";
+	await apply(database);
+	assert.equal((await execute(database, "PRAGMA foreign_keys"))[0]?.foreign_keys, 1);
+	assert.equal((await columns(database, "r2_deletion_outbox")).includes("parked_at"), true);
+	assert.equal((await columns(database, "outbound_provider_events")).includes("recipient_hashes_json"), true);
+	assert.equal((await columns(database, "draft_save_cleanup_intents")).includes("state"), true);
+	assert.equal((await columns(database, "outbound_acceptance_recovery")).includes("generation"), true);
+	await apply(database);
 });
 
-test("branch-local databases already through committed migration 37 upgrade safely", () => {
-	const database = new DatabaseSync(":memory:");
-	database.exec("PRAGMA foreign_keys = ON");
+test("branch-local databases already through committed migration 37 upgrade safely", async () => {
+	const database = "branch-local-through-37";
 	const deployedNames = new Set([
 		"10_add_inbound_delivery_ledgers",
 		"11_add_external_email_bodies",
@@ -183,20 +248,22 @@ test("branch-local databases already through committed migration 37 upgrade safe
 			.map((migration) => migration.name)
 			.filter((name) => !deployedNames.has(name)),
 	);
-	apply(database, through37);
-	assert.equal(hasMigration(database, "36_add_inbound_durability"), true);
-	assert.equal(hasMigration(database, "37_harden_outbound_reliability"), true);
+	await apply(database, through37);
+	assert.equal((await execute(database, "PRAGMA foreign_keys"))[0]?.foreign_keys, 1);
+	assert.equal(await hasMigration(database, "36_add_inbound_durability"), true);
+	assert.equal(await hasMigration(database, "37_harden_outbound_reliability"), true);
 
-	apply(database);
-	assert.equal(hasMigration(database, "10_add_inbound_delivery_ledgers"), true);
-	assert.equal(hasMigration(database, "38_reconcile_deployed_inbound_durability"), true);
-	assert.equal(columns(database, "outbound_acceptance_recovery").includes("generation"), true);
-	assert.equal(columns(database, "r2_deletion_outbox").includes("recovery_ref"), true);
-	database.close();
+	await apply(database);
+	assert.equal(await hasMigration(database, "10_add_inbound_delivery_ledgers"), true);
+	assert.equal(await hasMigration(database, "38_reconcile_deployed_inbound_durability"), true);
+	assert.equal((await columns(database, "outbound_acceptance_recovery")).includes("generation"), true);
+	assert.equal((await columns(database, "r2_deletion_outbox")).includes("recovery_ref"), true);
 });
 
-function hasMigration(database: DatabaseSync, name: string): boolean {
-	return (database.prepare(
+async function hasMigration(database: string, name: string): Promise<boolean> {
+	return (await execute(
+		database,
 		"SELECT COUNT(*) AS count FROM d1_migrations WHERE name = ?",
-	).get(name) as { count: number }).count === 1;
+		[name],
+	))[0]?.count === 1;
 }
