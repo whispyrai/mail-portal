@@ -23,6 +23,20 @@ const selectedPreview = "SELECTED PREVIEW MUST NEVER REPLACE THE COMPLETE MESSAG
 const replyPreview = "OLDER PREVIEW MUST NEVER REPLACE THE COMPLETE MESSAGE";
 const selectedFullBody = "AUTHORITATIVE SELECTED BODY FOR FORWARDING";
 const replyFullBody = "AUTHORITATIVE OLDER MESSAGE BODY";
+const cidContentId = "inline-proof@example.com";
+const cidAttachmentId = "inline-proof";
+const cidSrcsetOnlyContentId = "srcset-only@example.com";
+const cidSrcsetOnlyAttachmentId = "srcset-only";
+const hostileId = "hostile-inline-metadata";
+const hostileThreadId = "hostile-inline-metadata-thread";
+const hostileSubject = "Hostile metadata switch";
+const hostileBody = "SAFE HOSTILE METADATA MESSAGE";
+const cidPng = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	"base64",
+);
+const emailListOnly = process.argv.includes("--email-list-only");
+const cidOnly = process.argv.includes("--cid-only");
 
 mkdirSync(artifactDirectory, { recursive: true });
 
@@ -258,6 +272,253 @@ async function installMailFixture(page, handleBody) {
 	});
 }
 
+async function installCidFixture(page, counters) {
+	const mailboxPrefix = `/api/v1/mailboxes/${mailboxId}`;
+	const cidEmail = {
+		...selectedEmail,
+		thread_count: 1,
+		attachments: [
+			{
+				id: cidAttachmentId,
+				filename: "inline-proof.png",
+				mimetype: "image/png",
+				size: cidPng.byteLength,
+				content_id: `<${cidContentId.toUpperCase()}>`,
+				disposition: "inline",
+			},
+			{
+				id: cidSrcsetOnlyAttachmentId,
+				filename: "srcset-only.png",
+				mimetype: "image/png",
+				size: cidPng.byteLength,
+				content_id: cidSrcsetOnlyContentId,
+				disposition: "inline",
+			},
+			{
+				id: "unreferenced-inline",
+				filename: "private.png",
+				mimetype: "image/png",
+				size: cidPng.byteLength,
+				content_id: "unreferenced@example.com",
+				disposition: "inline",
+			},
+		],
+	};
+	const hostileEmail = {
+		...fixtureEmail({
+			id: hostileId,
+			sender: "hostile-metadata@example.com",
+			date: "2026-07-16T10:00:00.000Z",
+			preview: "HOSTILE METADATA PREVIEW",
+		}),
+		conversation_id: hostileThreadId,
+		thread_id: hostileThreadId,
+		subject: hostileSubject,
+		thread_count: 1,
+		attachments: [
+			{
+				id: null,
+				filename: "null-id.png",
+				mimetype: "image/png",
+				size: cidPng.byteLength,
+				content_id: "null-id@example.com",
+				disposition: "inline",
+			},
+			{
+				id: "x".repeat(10_000),
+				filename: {},
+				mimetype: 3,
+				size: cidPng.byteLength,
+				content_id: [],
+				disposition: "inline",
+			},
+		],
+	};
+	await page.route("https://tracker.example/**", async (route) => {
+		counters.remoteTracker += 1;
+		await route.fulfill({ status: 204 });
+	});
+	await page.route("https://override.example/**", async (route) => {
+		counters.remoteOverride += 1;
+		await route.fulfill({ status: 204 });
+	});
+	await page.route("**/api/v1/mailboxes/**", async (route) => {
+		const request = route.request();
+		const path = decodeURIComponent(new URL(request.url()).pathname);
+		if (request.method() !== "GET") {
+			await route.continue();
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify({ emails: [cidEmail, hostileEmail], totalCount: 2 }),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${selectedId}/body`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "text/plain",
+				body: [
+					"<p>Authenticated CID image:</p>",
+					"<picture>",
+					'<source srcset="https://override.example/cid-picture.png 1x">',
+					`<img alt="CID render proof" src="CID:${cidContentId.toUpperCase()}" srcset="https://override.example/cid-image.png 2x" style="width:24px;height:24px">`,
+					"</picture>",
+					`<img alt="CID srcset only" srcset="CID:${cidSrcsetOnlyContentId.toUpperCase()} 1x">`,
+					'<img alt="Remote tracker" src="https://tracker.example/pixel.png">',
+				].join(""),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${selectedId}`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify(cidEmail),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${hostileId}/body`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "text/plain",
+				body: `<p>${hostileBody}</p>`,
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${hostileId}`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify(hostileEmail),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/threads/${threadId}`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify([cidEmail]),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/threads/${hostileThreadId}`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify([hostileEmail]),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${selectedId}/attachments/${cidAttachmentId}`) {
+			counters.referenced += 1;
+			await counters.attachmentGate.promise;
+			await route.fulfill({
+				status: 200,
+				contentType: "image/png",
+				body: cidPng,
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${selectedId}/attachments/${cidSrcsetOnlyAttachmentId}`) {
+			counters.srcsetOnly += 1;
+			await route.fulfill({
+				status: 200,
+				contentType: "image/png",
+				body: cidPng,
+			});
+			return;
+		}
+		if (path.includes("/attachments/unreferenced-inline")) {
+			counters.unreferenced += 1;
+			await route.fulfill({
+				status: 200,
+				contentType: "image/png",
+				body: cidPng,
+			});
+			return;
+		}
+		await route.continue();
+	});
+}
+
+async function verifyEmailListRetry({ context, baseUrl, name }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(15_000);
+	observeBrowser(page, `${name} email-list-retry`);
+	const mailboxPrefix = `/api/v1/mailboxes/${mailboxId}`;
+	let allowSuccess = false;
+	let listRequests = 0;
+	try {
+		await page.route("**/api/v1/mailboxes/**", async (route) => {
+			const request = route.request();
+			const path = decodeURIComponent(new URL(request.url()).pathname);
+			if (request.method() !== "GET" || path !== `${mailboxPrefix}/emails`) {
+				await route.continue();
+				return;
+			}
+			listRequests += 1;
+			if (!allowSuccess) {
+				await route.fulfill({
+					status: 503,
+					contentType: "application/json",
+					body: JSON.stringify({ error: "fixture list unavailable" }),
+				});
+				return;
+			}
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify({ emails: [selectedEmail], totalCount: 1 }),
+			});
+		});
+
+		await page.goto(
+			`${baseUrl}/mailbox/${encodeURIComponent(mailboxId)}/emails/inbox`,
+			{ waitUntil: "domcontentloaded" },
+		);
+		const loadError = page.getByRole("alert").filter({
+			hasText: "Conversations could not be loaded",
+		});
+		await loadError.waitFor();
+		assert.equal(
+			await page.getByRole("heading", { name: "Your inbox is empty" }).count(),
+			0,
+			"a failed list read must not claim the inbox is empty",
+		);
+		assert.ok(listRequests >= 1);
+		const requestsAtSettledError = listRequests;
+		await delay(1_000);
+		assert.equal(
+			listRequests,
+			requestsAtSettledError,
+			"a settled list error must wait for explicit retry",
+		);
+		await page.screenshot({
+			path: join(artifactDirectory, `email-body-${runStamp}-${name}-list-error.png`),
+		});
+
+		allowSuccess = true;
+		await loadError.getByRole("button", { name: "Try again" }).click();
+		await page
+			.getByRole("button", { name: `Open conversation ${subject}` })
+			.waitFor();
+		assert.equal(await loadError.count(), 0);
+		assert.equal(listRequests, requestsAtSettledError + 1);
+		await assertNoHorizontalOverflow(page);
+		detail(`${name} list failure stayed truthful and recovered on one explicit retry`);
+	} catch (error) {
+		await captureDiagnostic(page, name, "email-list-retry", error);
+		throw error;
+	} finally {
+		await page.unrouteAll({ behavior: "ignoreErrors" });
+		await page.close();
+	}
+}
+
 async function openConversation(page, baseUrl) {
 	const inboxUrl = `${baseUrl}/mailbox/${encodeURIComponent(mailboxId)}/emails/inbox`;
 	for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -312,6 +573,227 @@ async function assertAuthoritativeIframe(page, messageId, expectedBody, forbidde
 	);
 	assert.match(srcdoc, new RegExp(expectedBody));
 	assert.doesNotMatch(srcdoc, new RegExp(forbiddenPreview));
+}
+
+async function verifyInlineCidRendering({ context, baseUrl, name }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(15_000);
+	observeBrowser(page, `${name} inline-cid`);
+	const attachmentGate = deferred();
+	const counters = {
+		attachmentGate,
+		referenced: 0,
+		unreferenced: 0,
+		srcsetOnly: 0,
+		remoteTracker: 0,
+		remoteOverride: 0,
+	};
+	try {
+		await installCidFixture(page, counters);
+		await openConversation(page, baseUrl);
+		const iframe = page
+			.locator(`[data-intelligence-message-id="${selectedId}"]`)
+			.getByTitle("Email content");
+		await iframe.waitFor();
+		const iframeHandle = await iframe.elementHandle();
+		assert.ok(iframeHandle);
+		const contentFrame = await iframeHandle.contentFrame();
+		assert.ok(contentFrame);
+		const inlineImage = contentFrame.locator('img[alt="CID render proof"]');
+		await inlineImage.waitFor();
+		await pollValue(
+			() => counters.referenced,
+			(value) => value === 1,
+			"gated authenticated CID download",
+		);
+		await pollValue(
+			() => contentFrame.evaluate(() => document.readyState),
+			(value) => value === "complete",
+			"opaque CID iframe readiness",
+		);
+		assert.equal(await inlineImage.getAttribute("src"), null);
+		assert.equal(await inlineImage.getAttribute("srcset"), null);
+		assert.equal(
+			await contentFrame.locator("picture source").getAttribute("srcset"),
+			null,
+		);
+		assert.equal(
+			await contentFrame.locator('img[alt="CID srcset only"]').getAttribute("srcset"),
+			null,
+		);
+		assert.equal(
+			await contentFrame.locator('img[alt="Remote tracker"]').getAttribute("src"),
+			null,
+		);
+
+		const srcdoc = await iframe.getAttribute("srcdoc");
+		assert.ok(srcdoc);
+		const nonceMatch = srcdoc.match(/var nonce = ("(?:[^"\\]|\\.)*");/);
+		assert.ok(nonceMatch);
+		const nonce = JSON.parse(nonceMatch[1]);
+		const exactBytes = Array.from(cidPng);
+		const postInlinePayload = async ({ payloadNonce, cid, mimeType, bytes, size }) => {
+			await iframe.evaluate((element, input) => {
+				const target = element.contentWindow;
+				if (!target) throw new Error("Email iframe has no content window");
+				const payloadBytes = input.bytes === null
+					? new Uint8Array(input.size)
+					: new Uint8Array(input.bytes);
+				target.postMessage({
+					__emailIframeInlineImages: true,
+					nonce: input.payloadNonce,
+					images: [{
+						cid: input.cid,
+						blob: new Blob([payloadBytes], { type: input.mimeType }),
+					}],
+				}, "*");
+			}, { payloadNonce, cid, mimeType, bytes, size });
+		};
+
+		await contentFrame.evaluate(() => {
+			const revoked = [];
+			globalThis.__revokedInlineImageUrls = revoked;
+			const originalRevoke = URL.revokeObjectURL.bind(URL);
+			URL.revokeObjectURL = (url) => {
+				revoked.push(url);
+				originalRevoke(url);
+			};
+		});
+		await postInlinePayload({
+			payloadNonce: "forged-nonce",
+			cid: cidContentId,
+			mimeType: "image/png",
+			bytes: exactBytes,
+			size: 0,
+		});
+		await postInlinePayload({
+			payloadNonce: nonce,
+			cid: "unexpected@example.com",
+			mimeType: "image/png",
+			bytes: exactBytes,
+			size: 0,
+		});
+		await postInlinePayload({
+			payloadNonce: nonce,
+			cid: cidContentId,
+			mimeType: "image/png",
+			bytes: [1],
+			size: 0,
+		});
+		await postInlinePayload({
+			payloadNonce: nonce,
+			cid: cidContentId,
+			mimeType: "image/gif",
+			bytes: exactBytes,
+			size: 0,
+		});
+		await postInlinePayload({
+			payloadNonce: nonce,
+			cid: cidContentId,
+			mimeType: "image/png",
+			bytes: null,
+			size: 25 * 1024 * 1024 + 1,
+		});
+		await delay(100);
+		assert.equal(await inlineImage.getAttribute("src"), null);
+		assert.deepEqual(
+			await contentFrame.evaluate(() => globalThis.__revokedInlineImageUrls),
+			[],
+		);
+
+		attachmentGate.resolve();
+		const initialState = await pollValue(
+			() => inlineImage.evaluate((image) => ({
+				complete: image.complete,
+				naturalWidth: image.naturalWidth,
+				naturalHeight: image.naturalHeight,
+				source: image.src,
+			})),
+			(value) => value.complete && value.naturalWidth === 1 &&
+				value.naturalHeight === 1 && value.source.startsWith("blob:"),
+			"authenticated CID image render",
+		);
+		assert.equal(counters.referenced, 1);
+		assert.equal(counters.unreferenced, 0);
+		assert.equal(counters.srcsetOnly, 0);
+		assert.equal(counters.remoteTracker, 0);
+		assert.equal(counters.remoteOverride, 0);
+
+		await postInlinePayload({
+			payloadNonce: nonce,
+			cid: cidContentId.toUpperCase(),
+			mimeType: "image/png",
+			bytes: exactBytes,
+			size: 0,
+		});
+		await delay(100);
+		assert.equal(await inlineImage.getAttribute("src"), initialState.source);
+		assert.deepEqual(
+			await contentFrame.evaluate(() => globalThis.__revokedInlineImageUrls),
+			[],
+		);
+
+		await assertNoHorizontalOverflow(page);
+		await page.screenshot({
+			path: join(artifactDirectory, `email-body-${runStamp}-${name}-inline-cid.png`),
+		});
+
+		await page.getByRole("button", { name: "Load images" }).click();
+		await pollValue(
+			() => counters.remoteTracker,
+			(value) => value === 1,
+			"explicit remote tracker opt-in",
+		);
+		const optedInIframeHandle = await iframe.elementHandle();
+		assert.ok(optedInIframeHandle);
+		const optedInContentFrame = await optedInIframeHandle.contentFrame();
+		assert.ok(optedInContentFrame);
+		const optedInInlineImage = optedInContentFrame.locator('img[alt="CID render proof"]');
+		await pollValue(
+			() => optedInInlineImage.evaluate((image) => ({
+				complete: image.complete,
+				naturalWidth: image.naturalWidth,
+				source: image.src,
+			})),
+			(value) => value.complete && value.naturalWidth === 1 && value.source.startsWith("blob:"),
+			"CID image after remote opt-in",
+		);
+		assert.equal(await optedInInlineImage.getAttribute("srcset"), null);
+		assert.equal(
+			await optedInContentFrame.locator("picture source").getAttribute("srcset"),
+			null,
+		);
+		assert.equal(counters.remoteOverride, 0);
+		assert.equal(counters.srcsetOnly, 0);
+		assert.equal(counters.referenced, 2);
+
+		const backToList = page.getByRole("button", { name: "Back to list" });
+		if (await backToList.isVisible()) await backToList.click();
+		await page
+			.getByRole("button", { name: `Open conversation ${hostileSubject}` })
+			.click();
+		await page.getByRole("heading", { name: hostileSubject }).waitFor();
+		const hostileIframe = page
+			.locator(`[data-intelligence-message-id="${hostileId}"]`)
+			.getByTitle("Email content");
+		await hostileIframe.waitFor();
+		const firstHostileSrcdoc = await hostileIframe.getAttribute("srcdoc");
+		assert.doesNotMatch(firstHostileSrcdoc ?? "", /Authenticated CID image/);
+		const settledHostileSrcdoc = await pollValue(
+			() => hostileIframe.getAttribute("srcdoc"),
+			(value) => typeof value === "string" && value.includes(hostileBody),
+			"hostile metadata message render",
+		);
+		assert.doesNotMatch(settledHostileSrcdoc, /Authenticated CID image/);
+		await assertNoHorizontalOverflow(page);
+		detail(`${name} rejected pre-acceptance nonce, manifest, MIME, size, and aggregate attacks; ignored valid replay; preserved CID over responsive remote sources; and cleared prior private content on hostile metadata switch`);
+	} catch (error) {
+		await captureDiagnostic(page, name, "inline-cid", error);
+		throw error;
+	} finally {
+		await page.unrouteAll({ behavior: "ignoreErrors" });
+		await page.close();
+	}
 }
 
 async function verifyDelayedSelected({ context, baseUrl, name }) {
@@ -501,6 +983,13 @@ async function verifyViewport({ browser, baseUrl, storageState, name, viewport }
 	progress(`Verifying ${name} at ${viewport.width}x${viewport.height}`);
 	const context = await browser.newContext({ storageState, viewport });
 	try {
+		if (cidOnly) {
+			await verifyInlineCidRendering({ context, baseUrl, name });
+			return;
+		}
+		await verifyEmailListRetry({ context, baseUrl, name });
+		if (emailListOnly) return;
+		await verifyInlineCidRendering({ context, baseUrl, name });
 		await verifyDelayedSelected({ context, baseUrl, name });
 		await verifyCollapseCancellation({ context, baseUrl, name });
 		await verifyRetryRecovery({ context, baseUrl, name });
@@ -563,7 +1052,13 @@ async function main() {
 			name: "desktop",
 			viewport: { width: 1440, height: 900 },
 		});
-		progress("PASS: authoritative email bodies are exact, cancellable, retryable, and Forward-safe at both widths");
+		progress(
+			cidOnly
+				? "PASS: CID inline images render through the nonce-bound opaque bridge at both widths"
+				: emailListOnly
+				? "PASS: email-list failures are truthful and recoverable at both widths"
+				: "PASS: email-list failures are truthful and recoverable, and authoritative email bodies are exact, cancellable, retryable, and Forward-safe at both widths",
+		);
 	} finally {
 		await browser?.close();
 		await stopServer(serverProcess);

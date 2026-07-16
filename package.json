@@ -44,6 +44,8 @@
 		"test:playwright:attachment-retry": "node scripts/verify-attachment-retry-playwright.mjs",
 		"pretest:playwright:email-body": "npm run test:playwright:install",
 		"test:playwright:email-body": "node scripts/verify-email-body-playwright.mjs",
+		"pretest:playwright:email-list-errors": "npm run test:playwright:install",
+		"test:playwright:email-list-errors": "node scripts/verify-email-body-playwright.mjs --email-list-only",
 		"test:playwright:install": "playwright install chromium",
 		"typecheck": "npm run cf-typegen && react-router typegen && tsc -b",
 		"typecheck:wiser": "npm run cf-typegen:wiser && react-router typegen && tsc -b",
