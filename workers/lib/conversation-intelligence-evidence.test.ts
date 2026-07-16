@@ -23,7 +23,8 @@ function fixture() {
       email_id TEXT NOT NULL,
       filename TEXT NOT NULL,
       mimetype TEXT NOT NULL,
-      size INTEGER NOT NULL
+      size INTEGER NOT NULL,
+      r2_key TEXT
     );
   `);
   const insertEmail = database.prepare(
@@ -64,7 +65,7 @@ function fixture() {
     );
   }
   const insertAttachment = database.prepare(
-    "INSERT INTO attachments VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?)",
   );
   for (let index = 0; index < 8; index++) {
     insertAttachment.run(
@@ -73,6 +74,7 @@ function fixture() {
       `${String(index)}-${"f".repeat(500)}`,
       `text/${"p".repeat(200)}`,
       100 + index,
+      null,
     );
   }
   return {

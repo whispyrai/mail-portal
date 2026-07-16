@@ -51,6 +51,7 @@ import { accountLifecycle } from "../lib/account-lifecycle-runtime.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
 import { createAdminReadDisclosureGuard } from "./admin-read-disclosure-guard.ts";
 import { requireAgentConnectionReconciliation } from "../lib/agent-connection-revocation-outbox.ts";
+import { adminInboundRecoveryApp } from "./admin-inbound-recovery.ts";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
@@ -118,6 +119,7 @@ adminApp.use(
 // Quiz admin console (open/close, edit questions, grade, results, seed). Mounted
 // inside adminApp so it inherits the ADMIN-only guard above.
 adminApp.route("/quizzes", adminQuizApp);
+adminApp.route("/", adminInboundRecoveryApp);
 
 adminApp.get("/ai-cost", async (c) => {
   const config = resolveAiCostControlConfig(c.env);

@@ -97,6 +97,7 @@ export type SemanticAttachmentExtractionLease = {
 	filename: string;
 	mimetype: string;
 	declaredSize: number;
+	r2Key: string | null;
 	leaseToken: string;
 	attemptCount: number;
 };
@@ -1125,13 +1126,16 @@ export function createSemanticIndex(input: {
 			);
 			const row = first(
 				store.sql.exec<SqlRow>(
-					`SELECT attachment_id AS attachmentId, message_id AS messageId,
-					 attachment_version AS attachmentVersion, filename, mimetype,
-					 declared_size AS declaredSize, attempt_count AS attemptCount
-					 FROM semantic_attachment_extractions
-					 WHERE state IN ('pending', 'failed') AND next_attempt_at <= ?1
-					   AND attempt_count < ?2
-					 ORDER BY next_attempt_at ASC, attachment_id ASC LIMIT 1`,
+					`SELECT x.attachment_id AS attachmentId, x.message_id AS messageId,
+					 x.attachment_version AS attachmentVersion, x.filename, x.mimetype,
+					 x.declared_size AS declaredSize, x.attempt_count AS attemptCount,
+					 a.r2_key AS r2Key
+					 FROM semantic_attachment_extractions x
+					 JOIN attachments a
+					   ON a.id = x.attachment_id AND a.email_id = x.message_id
+					 WHERE x.state IN ('pending', 'failed') AND x.next_attempt_at <= ?1
+					   AND x.attempt_count < ?2
+					 ORDER BY x.next_attempt_at ASC, x.attachment_id ASC LIMIT 1`,
 					nowMs,
 					MAX_JOB_ATTEMPTS,
 				),
@@ -1155,6 +1159,7 @@ export function createSemanticIndex(input: {
 				filename: text(row, "filename"),
 				mimetype: text(row, "mimetype"),
 				declaredSize: integer(row, "declaredSize"),
+				r2Key: typeof row.r2Key === "string" ? row.r2Key : null,
 				leaseToken,
 				attemptCount: integer(row, "attemptCount") + 1,
 			};

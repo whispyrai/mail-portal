@@ -38,6 +38,7 @@ export interface EmailMetadata {
 
 export interface EmailFull extends EmailMetadata {
 	body?: string | null;
+	body_external?: boolean;
 	message_id?: string | null;
 	raw_headers?: string | null;
 	attachments?: AttachmentInfo[];

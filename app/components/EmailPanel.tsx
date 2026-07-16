@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { useKumoToastManager } from "@cloudflare/kumo";
+import { useQueries } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { Folders } from "shared/folders";
@@ -23,6 +24,7 @@ import { evaluateStoredDraftAttachments } from "~/lib/compose-attachment-policy"
 import { planComposeEnqueueResult } from "~/lib/outbound-enqueue-outcome";
 import api from "~/services/api";
 import { useAiDraftReply, useCancelOutboundDelivery, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSaveDraft, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
+import { buildEmailBodyQueryOptions } from "~/queries/email-body";
 import { useFolders } from "~/queries/folders";
 import { useMailbox, useMailboxes } from "~/queries/mailboxes";
 import { useLabels, useMutateLabels } from "~/queries/labels";
@@ -111,6 +113,37 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		if (!email) return [];
 		return [email, ...threadReplies].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 	}, [email, threadReplies]);
+	const activeExternalBodyIds = useMemo(() => {
+		if (!email) return [];
+		const ids = new Set<string>();
+		if (email.body_external) ids.add(email.id);
+		for (const message of allMessages) {
+			if (
+				message.id !== email.id &&
+				message.body_external &&
+				expandedMessages.has(message.id)
+			) {
+				ids.add(message.id);
+			}
+		}
+		return [...ids];
+	}, [allMessages, email, expandedMessages]);
+	const externalBodyQueries = useQueries({
+		queries: mailboxId
+			? activeExternalBodyIds.map((messageId) =>
+					buildEmailBodyQueryOptions(mailboxId, messageId)
+				)
+			: [],
+	});
+	const externalBodyQueriesById = useMemo(
+		() => new Map(
+			activeExternalBodyIds.map((messageId, index) => [
+				messageId,
+				externalBodyQueries[index],
+			]),
+		),
+		[activeExternalBodyIds, externalBodyQueries],
+	);
 
 	const currentEmailId = email?.id;
 	useEffect(() => {
@@ -165,6 +198,14 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	);
 
 	if (!email) return <EmailPanelSkeleton />;
+	const selectedBodyQuery = externalBodyQueriesById.get(email.id);
+	const selectedBodyIsAuthoritative = !email.body_external || selectedBodyQuery?.data !== undefined;
+	const authoritativeSelectedEmail = selectedBodyIsAuthoritative
+		? {
+				...email,
+				body: email.body_external ? selectedBodyQuery?.data : email.body,
+			}
+		: null;
 
 	const snoozeFolderId = email.folder_id ?? folder ?? Folders.INBOX;
 	const reminderConversationKey = email.thread_id?.trim() || email.id;
@@ -465,16 +506,26 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				onBack={closePanel}
 				onSendDraft={() => handleSendDraft()}
 				onEditDraft={() => handleEditDraft()}
-				onReply={() =>
-					startCompose({ mode: "reply", originalEmail: lastReceivedMessage })
-				}
-				onReplyAll={() =>
-					startCompose({
-						mode: "reply-all",
-						originalEmail: lastReceivedMessage,
-					})
-				}
-				onForward={() => startCompose({ mode: "forward", originalEmail: email })}
+					onReply={() =>
+						startCompose({ mode: "reply", originalEmail: lastReceivedMessage })
+					}
+					onReplyAll={() =>
+						startCompose({
+							mode: "reply-all",
+							originalEmail: lastReceivedMessage,
+						})
+					}
+					onForward={() => {
+						if (!authoritativeSelectedEmail) return;
+						startCompose({
+							mode: "forward",
+							originalEmail: authoritativeSelectedEmail,
+						});
+					}}
+					canForward={Boolean(authoritativeSelectedEmail)}
+					forwardUnavailableReason={selectedBodyQuery?.isError
+						? "Complete message unavailable"
+						: "Loading complete message"}
 				onAiDraft={handleAiDraft}
 				onToggleStar={toggleStar}
 				onToggleRead={() => {
@@ -556,6 +607,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 								onPreviewImage={(url, filename) =>
 									setPreviewImage({ url, filename })
 								}
+								bodyState={externalBodyQueriesById.get(msg.id)}
 							/>
 						);
 					})
@@ -565,13 +617,14 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 						tabIndex={-1}
 						aria-label={`Message from ${email.sender}`}
 					>
-						<SingleMessageView
-							email={email}
-							mailboxId={mailboxId}
-							onPreviewImage={(url, filename) =>
-								setPreviewImage({ url, filename })
-							}
-						/>
+							<SingleMessageView
+								email={email}
+								mailboxId={mailboxId}
+								onPreviewImage={(url, filename) =>
+									setPreviewImage({ url, filename })
+								}
+								bodyState={selectedBodyQuery}
+							/>
 					</div>
 				)}
 				{!isIntelligenceUnsupported && mailboxId && (

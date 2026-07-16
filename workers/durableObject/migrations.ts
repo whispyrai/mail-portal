@@ -82,9 +82,9 @@ function txn(sql: string): string {
 }
 
 export const mailboxMigrations: Migration[] = [
-	{
-		name: "1_initial_setup",
-		sql: txn(`
+  {
+    name: "1_initial_setup",
+    sql: txn(`
             CREATE TABLE folders (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -122,10 +122,10 @@ export const mailboxMigrations: Migration[] = [
                 FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
             );
         `),
-	},
-	{
-		name: "2_add_email_threading",
-		sql: txn(`
+  },
+  {
+    name: "2_add_email_threading",
+    sql: txn(`
             ALTER TABLE emails ADD COLUMN in_reply_to TEXT;
             ALTER TABLE emails ADD COLUMN email_references TEXT;
             ALTER TABLE emails ADD COLUMN thread_id TEXT;
@@ -133,49 +133,53 @@ export const mailboxMigrations: Migration[] = [
             CREATE INDEX idx_emails_thread_id ON emails(thread_id);
             CREATE INDEX idx_emails_in_reply_to ON emails(in_reply_to);
         `),
-	},
-	{
-		name: "3_add_draft_folder",
-		sql: txn(`INSERT INTO folders (id, name, is_deletable) VALUES ('draft', 'Drafts', 0);`),
-	},
-	{
-		name: "4_add_message_id",
-		sql: txn(`ALTER TABLE emails ADD COLUMN message_id TEXT;`),
-	},
-	{
-		name: "5_add_raw_headers",
-		sql: txn(`ALTER TABLE emails ADD COLUMN raw_headers TEXT;`),
-	},
-	{
-		name: "6_mark_sent_emails_as_read",
-		sql: txn(`UPDATE emails SET read = 1 WHERE folder_id = 'sent' AND read = 0;`),
-	},
-	{
-		name: "7_add_cc_bcc",
-		sql: txn(`
+  },
+  {
+    name: "3_add_draft_folder",
+    sql: txn(
+      `INSERT INTO folders (id, name, is_deletable) VALUES ('draft', 'Drafts', 0);`,
+    ),
+  },
+  {
+    name: "4_add_message_id",
+    sql: txn(`ALTER TABLE emails ADD COLUMN message_id TEXT;`),
+  },
+  {
+    name: "5_add_raw_headers",
+    sql: txn(`ALTER TABLE emails ADD COLUMN raw_headers TEXT;`),
+  },
+  {
+    name: "6_mark_sent_emails_as_read",
+    sql: txn(
+      `UPDATE emails SET read = 1 WHERE folder_id = 'sent' AND read = 0;`,
+    ),
+  },
+  {
+    name: "7_add_cc_bcc",
+    sql: txn(`
             ALTER TABLE emails ADD COLUMN cc TEXT;
             ALTER TABLE emails ADD COLUMN bcc TEXT;
         `),
-	},
-	{
-		// No txn() wrapper: Cloudflare's DO runtime requires state.storage.transactionSync()
-		// instead of SQL-level BEGIN TRANSACTION. These are idempotent CREATE INDEX IF NOT EXISTS
-		// statements so they're safe to run without a transaction.
-		name: "8_add_folder_date_indexes",
-		sql: `
+  },
+  {
+    // No txn() wrapper: Cloudflare's DO runtime requires state.storage.transactionSync()
+    // instead of SQL-level BEGIN TRANSACTION. These are idempotent CREATE INDEX IF NOT EXISTS
+    // statements so they're safe to run without a transaction.
+    name: "8_add_folder_date_indexes",
+    sql: `
             CREATE INDEX IF NOT EXISTS idx_emails_folder_id ON emails(folder_id);
             CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date);
             CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
         `,
-	},
-	{
-		// Web Push per-device subscriptions for this mailbox (WISER-240). One row
-		// per device: `endpoint` is the browser-minted capability URL (unique);
-		// `id` is a stable client-facing handle for the device list + removal.
-		// No txn() wrapper — a single idempotent CREATE ... IF NOT EXISTS (see
-		// migration 8 for why DO runtime forbids SQL-level transactions).
-		name: "9_add_push_subscriptions",
-		sql: `
+  },
+  {
+    // Web Push per-device subscriptions for this mailbox (WISER-240). One row
+    // per device: `endpoint` is the browser-minted capability URL (unique);
+    // `id` is a stable client-facing handle for the device list + removal.
+    // No txn() wrapper — a single idempotent CREATE ... IF NOT EXISTS (see
+    // migration 8 for why DO runtime forbids SQL-level transactions).
+    name: "9_add_push_subscriptions",
+    sql: `
             CREATE TABLE IF NOT EXISTS push_subscriptions (
                 id TEXT PRIMARY KEY,
                 endpoint TEXT NOT NULL UNIQUE,
@@ -187,10 +191,10 @@ export const mailboxMigrations: Migration[] = [
                 last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 		`,
-	},
-	{
-		name: "10_add_safe_trash_and_activity_events",
-		sql: txn(`
+  },
+  {
+    name: "10_add_safe_trash_and_activity_events",
+    sql: txn(`
 			ALTER TABLE emails ADD COLUMN previous_folder_id TEXT;
 			ALTER TABLE emails ADD COLUMN trashed_at TEXT;
 
@@ -210,10 +214,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_activity_events_occurred_at
 				ON activity_events(occurred_at DESC);
 		`),
-	},
-	{
-		name: "11_add_truthful_outbox_storage",
-		sql: txn(`
+  },
+  {
+    name: "11_add_truthful_outbox_storage",
+    sql: txn(`
 			-- Preserve a user-created folder that already owns the reserved ID,
 			-- including every message that references it.
 			DROP TABLE IF EXISTS _outbox_folder_map;
@@ -319,10 +323,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_outbound_attempts_delivery
 				ON outbound_delivery_attempts(delivery_id, attempt_number);
 		`),
-	},
-	{
-		name: "12_scope_push_subscriptions_to_users",
-		sql: txn(`
+  },
+  {
+    name: "12_scope_push_subscriptions_to_users",
+    sql: txn(`
 			ALTER TABLE push_subscriptions ADD COLUMN user_id TEXT;
 			-- Legacy endpoint capabilities have no trustworthy user identity. Drop
 			-- them fail-closed; the authenticated client rebinds the browser's
@@ -331,19 +335,19 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_push_subscriptions_user_id
 				ON push_subscriptions(user_id);
 		`),
-	},
-	{
-		name: "13_index_truthful_outbox_runtime_queries",
-		sql: txn(`
+  },
+  {
+    name: "13_index_truthful_outbox_runtime_queries",
+    sql: txn(`
 			CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_status_lease
 				ON outbound_deliveries(status, lease_expires_at);
 			CREATE INDEX IF NOT EXISTS idx_outbound_deliveries_ses_message_id
 				ON outbound_deliveries(ses_message_id);
 		`),
-	},
-	{
-		name: "14_add_retired_outbound_folder",
-		sql: txn(`
+  },
+  {
+    name: "14_add_retired_outbound_folder",
+    sql: txn(`
 			-- Preserve a user-created folder that already owns the reserved ID,
 			-- including every message that references it.
 			DROP TABLE IF EXISTS _retired_outbound_folder_map;
@@ -386,10 +390,10 @@ export const mailboxMigrations: Migration[] = [
 				is_deletable = 0;
 			DROP TABLE _retired_outbound_folder_map;
 		`),
-	},
-	{
-		name: "15_add_mailbox_labels",
-		sql: txn(`
+  },
+  {
+    name: "15_add_mailbox_labels",
+    sql: txn(`
 			CREATE TABLE labels (
 				id TEXT PRIMARY KEY,
 				name TEXT NOT NULL,
@@ -416,10 +420,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_email_labels_email_id
 				ON email_labels(email_id, label_id);
 		`),
-	},
-	{
-		name: "16_add_mailbox_snooze",
-		sql: txn(`
+  },
+  {
+    name: "16_add_mailbox_snooze",
+    sql: txn(`
 			DROP TABLE IF EXISTS _snoozed_folder_map;
 			CREATE TABLE _snoozed_folder_map (
 				old_id TEXT PRIMARY KEY,
@@ -472,10 +476,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_snooze_reply_wake_requested
 				ON snooze_reply_wake_queue(requested_at, thread_id);
 		`),
-	},
-	{
-		name: "17_add_follow_up_reply_completion_queue",
-		sql: txn(`
+  },
+  {
+    name: "17_add_follow_up_reply_completion_queue",
+    sql: txn(`
 			CREATE TABLE follow_up_reply_completion_queue (
 				inbound_message_id TEXT PRIMARY KEY,
 				mailbox_address TEXT NOT NULL,
@@ -489,10 +493,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_follow_up_reply_completion_due
 				ON follow_up_reply_completion_queue(next_attempt_at, inbound_message_id);
 		`),
-	},
-	{
-		name: "18_add_recipient_memory",
-		sql: txn(`
+  },
+  {
+    name: "18_add_recipient_memory",
+    sql: txn(`
 			ALTER TABLE emails ADD COLUMN recipient_memory_origin TEXT
 				CHECK(recipient_memory_origin IN (
 					'live_inbound', 'accepted_outbound', 'admin_import'
@@ -514,20 +518,20 @@ export const mailboxMigrations: Migration[] = [
 				value TEXT NOT NULL
 			);
 		`),
-	},
-	{
-		name: "19_add_draft_create_replay",
-		sql: txn(`
+  },
+  {
+    name: "19_add_draft_create_replay",
+    sql: txn(`
 			ALTER TABLE emails ADD COLUMN draft_create_key TEXT;
 			ALTER TABLE emails ADD COLUMN draft_create_fingerprint TEXT;
 			CREATE UNIQUE INDEX idx_emails_draft_create_key
 				ON emails(draft_create_key)
 				WHERE draft_create_key IS NOT NULL;
 		`),
-	},
-	{
-		name: "20_add_today_brief_generation_claims",
-		sql: txn(`
+  },
+  {
+    name: "20_add_today_brief_generation_claims",
+    sql: txn(`
 			CREATE TABLE today_brief_generation_claims (
 				cache_key TEXT PRIMARY KEY,
 				owner_user_id TEXT NOT NULL,
@@ -538,17 +542,17 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_today_brief_generation_claim_expiry
 				ON today_brief_generation_claims(expires_at, cache_key);
 		`),
-	},
-	{
-		name: "21_index_mailbox_attachments",
-		sql: `
+  },
+  {
+    name: "21_index_mailbox_attachments",
+    sql: `
 			CREATE INDEX IF NOT EXISTS idx_attachments_email_id_id
 				ON attachments(email_id, id);
 		`,
-	},
-	{
-		name: "22_add_import_generation_claims",
-		sql: `
+  },
+  {
+    name: "22_add_import_generation_claims",
+    sql: `
 			CREATE TABLE import_generation_claims (
 				message_id TEXT PRIMARY KEY,
 				claim_token TEXT NOT NULL,
@@ -558,10 +562,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_import_generation_claims_expiry
 				ON import_generation_claims(expires_at, message_id);
 		`,
-	},
-	{
-		name: "23_add_mailbox_change_feed",
-		sql: txn(`
+  },
+  {
+    name: "23_add_mailbox_change_feed",
+    sql: txn(`
 			CREATE TABLE mailbox_changes (
 				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
 				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -666,10 +670,10 @@ export const mailboxMigrations: Migration[] = [
 				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'delivery_attempt', OLD.id, OLD.delivery_id, 'deleted');
 			END;
 		`),
-	},
-	{
-		name: "24_add_mail_people_projection",
-		sql: txn(`
+  },
+  {
+    name: "24_add_mail_people_projection",
+    sql: txn(`
 			ALTER TABLE emails ADD COLUMN sender_name TEXT;
 			CREATE INDEX idx_emails_people_backfill
 				ON emails(date DESC, id ASC);
@@ -718,10 +722,10 @@ export const mailboxMigrations: Migration[] = [
 				last_error TEXT
 			);
 		`),
-	},
-	{
-		name: "25_add_durable_push_outbox",
-		sql: txn(`
+  },
+  {
+    name: "25_add_durable_push_outbox",
+    sql: txn(`
 			ALTER TABLE push_subscriptions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;
 			ALTER TABLE push_subscriptions ADD COLUMN last_push_attempt_at TEXT;
 			ALTER TABLE push_subscriptions ADD COLUMN last_push_accepted_at TEXT;
@@ -772,10 +776,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_push_deliveries_actor_health
 				ON push_notification_deliveries(target_user_id, updated_at DESC, notification_id);
 		`),
-	},
-	{
-		name: "26_add_inbound_automation_rules",
-		sql: txn(`
+  },
+  {
+    name: "26_add_inbound_automation_rules",
+    sql: txn(`
 			CREATE TABLE automation_rule_state (
 				id INTEGER PRIMARY KEY CHECK(id = 1),
 				ruleset_generation INTEGER NOT NULL DEFAULT 0 CHECK(ruleset_generation >= 0),
@@ -1093,10 +1097,10 @@ export const mailboxMigrations: Migration[] = [
 				VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'automation_run', NEW.id, NEW.trigger_message_id, 'updated');
 			END;
 		`),
-	},
-	{
-		name: "27_add_semantic_message_projection",
-		sql: txn(`
+  },
+  {
+    name: "27_add_semantic_message_projection",
+    sql: txn(`
 			CREATE TABLE semantic_message_versions (
 				message_id TEXT PRIMARY KEY,
 				version INTEGER NOT NULL CHECK(version > 0),
@@ -1260,10 +1264,10 @@ export const mailboxMigrations: Migration[] = [
 				WHERE message_id = NEW.id;
 			END;
 		`),
-	},
-	{
-		name: "28_add_semantic_attachment_evidence",
-		sql: txn(`
+  },
+  {
+    name: "28_add_semantic_attachment_evidence",
+    sql: txn(`
 			DROP TRIGGER semantic_chunks_fts_insert;
 			DROP TRIGGER semantic_chunks_fts_delete;
 			DROP TRIGGER semantic_chunks_enqueue_upsert;
@@ -1611,10 +1615,10 @@ export const mailboxMigrations: Migration[] = [
 				WHERE message_id = NEW.id;
 			END;
 		`),
-	},
-	{
-		name: "29_retain_draft_create_operations",
-		sql: txn(`
+  },
+  {
+    name: "29_retain_draft_create_operations",
+    sql: txn(`
 			CREATE TABLE draft_create_operations (
 				create_key TEXT PRIMARY KEY,
 				fingerprint TEXT NOT NULL,
@@ -1641,10 +1645,10 @@ export const mailboxMigrations: Migration[] = [
 			WHERE draft_create_key IS NOT NULL
 			  AND draft_create_fingerprint IS NOT NULL;
 		`),
-	},
-	{
-		name: "30_add_draft_save_operations",
-		sql: txn(`
+  },
+  {
+    name: "30_add_draft_save_operations",
+    sql: txn(`
 			CREATE TABLE draft_save_operations (
 				save_key TEXT PRIMARY KEY,
 				fingerprint TEXT NOT NULL,
@@ -1659,24 +1663,24 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_draft_save_operations_revision
 				ON draft_save_operations(draft_id, expected_version, state);
 		`),
-	},
-	{
-		name: "31_add_draft_save_claim_token",
-		sql: txn(`
+  },
+  {
+    name: "31_add_draft_save_claim_token",
+    sql: txn(`
 			ALTER TABLE draft_save_operations ADD COLUMN claim_token TEXT;
 		`),
-	},
-	{
-		name: "32_index_draft_save_retention",
-		sql: txn(`
+  },
+  {
+    name: "32_index_draft_save_retention",
+    sql: txn(`
 			CREATE INDEX idx_draft_save_operations_retention
 				ON draft_save_operations(updated_at, save_key)
 				WHERE state IN ('committed', 'aborted');
 		`),
-	},
-	{
-		name: "33_add_draft_save_cleanup_intents",
-		sql: txn(`
+  },
+  {
+    name: "33_add_draft_save_cleanup_intents",
+    sql: txn(`
 			CREATE TABLE draft_save_cleanup_intents (
 				claim_token TEXT PRIMARY KEY,
 				draft_id TEXT NOT NULL,
@@ -1689,10 +1693,10 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_draft_save_cleanup_due
 				ON draft_save_cleanup_intents(next_attempt_at, claim_token);
 		`),
-	},
-	{
-		name: "34_add_draft_update_operations",
-		sql: txn(`
+  },
+  {
+    name: "34_add_draft_update_operations",
+    sql: txn(`
 			CREATE TABLE draft_update_operations (
 				update_key TEXT PRIMARY KEY,
 				fingerprint TEXT NOT NULL,
@@ -1705,7 +1709,7 @@ export const mailboxMigrations: Migration[] = [
 			CREATE INDEX idx_draft_update_operations_result
 				ON draft_update_operations(draft_id, result_version);
 		`),
-	},
+  },
   {
     name: "35_add_resource_create_operations",
     sql: txn(`
@@ -1722,6 +1726,234 @@ export const mailboxMigrations: Migration[] = [
 				CREATE INDEX idx_resource_create_operations_retention
 					ON resource_create_operations(updated_at, operation_key)
 					WHERE state IN ('superseded', 'unavailable');
+		`),
+  },
+  {
+    name: "36_add_inbound_durability",
+    sql: txn(`
+			ALTER TABLE attachments ADD COLUMN r2_key TEXT;
+
+			CREATE TABLE email_deletion_tombstones (
+				id TEXT PRIMARY KEY,
+				deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
+			CREATE TABLE inbound_terminal_failures (
+				id TEXT PRIMARY KEY,
+				queue_ref TEXT NOT NULL
+					CHECK(length(queue_ref) = 16 AND queue_ref NOT GLOB '*[^0-9a-f]*'),
+				attempts INTEGER NOT NULL CHECK(attempts >= 0),
+				error_code TEXT NOT NULL CHECK(error_code = 'QUEUE_RETRY_EXHAUSTED'),
+				recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
+			CREATE TABLE email_body_objects (
+				id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+				part_index INTEGER NOT NULL CHECK(part_index >= 0),
+				content_type TEXT NOT NULL CHECK(content_type IN ('text/html', 'text/plain')),
+				charset TEXT NOT NULL,
+				r2_key TEXT NOT NULL UNIQUE,
+				byte_length INTEGER NOT NULL CHECK(byte_length >= 0)
+			);
+			CREATE INDEX idx_email_body_objects_email_id
+				ON email_body_objects(email_id, part_index);
+
+			CREATE TABLE inbound_derived_content_state (
+				email_id TEXT PRIMARY KEY REFERENCES emails(id) ON DELETE CASCADE,
+				generation INTEGER NOT NULL DEFAULT 1 CHECK(generation >= 1),
+				last_repair_marker_id TEXT,
+				last_repaired_at TEXT
+			);
+				INSERT INTO inbound_derived_content_state (email_id)
+				SELECT id FROM emails WHERE recipient_memory_origin = 'live_inbound';
+
+				CREATE TABLE inbound_derived_content_repair_attempts (
+					attempt_id TEXT PRIMARY KEY,
+					email_id TEXT NOT NULL,
+					expected_generation INTEGER NOT NULL CHECK(expected_generation >= 1),
+					marker_id TEXT NOT NULL,
+					command_fingerprint TEXT NOT NULL CHECK(length(command_fingerprint) = 64),
+					outcome TEXT NOT NULL
+						CHECK(outcome IN ('committed', 'rejected', 'abandoned')),
+					result_generation INTEGER,
+					recorded_at TEXT NOT NULL,
+					CHECK(
+						(outcome = 'committed' AND result_generation IS NOT NULL AND result_generation >= 1)
+						OR (outcome <> 'committed' AND result_generation IS NULL)
+					)
+				);
+				CREATE INDEX idx_inbound_repair_attempts_email
+					ON inbound_derived_content_repair_attempts(email_id, recorded_at);
+
+				CREATE TABLE r2_deletion_outbox (
+				r2_key TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				projection_attempt_id TEXT,
+				state TEXT NOT NULL DEFAULT 'pending'
+					CHECK(state IN ('pending', 'deleting')),
+				claim_generation INTEGER NOT NULL DEFAULT 0
+					CHECK(claim_generation >= 0),
+				lease_token TEXT,
+				lease_expires_at TEXT,
+				attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+				next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+				last_error TEXT,
+				created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				CHECK(
+					(state = 'pending' AND lease_token IS NULL AND lease_expires_at IS NULL)
+					OR (state = 'deleting' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+				)
+			);
+			CREATE INDEX idx_r2_deletion_outbox_pending
+				ON r2_deletion_outbox(state, next_attempt_at, r2_key);
+			CREATE INDEX idx_r2_deletion_outbox_lease
+				ON r2_deletion_outbox(state, lease_expires_at, r2_key);
+
+			CREATE TABLE inbound_derived_content_retired_attempts (
+				attempt_id TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				retired_at TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				reason TEXT NOT NULL CHECK(reason = 'r2_deletion_started')
+			);
+			CREATE INDEX idx_inbound_retired_attempts_expiry
+				ON inbound_derived_content_retired_attempts(expires_at, attempt_id);
+
+			CREATE TABLE r2_retired_key_fences (
+				r2_key TEXT PRIMARY KEY,
+				email_id TEXT NOT NULL,
+				retired_at TEXT NOT NULL,
+				reason TEXT NOT NULL CHECK(reason = 'r2_deletion_started')
+			);
+
+			CREATE TABLE import_promotion_intents (
+				email_id TEXT NOT NULL,
+				claim_token TEXT NOT NULL,
+				object_count INTEGER NOT NULL CHECK(object_count >= 0),
+				total_byte_length INTEGER NOT NULL
+					CHECK(total_byte_length >= 0 AND total_byte_length <= 26214400),
+				recorded_count INTEGER NOT NULL DEFAULT 0
+					CHECK(recorded_count >= 0 AND recorded_count <= object_count),
+				recorded_byte_length INTEGER NOT NULL DEFAULT 0
+					CHECK(recorded_byte_length >= 0 AND recorded_byte_length <= total_byte_length),
+				rolling_fingerprint TEXT NOT NULL CHECK(
+					length(rolling_fingerprint) = 64
+					AND rolling_fingerprint NOT GLOB '*[^0-9a-f]*'
+				),
+				last_append_start INTEGER,
+				last_append_count INTEGER,
+				state TEXT NOT NULL CHECK(state IN (
+					'staging', 'recorded', 'reconciling', 'abandoned_watching',
+					'finalized', 'integrity_blocked'
+				)),
+				proof_fingerprint TEXT CHECK(
+					proof_fingerprint IS NULL OR (
+						length(proof_fingerprint) = 64
+						AND proof_fingerprint NOT GLOB '*[^0-9a-f]*'
+					)
+				),
+				writer_closed INTEGER NOT NULL DEFAULT 0 CHECK(writer_closed IN (0, 1)),
+				claim_generation INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation >= 0),
+				reconciliation_phase TEXT CHECK(reconciliation_phase IN ('validation', 'settlement')),
+				reconciliation_cycle INTEGER NOT NULL DEFAULT 0 CHECK(reconciliation_cycle >= 0),
+				validation_cursor INTEGER NOT NULL DEFAULT 0
+					CHECK(validation_cursor >= 0 AND validation_cursor <= object_count),
+				settlement_cursor INTEGER NOT NULL DEFAULT 0
+					CHECK(settlement_cursor >= 0 AND settlement_cursor <= object_count),
+				lease_token TEXT,
+				lease_expires_at INTEGER,
+				next_reconcile_at INTEGER NOT NULL,
+				retained_count INTEGER,
+				outboxed_count INTEGER,
+				absent_count INTEGER,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				finalized_at INTEGER,
+				PRIMARY KEY(email_id, claim_token),
+				CHECK(
+					(last_append_start IS NULL AND last_append_count IS NULL
+					 AND recorded_count = 0)
+					OR (last_append_start IS NOT NULL AND last_append_start >= 0
+					 AND last_append_count IS NOT NULL AND last_append_count > 0
+					 AND last_append_start + last_append_count = recorded_count)
+				),
+				CHECK(
+					(state = 'reconciling' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+					OR (state <> 'reconciling' AND lease_token IS NULL AND lease_expires_at IS NULL)
+				),
+				CHECK(
+					(state = 'finalized' AND finalized_at IS NOT NULL
+					 AND retained_count IS NOT NULL AND retained_count >= 0
+					 AND outboxed_count IS NOT NULL AND outboxed_count >= 0
+					 AND absent_count IS NOT NULL AND absent_count >= 0
+					 AND retained_count + outboxed_count + absent_count = object_count
+					 AND (writer_closed = 1 OR (
+						retained_count = object_count
+						AND outboxed_count = 0 AND absent_count = 0
+					 )))
+					OR (state <> 'finalized' AND finalized_at IS NULL
+					 AND retained_count IS NULL AND outboxed_count IS NULL AND absent_count IS NULL)
+				),
+				CHECK(
+					(state = 'staging' AND proof_fingerprint IS NULL
+					 AND reconciliation_phase IS NULL AND reconciliation_cycle = 0
+					 AND validation_cursor = 0 AND settlement_cursor = 0)
+					OR (state IN ('recorded', 'reconciling', 'abandoned_watching')
+					 AND proof_fingerprint = rolling_fingerprint
+					 AND reconciliation_phase IN ('validation', 'settlement')
+					 AND reconciliation_cycle > 0)
+					OR (state = 'integrity_blocked'
+					 AND proof_fingerprint = rolling_fingerprint
+					 AND reconciliation_phase = 'validation'
+					 AND reconciliation_cycle > 0)
+					OR (state = 'finalized' AND proof_fingerprint = rolling_fingerprint
+					 AND reconciliation_phase IS NULL AND reconciliation_cycle > 0)
+				),
+				CHECK(
+					(reconciliation_phase = 'validation' AND settlement_cursor = 0)
+					OR (reconciliation_phase = 'settlement'
+					 AND validation_cursor = object_count)
+					OR reconciliation_phase IS NULL
+				)
+			);
+			CREATE INDEX idx_import_promotion_intents_due
+				ON import_promotion_intents(state, next_reconcile_at, email_id, claim_token);
+			CREATE INDEX idx_import_promotion_intents_lease
+				ON import_promotion_intents(state, lease_expires_at, email_id, claim_token);
+
+			CREATE TABLE import_promotion_intent_objects (
+				email_id TEXT NOT NULL,
+				claim_token TEXT NOT NULL,
+				ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+				r2_key TEXT NOT NULL UNIQUE,
+				byte_length INTEGER NOT NULL
+					CHECK(byte_length >= 0 AND byte_length <= 26214400),
+				resolution TEXT NOT NULL CHECK(resolution IN (
+					'pending', 'retained', 'outboxed', 'absent', 'integrity_blocked'
+				)),
+				observation_state TEXT CHECK(observation_state IN (
+					'authoritative', 'unowned_present', 'absent'
+				)),
+				observation_cycle INTEGER CHECK(observation_cycle >= 0),
+				observed_byte_length INTEGER CHECK(observed_byte_length >= 0),
+				last_observed_at INTEGER,
+				PRIMARY KEY(email_id, claim_token, ordinal),
+				FOREIGN KEY(email_id, claim_token)
+					REFERENCES import_promotion_intents(email_id, claim_token) ON DELETE CASCADE,
+				CHECK(
+					(observation_state IS NULL AND observation_cycle IS NULL
+					 AND observed_byte_length IS NULL)
+					OR (observation_state IN ('authoritative', 'unowned_present')
+					 AND observation_cycle IS NOT NULL AND observed_byte_length IS NOT NULL)
+					OR (observation_state = 'absent' AND observation_cycle IS NOT NULL
+					 AND observed_byte_length IS NULL)
+				)
+			);
+			CREATE INDEX idx_import_promotion_objects_resolution
+				ON import_promotion_intent_objects(
+					email_id, claim_token, resolution, last_observed_at, ordinal
+				);
 		`),
   },
 ];

@@ -1,6 +1,10 @@
 import type { Env } from "../types.ts";
 import type { OutboundMessageSnapshot } from "./outbound-delivery-contract.ts";
-import { attachmentKey, attachmentKeyPrefix } from "./attachments.ts";
+import {
+	attachmentKey,
+	attachmentKeyPrefix,
+	storedAttachmentKey,
+} from "./attachments.ts";
 import { safeAttachmentStorageFilename } from "../../shared/attachment-filename.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
 
@@ -12,6 +16,7 @@ export type CancelledSnapshotAttachment = {
 	size: number;
 	content_id?: string | null;
 	disposition?: string | null;
+	r2_key?: string | null;
 };
 
 type RecoveryBucket = Pick<Env["BUCKET"], "get" | "put" | "delete">;
@@ -96,9 +101,7 @@ export async function prepareRecoveredDraftAttachments(
 	const recovered: CancelledSnapshotAttachment[] = [];
 	try {
 		for (const attachment of attachments) {
-			const object = await bucket.get(
-				attachmentKey(snapshotEmailId, attachment.id, attachment.filename),
-			);
+			const object = await bucket.get(storedAttachmentKey(attachment));
 			if (!object) {
 				throw new Error(`Missing cancelled attachment ${attachment.id}`);
 			}
@@ -110,11 +113,12 @@ export async function prepareRecoveredDraftAttachments(
 			const destinationKey = attachmentKey(draftId, id, filename);
 			await bucket.put(destinationKey, await object.arrayBuffer());
 			copiedKeys.push(destinationKey);
-			recovered.push({
+				recovered.push({
 				...attachment,
 				id,
 				email_id: draftId,
 				filename,
+				r2_key: destinationKey,
 				content_id: contentIdForDisposition(
 					attachment.disposition,
 					attachment.content_id,

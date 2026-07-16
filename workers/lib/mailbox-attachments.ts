@@ -25,6 +25,7 @@ export interface MailboxAttachmentByteMetadata {
 	size: number;
 	content_id: string | null;
 	disposition: string | null;
+	r2_key: string | null;
 }
 
 type AttachmentProjectionRow = {
@@ -169,7 +170,8 @@ export function readMailboxAttachmentForEmail(
 	}
 	return [
 		...sql.exec<MailboxAttachmentByteMetadata & Record<string, SqlValue>>(
-			`SELECT a.id, a.email_id, a.filename, a.mimetype, a.size, a.content_id, a.disposition
+			`SELECT a.id, a.email_id, a.filename, a.mimetype, a.size, a.content_id, a.disposition,
+			        a.r2_key
 			 FROM attachments a
 			 INNER JOIN emails e ON e.id = a.email_id
 			 WHERE a.id = ? AND a.email_id = ? AND e.folder_id <> '_cancelled_outbound'

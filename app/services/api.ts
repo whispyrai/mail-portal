@@ -94,6 +94,9 @@ async function request<T>(
 		if (contentType.includes("application/json")) {
 			return res.json() as Promise<T>;
 		}
+		if (contentType.startsWith("text/plain")) {
+			return res.text() as Promise<T>;
+		}
 		return res.blob() as unknown as T;
 	} finally {
 		clearTimeout(timeout);
@@ -311,6 +314,10 @@ const api = {
 		),
 	getEmail: (mailboxId: string, id: string, opts?: { signal?: AbortSignal }) =>
 		get<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, { signal: opts?.signal }),
+	getEmailBody: (mailboxId: string, id: string, opts?: { signal?: AbortSignal }) =>
+		get<string>(`/api/v1/mailboxes/${mailboxId}/emails/${id}/body`, {
+			signal: opts?.signal,
+		}),
 	updateEmail: (mailboxId: string, id: string, data: unknown) =>
 		put<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, data),
 	deleteEmail: (mailboxId: string, id: string) =>

@@ -14,6 +14,8 @@ test("both isolated environments ship the scheduled maintenance entrypoint", () 
   );
   assert.match(app, /async scheduled\(controller: ScheduledController, env: Env\)/);
   assert.match(app, /runScheduledMaintenance\(env, controller\)/);
-  assert.match(config, /"crons": \["\* \* \* \* \*", "17 \* \* \* \*"\]/);
-  assert.match(verifier, /scheduled maintenance crons/);
+  const exactCronTopology =
+    /"crons": \["\* \* \* \* \*", "\*\/5 \* \* \* \*", "17 \* \* \* \*"\]/g;
+  assert.equal(config.match(exactCronTopology)?.length, 3);
+  assert.match(verifier, /Cron schedules/);
 });

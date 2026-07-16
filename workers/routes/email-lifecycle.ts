@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import type { MailboxContext } from "../lib/mailbox.ts";
-import { attachmentKey } from "../lib/attachments.ts";
+import { storedAttachmentKey } from "../lib/attachments.ts";
 import { actorFromSession } from "../lib/activity.ts";
 
 type AppContext = Context<MailboxContext>;
@@ -81,7 +81,7 @@ export async function handleDiscardDraft(c: AppContext) {
 	}
 	if (result.attachments.length > 0) {
 		const keys = result.attachments.map((attachment) =>
-			attachmentKey(id, attachment.id, attachment.filename),
+			storedAttachmentKey({ ...attachment, email_id: id }),
 		);
 		try {
 			await c.env.BUCKET.delete(keys);

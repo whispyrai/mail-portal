@@ -36,6 +36,7 @@ export type StoredAttachment = {
 	size: number;
 	content_id: string | null;
 	disposition: string;
+	r2_key?: string | null;
 };
 
 /** An attachment shaped for `sendEmail` (SES inline delivery). */
@@ -99,9 +100,62 @@ export function attachmentKey(emailId: string, attachmentId: string, filename: s
 	return `${attachmentKeyPrefix(emailId, attachmentId)}${filename}`;
 }
 
+/** Exact stored byte authority, with a fallback for rows created before migration 36. */
+export function storedAttachmentKey(attachment: {
+	email_id: string;
+	id: string;
+	filename: string;
+	r2_key?: string | null;
+}): string {
+	return attachment.r2_key ?? attachmentKey(
+		attachment.email_id,
+		attachment.id,
+		attachment.filename,
+	);
+}
+
 /** Strip characters that could escape the R2 key namespace or break headers. */
 export function sanitizeFilename(name: string): string {
 	return (name || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+}
+
+const MAX_ATTACHMENT_STORAGE_FILENAME_BYTES = 240;
+const MAX_ATTACHMENT_STORAGE_EXTENSION_BYTES = 24;
+
+/** Truncate without splitting a UTF-8 code point. */
+export function truncateUtf8Bytes(value: string, maxBytes: number): string {
+	if (maxBytes <= 0 || value.length === 0) return "";
+	const encoder = new TextEncoder();
+	if (encoder.encode(value).byteLength <= maxBytes) return value;
+	let result = "";
+	let usedBytes = 0;
+	for (const character of value) {
+		const characterBytes = encoder.encode(character).byteLength;
+		if (usedBytes + characterBytes > maxBytes) break;
+		result += character;
+		usedBytes += characterBytes;
+	}
+	return result;
+}
+
+/** Bound only the filename segment used in a derived R2 object key. */
+export function boundedAttachmentStorageFilename(name: string): string {
+	const cleaned = sanitizeFilename(name);
+	const encoder = new TextEncoder();
+	if (encoder.encode(cleaned).byteLength <= MAX_ATTACHMENT_STORAGE_FILENAME_BYTES)
+		return cleaned;
+	const dot = cleaned.lastIndexOf(".");
+	const hasExtension = dot > 0 && dot < cleaned.length - 1;
+	const extension = hasExtension
+		? truncateUtf8Bytes(
+				cleaned.slice(dot),
+				MAX_ATTACHMENT_STORAGE_EXTENSION_BYTES,
+			)
+		: "";
+	const baseLimit =
+		MAX_ATTACHMENT_STORAGE_FILENAME_BYTES - encoder.encode(extension).byteLength;
+	const rawBase = hasExtension ? cleaned.slice(0, dot) : cleaned;
+	return `${truncateUtf8Bytes(rawBase, baseLimit) || "attachment"}${extension}`;
 }
 
 /**
@@ -134,9 +188,10 @@ type StubForResolve = {
 		mimetype: string;
 		size: number;
 		email_id: string;
-		content_id?: string | null;
-		disposition?: string | null;
-	} | null>;
+			content_id?: string | null;
+			disposition?: string | null;
+			r2_key?: string | null;
+		} | null>;
 	queueAttachmentCleanup?: (
 		emailId: string,
 		keys: string[],
@@ -237,16 +292,16 @@ export async function cleanupStoredAttachmentObjects(
 	bucket: Env["BUCKET"],
 	stub: StubForResolve,
 	emailId: string,
-	attachments: Array<{ id: string; filename: string }>,
+	attachments: Array<{ id: string; filename: string; r2_key?: string | null }>,
 	actor: ActivityActor = { kind: "system" },
 ) {
 	await cleanupOrQueue(
 		bucket,
 		stub,
 		emailId,
-		attachments.map((attachment) =>
-			attachmentKey(emailId, attachment.id, attachment.filename),
-		),
+			attachments.map((attachment) =>
+				storedAttachmentKey({ ...attachment, email_id: emailId }),
+			),
 		actor,
 	);
 }
@@ -331,7 +386,9 @@ export async function resolveAndPromoteAttachments(
 			const disposition: "attachment" | "inline" =
 				att.disposition === "inline" ? "inline" : "attachment";
 			const safe = sanitizeFilename(att.filename);
-			const obj = await bucket.get(attachmentKey(att.email_id, ref.attachmentId, safe));
+			const obj = await bucket.get(
+				storedAttachmentKey({ ...att, id: ref.attachmentId, filename: safe }),
+			);
 			if (!obj) throw new Error("A referenced attachment file is missing.");
 			sources.push({
 				attachmentId,
@@ -439,9 +496,10 @@ export async function resolveAndPromoteAttachments(
 				filename,
 				mimetype: s.mimetype,
 				size: s.bytes.byteLength,
-				content_id: s.contentId,
-				disposition: s.disposition,
-			});
+					content_id: s.contentId,
+					disposition: s.disposition,
+					r2_key: destinationKey,
+				});
 		}
 	} catch (error) {
 		await cleanupOrQueue(

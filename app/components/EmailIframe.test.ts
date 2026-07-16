@@ -22,6 +22,11 @@ test("every email renderer passes explicit message identity", () => {
 		"./email-panel/ThreadMessage.tsx",
 	]) {
 		const renderer = readFileSync(new URL(relative, import.meta.url), "utf8");
-		assert.match(renderer, /<EmailIframe[\s\S]*?messageId=\{email\.id\}/);
+		assert.match(renderer, /<EmailMessageBody[\s\S]*?email=\{email\}/);
 	}
+	const sharedRenderer = readFileSync(
+		new URL("./email-panel/EmailMessageBody.tsx", import.meta.url),
+		"utf8",
+	);
+	assert.match(sharedRenderer, /<EmailIframe[\s\S]*?messageId=\{email\.id\}/);
 });

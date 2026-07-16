@@ -67,40 +67,85 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, �
 1. **D1 database**
 
    ```bash
-   npx wrangler d1 create sales_portal_users
+   npx wrangler d1 create sales_portal_users --env whispyr
    ```
 
    Copy the returned `database_id` into `wrangler.jsonc` (`d1_databases[0].database_id`), then apply the schema:
 
    ```bash
-   npx wrangler d1 migrations apply sales_portal_users --remote
+   npx wrangler d1 migrations apply sales_portal_users --env whispyr --remote
    ```
 
    Apply all migrations through
-   `0010_create_agent_connection_revocations.sql` before deploying the current
+   `0011_create_saved_view_create_operations.sql` before deploying the current
    Worker. Migration 0010 creates the durable Agent connection-reconciliation
-   outbox and lifecycle triggers required by live access revocation. Apply the
-   migration before enabling the current minutely reconciliation and hourly AI
-   cache-retention schedules. The application fails closed when required D1
-   authorization or reconciliation state is unavailable.
+   outbox and lifecycle triggers required by live access revocation. Migration
+   0011 adds the idempotency ledger required by saved-view creation. Apply them
+   before enabling the minutely connection reconciler, five-minute inbound
+   archive reconciler, and hourly AI cache-retention schedules. The application
+   fails closed when required D1 authorization or reconciliation state is
+   unavailable.
 
 2. **R2 bucket**
 
    ```bash
-   npx wrangler r2 bucket create sales-mail-portal
+   npx wrangler r2 bucket create sales-mail-portal --env whispyr
+   npx wrangler r2 bucket create sales-mail-raw-archive --env whispyr
+   npx wrangler r2 bucket create sales-mail-raw-archive-preview --env whispyr
+   npx wrangler queues create sales-mail-inbound --env whispyr --message-retention-period-secs 1209600
+   npx wrangler queues create sales-mail-inbound-dlq --env whispyr --message-retention-period-secs 1209600
+   npx wrangler queues create sales-mail-inbound-parking --env whispyr --message-retention-period-secs 1209600
+   ```
+
+   `sales-mail-raw-archive` is the private authoritative copy of every accepted
+   raw inbound message. The separate preview bucket prevents remote development
+   from writing to the production archive. The Queue graph is exactly
+   `sales-mail-inbound` → `sales-mail-inbound-dlq` →
+   `sales-mail-inbound-parking`, with the configured terminal parking consumer.
+   All three Queues must use the locked 14-day retention.
+
+   Raw-archive lifecycle and Bucket Lock retention are not yet product-locked.
+   Before routing live mail, make that product decision, record it, obtain
+   separate approval, and only then apply the selected policies. Do not copy a
+   placeholder retention value into production.
+
+   For existing Queues, inspect and correct retention before deployment:
+
+   ```bash
+   npx wrangler queues info sales-mail-inbound --env whispyr
+   npx wrangler queues info sales-mail-inbound-dlq --env whispyr
+   npx wrangler queues info sales-mail-inbound-parking --env whispyr
+   npx wrangler r2 bucket info sales-mail-raw-archive --env whispyr
+   npx wrangler r2 bucket lifecycle list sales-mail-raw-archive --env whispyr
+   npx wrangler r2 bucket lock list sales-mail-raw-archive --env whispyr
+   ```
+
+   These Wrangler 4.74 commands are read-only. `queues info` confirms that each
+   Queue exists, but it does not prove the locked 14-day retention or the
+   deployed consumer settings. Verify retention in the Cloudflare control plane
+   and verify consumer settings and edges in the rebuilt deployment artifact.
+   Queue creation or updates, and any R2 lifecycle or Bucket Lock mutation, are
+   separately approval-gated. After approval, existing Queue retention is set
+   with:
+
+   ```bash
+   npx wrangler queues update sales-mail-inbound --env whispyr --message-retention-period-secs 1209600
+   npx wrangler queues update sales-mail-inbound-dlq --env whispyr --message-retention-period-secs 1209600
+   npx wrangler queues update sales-mail-inbound-parking --env whispyr --message-retention-period-secs 1209600
    ```
 
 3. **Secrets**
 
    ```bash
-   npx wrangler secret put AWS_ACCESS_KEY_ID       # SES IAM user (ses:SendEmail)
-   npx wrangler secret put AWS_SECRET_ACCESS_KEY
-   npx wrangler secret put SES_EVENT_WEBHOOK_SECRET
-   npx wrangler secret put JWT_SECRET              # openssl rand -base64 48
-   npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL   # e.g. hesham@whispyrcrm.com
-   npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY
-   npx wrangler secret put VAPID_PUBLIC_KEY
-   npx wrangler secret put VAPID_PRIVATE_KEY
+   npx wrangler secret put AWS_ACCESS_KEY_ID --env whispyr       # SES IAM user (ses:SendEmail)
+   npx wrangler secret put AWS_SECRET_ACCESS_KEY --env whispyr
+   npx wrangler secret put SES_EVENT_WEBHOOK_SECRET --env whispyr
+   npx wrangler secret put JWT_SECRET --env whispyr              # openssl rand -base64 48
+   npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL --env whispyr   # e.g. hesham@whispyrcrm.com
+   npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY --env whispyr
+   npx wrangler secret put EMERGENCY_FORWARD_TO --env whispyr
+   npx wrangler secret put VAPID_PUBLIC_KEY --env whispyr
+   npx wrangler secret put VAPID_PRIVATE_KEY --env whispyr
    ```
 
    `ACCOUNT_RECOVERY_DIRECTORY` is a platform-operator managed JSON object that

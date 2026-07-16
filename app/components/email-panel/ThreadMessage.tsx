@@ -12,14 +12,15 @@ import {
 	TrashIcon,
 } from "@phosphor-icons/react";
 import EmailAttachmentList from "~/components/EmailAttachmentList";
-import EmailIframe from "~/components/EmailIframe";
 import {
 	formatDetailDate,
 	formatShortDate,
-	rewriteInlineImages,
 	stripHtml,
 } from "~/lib/utils";
 import type { Email } from "~/types";
+import EmailMessageBody, {
+	type EmailBodyLoadState,
+} from "~/components/email-panel/EmailMessageBody";
 
 interface ThreadMessageProps {
 	email: Email;
@@ -35,6 +36,7 @@ interface ThreadMessageProps {
 	onDeleteDraft?: () => void;
 	onViewSource?: () => void;
 	onPreviewImage?: (url: string, filename: string) => void;
+	bodyState?: EmailBodyLoadState;
 }
 
 function Avatar({ isDraft, isSelf, sender }: { isDraft?: boolean; isSelf: boolean; sender: string }) {
@@ -67,6 +69,7 @@ export default function ThreadMessage({
 	onDeleteDraft,
 	onViewSource,
 	onPreviewImage,
+	bodyState,
 }: ThreadMessageProps) {
 	const isSelf = email.sender === mailboxEmail;
 	const containerClassName = `${!isLast ? "border-b border-kumo-line" : ""} ${isDraft ? "border-l-2 border-l-kumo-warning bg-kumo-warning/[0.02]" : ""}`;
@@ -167,14 +170,11 @@ export default function ThreadMessage({
 				</div>
 
 				<div className="md:ml-[42px]">
-					<EmailIframe
-						messageId={email.id}
-						body={rewriteInlineImages(
-							email.body || "",
-							mailboxId || "",
-							email.id,
-							email.attachments,
-						)}
+					<EmailMessageBody
+						email={email}
+						mailboxId={mailboxId}
+						bodyState={bodyState}
+						senderLabel={senderLabel}
 						autoSize
 					/>
 				</div>

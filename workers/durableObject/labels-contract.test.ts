@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import {
+	classMethodText,
+	parseTypescriptSource,
+} from "../testing/typescript-source.ts";
 
 const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-const mutationStart = source.indexOf("async mutateLabels(");
-const mutationEnd = source.indexOf("\n\tasync createFolder", mutationStart);
-const mutation = source.slice(mutationStart, mutationEnd);
+const mutation = classMethodText(
+	parseTypescriptSource(source, "index.ts"),
+	"mutateLabels",
+);
 
 test("label mutation defends its authoritative mailbox boundary", () => {
-	assert.ok(mutationStart >= 0 && mutationEnd > mutationStart);
 	assert.match(mutation, /validateLabelMutationTargets\(input\.targets\)/);
 	assert.match(mutation, /#visibleFolderId\(target\.folderId\)/);
 	assert.match(mutation, /#conversationScope\(target\.conversationId, folderId\)/);

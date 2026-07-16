@@ -225,6 +225,38 @@ test("direct projection exposes exact mailbox-local inbound, outbound, imported,
 	state.value.close();
 });
 
+test("People projection rolls back with its authoritative Message transaction", () => {
+	const state = database();
+	insertEmail(state.value, {
+		id: "rollback-message",
+		folder: "inbox",
+		sender: "rollback@example.com",
+		recipient: "team@example.com",
+		date: "2026-07-12T10:00:00.000Z",
+		thread: "rollback-thread",
+		origin: "live_inbound",
+	});
+	assert.throws(() => {
+		state.value.exec("BEGIN");
+		try {
+			state.projector.projectMessage("rollback-message");
+			throw new Error("controlled authoritative rollback");
+		} catch (error) {
+			state.value.exec("ROLLBACK");
+			throw error;
+		}
+	}, /controlled authoritative rollback/);
+	assert.equal(
+		state.value.prepare("SELECT COUNT(*) AS total FROM mail_people").get()?.total,
+		0,
+	);
+	assert.equal(
+		state.value.prepare("SELECT COUNT(*) AS total FROM mail_message_participants").get()?.total,
+		0,
+	);
+	state.value.close();
+});
+
 test("projection includes only explicitly authoritative mail in eligible folders", () => {
 	const state = database();
 	const fixtures = [

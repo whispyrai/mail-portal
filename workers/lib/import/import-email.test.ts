@@ -13,23 +13,19 @@ type CreatedEmail = {
 	attachments: Array<Record<string, unknown>>;
 };
 
+function objectMetadata(value: ArrayBuffer | string) {
+	return {
+		size: typeof value === "string"
+			? new TextEncoder().encode(value).byteLength
+			: value.byteLength,
+	};
+}
+
 function withImportClaims<
 	T extends { getEmail(id: string): Promise<{ id: string } | null> },
->(mailbox: T): T & {
-	claimImportedEmail(
-		emailId: string,
-		legacyId: string,
-		token: string,
-	): Promise<
-		| { status: "claimed" }
-		| { status: "existing"; id: string }
-		| { status: "busy" }
-	>;
-	releaseImportedEmailClaim(emailId: string, token: string): Promise<void>;
-	renewImportedEmailClaim(emailId: string, token: string): Promise<boolean>;
-	hasEmailOrThreadIdentity(identity: string): Promise<boolean>;
-} {
+>(mailbox: T) {
 	let active: { emailId: string; token: string } | null = null;
+	let sealedFingerprint: string | null = null;
 	const customHasEmailOrThreadIdentity = (mailbox as T & {
 		hasEmailOrThreadIdentity?: (value: string) => Promise<boolean>;
 	}).hasEmailOrThreadIdentity;
@@ -42,7 +38,9 @@ function withImportClaims<
 			return { status: "claimed" as const };
 		},
 		async releaseImportedEmailClaim(emailId: string, token: string) {
+			if (sealedFingerprint) return false;
 			if (active?.emailId === emailId && active.token === token) active = null;
+			return true;
 		},
 		async renewImportedEmailClaim(emailId: string, token: string) {
 			return active?.emailId === emailId && active.token === token;
@@ -51,6 +49,40 @@ function withImportClaims<
 			return customHasEmailOrThreadIdentity
 				? customHasEmailOrThreadIdentity(identity)
 				: Boolean(await mailbox.getEmail(identity));
+		},
+		async beginImportedEmailPromotionIntent() {},
+		async appendImportedEmailPromotionIntent() {},
+		async sealImportedEmailPromotionIntent() {
+			sealedFingerprint = "a".repeat(64);
+			return { proofFingerprint: sealedFingerprint };
+		},
+		async finalizeImportedEmailPromotionIntent(emailId: string, token: string) {
+			sealedFingerprint = null;
+			if (active?.emailId === emailId && active.token === token) active = null;
+			return { status: "finalized" as const };
+		},
+		async createImportedEmail(
+			folder: string,
+			email: Record<string, unknown>,
+			attachments: Array<Record<string, unknown>>,
+			mailboxAddress: string | undefined,
+		) {
+			const createEmail = mailbox as T & {
+				createEmail(
+					folder: string,
+					email: Record<string, unknown>,
+					attachments: Array<Record<string, unknown>>,
+					actor?: undefined,
+					mailboxAddress?: string,
+				): Promise<unknown>;
+			};
+			return (await createEmail.createEmail(
+				folder,
+				email,
+				attachments,
+				undefined,
+				mailboxAddress,
+			)) ?? { status: "stored" };
 		},
 	});
 }
@@ -76,8 +108,9 @@ test("importParsedEmail preserves metadata, attachments, threads, and idempotenc
 		},
 	});
 	const bucket = {
-		async put(key: string) {
+		async put(key: string, value: ArrayBuffer | string) {
 			storedAttachmentKeys.push(key);
+			return objectMetadata(value);
 		},
 		async delete() {},
 	};
@@ -160,8 +193,9 @@ test("importParsedEmail cleans partial objects and retries with isolated attachm
 		},
 	});
 	const bucket = {
-		async put(key: string, value: unknown) {
+		async put(key: string, value: ArrayBuffer | string) {
 			objects.set(key, value);
+			return objectMetadata(value);
 		},
 		async delete(key: string) {
 			objects.delete(key);
@@ -199,11 +233,79 @@ test("importParsedEmail cleans partial objects and retries with isolated attachm
 	]);
 });
 
+test("a lost create response preserves committed bytes and finalizes the durable promotion", async () => {
+	const objects = new Map<string, unknown>();
+	const storedEmailIds = new Set<string>();
+	let deletes = 0;
+	let finalizations = 0;
+	const mailbox = withImportClaims({
+		async getEmail(id: string) {
+			return storedEmailIds.has(id) ? { id } : null;
+		},
+		async resolveCanonicalThreadId() {
+			return null;
+		},
+		async createEmail(
+			_folder: string,
+			email: Record<string, unknown>,
+		) {
+			if (typeof email.id === "string") storedEmailIds.add(email.id);
+			throw new Error("simulated lost create response");
+		},
+	});
+	const finalize = mailbox.finalizeImportedEmailPromotionIntent.bind(mailbox);
+	mailbox.finalizeImportedEmailPromotionIntent = async (...args) => {
+		finalizations += 1;
+		return finalize(...args);
+	};
+	const bucket = {
+		async put(key: string, value: ArrayBuffer | string) {
+			objects.set(key, value);
+			return objectMetadata(value);
+		},
+		async delete(key: string) {
+			deletes += 1;
+			objects.delete(key);
+		},
+	};
+	const parsed = {
+		messageId: "<lost-create-response@zoho.example>",
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		subject: "Committed despite response loss",
+		from: { address: "sender@example.com" },
+		to: [{ address: "hello@wiserchat.ai" }],
+		text: "Preserve the committed attachment",
+		headers: [],
+		headerLines: [],
+		attachments: [{
+			filename: "committed.txt",
+			mimeType: "text/plain",
+			content: new TextEncoder().encode("committed").buffer,
+		}],
+	};
+
+	await assert.rejects(
+		() => importParsedEmail({ bucket, mailbox }, parsed, "inbox", "team@example.com"),
+		/simulated lost create response/,
+	);
+	assert.equal(storedEmailIds.size, 1);
+	assert.equal(objects.size, 1, "ambiguous commit preserves its authoritative R2 bytes");
+	assert.equal(deletes, 0);
+	assert.equal(finalizations, 1);
+	assert.equal(
+		(await importParsedEmail({ bucket, mailbox }, parsed, "inbox", "team@example.com")).reason,
+		"duplicate",
+	);
+});
+
 test("the same imported RFC identity produces mailbox-isolated attachment ids and R2 keys", async () => {
 	const keys: string[] = [];
 	const attachmentIds: string[] = [];
 	const bucket = {
-		async put(key: string) { keys.push(key); },
+		async put(key: string, value: ArrayBuffer | string) {
+			keys.push(key);
+			return objectMetadata(value);
+		},
 		async delete() {},
 	};
 	function mailbox() {
@@ -373,6 +475,7 @@ test("a concurrent duplicate import cannot overwrite the winning attachment byte
 					? new TextEncoder().encode(value)
 					: new Uint8Array(value),
 			);
+			return objectMetadata(value);
 		},
 		async delete(key: string) {
 			storedObjects.delete(key);
@@ -470,6 +573,26 @@ test("an expired in-flight writer cannot overwrite a successor generation", asyn
 			if (currentClaim?.emailId === emailId && currentClaim.token === token) {
 				currentClaim = null;
 			}
+			return true;
+		},
+		async beginImportedEmailPromotionIntent() {},
+		async appendImportedEmailPromotionIntent() {},
+		async sealImportedEmailPromotionIntent() {
+			return { proofFingerprint: "b".repeat(64) };
+		},
+		async finalizeImportedEmailPromotionIntent(emailId: string, token: string) {
+			if (currentClaim?.emailId === emailId && currentClaim.token === token) {
+				currentClaim = null;
+			}
+			return { status: "finalized" as const };
+		},
+		async createImportedEmail(
+			folder: string,
+			email: Record<string, unknown>,
+			attachments: Array<Record<string, unknown>>,
+		) {
+			await this.createEmail(folder, email, attachments);
+			return { status: "stored" };
 		},
 		async createEmail(
 			_folder: string,
@@ -493,6 +616,7 @@ test("an expired in-flight writer cannot overwrite a successor generation", asyn
 				await expiredWriteCanFinish;
 			}
 			storedObjects.set(key, bytes);
+			return objectMetadata(value);
 		},
 		async delete(key: string) {
 			storedObjects.delete(key);
@@ -534,4 +658,187 @@ test("an expired in-flight writer cannot overwrite a successor generation", asyn
 	const [key, bytes] = [...storedObjects.entries()][0]!;
 	assert.match(key, new RegExp(`/${committedId}/shared\\.pdf$`));
 	assert.deepEqual([...bytes], [9, 9, 9]);
+});
+
+test("canonical import promotion rejects missing or wrong R2 size metadata before Mailbox commit", async () => {
+	for (const testCase of [
+		{ name: "missing metadata", result: {} },
+		{ name: "wrong metadata", result: { size: 2 } },
+	]) {
+		let createCalls = 0;
+		const promotedKeys: string[] = [];
+		const deletedKeys: string[] = [];
+		const mailbox = withImportClaims({
+			async getEmail() { return null; },
+			async resolveCanonicalThreadId() { return null; },
+			async createEmail() { createCalls += 1; },
+		});
+		await assert.rejects(
+			() => importParsedEmail({
+				bucket: {
+					async put(key: string) {
+						promotedKeys.push(key);
+						return testCase.result;
+					},
+					async delete(key: string) {
+						deletedKeys.push(key);
+					},
+				},
+				mailbox,
+			}, {
+				messageId: `<integrity-${testCase.name}@zoho.example>`,
+				date: "Wed, 15 Apr 2026 15:42:00 +0000",
+				subject: "Integrity",
+				from: { address: "sender@example.com" },
+				to: [{ address: "team@example.com" }],
+				text: "Attachment",
+				headers: [],
+				headerLines: [],
+				attachments: [{
+					filename: "proof.bin",
+					mimeType: "application/octet-stream",
+					content: new Uint8Array([7]).buffer,
+				}],
+			}, "archive", "team@example.com"),
+			(error) =>
+				Boolean(
+					error &&
+					typeof error === "object" &&
+					"code" in error &&
+					error.code === "R2_DERIVED_UPLOAD_INTEGRITY_FAILED",
+				),
+			testCase.name,
+		);
+		assert.equal(createCalls, 0, testCase.name);
+		assert.equal(promotedKeys.length, 1, testCase.name);
+		assert.deepEqual(deletedKeys, promotedKeys, testCase.name);
+	}
+});
+
+test("promotion is sealed before the first R2 put and sealed failures use the durable finalizer", async () => {
+	const events: string[] = [];
+	let releaseCalls = 0;
+	const fingerprint = "c".repeat(64);
+	const mailbox = {
+		async getEmail() { return null; },
+		async resolveCanonicalThreadId() { return null; },
+		async hasEmailOrThreadIdentity() { return false; },
+		async claimImportedEmail() { return { status: "claimed" as const }; },
+		async renewImportedEmailClaim() { return true; },
+		async releaseImportedEmailClaim() {
+			releaseCalls += 1;
+			return true;
+		},
+		async beginImportedEmailPromotionIntent() { events.push("begin"); },
+		async appendImportedEmailPromotionIntent() { events.push("append"); },
+		async sealImportedEmailPromotionIntent() {
+			events.push("seal");
+			return { proofFingerprint: fingerprint };
+		},
+		async finalizeImportedEmailPromotionIntent(
+			_emailId: string,
+			_claimToken: string,
+			proofFingerprint: string,
+		) {
+			assert.equal(proofFingerprint, fingerprint);
+			events.push("finalize");
+			return { status: "finalized" as const };
+		},
+		async createImportedEmail() {
+			assert.fail("failed R2 promotion cannot commit a Message");
+		},
+		async createEmail() {
+			assert.fail("generic create must not be used by an import");
+		},
+	};
+	await assert.rejects(
+		() => importParsedEmail({
+			mailbox,
+			bucket: {
+				async put() {
+					events.push("put");
+					throw new Error("controlled promotion failure");
+				},
+				async delete() {
+					events.push("delete-failed");
+					throw new Error("controlled delete failure");
+				},
+			},
+		}, {
+			messageId: "<intent-order@zoho.example>",
+			date: "Wed, 15 Apr 2026 15:42:00 +0000",
+			subject: "Intent first",
+			from: { address: "sender@example.com" },
+			to: [{ address: "team@example.com" }],
+			text: "Attachment",
+			headers: [],
+			headerLines: [],
+			attachments: [{
+				filename: "proof.bin",
+				mimeType: "application/octet-stream",
+				content: new Uint8Array([7]).buffer,
+			}],
+		}, "archive", "team@example.com"),
+		/controlled promotion failure/,
+	);
+	assert.deepEqual(events, [
+		"begin",
+		"append",
+		"seal",
+		"put",
+		"delete-failed",
+		"finalize",
+	]);
+	assert.equal(releaseCalls, 0);
+});
+
+test("import finalization budgets both validation and settlement passes", async () => {
+	let finalizerCalls = 0;
+	const fingerprint = "d".repeat(64);
+	const result = await importParsedEmail({
+		mailbox: {
+			async getEmail() { return null; },
+			async resolveCanonicalThreadId() { return null; },
+			async hasEmailOrThreadIdentity() { return false; },
+			async claimImportedEmail() { return { status: "claimed" as const }; },
+			async renewImportedEmailClaim() { return true; },
+			async releaseImportedEmailClaim() { return false; },
+			async beginImportedEmailPromotionIntent() {},
+			async appendImportedEmailPromotionIntent() {},
+			async sealImportedEmailPromotionIntent() {
+				return { proofFingerprint: fingerprint };
+			},
+			async finalizeImportedEmailPromotionIntent() {
+				finalizerCalls += 1;
+				return {
+					status: finalizerCalls < 5 ? "pending" as const : "finalized" as const,
+				};
+			},
+			async createImportedEmail() { return { status: "stored" }; },
+			async createEmail() { assert.fail("generic create must not be used"); },
+		},
+		bucket: {
+			async put(_key: string, value: ArrayBuffer | string) {
+				return objectMetadata(value);
+			},
+			async delete() {},
+		},
+	}, {
+		messageId: "<two-phase-finalizer@zoho.example>",
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		subject: "Two phase finalizer",
+		from: { address: "sender@example.com" },
+		to: [{ address: "team@example.com" }],
+		text: "Attachment",
+		headers: [],
+		headerLines: [],
+		attachments: [{
+			filename: "proof.bin",
+			mimeType: "application/octet-stream",
+			content: new Uint8Array([7]).buffer,
+		}],
+	}, "archive", "team@example.com");
+
+	assert.equal(result.status, "imported");
+	assert.equal(finalizerCalls, 5);
 });

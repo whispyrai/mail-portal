@@ -43,7 +43,7 @@ test("fresh admission atomically consumes one matching live reservation", () => 
 		reservationValidation,
 	);
 	const reservationDelete = admission.indexOf(
-		"kv.delete(\n\t\t\t\t\t`${BULK_RESERVATION_PREFIX}${input.operationId}`",
+		"`${BULK_RESERVATION_PREFIX}${input.operationId}`",
 		admissionWrite,
 	);
 	assert.ok(
@@ -51,6 +51,10 @@ test("fresh admission atomically consumes one matching live reservation", () => 
 			reservationValidation > reservationRead &&
 			admissionWrite > reservationValidation &&
 			reservationDelete > admissionWrite,
+	);
+	assert.match(
+		admission.slice(admissionWrite, reservationDelete + 80),
+		/kv\.delete\(\s*`\$\{BULK_RESERVATION_PREFIX\}\$\{input\.operationId\}`,?\s*\)/,
 	);
 	assert.match(admission, /status: "reservation_invalid" as const/);
 	assert.match(admission, /const rejectCapacity[\s\S]*kv\.delete/);

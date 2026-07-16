@@ -19,9 +19,10 @@ function database() {
 			id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, subject TEXT, sender TEXT, date TEXT,
 			body TEXT, recipient TEXT, cc TEXT, bcc TEXT, raw_headers TEXT
 		);
-		CREATE TABLE attachments (
-			id TEXT PRIMARY KEY, email_id TEXT NOT NULL, filename TEXT NOT NULL,
-			mimetype TEXT NOT NULL, size INTEGER NOT NULL, content_id TEXT, disposition TEXT
+			CREATE TABLE attachments (
+				id TEXT PRIMARY KEY, email_id TEXT NOT NULL, filename TEXT NOT NULL,
+				mimetype TEXT NOT NULL, size INTEGER NOT NULL, content_id TEXT, disposition TEXT,
+				r2_key TEXT
 		);
 		INSERT INTO folders VALUES
 			('inbox', 'Inbox'), ('sent', 'Sent'), ('archive', 'Archive'),
@@ -55,14 +56,23 @@ function options(
 
 function add(
 	db: DatabaseSync,
-	row: { id: string; folder: string; date: string; filename: string; disposition?: string | null; mime?: string },
+		row: { id: string; folder: string; date: string; filename: string; disposition?: string | null; mime?: string; r2Key?: string | null },
 ) {
 	db.prepare(`INSERT INTO emails
 		(id, folder_id, subject, sender, date, body, recipient, cc, bcc, raw_headers)
 		VALUES (?, ?, ?, 'sender@example.com', ?, 'SECRET BODY', 'secret-recipient', 'secret-cc', 'secret-bcc', 'secret-headers')`)
 		.run(row.id, row.folder, `Subject ${row.id}`, row.date);
-	db.prepare(`INSERT INTO attachments VALUES (?, ?, ?, ?, 42, 'secret-cid', ?)`)
-		.run(`attachment-${row.id}`, row.id, row.filename, row.mime ?? "application/pdf", row.disposition ?? null);
+	db.prepare(`INSERT INTO attachments
+		(id, email_id, filename, mimetype, size, content_id, disposition, r2_key)
+		VALUES (?, ?, ?, ?, 42, 'secret-cid', ?, ?)`)
+			.run(
+				`attachment-${row.id}`,
+				row.id,
+				row.filename,
+				row.mime ?? "application/pdf",
+				row.disposition ?? null,
+				row.r2Key ?? null,
+			);
 }
 
 test("mailbox attachment projection includes stable mailbox folders while excluding mutable, internal, and inline rows", () => {
@@ -159,11 +169,13 @@ test("mailbox attachment detail returns only eligible bounded metadata", () => {
 
 test("exact-pair byte metadata preserves Draft and Outbox reads while hiding internal snapshots", () => {
 	const { db, sql } = database();
-	add(db, { id: "draft", folder: "draft", date: "2026-07-12T10:00:00.000Z", filename: "draft.pdf" });
-	add(db, { id: "outbox", folder: "outbox", date: "2026-07-12T10:00:00.000Z", filename: "queued.pdf" });
+	add(db, { id: "draft", folder: "draft", date: "2026-07-12T10:00:00.000Z", filename: "draft.pdf", r2Key: "attachments/draft/exact.pdf" });
+	add(db, { id: "outbox", folder: "outbox", date: "2026-07-12T10:00:00.000Z", filename: "queued.pdf", r2Key: "attachments/outbox/exact.pdf" });
 	add(db, { id: "internal", folder: "_cancelled_outbound", date: "2026-07-12T10:00:00.000Z", filename: "snapshot.pdf" });
 	assert.equal(readMailboxAttachmentForEmail(sql, "draft", "attachment-draft")?.filename, "draft.pdf");
+	assert.equal(readMailboxAttachmentForEmail(sql, "draft", "attachment-draft")?.r2_key, "attachments/draft/exact.pdf");
 	assert.equal(readMailboxAttachmentForEmail(sql, "outbox", "attachment-outbox")?.filename, "queued.pdf");
+	assert.equal(readMailboxAttachmentForEmail(sql, "outbox", "attachment-outbox")?.r2_key, "attachments/outbox/exact.pdf");
 	assert.equal(readMailboxAttachmentForEmail(sql, "internal", "attachment-internal"), null);
 	assert.equal(readMailboxAttachmentForEmail(sql, "wrong", "attachment-draft"), null);
 	db.close();

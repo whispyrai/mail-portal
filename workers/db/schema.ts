@@ -251,8 +251,190 @@ export const attachments = sqliteTable(
 		size: integer("size").notNull(),
 		content_id: text("content_id"),
 		disposition: text("disposition"),
+		r2_key: text("r2_key"),
 	},
 	(table) => [index("idx_attachments_email_id_id").on(table.email_id, table.id)],
+);
+
+export const emailDeletionTombstones = sqliteTable("email_deletion_tombstones", {
+	id: text("id").primaryKey(),
+	deleted_at: text("deleted_at").notNull().default(sql`(datetime('now'))`),
+});
+
+export const inboundTerminalFailures = sqliteTable(
+	"inbound_terminal_failures",
+	{
+		id: text("id").primaryKey(),
+		queue_ref: text("queue_ref").notNull(),
+		attempts: integer("attempts").notNull(),
+		error_code: text("error_code").notNull(),
+		recorded_at: text("recorded_at").notNull().default(sql`(datetime('now'))`),
+	},
+	(table) => [
+		check(
+			"inbound_terminal_failures_queue_ref",
+			sql`length(${table.queue_ref}) = 16 AND ${table.queue_ref} NOT GLOB '*[^0-9a-f]*'`,
+		),
+		check("inbound_terminal_failures_attempts_nonnegative", sql`${table.attempts} >= 0`),
+		check(
+			"inbound_terminal_failures_error_code",
+			sql`${table.error_code} = 'QUEUE_RETRY_EXHAUSTED'`,
+		),
+	],
+);
+
+export const emailBodyObjects = sqliteTable(
+	"email_body_objects",
+	{
+		id: text("id").primaryKey(),
+		email_id: text("email_id")
+			.notNull()
+			.references(() => emails.id, { onDelete: "cascade" }),
+		part_index: integer("part_index").notNull(),
+		content_type: text("content_type", {
+			enum: ["text/html", "text/plain"],
+		}).notNull(),
+		charset: text("charset").notNull(),
+		r2_key: text("r2_key").notNull(),
+		byte_length: integer("byte_length").notNull(),
+	},
+	(table) => [
+		index("idx_email_body_objects_email_id").on(table.email_id, table.part_index),
+		uniqueIndex("idx_email_body_objects_r2_key").on(table.r2_key),
+		check("email_body_objects_part_index_nonnegative", sql`${table.part_index} >= 0`),
+		check("email_body_objects_byte_length_nonnegative", sql`${table.byte_length} >= 0`),
+	],
+);
+
+export const inboundDerivedContentState = sqliteTable(
+	"inbound_derived_content_state",
+	{
+		email_id: text("email_id")
+			.primaryKey()
+			.references(() => emails.id, { onDelete: "cascade" }),
+		generation: integer("generation").notNull().default(1),
+		last_repair_marker_id: text("last_repair_marker_id"),
+		last_repaired_at: text("last_repaired_at"),
+	},
+	(table) => [
+		check("inbound_derived_content_state_generation_positive", sql`${table.generation} >= 1`),
+	],
+);
+
+export const inboundDerivedContentRepairAttempts = sqliteTable(
+	"inbound_derived_content_repair_attempts",
+	{
+		attempt_id: text("attempt_id").primaryKey(),
+		email_id: text("email_id").notNull(),
+		expected_generation: integer("expected_generation").notNull(),
+		marker_id: text("marker_id").notNull(),
+		command_fingerprint: text("command_fingerprint").notNull(),
+		outcome: text("outcome", {
+			enum: ["committed", "rejected", "abandoned"],
+		}).notNull(),
+		result_generation: integer("result_generation"),
+		recorded_at: text("recorded_at").notNull(),
+	},
+	(table) => [
+		index("idx_inbound_repair_attempts_email").on(table.email_id, table.recorded_at),
+		check(
+			"inbound_repair_attempts_generation_positive",
+			sql`${table.expected_generation} >= 1`,
+		),
+		check(
+			"inbound_repair_attempts_fingerprint_length",
+			sql`length(${table.command_fingerprint}) = 64`,
+		),
+		check(
+			"inbound_repair_attempts_outcome_closed",
+			sql`${table.outcome} IN ('committed', 'rejected', 'abandoned')`,
+		),
+		check(
+			"inbound_repair_attempts_result_generation",
+			sql`(${table.outcome} = 'committed' AND ${table.result_generation} IS NOT NULL AND ${table.result_generation} >= 1) OR (${table.outcome} <> 'committed' AND ${table.result_generation} IS NULL)`,
+		),
+	],
+);
+
+export const r2DeletionOutbox = sqliteTable(
+	"r2_deletion_outbox",
+	{
+		r2_key: text("r2_key").primaryKey(),
+		email_id: text("email_id").notNull(),
+		projection_attempt_id: text("projection_attempt_id"),
+		state: text("state", { enum: ["pending", "deleting"] })
+			.notNull()
+			.default("pending"),
+		claim_generation: integer("claim_generation").notNull().default(0),
+		lease_token: text("lease_token"),
+		lease_expires_at: text("lease_expires_at"),
+		attempts: integer("attempts").notNull().default(0),
+		next_attempt_at: text("next_attempt_at").notNull().default(sql`(datetime('now'))`),
+		last_error: text("last_error"),
+		created_at: text("created_at").notNull().default(sql`(datetime('now'))`),
+	},
+	(table) => [
+		index("idx_r2_deletion_outbox_pending").on(
+			table.state,
+			table.next_attempt_at,
+			table.r2_key,
+		),
+		index("idx_r2_deletion_outbox_lease").on(
+			table.state,
+			table.lease_expires_at,
+			table.r2_key,
+		),
+		check(
+			"r2_deletion_outbox_state_valid",
+			sql`${table.state} IN ('pending', 'deleting')`,
+		),
+		check(
+			"r2_deletion_outbox_claim_generation_nonnegative",
+			sql`${table.claim_generation} >= 0`,
+		),
+		check("r2_deletion_outbox_attempts_nonnegative", sql`${table.attempts} >= 0`),
+		check(
+			"r2_deletion_outbox_lease_state",
+			sql`(${table.state} = 'pending' AND ${table.lease_token} IS NULL AND ${table.lease_expires_at} IS NULL) OR (${table.state} = 'deleting' AND ${table.lease_token} IS NOT NULL AND ${table.lease_expires_at} IS NOT NULL)`,
+		),
+	],
+);
+
+export const inboundDerivedContentRetiredAttempts = sqliteTable(
+	"inbound_derived_content_retired_attempts",
+	{
+		attempt_id: text("attempt_id").primaryKey(),
+		email_id: text("email_id").notNull(),
+		retired_at: text("retired_at").notNull(),
+		expires_at: text("expires_at").notNull(),
+		reason: text("reason", { enum: ["r2_deletion_started"] }).notNull(),
+	},
+	(table) => [
+		index("idx_inbound_retired_attempts_expiry").on(
+			table.expires_at,
+			table.attempt_id,
+		),
+		check(
+			"inbound_retired_attempts_reason",
+			sql`${table.reason} = 'r2_deletion_started'`,
+		),
+	],
+);
+
+export const r2RetiredKeyFences = sqliteTable(
+	"r2_retired_key_fences",
+	{
+		r2_key: text("r2_key").primaryKey(),
+		email_id: text("email_id").notNull(),
+		retired_at: text("retired_at").notNull(),
+		reason: text("reason", { enum: ["r2_deletion_started"] }).notNull(),
+	},
+	(table) => [
+		check(
+			"r2_retired_key_fences_reason",
+			sql`${table.reason} = 'r2_deletion_started'`,
+		),
+	],
 );
 
 export const importGenerationClaims = sqliteTable(
@@ -266,57 +448,243 @@ export const importGenerationClaims = sqliteTable(
 	(table) => [index("idx_import_generation_claims_expiry").on(table.expires_at, table.message_id)],
 );
 
-export const pushSubscriptions = sqliteTable("push_subscriptions", {
-	id: text("id").primaryKey(),
-	user_id: text("user_id"),
-	endpoint: text("endpoint").notNull().unique(),
-	p256dh: text("p256dh").notNull(),
-	auth: text("auth").notNull(),
-	user_agent: text("user_agent"),
-	device_label: text("device_label"),
-	created_at: text("created_at").notNull().default(sql`(datetime('now'))`),
-	last_seen_at: text("last_seen_at").notNull().default(sql`(datetime('now'))`),
-	generation: integer("generation").notNull().default(1),
-	last_push_attempt_at: text("last_push_attempt_at"),
-	last_push_accepted_at: text("last_push_accepted_at"),
-	last_push_failure_at: text("last_push_failure_at"),
-	last_push_failure_reason: text("last_push_failure_reason"),
-	consecutive_push_failures: integer("consecutive_push_failures").notNull().default(0),
-}, (table) => [index("idx_push_subscriptions_user_id").on(table.user_id)]);
+export const importPromotionIntents = sqliteTable(
+  "import_promotion_intents",
+  {
+    email_id: text("email_id").notNull(),
+    claim_token: text("claim_token").notNull(),
+    object_count: integer("object_count").notNull(),
+    total_byte_length: integer("total_byte_length").notNull(),
+    state: text("state", {
+      enum: [
+        "staging",
+        "recorded",
+        "reconciling",
+        "abandoned_watching",
+        "finalized",
+        "integrity_blocked",
+      ],
+    }).notNull(),
+    proof_fingerprint: text("proof_fingerprint"),
+    recorded_count: integer("recorded_count").notNull().default(0),
+    recorded_byte_length: integer("recorded_byte_length").notNull().default(0),
+    rolling_fingerprint: text("rolling_fingerprint").notNull(),
+    last_append_start: integer("last_append_start"),
+    last_append_count: integer("last_append_count"),
+    writer_closed: integer("writer_closed").notNull().default(0),
+    claim_generation: integer("claim_generation").notNull().default(0),
+    reconciliation_phase: text("reconciliation_phase", {
+      enum: ["validation", "settlement"],
+    }),
+    reconciliation_cycle: integer("reconciliation_cycle").notNull().default(0),
+    validation_cursor: integer("validation_cursor").notNull().default(0),
+    settlement_cursor: integer("settlement_cursor").notNull().default(0),
+    lease_token: text("lease_token"),
+    lease_expires_at: integer("lease_expires_at"),
+    next_reconcile_at: integer("next_reconcile_at").notNull(),
+    retained_count: integer("retained_count"),
+    outboxed_count: integer("outboxed_count"),
+    absent_count: integer("absent_count"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+    finalized_at: integer("finalized_at"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.email_id, table.claim_token] }),
+    index("idx_import_promotion_intents_due").on(
+      table.state,
+      table.next_reconcile_at,
+      table.email_id,
+      table.claim_token,
+    ),
+    index("idx_import_promotion_intents_lease").on(
+      table.state,
+      table.lease_expires_at,
+      table.email_id,
+      table.claim_token,
+    ),
+    check(
+      "import_promotion_intents_object_count",
+      sql`${table.object_count} >= 0`,
+    ),
+    check(
+      "import_promotion_intents_total_bytes",
+      sql`${table.total_byte_length} >= 0 AND ${table.total_byte_length} <= 26214400`,
+    ),
+    check(
+      "import_promotion_intents_recorded_count",
+      sql`${table.recorded_count} >= 0 AND ${table.recorded_count} <= ${table.object_count}`,
+    ),
+    check(
+      "import_promotion_intents_recorded_bytes",
+      sql`${table.recorded_byte_length} >= 0 AND ${table.recorded_byte_length} <= ${table.total_byte_length}`,
+    ),
+    check(
+      "import_promotion_intents_state",
+      sql`${table.state} IN ('staging', 'recorded', 'reconciling', 'abandoned_watching', 'finalized', 'integrity_blocked')`,
+    ),
+    check(
+      "import_promotion_intents_phase",
+      sql`${table.reconciliation_phase} IS NULL OR ${table.reconciliation_phase} IN ('validation', 'settlement')`,
+    ),
+    check(
+      "import_promotion_intents_fingerprint",
+      sql`(${table.proof_fingerprint} IS NULL OR (length(${table.proof_fingerprint}) = 64 AND ${table.proof_fingerprint} NOT GLOB '*[^0-9a-f]*')) AND length(${table.rolling_fingerprint}) = 64 AND ${table.rolling_fingerprint} NOT GLOB '*[^0-9a-f]*'`,
+    ),
+    check(
+      "import_promotion_intents_last_append",
+      sql`(${table.last_append_start} IS NULL AND ${table.last_append_count} IS NULL AND ${table.recorded_count} = 0) OR (${table.last_append_start} IS NOT NULL AND ${table.last_append_start} >= 0 AND ${table.last_append_count} IS NOT NULL AND ${table.last_append_count} > 0 AND ${table.last_append_start} + ${table.last_append_count} = ${table.recorded_count})`,
+    ),
+    check(
+      "import_promotion_intents_writer",
+      sql`${table.writer_closed} IN (0, 1)`,
+    ),
+    check(
+      "import_promotion_intents_generations",
+      sql`${table.claim_generation} >= 0 AND ${table.reconciliation_cycle} >= 0`,
+    ),
+    check(
+      "import_promotion_intents_cursors",
+      sql`${table.validation_cursor} >= 0 AND ${table.validation_cursor} <= ${table.object_count} AND ${table.settlement_cursor} >= 0 AND ${table.settlement_cursor} <= ${table.object_count}`,
+    ),
+    check(
+      "import_promotion_intents_lease_state",
+      sql`(${table.state} = 'reconciling' AND ${table.lease_token} IS NOT NULL AND ${table.lease_expires_at} IS NOT NULL) OR (${table.state} <> 'reconciling' AND ${table.lease_token} IS NULL AND ${table.lease_expires_at} IS NULL)`,
+    ),
+    check(
+      "import_promotion_intents_finalized_metadata",
+      sql`(${table.state} = 'finalized' AND ${table.finalized_at} IS NOT NULL AND ${table.retained_count} IS NOT NULL AND ${table.retained_count} >= 0 AND ${table.outboxed_count} IS NOT NULL AND ${table.outboxed_count} >= 0 AND ${table.absent_count} IS NOT NULL AND ${table.absent_count} >= 0 AND ${table.retained_count} + ${table.outboxed_count} + ${table.absent_count} = ${table.object_count} AND (${table.writer_closed} = 1 OR (${table.retained_count} = ${table.object_count} AND ${table.outboxed_count} = 0 AND ${table.absent_count} = 0))) OR (${table.state} <> 'finalized' AND ${table.finalized_at} IS NULL AND ${table.retained_count} IS NULL AND ${table.outboxed_count} IS NULL AND ${table.absent_count} IS NULL)`,
+    ),
+    check(
+      "import_promotion_intents_lifecycle",
+      sql`(${table.state} = 'staging' AND ${table.proof_fingerprint} IS NULL AND ${table.reconciliation_phase} IS NULL AND ${table.reconciliation_cycle} = 0 AND ${table.validation_cursor} = 0 AND ${table.settlement_cursor} = 0) OR (${table.state} IN ('recorded', 'reconciling', 'abandoned_watching') AND ${table.proof_fingerprint} = ${table.rolling_fingerprint} AND ${table.reconciliation_phase} IN ('validation', 'settlement') AND ${table.reconciliation_cycle} > 0) OR (${table.state} = 'integrity_blocked' AND ${table.proof_fingerprint} = ${table.rolling_fingerprint} AND ${table.reconciliation_phase} = 'validation' AND ${table.reconciliation_cycle} > 0) OR (${table.state} = 'finalized' AND ${table.proof_fingerprint} = ${table.rolling_fingerprint} AND ${table.reconciliation_phase} IS NULL AND ${table.reconciliation_cycle} > 0)`,
+    ),
+    check(
+      "import_promotion_intents_phase_cursor",
+      sql`(${table.reconciliation_phase} = 'validation' AND ${table.settlement_cursor} = 0) OR (${table.reconciliation_phase} = 'settlement' AND ${table.validation_cursor} = ${table.object_count}) OR ${table.reconciliation_phase} IS NULL`,
+    ),
+  ],
+);
+
+export const importPromotionIntentObjects = sqliteTable(
+  "import_promotion_intent_objects",
+  {
+    email_id: text("email_id").notNull(),
+    claim_token: text("claim_token").notNull(),
+    ordinal: integer("ordinal").notNull(),
+    r2_key: text("r2_key").notNull().unique(),
+    byte_length: integer("byte_length").notNull(),
+    resolution: text("resolution", {
+      enum: ["pending", "retained", "outboxed", "absent", "integrity_blocked"],
+    }).notNull(),
+    observation_state: text("observation_state", {
+      enum: ["authoritative", "unowned_present", "absent"],
+    }),
+    observation_cycle: integer("observation_cycle"),
+    observed_byte_length: integer("observed_byte_length"),
+    last_observed_at: integer("last_observed_at"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.email_id, table.claim_token, table.ordinal] }),
+    foreignKey({
+      columns: [table.email_id, table.claim_token],
+      foreignColumns: [
+        importPromotionIntents.email_id,
+        importPromotionIntents.claim_token,
+      ],
+    }).onDelete("cascade"),
+    index("idx_import_promotion_objects_resolution").on(
+      table.email_id,
+      table.claim_token,
+      table.resolution,
+      table.last_observed_at,
+      table.ordinal,
+    ),
+    check("import_promotion_objects_ordinal", sql`${table.ordinal} >= 0`),
+    check(
+      "import_promotion_objects_bytes",
+      sql`${table.byte_length} >= 0 AND ${table.byte_length} <= 26214400`,
+    ),
+    check(
+      "import_promotion_objects_resolution",
+      sql`${table.resolution} IN ('pending', 'retained', 'outboxed', 'absent', 'integrity_blocked')`,
+    ),
+    check(
+      "import_promotion_objects_observation_state",
+      sql`${table.observation_state} IS NULL OR ${table.observation_state} IN ('authoritative', 'unowned_present', 'absent')`,
+    ),
+    check(
+      "import_promotion_objects_observation_bounds",
+      sql`(${table.observation_cycle} IS NULL OR ${table.observation_cycle} >= 0) AND (${table.observed_byte_length} IS NULL OR ${table.observed_byte_length} >= 0)`,
+    ),
+    check(
+      "import_promotion_objects_observation",
+      sql`(${table.observation_state} IS NULL AND ${table.observation_cycle} IS NULL AND ${table.observed_byte_length} IS NULL) OR (${table.observation_state} IN ('authoritative', 'unowned_present') AND ${table.observation_cycle} IS NOT NULL AND ${table.observed_byte_length} IS NOT NULL) OR (${table.observation_state} = 'absent' AND ${table.observation_cycle} IS NOT NULL AND ${table.observed_byte_length} IS NULL)`,
+    ),
+  ],
+);
+
+export const pushSubscriptions = sqliteTable(
+  "push_subscriptions",
+  {
+    id: text("id").primaryKey(),
+    user_id: text("user_id"),
+    endpoint: text("endpoint").notNull().unique(),
+    p256dh: text("p256dh").notNull(),
+    auth: text("auth").notNull(),
+    user_agent: text("user_agent"),
+    device_label: text("device_label"),
+    created_at: text("created_at")
+      .notNull()
+      .default(sql`(datetime('now'))`),
+    last_seen_at: text("last_seen_at")
+      .notNull()
+      .default(sql`(datetime('now'))`),
+    generation: integer("generation").notNull().default(1),
+    last_push_attempt_at: text("last_push_attempt_at"),
+    last_push_accepted_at: text("last_push_accepted_at"),
+    last_push_failure_at: text("last_push_failure_at"),
+    last_push_failure_reason: text("last_push_failure_reason"),
+    consecutive_push_failures: integer("consecutive_push_failures")
+      .notNull()
+      .default(0),
+  },
+  (table) => [index("idx_push_subscriptions_user_id").on(table.user_id)],
+);
 
 export const activityEvents = sqliteTable("activity_events", {
-	id: text("id").primaryKey(),
-	actor_kind: text("actor_kind").notNull(),
-	actor_id: text("actor_id"),
-	action: text("action").notNull(),
-	entity_type: text("entity_type").notNull(),
-	entity_id: text("entity_id").notNull(),
-	metadata_json: text("metadata_json"),
-	occurred_at: text("occurred_at").notNull(),
+  id: text("id").primaryKey(),
+  actor_kind: text("actor_kind").notNull(),
+  actor_id: text("actor_id"),
+  action: text("action").notNull(),
+  entity_type: text("entity_type").notNull(),
+  entity_id: text("entity_id").notNull(),
+  metadata_json: text("metadata_json"),
+  occurred_at: text("occurred_at").notNull(),
 });
 
 export const mailboxChanges = sqliteTable("mailbox_changes", {
-	sequence: integer("sequence").primaryKey({ autoIncrement: true }),
-	schema_version: integer("schema_version").notNull(),
-	committed_at: text("committed_at").notNull(),
-	resource: text("resource", {
-		enum: [
-			"message",
-			"attachment",
-			"folder",
-			"label",
-			"message_label",
-				"delivery",
-				"delivery_attempt",
-				"automation_rule",
-				"automation_run",
-		],
-	}).notNull(),
-	entity_id: text("entity_id").notNull(),
-	parent_id: text("parent_id"),
-	operation: text("operation", {
-		enum: ["created", "updated", "deleted"],
-	}).notNull(),
+  sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+  schema_version: integer("schema_version").notNull(),
+  committed_at: text("committed_at").notNull(),
+  resource: text("resource", {
+    enum: [
+      "message",
+      "attachment",
+      "folder",
+      "label",
+      "message_label",
+      "delivery",
+      "delivery_attempt",
+      "automation_rule",
+      "automation_run",
+    ],
+  }).notNull(),
+  entity_id: text("entity_id").notNull(),
+  parent_id: text("parent_id"),
+  operation: text("operation", {
+    enum: ["created", "updated", "deleted"],
+  }).notNull(),
 });
 
 export const mailPeople = sqliteTable(

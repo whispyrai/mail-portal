@@ -36,6 +36,7 @@ import { globalTodayBriefRoutes } from "./routes/global-today-brief";
 import { globalSemanticSearchRoutes } from "./routes/global-semantic-search";
 import { mailboxAttachmentRoutes } from "./routes/mailbox-attachments";
 import { mailboxAttachmentByteRoutes } from "./routes/mailbox-attachment-bytes";
+import { mailboxEmailBodyRoutes } from "./routes/mailbox-email-body.ts";
 import { attachmentUploadRoutes } from "./routes/attachment-uploads";
 import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
 import { mailPeopleRoutes } from "./routes/mail-people";
@@ -158,6 +159,7 @@ app.route("/", pushSubscriptionRoutes);
 app.route("/", mailboxMessageLocationRoutes);
 app.route("/", automationRuleRoutes);
 app.route("/", attachmentUploadRoutes);
+app.route("/", mailboxEmailBodyRoutes);
 
 // -- Config ---------------------------------------------------------
 

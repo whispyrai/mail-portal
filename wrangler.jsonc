@@ -15,7 +15,7 @@
 		"enabled": true
 	},
 	"triggers": {
-		"crons": ["* * * * *", "17 * * * *"]
+		"crons": ["* * * * *", "*/5 * * * *", "17 * * * *"]
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
@@ -25,10 +25,13 @@
 		// to the existing Worker so `CLOUDFLARE_ENV=whispyr` redeploys onto it
 		// byte-identical (without the pin, a named env would deploy to a new
 		// Worker `mail-portal-whispyr`). All bindings/IDs are the live resources,
-		// unchanged. Secrets (via `wrangler secret put --env whispyr`):
-		// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, JWT_SECRET, ADMIN_BOOTSTRAP_EMAIL.
+		// unchanged. The exact nine production secret names are declared in
+		// `secrets.required`; values remain isolated per environment.
 		"whispyr": {
 			"name": "sales-mail-portal",
+			"triggers": {
+				"crons": ["* * * * *", "*/5 * * * *", "17 * * * *"]
+			},
 			"vars": {
 				"BRAND": "whispyr",
 				// Brand-specific modules enabled in this environment (WISER-239). The
@@ -36,6 +39,9 @@
 				"FEATURES": ["quiz"],
 				"DOMAINS": "whispyrcrm.com",
 				"EMAIL_ADDRESSES": [],
+				"INBOUND_QUEUE_NAME": "sales-mail-inbound",
+				"INBOUND_DLQ_NAME": "sales-mail-inbound-dlq",
+				"INBOUND_PARKING_NAME": "sales-mail-inbound-parking",
 				"AWS_REGION": "eu-west-2",
 				"SES_CONFIGURATION_SET": "mail-portal-events",
 				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -43,10 +49,10 @@
 				"AI_STRONG_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
 				"AI_COST_ALERT_USD": "25",
 				"AI_COST_REVIEW_USD": "50",
-					// Web Push contact (RFC 8292 VAPID subject) for WISER-240. The keypair
-					// is secret (`wrangler secret put VAPID_PUBLIC_KEY --env whispyr` +
-					// `VAPID_PRIVATE_KEY`). Until set, push self-disables.
-					"VAPID_SUBJECT": "mailto:hesham@whispyrcrm.com"
+				// Web Push contact (RFC 8292 VAPID subject) for WISER-240. The keypair
+				// is secret (`wrangler secret put VAPID_PUBLIC_KEY --env whispyr` +
+				// `VAPID_PRIVATE_KEY`). Until set, push self-disables.
+				"VAPID_SUBJECT": "mailto:hesham@whispyrcrm.com"
 			},
 			"secrets": {
 				"required": [
@@ -54,8 +60,9 @@
 					"AWS_SECRET_ACCESS_KEY",
 					"SES_EVENT_WEBHOOK_SECRET",
 					"JWT_SECRET",
-						"ADMIN_BOOTSTRAP_EMAIL",
-						"ACCOUNT_RECOVERY_DIRECTORY",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"ACCOUNT_RECOVERY_DIRECTORY",
+					"EMERGENCY_FORWARD_TO",
 					"VAPID_PUBLIC_KEY",
 					"VAPID_PRIVATE_KEY"
 				]
@@ -81,8 +88,49 @@
 					"binding": "BUCKET",
 					"bucket_name": "sales-mail-portal",
 					"preview_bucket_name": "sales-mail-portal"
+				},
+				{
+					"binding": "RAW_MAIL_BUCKET",
+					"bucket_name": "sales-mail-raw-archive",
+					"preview_bucket_name": "sales-mail-raw-archive-preview"
 				}
 			],
+			// Queue retention is a control-plane setting, not a Wrangler binding
+			// field. All three queues are locked at 14 days and must be verified
+			// separately before deploy.
+			"queues": {
+				"producers": [
+					{ "binding": "INBOUND_QUEUE", "queue": "sales-mail-inbound" }
+				],
+				"consumers": [
+					{
+						"queue": "sales-mail-inbound",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 1,
+						"dead_letter_queue": "sales-mail-inbound-dlq"
+					},
+					{
+						"queue": "sales-mail-inbound-dlq",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 60,
+						"dead_letter_queue": "sales-mail-inbound-parking"
+					},
+					{
+						"queue": "sales-mail-inbound-parking",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 100,
+						"retry_delay": 3600
+					}
+				]
+			},
 			// Backs @cloudflare/workers-oauth-provider (OAuth grants, registered
 			// clients, access/refresh tokens) for the MCP connector.
 			"kv_namespaces": [
@@ -137,11 +185,17 @@
 		// No temporary test mail domain is authorized or required.
 		"wiser": {
 			"name": "wiser-mail-portal",
+			"triggers": {
+				"crons": ["* * * * *", "*/5 * * * *", "17 * * * *"]
+			},
 			"vars": {
 				"BRAND": "wiser",
 				"FEATURES": [],
 				"DOMAINS": "wiserchat.ai",
 				"EMAIL_ADDRESSES": [],
+				"INBOUND_QUEUE_NAME": "wiser-mail-inbound",
+				"INBOUND_DLQ_NAME": "wiser-mail-inbound-dlq",
+				"INBOUND_PARKING_NAME": "wiser-mail-inbound-parking",
 				"AWS_REGION": "eu-west-2",
 				"SES_CONFIGURATION_SET": "mail-portal-events",
 				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -157,8 +211,9 @@
 					"AWS_SECRET_ACCESS_KEY",
 					"SES_EVENT_WEBHOOK_SECRET",
 					"JWT_SECRET",
-						"ADMIN_BOOTSTRAP_EMAIL",
-						"ACCOUNT_RECOVERY_DIRECTORY",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"ACCOUNT_RECOVERY_DIRECTORY",
+					"EMERGENCY_FORWARD_TO",
 					"VAPID_PUBLIC_KEY",
 					"VAPID_PRIVATE_KEY"
 				]
@@ -182,8 +237,49 @@
 					"binding": "BUCKET",
 					"bucket_name": "wiser-mail-portal",
 					"preview_bucket_name": "wiser-mail-portal"
+				},
+				{
+					"binding": "RAW_MAIL_BUCKET",
+					"bucket_name": "wiser-mail-raw-archive",
+					"preview_bucket_name": "wiser-mail-raw-archive-preview"
 				}
 			],
+			// Queue retention is a control-plane setting, not a Wrangler binding
+			// field. All three queues are locked at 14 days and must be verified
+			// separately before deploy.
+			"queues": {
+				"producers": [
+					{ "binding": "INBOUND_QUEUE", "queue": "wiser-mail-inbound" }
+				],
+				"consumers": [
+					{
+						"queue": "wiser-mail-inbound",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 1,
+						"dead_letter_queue": "wiser-mail-inbound-dlq"
+					},
+					{
+						"queue": "wiser-mail-inbound-dlq",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 60,
+						"dead_letter_queue": "wiser-mail-inbound-parking"
+					},
+					{
+						"queue": "wiser-mail-inbound-parking",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 100,
+						"retry_delay": 3600
+					}
+				]
+			},
 			"kv_namespaces": [
 				{
 					"binding": "OAUTH_KV",

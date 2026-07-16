@@ -354,11 +354,17 @@ export async function draftReplyForEmail(
 				const when = m.date
 					? new Date(m.date).toISOString().slice(0, 16).replace("T", " ")
 					: "";
-				return `From: ${boundAiText(m.sender || "unknown", 500)}${when ? ` (${when})` : ""}\nSubject: ${boundAiText(m.subject || "(no subject)", 1_000)}\n\n${boundAiText(m.body_text || "", 4_000)}`;
+				const previewNotice = m.body_external
+					? "[The complete Message body is external. This is a bounded preview.]\n"
+					: "";
+				return `From: ${boundAiText(m.sender || "unknown", 500)}${when ? ` (${when})` : ""}\nSubject: ${boundAiText(m.subject || "(no subject)", 1_000)}\n\n${previewNotice}${boundAiText(m.body_text || "", 4_000)}`;
 			})
 			.join("\n\n---\n\n");
 	} else {
-		threadText = `From: ${boundAiText(email.sender || "unknown", 500)}\nSubject: ${boundAiText(email.subject || "(no subject)", 1_000)}\n\n${boundAiText(email.body_text || "", 8_000)}`;
+		const previewNotice = email.body_external
+			? "[The complete Message body is external. This is a bounded preview.]\n"
+			: "";
+		threadText = `From: ${boundAiText(email.sender || "unknown", 500)}\nSubject: ${boundAiText(email.subject || "(no subject)", 1_000)}\n\n${previewNotice}${boundAiText(email.body_text || "", 8_000)}`;
 	}
 	threadText = boundAiText(threadText, 28_000);
 

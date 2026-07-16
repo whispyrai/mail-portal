@@ -12,6 +12,11 @@ import { createRequestHandler } from "react-router";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { app as apiApp } from "./index";
 import { receiveEmail } from "./inbound-email";
+import {
+  processInboundBatch,
+  processInboundDeadLetterBatch,
+} from "./inbound-queue.ts";
+import { reconcileInboundArchives } from "./inbound-reconciliation.ts";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
 import { bulkPage } from "./routes/bulk";
@@ -420,19 +425,38 @@ export default {
   async scheduled(controller: ScheduledController, env: Env) {
     // Per Cloudflare Workers Cron Triggers docs, every configured schedule invokes
     // this handler and controller.cron identifies the exact maintenance lane.
-    await runScheduledMaintenance(env, controller);
+	if (controller.cron === "*/5 * * * *") {
+		await reconcileInboundArchives(env);
+		return;
+	}
+	await runScheduledMaintenance(env, controller);
+  },
+  async queue(batch: MessageBatch<unknown>, env: Env) {
+	if (batch.queue === env.INBOUND_QUEUE_NAME) {
+		await processInboundBatch(batch, env);
+		return;
+	}
+	if (
+		batch.queue === env.INBOUND_DLQ_NAME ||
+		batch.queue === env.INBOUND_PARKING_NAME
+	) {
+		await processInboundDeadLetterBatch(batch, env);
+		return;
+	}
+	throw new Error(`Unknown Queue binding: ${batch.queue}`);
   },
   async email(event: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
     try {
       await receiveEmail(event, env, ctx);
-    } catch (e) {
-      console.error(
-        "Failed to process incoming email:",
-        (e as Error).message,
-        (e as Error).stack,
-      );
-      // Re-throw so Cloudflare's email routing can retry delivery or bounce.
-      throw e;
+    } catch (error) {
+      console.error("[mail-ingress] outer handler failed", {
+        errorCode: "INBOUND_EMAIL_HANDLER_FAILED",
+        operation: "inbound_receive",
+        status: "failed",
+      });
+		  // Raw-first handling owns its recovery paths. An unexpected throw remains a
+		  // platform-visible failure instead of being falsely reported as accepted.
+      throw error;
     }
   },
 };

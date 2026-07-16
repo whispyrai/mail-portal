@@ -39,7 +39,7 @@ test("attachment candidate authority never turns an R2 outage or replacement int
 		durableObject.indexOf("async resolveSemanticCandidates"),
 		durableObject.indexOf("claimTodayBriefGeneration"),
 	);
-	assert.match(resolver, /this\.env\.BUCKET\.head\(attachmentKey\(/);
+	assert.match(resolver, /this\.env\.BUCKET\.head\(storedAttachmentKey\(/);
 	assert.doesNotMatch(resolver, /BUCKET\.head[\s\S]*?\.catch\(\(\) => null\)/);
 	assert.match(resolver, /invalidateAttachmentAuthority\(/);
 	assert.match(resolver, /r2_authority_changed/);

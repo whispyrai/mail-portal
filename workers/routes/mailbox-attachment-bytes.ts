@@ -1,6 +1,6 @@
 import { Hono, type Context } from "hono";
 import { safeAttachmentPresentationFilename } from "../../shared/attachment-filename.ts";
-import { attachmentKey } from "../lib/attachments.ts";
+import { storedAttachmentKey } from "../lib/attachments.ts";
 import {
 	hasLiveMailboxContentAccess,
 	type MailboxContext,
@@ -17,6 +17,7 @@ export interface MailboxAttachmentByteMetadata {
 	size: number;
 	content_id?: string | null;
 	disposition?: string | null;
+	r2_key?: string | null;
 }
 
 export interface MailboxAttachmentByteOperations {
@@ -58,13 +59,7 @@ export function createMailboxAttachmentByteRoutes(
 				? attachment
 				: null;
 			const object = exactAttachment
-				? await dependencies.bucket(c).get(
-					attachmentKey(
-						exactAttachment.email_id,
-						exactAttachment.id,
-						exactAttachment.filename,
-					),
-				)
+				? await dependencies.bucket(c).get(storedAttachmentKey(exactAttachment))
 				: null;
 			if (!(await dependencies.revalidateAccess(c))) {
 				return c.json({ error: "Forbidden" }, 403);

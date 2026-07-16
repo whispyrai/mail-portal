@@ -29,7 +29,7 @@ import { verifyDraft } from "./ai.ts";
 import { Folders } from "../../shared/folders.ts";
 import type { Env } from "../types.ts";
 import type { ActivityActor } from "./activity.ts";
-import { attachmentKey } from "./attachments.ts";
+import { storedAttachmentKey } from "./attachments.ts";
 import type {
 	EnqueueOutboundCommand,
 	OutboundDeliveryStatus,
@@ -756,7 +756,7 @@ export async function toolDiscardDraft(
 	}
 	if (result.attachments.length > 0) {
 		const keys = result.attachments.map((attachment) =>
-			attachmentKey(draftId, attachment.id, attachment.filename),
+			storedAttachmentKey({ ...attachment, email_id: draftId }),
 		);
 		try {
 			await env.BUCKET.delete(keys);

@@ -17,6 +17,17 @@ function database() {
 		CREATE TABLE attachments (
 			id TEXT PRIMARY KEY, email_id TEXT NOT NULL, filename TEXT NOT NULL
 		);
+		CREATE TABLE email_body_objects (
+			id TEXT PRIMARY KEY,
+			email_id TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+			part_index INTEGER NOT NULL CHECK(part_index >= 0),
+			content_type TEXT NOT NULL CHECK(content_type IN ('text/html', 'text/plain')),
+			charset TEXT NOT NULL,
+			r2_key TEXT NOT NULL UNIQUE,
+			byte_length INTEGER NOT NULL CHECK(byte_length >= 0)
+		);
+		CREATE INDEX idx_email_body_objects_email_id
+			ON email_body_objects(email_id, part_index);
 		CREATE TABLE email_labels (email_id TEXT NOT NULL, label_id TEXT NOT NULL);
 		INSERT INTO folders VALUES ('inbox', 'Inbox'), ('archive', 'Archive'),
 			('_cancelled_outbound', 'Retired');
@@ -41,12 +52,15 @@ test("mail search ANDs free-text terms across mail fields and attachment filenam
 			('one', 'inbox', 'Renewal only', 'bob@example.com', 'team@example.com', NULL, NULL,
 			 '2026-07-11T10:00:00.000Z', 0, 0, 'No file here', NULL, NULL, 't2', NULL, NULL);
 		INSERT INTO attachments VALUES ('a1', 'both', 'signed-proposal.pdf');
+		INSERT INTO email_body_objects VALUES
+			('body-both', 'both', 0, 'text/html', 'utf-8', 'email-bodies/both/0.body', 31);
 	`);
 
 	const result = run(db, { terms: ["renewal", "proposal"], page: 1, limit: 25 });
 	assert.deepEqual(result.rows.map((row) => row.id), ["both"]);
 	assert.equal(result.count.total, 1);
 	assert.equal(result.rows[0]?.matched_attachment_filename, "signed-proposal.pdf");
+	assert.equal(Number(result.rows[0]?.body_external), 1);
 	assert.ok(Number(result.rows[0]?.relevance) > 0);
 	assert.match(String(result.rows[0]?.snippet), /final package/);
 	db.close();

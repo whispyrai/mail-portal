@@ -5,6 +5,7 @@
 import type { Email } from "postal-mime";
 import type { FolderId } from "../../../shared/folders";
 import {
+	assertR2DerivedUploadSize,
 	storeParsedEmail,
 	type EmailStorageDependencies,
 	type MailboxEmailStore,
@@ -17,6 +18,7 @@ import {
 	normalizeEmailDate,
 } from "./parse.ts";
 import { RecipientMemoryOrigins } from "../../../shared/recipient-suggestions.ts";
+import { mailTelemetryLogRef } from "../mail-telemetry.ts";
 
 type ImportMailboxStore = MailboxEmailStore & {
 	claimImportedEmail(
@@ -28,14 +30,48 @@ type ImportMailboxStore = MailboxEmailStore & {
 		| { status: "existing"; id: string }
 		| { status: "busy" }
 	>;
-	releaseImportedEmailClaim(emailId: string, token: string): Promise<void>;
+	releaseImportedEmailClaim(emailId: string, token: string): Promise<boolean>;
 	renewImportedEmailClaim(emailId: string, token: string): Promise<boolean>;
+	beginImportedEmailPromotionIntent(
+		emailId: string,
+		claimToken: string,
+		objectCount: number,
+		totalByteLength: number,
+	): Promise<unknown>;
+	appendImportedEmailPromotionIntent(
+		emailId: string,
+		claimToken: string,
+		objects: Array<{ ordinal: number; r2Key: string; byteLength: number }>,
+	): Promise<unknown>;
+	sealImportedEmailPromotionIntent(
+		emailId: string,
+		claimToken: string,
+	): Promise<{ proofFingerprint: string }>;
+	finalizeImportedEmailPromotionIntent(
+		emailId: string,
+		claimToken: string,
+		proofFingerprint: string,
+	): Promise<{ status: "pending" | "finalized" | "integrity_blocked" }>;
+	createImportedEmail(
+		folder: Parameters<MailboxEmailStore["createEmail"]>[0],
+		email: Parameters<MailboxEmailStore["createEmail"]>[1],
+		attachments: Parameters<MailboxEmailStore["createEmail"]>[2],
+		mailboxAddress: string | undefined,
+		claimToken: string,
+		proofFingerprint: string,
+	): Promise<{ status?: string }>;
 	hasEmailOrThreadIdentity(identity: string): Promise<boolean>;
 };
 
 type ImportEmailDependencies = Omit<EmailStorageDependencies, "mailbox"> & {
 	mailbox: ImportMailboxStore;
 };
+
+function objectByteLength(value: ArrayBuffer | string): number {
+	return typeof value === "string"
+		? new TextEncoder().encode(value).byteLength
+		: value.byteLength;
+}
 
 /** Import one parsed Zoho message without duplicating an earlier run. */
 export async function importParsedEmail(
@@ -61,6 +97,8 @@ export async function importParsedEmail(
 		deriveLegacyImportId(identity),
 	]);
 	const claimToken = crypto.randomUUID();
+	let sealedFingerprint: string | null = null;
+	let intendedObjectCount = 0;
 	const claim = await dependencies.mailbox.claimImportedEmail(id, legacyId, claimToken);
 	if (claim.status === "existing") {
 		return {
@@ -97,8 +135,12 @@ export async function importParsedEmail(
 		const attachmentIdNamespace = claimToken.replaceAll("-", "");
 		const abandonPromotedObjects = async () => {
 			const keys = [...promotedObjects];
-			promotedObjects.clear();
-			await Promise.allSettled(keys.map((key) => dependencies.bucket.delete(key)));
+			const outcomes = await Promise.allSettled(
+				keys.map((key) => dependencies.bucket.delete(key)),
+			);
+			outcomes.forEach((outcome, index) => {
+				if (outcome.status === "fulfilled") promotedObjects.delete(keys[index]!);
+			});
 		};
 		const ensureClaim = async () => {
 			if (!(await dependencies.mailbox.renewImportedEmailClaim(id, claimToken))) {
@@ -109,6 +151,7 @@ export async function importParsedEmail(
 		const importBucket = {
 			async put(key: string, value: ArrayBuffer | string) {
 				pendingObjects.set(key, value);
+				return { size: objectByteLength(value) };
 			},
 			async delete(key: string) {
 				pendingObjects.delete(key);
@@ -123,13 +166,47 @@ export async function importParsedEmail(
 				dependencies.mailbox.resolveCanonicalThreadId(messageIds),
 			createEmail: async (...args) => {
 				await ensureClaim();
+				const objects = [...pendingObjects].map(([r2Key, value], ordinal) => ({
+					ordinal,
+					r2Key,
+					byteLength: objectByteLength(value),
+				}));
+				intendedObjectCount = objects.length;
+				await dependencies.mailbox.beginImportedEmailPromotionIntent(
+					id,
+					claimToken,
+					objects.length,
+					objects.reduce((total, object) => total + object.byteLength, 0),
+				);
+				for (let offset = 0; offset < objects.length; offset += 20) {
+					await dependencies.mailbox.appendImportedEmailPromotionIntent(
+						id,
+						claimToken,
+						objects.slice(offset, offset + 20),
+					);
+				}
+				sealedFingerprint = (
+					await dependencies.mailbox.sealImportedEmailPromotionIntent(id, claimToken)
+				).proofFingerprint;
 				for (const [key, value] of pendingObjects) {
 					await ensureClaim();
 					promotedObjects.add(key);
-					await dependencies.bucket.put(key, value);
+					const result = await dependencies.bucket.put(key, value);
+					assertR2DerivedUploadSize(result, objectByteLength(value));
 				}
 				await ensureClaim();
-				return dependencies.mailbox.createEmail(...args);
+				const result = await dependencies.mailbox.createImportedEmail(
+					args[0],
+					args[1],
+					args[2],
+					args[4],
+					claimToken,
+					sealedFingerprint,
+				);
+				if (result.status === "cleanup_conflict") {
+					throw new Error("Import promotion cleanup ownership conflicted");
+				}
+				return result;
 			},
 		};
 
@@ -145,15 +222,38 @@ export async function importParsedEmail(
 		});
 
 		return { status: "imported" as const, id, folder };
-	} finally {
-		// The committed email is authoritative, and an abandoned claim expires.
-		// A release transport failure must not turn a successful import into an
-		// ambiguous client error or hide the original storage failure.
-		await dependencies.mailbox.releaseImportedEmailClaim(id, claimToken).catch((error) => {
-			console.warn("[mail-import] import claim release failed", {
-				emailId: id,
-				errorName: error instanceof Error ? error.name : "UnknownError",
+		} finally {
+			const messageRef = await mailTelemetryLogRef("message", id);
+			if (sealedFingerprint) {
+			const maximumPasses = 2 * Math.ceil(intendedObjectCount / 20) + 3;
+			for (let pass = 0; pass < maximumPasses; pass += 1) {
+				try {
+					const result = await dependencies.mailbox.finalizeImportedEmailPromotionIntent(
+						id,
+						claimToken,
+						sealedFingerprint,
+					);
+					if (result.status !== "pending") break;
+					} catch {
+						if (pass + 1 === maximumPasses) {
+							console.warn("[mail-import] durable promotion finalization deferred", {
+								errorCode: "IMPORT_PROMOTION_FINALIZATION_DEFERRED",
+								messageRef,
+								operation: "import_promotion_finalize",
+								status: "deferred",
+							});
+					}
+				}
+			}
+		} else {
+				await dependencies.mailbox.releaseImportedEmailClaim(id, claimToken).catch(() => {
+					console.warn("[mail-import] import claim release failed", {
+						errorCode: "IMPORT_CLAIM_RELEASE_FAILED",
+						messageRef,
+						operation: "import_claim_release",
+						status: "degraded",
+					});
 			});
-		});
+		}
 	}
 }

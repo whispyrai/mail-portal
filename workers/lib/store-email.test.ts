@@ -1,8 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Email } from "postal-mime";
-import { storeParsedEmail, type EmailStorageDependencies } from "./store-email.ts";
+import {
+	storeParsedEmail as storeParsedEmailProduction,
+	type EmailStorageDependencies,
+} from "./store-email.ts";
+import type { InboundProjectionCommand } from "./inbound-projection-contract.ts";
+import { liveInboundProjectionOptions } from "./live-inbound-projection.ts";
 import { resolveUnambiguousThreadReference } from "./thread-reference.ts";
+
+async function storeParsedEmail(
+	dependencies: Parameters<typeof storeParsedEmailProduction>[0],
+	parsed: Parameters<typeof storeParsedEmailProduction>[1],
+	options: Parameters<typeof storeParsedEmailProduction>[2],
+) {
+	return storeParsedEmailProduction(dependencies, parsed, {
+		recipientMemoryOrigin: "admin_import",
+		...options,
+	});
+}
 
 function dependencies() {
 	const created: Array<Record<string, unknown>> = [];
@@ -10,7 +26,15 @@ function dependencies() {
 	const storedKeys: string[] = [];
 	const value: EmailStorageDependencies = {
 		bucket: {
-			async put(key) { storedKeys.push(key); },
+				async put(key, content) {
+					storedKeys.push(key);
+					const size = typeof content === "string"
+						? new TextEncoder().encode(content).byteLength
+						: content instanceof ReadableStream
+							? (await new Response(content).arrayBuffer()).byteLength
+							: content.byteLength;
+					return { size };
+				},
 			async delete() {},
 		},
 		mailbox: {
@@ -77,31 +101,80 @@ test("storeParsedEmail persists only normalized control-safe structured sender n
 });
 
 test("live RFC reply identity may wake its exact stored thread", async () => {
-	const state = dependencies();
-	await storeParsedEmail(state.value, parsed({
-		messageId: "<raw-original@example.com>",
-	}), {
-		folder: "inbox",
-		date: "2026-07-11T09:00:00.000Z",
-		messageId: "internal-original",
-		wakeSnoozedOnReply: true,
-	});
-	const signal = await storeParsedEmail(state.value, parsed({
-		inReplyTo: "<raw-original@example.com>",
-	}), {
-		folder: "inbox",
-		date: "2026-07-11T10:00:00.000Z",
-		messageId: "internal-reply",
-		wakeSnoozedOnReply: true,
-	});
-	assert.equal(state.created[0]!.message_id, "raw-original@example.com");
-	assert.equal(state.created[1]!.thread_id, "internal-original");
-	assert.equal(state.created[1]!.snooze_wake_thread_id, "internal-original");
+		const state = dependencies();
+		const commands: InboundProjectionCommand[] = [];
+		state.value.mailbox.createInboundEmail = async (command) => {
+			commands.push(command);
+			state.created.push(command.email);
+			state.storedAttachments.push(command.attachments);
+			return { status: "stored" };
+		};
+		await storeParsedEmailProduction(state.value, parsed({
+			messageId: "<raw-original@example.com>",
+		}), liveInboundProjectionOptions({
+			brand: "wiser",
+			mailboxId: "team@example.com",
+			date: "2026-07-11T09:00:00.000Z",
+			messageId: "internal-original",
+		}));
+		const signal = await storeParsedEmailProduction(state.value, parsed({
+			inReplyTo: "<raw-original@example.com>",
+		}), liveInboundProjectionOptions({
+			brand: "wiser",
+			mailboxId: "team@example.com",
+			date: "2026-07-11T10:00:00.000Z",
+			messageId: "internal-reply",
+		}));
+		assert.equal(state.created[0]!.message_id, "raw-original@example.com");
+		assert.equal(state.created[1]!.thread_id, "internal-original");
+		assert.equal(state.created[1]!.snooze_wake_thread_id, "internal-original");
+		assert.equal(commands.length, 2);
+		assert.equal(commands[1]?.folder, "inbox");
+		assert.equal(commands[1]?.mailboxAddress, "team@example.com");
+		assert.equal(commands[1]?.allowTerminalRecovery, false);
+		assert.deepEqual(commands[1]?.attachments, []);
+		assert.deepEqual(commands[1]?.bodyObjects, []);
+		assert.equal(commands[1]?.email.id, "internal-reply");
+		assert.equal(commands[1]?.email.read, false);
+		assert.equal(commands[1]?.email.recipient_memory_origin, "live_inbound");
+		assert.equal(commands[1]?.email.automation_trigger, "live_inbound");
+		assert.equal(
+			commands[1]?.email.follow_up_reply_mailbox_address,
+			"team@example.com",
+		);
+		assert.deepEqual(commands[1]?.email.push_notification.data, {
+			emailId: "internal-reply",
+			mailboxId: "team@example.com",
+		});
 	assert.deepEqual(signal, {
 		conversationKey: "internal-original",
 		inboundMessageId: "internal-reply",
 		inboundMessageDate: "2026-07-11T10:00:00.000Z",
 	});
+});
+
+test("live projection surfaces active derived-content deletion as a retryable conflict", async () => {
+	const state = dependencies();
+	state.value.mailbox.createInboundEmail = async () => ({
+		status: "cleanup_conflict",
+	});
+	await assert.rejects(
+		() =>
+			storeParsedEmailProduction(
+				state.value,
+				parsed(),
+				liveInboundProjectionOptions({
+					brand: "wiser",
+					mailboxId: "team@example.com",
+					date: "2026-07-15T10:00:00.000Z",
+					messageId: "cleanup-conflict",
+				}),
+			),
+		(error: unknown) =>
+			error instanceof Error &&
+			"code" in error &&
+			error.code === "INBOUND_DERIVED_CONTENT_CLEANUP_CONFLICT",
+	);
 });
 
 test("imports never wake Snoozed mail even when they carry a derived thread ID", async () => {
@@ -238,7 +311,7 @@ test("ingest bounds multi-byte attachment storage beneath the exact R2 key limit
 		folder: "inbox",
 		date: "2026-07-11T10:00:00.000Z",
 		messageId: "unicode-storage",
-		recipientMemoryOrigin: "live_inbound",
+			recipientMemoryOrigin: "admin_import",
 	});
 	const stored = state.storedAttachments[0]?.[0];
 	assert.equal(typeof stored?.filename, "string");

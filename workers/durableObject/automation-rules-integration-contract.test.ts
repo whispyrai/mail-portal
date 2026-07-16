@@ -4,11 +4,18 @@ import test from "node:test";
 
 const durableObject = await readFile(new URL("./index.ts", import.meta.url), "utf8");
 const inbound = await readFile(new URL("../inbound-email.ts", import.meta.url), "utf8");
+const inboundQueue = await readFile(new URL("../inbound-queue.ts", import.meta.url), "utf8");
 const storeEmail = await readFile(new URL("../lib/store-email.ts", import.meta.url), "utf8");
+const liveInboundProjection = await readFile(
+	new URL("../lib/live-inbound-projection.ts", import.meta.url),
+	"utf8",
+);
 const automationModule = await readFile(new URL("../lib/automation-rules/index.ts", import.meta.url), "utf8");
 
 test("only live receive supplies the explicit Automation trigger through shared storage", () => {
-	assert.match(inbound, /automationTrigger:\s*"live_inbound"/u);
+	assert.match(liveInboundProjection, /automationTrigger:\s*"live_inbound"/u);
+	assert.match(inbound, /liveInboundProjectionOptions\(/u);
+	assert.match(inboundQueue, /liveInboundProjectionOptions\(/u);
 	assert.match(storeEmail, /automation_trigger:\s*options\.automationTrigger/u);
 	assert.match(
 		durableObject,
@@ -18,7 +25,10 @@ test("only live receive supplies the explicit Automation trigger through shared 
 });
 
 test("Message acceptance reserves durable provenance before isolating captured-version failure", () => {
-	assert.match(durableObject, /captureLiveInbound\(email\.id, email\.date\)/u);
+	assert.match(
+		durableObject,
+		/captureLiveInbound\(\s*email\.id,\s*email\.date,?\s*\)/u,
+	);
 	const createEmail = durableObject.indexOf("async createEmail(");
 	const scheduled = durableObject.indexOf("await this.#scheduleAlarmAt(Date.now() + 100)", createEmail);
 	const accepted = durableObject.indexOf("this.ctx.storage.transactionSync", createEmail);

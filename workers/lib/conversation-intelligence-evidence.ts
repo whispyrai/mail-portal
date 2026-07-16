@@ -31,6 +31,7 @@ export type ConversationIntelligenceEvidenceMessage = {
     filename: string;
     mimetype: string;
     size: number;
+    r2Key: string | null;
   }>;
 };
 
@@ -123,11 +124,12 @@ export function readConversationIntelligenceEvidenceProjection(
           SUBSTR(a.filename, 1, ${CONVERSATION_INTELLIGENCE_EVIDENCE_LIMITS.attachmentFilenameChars}) AS filename,
           SUBSTR(a.mimetype, 1, ${CONVERSATION_INTELLIGENCE_EVIDENCE_LIMITS.attachmentMimetypeChars}) AS mimetype,
           MAX(0, a.size) AS size,
+          a.r2_key AS r2Key,
           ROW_NUMBER() OVER (PARTITION BY a.email_id ORDER BY a.id ASC) AS rank
         FROM attachments a
         INNER JOIN eligible_messages e ON e.id = a.email_id
       )
-      SELECT id, emailId, filename, mimetype, size
+      SELECT id, emailId, filename, mimetype, size, r2Key
       FROM ranked_attachments
       WHERE rank <= ${CONVERSATION_INTELLIGENCE_EVIDENCE_LIMITS.attachmentsPerMessage}
       ORDER BY emailId ASC, id ASC`,

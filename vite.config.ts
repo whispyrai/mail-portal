@@ -12,10 +12,10 @@ export default defineConfig({
   plugins: [
     cloudflare({
       viteEnvironment: { name: "ssr" },
+      remoteBindings: false,
       ...(process.env.MAIL_PORTAL_PLAYWRIGHT_CONFIG
         ? {
             configPath: process.env.MAIL_PORTAL_PLAYWRIGHT_CONFIG,
-            remoteBindings: false,
           }
         : {}),
       ...(process.env.MAIL_PORTAL_PLAYWRIGHT_STATE

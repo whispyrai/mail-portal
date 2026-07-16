@@ -1,0 +1,61 @@
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "mail-portal-email-body-playwright",
+	"compatibility_date": "2025-11-28",
+	"main": "../workers/app.ts",
+	"compatibility_flags": ["nodejs_compat"],
+	"vars": {
+		"BRAND": "wiser",
+		"FEATURES": [],
+		"DOMAINS": "wiserchat.ai",
+		"EMAIL_ADDRESSES": [],
+		"AWS_REGION": "local-test-1",
+		"AWS_ACCESS_KEY_ID": "local-playwright-no-remote-access",
+		"AWS_SECRET_ACCESS_KEY": "local-playwright-no-remote-access",
+		"SES_CONFIGURATION_SET": "local-playwright",
+		"SES_EVENT_WEBHOOK_SECRET": "local-playwright-webhook-secret",
+		"JWT_SECRET": "local-email-body-playwright-secret-2026-only",
+		"ADMIN_BOOTSTRAP_EMAIL": "playwright-email-body@wiserchat.ai",
+		"ACCOUNT_RECOVERY_DIRECTORY": "{}",
+		"VAPID_SUBJECT": "mailto:local-playwright@wiserchat.ai",
+		"VAPID_PUBLIC_KEY": "",
+		"VAPID_PRIVATE_KEY": "",
+		"AI_MODEL": "local-playwright-disabled",
+		"AI_CHEAP_MODEL": "local-playwright-disabled",
+		"AI_STRONG_MODEL": "local-playwright-disabled",
+		"AI_COST_ALERT_USD": "0",
+		"AI_COST_REVIEW_USD": "0"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "mail-portal-email-body-playwright",
+			"database_id": "00000000-0000-0000-0000-000000000003",
+			"migrations_dir": "../migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "mail-portal-email-body-playwright"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "OAUTH_KV",
+			"id": "00000000000000000000000000000003"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "MAILBOX", "class_name": "MailboxDO" },
+			{ "name": "EMAIL_AGENT", "class_name": "EmailAgent" },
+			{ "name": "EMAIL_MCP", "class_name": "EmailMCP" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["MailboxDO"] },
+		{ "tag": "v2", "new_sqlite_classes": ["EmailAgent"] },
+		{ "tag": "v3", "new_sqlite_classes": ["EmailMCP"] }
+	]
+}

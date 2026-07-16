@@ -42,6 +42,8 @@ interface EmailPanelToolbarProps {
 	onReply: () => void;
 	onReplyAll: () => void;
 	onForward: () => void;
+	canForward: boolean;
+	forwardUnavailableReason: string;
 	onAiDraft: () => void;
 	onToggleStar: () => void;
 	onToggleRead: () => void;
@@ -71,6 +73,8 @@ export default function EmailPanelToolbar({
 	onReply,
 	onReplyAll,
 	onForward,
+	canForward,
+	forwardUnavailableReason,
 	onAiDraft,
 	onToggleStar,
 	onToggleRead,
@@ -145,14 +149,21 @@ export default function EmailPanelToolbar({
 							aria-label="Reply All"
 						/>
 					</Tooltip>
-					<Tooltip content="Forward" side="bottom" asChild>
+					<Tooltip
+						content={canForward ? "Forward" : forwardUnavailableReason}
+						side="bottom"
+						asChild
+					>
 						<Button
 							variant="ghost"
 							shape="square"
 							size="sm"
 							icon={<ArrowBendUpRightIcon size={18} />}
 							onClick={onForward}
-							aria-label="Forward"
+							disabled={!canForward}
+							aria-label={canForward
+								? "Forward"
+								: `Forward unavailable: ${forwardUnavailableReason}`}
 						/>
 					</Tooltip>
 					<div className="h-5 w-px bg-kumo-fill mx-0.5" />

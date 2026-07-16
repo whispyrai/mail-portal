@@ -189,6 +189,17 @@ test("the frozen Search v2 baseline executes through its production SQLite plan"
 			snooze_source_folder_id TEXT, snoozed_until TEXT
 		);
 		CREATE TABLE attachments (id TEXT PRIMARY KEY, email_id TEXT NOT NULL, filename TEXT NOT NULL);
+		CREATE TABLE email_body_objects (
+			id TEXT PRIMARY KEY,
+			email_id TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+			part_index INTEGER NOT NULL CHECK(part_index >= 0),
+			content_type TEXT NOT NULL CHECK(content_type IN ('text/html', 'text/plain')),
+			charset TEXT NOT NULL,
+			r2_key TEXT NOT NULL UNIQUE,
+			byte_length INTEGER NOT NULL CHECK(byte_length >= 0)
+		);
+		CREATE INDEX idx_email_body_objects_email_id
+			ON email_body_objects(email_id, part_index);
 		CREATE TABLE email_labels (email_id TEXT NOT NULL, label_id TEXT NOT NULL);
 		INSERT INTO folders VALUES ('inbox', 'Inbox');
 		INSERT INTO emails VALUES

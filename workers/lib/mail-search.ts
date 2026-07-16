@@ -331,6 +331,8 @@ export function buildMailSearchPlan(options: MailSearchOptions): MailSearchPlan 
 		SELECT e.id, e.subject, e.sender, e.recipient, e.cc, e.bcc, e.date,
 			e.read, e.starred, e.in_reply_to, e.email_references,
 			e.thread_id, e.folder_id, e.snooze_source_folder_id, e.snoozed_until,
+			EXISTS(SELECT 1 FROM email_body_objects body_object
+			       WHERE body_object.email_id = e.id) AS body_external,
 			${snippet} AS snippet,
 			${data.relevance} AS relevance,
 			${matchedAttachment} AS matched_attachment_filename,

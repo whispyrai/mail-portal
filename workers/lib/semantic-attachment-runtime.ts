@@ -160,7 +160,11 @@ export async function advanceSemanticAttachmentExtraction(input: {
 	});
 
 	try {
-		const key = attachmentKey(lease.messageId, lease.attachmentId, lease.filename);
+		const key = lease.r2Key ?? attachmentKey(
+			lease.messageId,
+			lease.attachmentId,
+			lease.filename,
+		);
 		const head = await bounded(input.bucket.head(key));
 		if (!head) {
 			await fail(new Error("missing_object"));

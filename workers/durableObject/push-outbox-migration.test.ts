@@ -48,8 +48,8 @@ test("migration 25 preserves subscriptions and installs the durable push constra
 
 test("Drizzle mirrors migration 25 defaults, closed states, checks, and descending health index", () => {
 	const source = readFileSync(new URL("../db/schema.ts", import.meta.url), "utf8");
-	assert.match(source, /created_at: text\("created_at"\)\.notNull\(\)\.default\(sql`\(datetime\('now'\)\)`\)/);
-	assert.match(source, /last_seen_at: text\("last_seen_at"\)\.notNull\(\)\.default\(sql`\(datetime\('now'\)\)`\)/);
+	assert.match(source, /created_at:\s*text\("created_at"\)[\s\S]{0,80}?\.notNull\(\)[\s\S]{0,80}?\.default\(sql`\(datetime\('now'\)\)`\)/);
+	assert.match(source, /last_seen_at:\s*text\("last_seen_at"\)[\s\S]{0,80}?\.notNull\(\)[\s\S]{0,80}?\.default\(sql`\(datetime\('now'\)\)`\)/);
 	assert.match(source, /push_notifications_state_closed/);
 	assert.match(source, /sql`\$\{table\.state\} IN \('pending', 'completed', 'no_targets', 'expired'\)`/);
 	assert.match(source, /push_notifications_target_count_nonnegative/);

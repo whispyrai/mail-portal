@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import {
+	classMethodText,
+	parseTypescriptSource,
+} from "../testing/typescript-source.ts";
 
 const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 
@@ -25,10 +29,11 @@ test("generic lifecycle resolves aliases before enforcing Snooze protection", ()
 
 	const readStart = source.indexOf("async setConversationRead(");
 	const readEnd = source.indexOf("async archiveConversation(", readStart);
-	const moveBodyStart = source.indexOf("\n\t#moveConversationInFolder(", readEnd);
-	const moveEnd = source.indexOf("\n\tasync deleteEmail(", moveBodyStart);
 	const readBody = source.slice(readStart, readEnd);
-	const moveBody = source.slice(moveBodyStart, moveEnd);
+	const moveBody = classMethodText(
+		parseTypescriptSource(source, "index.ts"),
+		"moveConversationInFolder",
+	);
 
 	assert.doesNotMatch(readBody, /snoozed_state_requires_unsnooze/);
 	assert.match(moveBody, /scope\.folderId === Folders\.SNOOZED/);

@@ -41,6 +41,7 @@ export interface Email {
 	read: boolean;
 	starred: boolean;
 	body?: string | null;
+	body_external?: boolean;
 	in_reply_to?: string | null;
 	email_references?: string | null;
 	message_id?: string | null;

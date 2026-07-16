@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+	classMethodText,
+	parseTypescriptSource,
+} from "../testing/typescript-source.ts";
 
 test("attachment cleanup finalizes against the post-R2 queue snapshot", async () => {
 	const source = await readFile(
 		new URL("./index.ts", import.meta.url),
 		"utf8",
 	);
-	const method = source.match(
-		/async #processAttachmentCleanup\(\): Promise<boolean> \{[\s\S]*?\n\t\}/,
-	)?.[0];
-	assert.ok(method);
+	const method = classMethodText(
+		parseTypescriptSource(source, "index.ts"),
+		"processAttachmentCleanup",
+	);
 	const r2Yield = method.indexOf("await this.env.BUCKET.delete");
 	const latestRead = method.indexOf(
 		"await this.ctx.storage.get<AttachmentCleanupJob[]>",
@@ -26,7 +30,7 @@ test("attachment cleanup finalizes against the post-R2 queue snapshot", async ()
 	assert.ok(finalWrite > latestRead);
 	assert.match(
 		method,
-		/latestQueue\.filter\(\(candidate\) => candidate\.id !== job\.id\)/,
+		/latestQueue\.filter\(\s*\(candidate\) => candidate\.id !== job\.id,?\s*\)/,
 	);
 	assert.doesNotMatch(method, /queue\.shift\(\)/);
 });

@@ -57,7 +57,8 @@ export function useEmail(
 		queryKey: mailboxId && emailId
 			? queryKeys.emails.detail(mailboxId, emailId)
 			: ["emails", "_disabled_detail"],
-		queryFn: () => api.getEmail(mailboxId!, emailId!) as Promise<Email>,
+		queryFn: ({ signal }) =>
+			api.getEmail(mailboxId!, emailId!, { signal }) as Promise<Email>,
 		enabled: !!mailboxId && !!emailId,
 	});
 }
@@ -134,14 +135,15 @@ export function useThreadReplies(
 			? queryKeys.emails.thread(mailboxId, threadId)
 			: ["emails", "_disabled_thread"],
 		queryFn: async ({ signal }) => {
-			// Single request returns all thread emails with full bodies +
-			// attachments. Eliminates the previous N+1 pattern that fired
-			// a separate getEmail call per thread message.
+			// Single request returns every thread email with bounded body previews
+			// and attachments. External full bodies load only while their message
+			// is selected or expanded.
 			const emails = await api.getThread(mailboxId!, threadId!, { signal }) as Email[];
 
 			// Populate individual email detail caches so clicking a thread
 			// message in the panel doesn't re-fetch.
 			for (const email of emails) {
+				if (email.body_external) continue;
 				qc.setQueryData(
 					queryKeys.emails.detail(mailboxId!, email.id),
 					email,

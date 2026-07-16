@@ -26,7 +26,7 @@ import {
   getCachedAiResponse,
   putCachedAiResponse,
 } from "./ai-cost-control-d1.ts";
-import { attachmentKey, sanitizeFilename } from "./attachments.ts";
+import { storedAttachmentKey } from "./attachments.ts";
 import { stripHtmlToText } from "./email-helpers.ts";
 
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -102,11 +102,12 @@ export async function gatherConversationIntelligenceEvidence(
         textReads++;
         try {
           const object = await bucket.get(
-            attachmentKey(
-              message.id,
-              attachment.id,
-              sanitizeFilename(attachment.filename),
-            ),
+            storedAttachmentKey({
+              email_id: message.id,
+              id: attachment.id,
+              filename: attachment.filename,
+              r2_key: attachment.r2Key,
+            }),
           );
           text =
             object && object.size <= MAX_ATTACHMENT_TEXT_BYTES

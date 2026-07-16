@@ -27,6 +27,7 @@ export type MailboxContext = {
 	Variables: {
 		mailboxStub: DurableObjectStub<MailboxDO>;
 		authorizedMailboxId: string;
+		mailboxReadAuthorizationFinalized?: boolean;
 		session?: SessionClaims;
 	};
 };
@@ -44,6 +45,13 @@ export async function hasLiveMailboxContentAccess(
 		session.sub,
 		session.sessionVersion,
 	);
+}
+
+/** Tell the mailbox middleware that this route owns the terminal disclosure check. */
+export function markMailboxReadAuthorizationFinalized(
+	c: Context<MailboxContext>,
+): void {
+	c.set("mailboxReadAuthorizationFinalized", true);
 }
 
 function isReadMethod(method: string): boolean {
@@ -123,7 +131,10 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	c.set("mailboxStub", stub);
 
 	await next();
-	if (isReadMethod(c.req.method)) {
+	if (
+		isReadMethod(c.req.method) &&
+		!c.get("mailboxReadAuthorizationFinalized")
+	) {
 		let hasAccess: boolean;
 		try {
 			hasAccess = await hasLiveMailboxContentAccess(c);
