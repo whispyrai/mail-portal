@@ -27,7 +27,24 @@ import {
 } from "./lib/mail-address.ts";
 import { mailTelemetryLogRef } from "./lib/mail-telemetry.ts";
 import { safeErrorCode } from "./lib/safe-error-code.ts";
-import { INBOUND_ARCHIVE_RECONCILIATION_BATCH_SIZE } from "./lib/inbound-reconciliation-budget.ts";
+import {
+  INBOUND_ACTIVE_RECONCILIATION_BATCH_SIZE,
+  INBOUND_RECENT_RAW_MAX_PREFIX_LIST_CALLS,
+  INBOUND_RECENT_RAW_RECONCILIATION_BATCH_SIZE,
+  INBOUND_RAW_BACKSTOP_RECONCILIATION_BATCH_SIZE,
+} from "./lib/inbound-reconciliation-budget.ts";
+import {
+  INBOUND_ACTIVE_INDEX_CURSOR_KEY,
+  INBOUND_ACTIVE_INDEX_PREFIX,
+  inboundActiveMarkerKey,
+  persistInboundActiveMarkerForRawKey,
+  rawKeyFromInboundActiveMarkerKey,
+} from "./lib/inbound-active-index.ts";
+import {
+  inboundIngressIdFromRawKey,
+  inboundRawMinutePrefix,
+  isInboundRawKeyForIngress,
+} from "./lib/inbound-raw-key.ts";
 import {
   inboundReconciliationAnomalyKey,
   isStoredPendingReconciliationAnomaly,
@@ -38,9 +55,22 @@ import { MAX_EMAIL_SIZE } from "./lib/store-email.ts";
 
 const RAW_PREFIX = "raw/";
 const SWEEP_CURSOR_KEY = "system/reconciliation-cursor.json";
+const RECENT_SWEEP_CURSOR_KEY = "system/inbound-recent-cursor.json";
+const RECENT_BACKSTOP_SWEEP_CURSOR_KEY =
+  "system/inbound-recent-backstop-cursor.json";
 const FAILURE_LEDGER_PREFIX = "system/reconciliation-failures/";
-const LIST_PAGE_SIZE = INBOUND_ARCHIVE_RECONCILIATION_BATCH_SIZE;
 const STALE_HANDOFF_MS = 15 * 60 * 1000;
+// Cloudflare documents at most 15 minutes for Cron Trigger propagation. The
+// deployed trigger runs every five minutes, so this one-hour first-run window
+// covers that contract in one sweep with forty minutes of operational margin.
+// https://developers.cloudflare.com/workers/configuration/cron-triggers/
+const RECENT_SWEEP_INITIAL_LOOKBACK_MINUTES = 60;
+// The priority cursor above removes calendar-delay latency. This independent
+// fixed floor guarantees eventual discovery if marker writes stay unavailable
+// long enough for an archive to age out of the priority window.
+const RECENT_BACKSTOP_INTRODUCTION_MINUTE_MS = Date.parse(
+  "2026-07-16T00:00:00.000Z",
+);
 const MAX_DERIVED_OBJECTS_PER_PROJECTION = 512;
 const DERIVED_HEAD_CONCURRENCY = 16;
 
@@ -70,6 +100,7 @@ type ReconciliationBucket = {
     value: string,
     options?: {
       customMetadata?: Record<string, string>;
+      httpMetadata?: { contentType?: string };
       onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
     },
   ): Promise<{ etag?: string } | null>;
@@ -559,8 +590,9 @@ function isStale(updatedAt: unknown, now: Date): boolean {
 
 async function readSweepCursor(
   bucket: ReconciliationBucket,
+  key: string,
 ): Promise<{ cursor?: string; etag?: string }> {
-  const object = await bucket.get(SWEEP_CURSOR_KEY);
+  const object = await bucket.get(key);
   if (!object) return {};
   try {
     const value: unknown = JSON.parse(await object.text());
@@ -600,7 +632,7 @@ function pointerFromArchive(
     parsedSize > MAX_EMAIL_SIZE ||
     parsedSize !== archive.size ||
     (rawSha256 !== undefined && !isSha256Hex(rawSha256)) ||
-    !archive.key.endsWith(`/${ingressId}.eml`) ||
+    !isInboundRawKeyForIngress(archive.key, ingressId) ||
     !archive.etag ||
     !archive.version
   ) {
@@ -1480,6 +1512,337 @@ async function reconcileArchive(
   return "reenqueued";
 }
 
+type ReconcileOneDisposition = "completed" | "ledgered" | "unledgered";
+
+async function reconcileOneArchive(
+  rawKey: string,
+  env: ReconciliationEnvironment,
+  runtime: ReconciliationRuntime,
+  result: ReconciliationResult,
+): Promise<ReconcileOneDisposition> {
+  result.scanned += 1;
+  const objectRef = await mailTelemetryLogRef("object", rawKey);
+  try {
+    const outcome = await reconcileArchive(rawKey, env, runtime);
+    result[outcome] += 1;
+    try {
+      await env.RAW_MAIL_BUCKET.delete(failureLedgerKey(rawKey));
+    } catch (error) {
+      console.error("[mail-reconciliation] failure ledger cleanup degraded", {
+        errorCode: safeErrorCode(
+          error,
+          "RECONCILIATION_LEDGER_CLEANUP_FAILED",
+        ),
+        objectRef,
+        operation: "reconciliation_failure_ledger_delete",
+        status: "degraded",
+      });
+    }
+    return "completed";
+  } catch (error) {
+    result.failed += 1;
+    const failureCode = safeErrorCode(error, "ARCHIVE_RECONCILIATION_FAILED");
+    console.error("[mail-reconciliation] archive reconciliation failed", {
+      errorCode: failureCode,
+      objectRef,
+      operation: "archive_reconcile",
+      status: "failed",
+    });
+    try {
+      const ledgered = await env.RAW_MAIL_BUCKET.put(
+        failureLedgerKey(rawKey),
+        JSON.stringify({
+          rawKey,
+          failedAt: runtime.now().toISOString(),
+          errorCode: failureCode,
+        }),
+        { customMetadata: { status: "pending" } },
+      );
+      if (!ledgered) throw new Error("R2 rejected failure ledger write");
+      result.failureLedgered += 1;
+      console.error("[mail-reconciliation] failure durably ledgered", {
+        errorCode: "ARCHIVE_RECONCILIATION_LEDGERED",
+        objectRef,
+        operation: "reconciliation_failure_ledger_write",
+        status: "pending",
+      });
+      return "ledgered";
+    } catch (ledgerError) {
+      console.error("[mail-reconciliation] failure ledger write failed", {
+        errorCode: safeErrorCode(
+          ledgerError,
+          "RECONCILIATION_LEDGER_WRITE_FAILED",
+        ),
+        objectRef,
+        operation: "reconciliation_failure_ledger_write",
+        status: "failed",
+      });
+      return "unledgered";
+    }
+  }
+}
+
+function isTerminalActiveReceiptState(state: string | undefined): boolean {
+  return (
+    state === "stored" ||
+    state === "deleted" ||
+    state === "quarantined" ||
+    state === "rejected" ||
+    state === "dead_lettered"
+  );
+}
+
+async function clearTerminalActiveMarker(
+  rawKey: string,
+  env: ReconciliationEnvironment,
+): Promise<void> {
+  const ingressId = inboundIngressIdFromRawKey(rawKey);
+  if (!ingressId) return;
+  const receipt = await env.RAW_MAIL_BUCKET.head(`receipts/${ingressId}.json`);
+  if (!isTerminalActiveReceiptState(receipt?.customMetadata?.state)) return;
+  await env.RAW_MAIL_BUCKET.delete(inboundActiveMarkerKey(rawKey));
+}
+
+function startOfUtcMinute(value: Date): Date {
+  return new Date(Math.floor(value.getTime() / 60_000) * 60_000);
+}
+
+function addUtcMinutes(value: Date, minutes: number): Date {
+  return new Date(value.getTime() + minutes * 60_000);
+}
+
+function canonicalUtcMinute(value: unknown): Date | null {
+  if (typeof value !== "string") return null;
+  const parsed = new Date(value);
+  if (
+    !Number.isFinite(parsed.getTime()) ||
+    parsed.toISOString() !== value ||
+    startOfUtcMinute(parsed).getTime() !== parsed.getTime()
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+async function readRecentSweepCursor(
+  bucket: ReconciliationBucket,
+  runtime: ReconciliationRuntime,
+  key: string,
+  initialMinute: Date,
+): Promise<{ minute: Date; cursor?: string; etag?: string }> {
+  const object = await bucket.get(key);
+  if (!object) {
+    return { minute: initialMinute };
+  }
+  const value: unknown = JSON.parse(await object.text());
+  if (!isRecord(value)) {
+    throw new Error("Recent inbound sweep cursor is invalid");
+  }
+  const minute = canonicalUtcMinute(value.minute);
+  const cursor = value.cursor;
+  if (
+    !minute ||
+    minute.getTime() > startOfUtcMinute(runtime.now()).getTime() ||
+    (cursor !== null &&
+      cursor !== undefined &&
+      (typeof cursor !== "string" || cursor.length === 0)) ||
+    !object.etag
+  ) {
+    throw new Error("Recent inbound sweep cursor is invalid");
+  }
+  return {
+    minute,
+    ...(typeof cursor === "string" ? { cursor } : {}),
+    etag: object.etag,
+  };
+}
+
+async function persistRecentSweepCursor(
+  bucket: ReconciliationBucket,
+  key: string,
+  previous: { etag?: string },
+  next: { minute: Date; cursor?: string },
+  runtime: ReconciliationRuntime,
+): Promise<boolean> {
+  return Boolean(
+    await bucket.put(
+      key,
+      JSON.stringify({
+        minute: next.minute.toISOString(),
+        cursor: next.cursor ?? null,
+        updatedAt: runtime.now().toISOString(),
+      }),
+      {
+        customMetadata: { status: "active" },
+        onlyIf: previous.etag
+          ? { etagMatches: previous.etag }
+          : { etagDoesNotMatch: "*" },
+      },
+    ),
+  );
+}
+
+type RecentSweepSharedBudget = {
+  discovered: number;
+  listCalls: number;
+  scanned: number;
+};
+
+async function scanRecentRawArchiveLane(
+  env: ReconciliationEnvironment,
+  previous: { minute: Date; cursor?: string },
+  lastClosedMinute: Date,
+  budget: RecentSweepSharedBudget,
+): Promise<{ minute: Date; cursor?: string }> {
+  let minute = previous.minute;
+  let cursor = previous.cursor;
+
+  // R2 lists lexicographically and continuation cursors are opaque. Restricting
+  // each page to a closed minute keeps later writes out of an already checkpointed
+  // prefix. https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#bucket-method-definitions
+  while (
+    minute.getTime() <= lastClosedMinute.getTime() &&
+    budget.scanned < INBOUND_RECENT_RAW_RECONCILIATION_BATCH_SIZE &&
+    budget.listCalls < INBOUND_RECENT_RAW_MAX_PREFIX_LIST_CALLS
+  ) {
+    const remaining =
+      INBOUND_RECENT_RAW_RECONCILIATION_BATCH_SIZE - budget.scanned;
+    budget.listCalls += 1;
+    const page = await env.RAW_MAIL_BUCKET.list({
+      prefix: inboundRawMinutePrefix(minute),
+      limit: remaining,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (page.objects.length > remaining) {
+      throw new Error("R2 recent inbound page exceeded its requested limit");
+    }
+
+    for (const object of page.objects) {
+      budget.scanned += 1;
+      const ingressId = inboundIngressIdFromRawKey(object.key);
+      if (!ingressId) continue;
+      const receipt = await env.RAW_MAIL_BUCKET.head(
+        `receipts/${ingressId}.json`,
+      );
+      if (isTerminalActiveReceiptState(receipt?.customMetadata?.state)) {
+        continue;
+      }
+      await persistInboundActiveMarkerForRawKey(
+        env.RAW_MAIL_BUCKET,
+        object.key,
+        ingressId,
+      );
+      budget.discovered += 1;
+    }
+
+    if (page.truncated) {
+      if (!page.cursor) {
+        throw new Error(
+          "R2 returned a truncated recent inbound page without a continuation cursor",
+        );
+      }
+      cursor = page.cursor;
+      break;
+    }
+    minute = addUtcMinutes(minute, 1);
+    cursor = undefined;
+  }
+
+  return { minute, ...(cursor ? { cursor } : {}) };
+}
+
+async function discoverRecentRawArchives(
+  env: ReconciliationEnvironment,
+  runtime: ReconciliationRuntime,
+): Promise<{ discovered: number; scanned: number; cursorWritten: boolean }> {
+  const currentMinute = startOfUtcMinute(runtime.now());
+  const budget: RecentSweepSharedBudget = {
+    discovered: 0,
+    listCalls: 0,
+    scanned: 0,
+  };
+  let cursorWritten = true;
+  const lanes = [
+    {
+      key: RECENT_SWEEP_CURSOR_KEY,
+      initialMinute: addUtcMinutes(
+        currentMinute,
+        -RECENT_SWEEP_INITIAL_LOOKBACK_MINUTES,
+      ),
+      lastClosedMinute: addUtcMinutes(currentMinute, -1),
+    },
+    {
+      key: RECENT_BACKSTOP_SWEEP_CURSOR_KEY,
+      initialMinute: new Date(
+        Math.min(
+          RECENT_BACKSTOP_INTRODUCTION_MINUTE_MS,
+          currentMinute.getTime(),
+        ),
+      ),
+      lastClosedMinute: addUtcMinutes(
+        currentMinute,
+        -(RECENT_SWEEP_INITIAL_LOOKBACK_MINUTES + 1),
+      ),
+    },
+  ];
+
+  for (const lane of lanes) {
+    try {
+      const previous = await readRecentSweepCursor(
+        env.RAW_MAIL_BUCKET,
+        runtime,
+        lane.key,
+        lane.initialMinute,
+      );
+      const next = await scanRecentRawArchiveLane(
+        env,
+        previous,
+        lane.lastClosedMinute,
+        budget,
+      );
+      const written = await persistRecentSweepCursor(
+        env.RAW_MAIL_BUCKET,
+        lane.key,
+        previous,
+        next,
+        runtime,
+      );
+      if (!written) cursorWritten = false;
+    } catch {
+      cursorWritten = false;
+    }
+  }
+
+  return {
+    discovered: budget.discovered,
+    scanned: budget.scanned,
+    cursorWritten,
+  };
+}
+
+async function persistSweepCursor(
+  bucket: ReconciliationBucket,
+  key: string,
+  cursorState: { cursor?: string; etag?: string },
+  page: { truncated: boolean; cursor?: string },
+  runtime: ReconciliationRuntime,
+): Promise<boolean> {
+  return Boolean(
+    await bucket.put(
+      key,
+      JSON.stringify({
+        cursor: page.truncated ? page.cursor : null,
+        updatedAt: runtime.now().toISOString(),
+      }),
+      {
+        onlyIf: cursorState.etag
+          ? { etagMatches: cursorState.etag }
+          : { etagDoesNotMatch: "*" },
+      },
+    ),
+  );
+}
+
 export async function reconcileInboundArchives(
   env: ReconciliationEnvironment,
   runtime: ReconciliationRuntime = defaultRuntime,
@@ -1502,6 +1865,9 @@ export async function reconcileInboundArchives(
   let cleanupScanned = 0;
   let cleanupAccepted = 0;
   let cleanupSweepStatus: ReconciliationSubSweepStatus = "succeeded";
+  let recentDiscovered = 0;
+  let recentScanned = 0;
+  let recentSweepStatus: ReconciliationSubSweepStatus = "succeeded";
   let terminalSummaryEmitted = false;
   const emitTerminalSummary = (status: ReconciliationSweepStatus): void => {
     if (terminalSummaryEmitted) return;
@@ -1520,6 +1886,9 @@ export async function reconcileInboundArchives(
         pendingReview: result.pendingReview,
         projectionMissing: result.projectionMissing,
         reenqueued: result.reenqueued,
+        recentDiscovered,
+        recentScanned,
+        recentSweepStatus,
         repairResolved,
         repairScanned,
         repairSweepStatus,
@@ -1542,6 +1911,9 @@ export async function reconcileInboundArchives(
       pendingReview: result.pendingReview,
       projectionMissing: result.projectionMissing,
       reenqueued: result.reenqueued,
+      recentDiscovered,
+      recentScanned,
+      recentSweepStatus,
       repairResolved,
       repairScanned,
       repairSweepStatus,
@@ -1595,11 +1967,105 @@ export async function reconcileInboundArchives(
         status: "degraded",
       });
     }
-    const cursorState = await readSweepCursor(env.RAW_MAIL_BUCKET);
+    try {
+      const recentResult = await discoverRecentRawArchives(env, runtime);
+      recentDiscovered = recentResult.discovered;
+      recentScanned = recentResult.scanned;
+      if (!recentResult.cursorWritten) {
+        recentSweepStatus = "degraded";
+        console.error("[mail-reconciliation] recent raw sweep degraded", {
+          errorCode: "RECENT_RAW_SWEEP_FAILED",
+          operation: "recent_raw_reconcile",
+          status: "degraded",
+        });
+      }
+    } catch {
+      recentSweepStatus = "degraded";
+      console.error("[mail-reconciliation] recent raw sweep degraded", {
+        errorCode: "RECENT_RAW_SWEEP_FAILED",
+        operation: "recent_raw_reconcile",
+        status: "degraded",
+      });
+    }
+    let activeSweepStatus: ReconciliationSubSweepStatus = "succeeded";
+    const activeRawKeys = new Set<string>();
+    try {
+      const activeCursorState = await readSweepCursor(
+        env.RAW_MAIL_BUCKET,
+        INBOUND_ACTIVE_INDEX_CURSOR_KEY,
+      );
+      const activePage = await env.RAW_MAIL_BUCKET.list({
+        prefix: INBOUND_ACTIVE_INDEX_PREFIX,
+        limit: INBOUND_ACTIVE_RECONCILIATION_BATCH_SIZE,
+        ...(activeCursorState.cursor
+          ? { cursor: activeCursorState.cursor }
+          : {}),
+      });
+      let activePageComplete = true;
+      for (const marker of activePage.objects) {
+        const rawKey = rawKeyFromInboundActiveMarkerKey(marker.key);
+        if (!rawKey) continue;
+        activeRawKeys.add(rawKey);
+        const disposition = await reconcileOneArchive(
+          rawKey,
+          env,
+          runtime,
+          result,
+        );
+        if (disposition === "unledgered") activePageComplete = false;
+        if (disposition === "completed") {
+          try {
+            await clearTerminalActiveMarker(rawKey, env);
+          } catch (error) {
+            console.error(
+              "[mail-reconciliation] active marker cleanup degraded",
+              {
+                errorCode: safeErrorCode(
+                  error,
+                  "ACTIVE_RECOVERY_INDEX_DELETE_FAILED",
+                ),
+                objectRef: await mailTelemetryLogRef("object", rawKey),
+                operation: "active_recovery_index_delete",
+                status: "degraded",
+              },
+            );
+          }
+        }
+      }
+      if (activePage.truncated && !activePage.cursor) {
+        throw new Error(
+          "R2 returned a truncated active-index page without a continuation cursor",
+        );
+      }
+      if (activePageComplete) {
+        const cursorWritten = await persistSweepCursor(
+          env.RAW_MAIL_BUCKET,
+          INBOUND_ACTIVE_INDEX_CURSOR_KEY,
+          activeCursorState,
+          activePage,
+          runtime,
+        );
+        if (!cursorWritten) activeSweepStatus = "degraded";
+      } else {
+        activeSweepStatus = "degraded";
+      }
+    } catch {
+      activeSweepStatus = "degraded";
+      console.error("[mail-reconciliation] active recovery sweep degraded", {
+        errorCode: "ACTIVE_RECOVERY_INDEX_SWEEP_FAILED",
+        operation: "active_recovery_index_reconcile",
+        status: "degraded",
+      });
+    }
+
+    const cursorState = await readSweepCursor(
+      env.RAW_MAIL_BUCKET,
+      SWEEP_CURSOR_KEY,
+    );
     const listStartedAt = runtime.now().getTime();
     const page = await env.RAW_MAIL_BUCKET.list({
       prefix: RAW_PREFIX,
-      limit: LIST_PAGE_SIZE,
+      limit: INBOUND_RAW_BACKSTOP_RECONCILIATION_BATCH_SIZE,
       ...(cursorState.cursor ? { cursor: cursorState.cursor } : {}),
     });
     console.log("[mail-reconciliation] archive page listed", {
@@ -1610,80 +2076,26 @@ export async function reconcileInboundArchives(
       target: "r2",
       truncated: page.truncated,
     });
+    let rawPageComplete = true;
     for (const object of page.objects) {
-      result.scanned += 1;
-      const objectRef = await mailTelemetryLogRef("object", object.key);
-      try {
-        const outcome = await reconcileArchive(object.key, env, runtime);
-        result[outcome] += 1;
-        try {
-          await env.RAW_MAIL_BUCKET.delete(failureLedgerKey(object.key));
-        } catch (error) {
-          console.error(
-            "[mail-reconciliation] failure ledger cleanup degraded",
-            {
-              errorCode: safeErrorCode(
-                error,
-                "RECONCILIATION_LEDGER_CLEANUP_FAILED",
-              ),
-              objectRef,
-              operation: "reconciliation_failure_ledger_delete",
-              status: "degraded",
-            },
-          );
-        }
-      } catch (error) {
-        result.failed += 1;
-        const failureCode = safeErrorCode(
-          error,
-          "ARCHIVE_RECONCILIATION_FAILED",
-        );
-        console.error("[mail-reconciliation] archive reconciliation failed", {
-          errorCode: failureCode,
-          objectRef,
-          operation: "archive_reconcile",
-          status: "failed",
-        });
-        try {
-          const ledgered = await env.RAW_MAIL_BUCKET.put(
-            failureLedgerKey(object.key),
-            JSON.stringify({
-              rawKey: object.key,
-              failedAt: runtime.now().toISOString(),
-              errorCode: failureCode,
-            }),
-            { customMetadata: { status: "pending" } },
-          );
-          if (!ledgered) throw new Error("R2 rejected failure ledger write");
-          result.failureLedgered += 1;
-          console.error("[mail-reconciliation] failure durably ledgered", {
-            errorCode: "ARCHIVE_RECONCILIATION_LEDGERED",
-            objectRef,
-            operation: "reconciliation_failure_ledger_write",
-            status: "pending",
-          });
-        } catch (ledgerError) {
-          console.error("[mail-reconciliation] failure ledger write failed", {
-            errorCode: safeErrorCode(
-              ledgerError,
-              "RECONCILIATION_LEDGER_WRITE_FAILED",
-            ),
-            objectRef,
-            operation: "reconciliation_failure_ledger_write",
-            status: "failed",
-          });
-        }
-      }
+      if (activeRawKeys.has(object.key)) continue;
+      const disposition = await reconcileOneArchive(
+        object.key,
+        env,
+        runtime,
+        result,
+      );
+      if (disposition === "unledgered") rawPageComplete = false;
     }
     if (page.truncated && !page.cursor) {
       throw new Error(
         "R2 returned a truncated archive page without a continuation cursor",
       );
     }
-    if (result.failed > result.failureLedgered) {
+    if (!rawPageComplete) {
       console.error("[mail-reconciliation] sweep cursor held for retry", {
         errorCode: "RECONCILIATION_PAGE_INCOMPLETE",
-        failed: result.failed - result.failureLedgered,
+        failed: 1,
         operation: "reconciliation_cursor_write",
         status: "deferred",
       });
@@ -1692,17 +2104,12 @@ export async function reconcileInboundArchives(
     }
 
     const cursorWriteStartedAt = runtime.now().getTime();
-    const cursorWritten = await env.RAW_MAIL_BUCKET.put(
+    const cursorWritten = await persistSweepCursor(
+      env.RAW_MAIL_BUCKET,
       SWEEP_CURSOR_KEY,
-      JSON.stringify({
-        cursor: page.truncated ? page.cursor : null,
-        updatedAt: runtime.now().toISOString(),
-      }),
-      {
-        onlyIf: cursorState.etag
-          ? { etagMatches: cursorState.etag }
-          : { etagDoesNotMatch: "*" },
-      },
+      cursorState,
+      page,
+      runtime,
     );
     if (!cursorWritten) {
       console.log("[mail-reconciliation] sweep cursor update superseded", {
@@ -1723,6 +2130,8 @@ export async function reconcileInboundArchives(
     const status: ReconciliationSweepStatus =
       repairSweepStatus === "degraded" ||
       cleanupSweepStatus === "degraded" ||
+      recentSweepStatus === "degraded" ||
+      activeSweepStatus === "degraded" ||
       result.failed > 0
         ? "partial"
         : "succeeded";

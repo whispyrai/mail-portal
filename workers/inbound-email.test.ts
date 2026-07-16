@@ -52,6 +52,25 @@ function r2Object(
   };
 }
 
+function isActiveMarkerKey(key: string): boolean {
+  return key.startsWith("system/inbound-active/");
+}
+
+function activeMarkerObject(
+  key: string,
+  value: unknown,
+  options?: R2PutTestOptions,
+) {
+  assert.equal(typeof value, "string");
+  return r2Object(
+    key,
+    value.length,
+    options,
+    "active-marker-etag",
+    "active-marker-version",
+  );
+}
+
 function rawEmail(headers: string, body = "Hello from the Internet.") {
   const bytes = new TextEncoder().encode(`${headers}\r\n\r\n${body}`);
   return {
@@ -386,6 +405,10 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
         value: ReadableStream | ArrayBuffer | string,
         options?: R2PutTestOptions,
       ) {
+        if (isActiveMarkerKey(key)) {
+          externalOperations.push("active-marker-put");
+          return activeMarkerObject(key, value, options);
+        }
         if (key.startsWith("receipts/")) {
           externalOperations.push("receipt-put");
           assert.equal(typeof value, "string");
@@ -447,7 +470,10 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
 
   assert.equal(archived.length, 1);
   assert.deepEqual(archived[0].bytes, expectedRaw);
-  assert.match(archived[0].key, /^raw\/2026\/07\/13\/ingress-test\.eml$/);
+  assert.equal(
+    archived[0].key,
+    "raw/2026/07/13/09/30/ingress-test.eml",
+  );
   assert.deepEqual(archived[0].customMetadata, {
     archivedAt: "2026-07-13T09:30:00.000Z",
     declaredRawSize: String(expectedRaw.byteLength),
@@ -473,6 +499,7 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
   assert.deepEqual(receiptStates, ["archived", "admitted", "enqueued"]);
   assert.deepEqual(externalOperations, [
     "raw-put",
+    "active-marker-put",
     "receipt-put",
     "mailbox-head",
     "receipt-put",
@@ -490,6 +517,117 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
     "queue_enqueue",
     "receipt_write",
   ]);
+});
+
+test("inbound delivery uses direct durable projection when every active-marker write fails after raw archival", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let markerAttempts = 0;
+  let sleepCalls = 0;
+  let projectedId: string | undefined;
+  let queued = false;
+  let forwarded = false;
+  let rejected = false;
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward() {
+        forwarded = true;
+        return { messageId: "must-not-forward" };
+      },
+      setReject() {
+        rejected = true;
+      },
+    },
+    {
+      BRAND: "wiser",
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain direct projection must not write derived objects");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (isActiveMarkerKey(key)) {
+            markerAttempts += 1;
+            throw new Error("simulated active marker outage");
+          }
+          if (key.startsWith("receipts/")) {
+            assert.fail("marker failure must stop before receipt admission");
+          }
+          assert.ok(value instanceof ArrayBuffer);
+          return r2Object(key, value.byteLength, options);
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          queued = true;
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return projectedId ? { id: projectedId } : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail(command: {
+              email: { id: string };
+            }) {
+              projectedId = command.email.id;
+              return { status: "stored", cleanupKeys: [] };
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "active-marker-outage",
+      sleep() {
+        sleepCalls += 1;
+        return Promise.resolve();
+      },
+      async parse() {
+        return {
+          headers: [],
+          headerLines: [],
+          from: { name: "Sender", address: "sender@example.com" },
+          to: [{ name: "Mailbox", address: mailboxAddress }],
+          text: "Recovered from the authoritative raw archive.",
+          attachments: [],
+        };
+      },
+    },
+  );
+
+  assert.equal(markerAttempts, 10);
+  assert.equal(sleepCalls, 9);
+  assert.equal(projectedId, "active-marker-outage");
+  assert.equal(queued, false);
+  assert.equal(forwarded, false);
+  assert.equal(rejected, false);
 });
 
 test("inbound delivery directly projects exact archived bytes when the archived receipt cannot commit", async () => {
@@ -546,6 +684,9 @@ test("inbound delivery directly projects exact archived bytes when the archived 
           value: ArrayBuffer | string,
           options?: R2PutTestOptions,
         ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
           if (key.startsWith("receipts/")) {
             receiptAttempts += 1;
             throw new Error("simulated receipt outage");
@@ -657,6 +798,9 @@ for (const scenario of [
             value: ArrayBuffer | string,
             options?: R2PutTestOptions,
           ) {
+            if (isActiveMarkerKey(key)) {
+              return activeMarkerObject(key, value, options);
+            }
             if (key.startsWith("receipts/"))
               throw new Error("simulated receipt outage");
             assert.ok(value instanceof ArrayBuffer);
@@ -760,6 +904,9 @@ for (const deactivationCase of [
             value: ArrayBuffer | string,
             options?: R2PutTestOptions,
           ) {
+            if (isActiveMarkerKey(key)) {
+              return activeMarkerObject(key, value, options);
+            }
             if (key.startsWith("receipts/"))
               throw new Error("simulated receipt outage");
             assert.ok(value instanceof ArrayBuffer);
@@ -879,6 +1026,9 @@ test("inbound delivery emergency-forwards once when the per-attempt active reche
           value: ArrayBuffer | string,
           options?: R2PutTestOptions,
         ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
           if (!key.startsWith("receipts/")) {
             assert.ok(value instanceof ArrayBuffer);
             return r2Object(key, value.byteLength, options);
@@ -984,6 +1134,9 @@ async function assertEmergencyForwardResultRejected(
             value: ArrayBuffer | string,
             options?: R2PutTestOptions,
           ) {
+            if (isActiveMarkerKey(key)) {
+              return activeMarkerObject(key, value, options);
+            }
             if (key.startsWith("receipts/"))
               throw new Error("simulated receipt outage");
             assert.ok(value instanceof ArrayBuffer);
@@ -1074,12 +1227,15 @@ test("inbound delivery keeps a successful Queue handoff when enqueued receipt ad
       },
     },
     RAW_MAIL_BUCKET: {
-      async put(
-        key: string,
-        value: ReadableStream | ArrayBuffer | string,
-        options?: R2PutTestOptions,
-      ) {
-        if (!key.startsWith("receipts/")) {
+        async put(
+          key: string,
+          value: ReadableStream | ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
+          if (!key.startsWith("receipts/")) {
           assert.notEqual(typeof value, "string");
           const size = new Uint8Array(await new Response(value).arrayBuffer())
             .byteLength;
@@ -1197,6 +1353,9 @@ test("inbound delivery directly projects when the admitted receipt cannot commit
           value: ArrayBuffer | string,
           options?: R2PutTestOptions,
         ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
           if (!key.startsWith("receipts/")) {
             assert.ok(value instanceof ArrayBuffer);
             return r2Object(key, value.byteLength, options);
@@ -1300,6 +1459,9 @@ test("inbound delivery preserves a concurrent terminal winner when admitted rece
           value: ArrayBuffer | string,
           options?: R2PutTestOptions,
         ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
           if (!key.startsWith("receipts/")) {
             assert.ok(value instanceof ArrayBuffer);
             return r2Object(key, value.byteLength, options);
@@ -2166,6 +2328,9 @@ test("inbound delivery directly projects when Queue enqueue fails", async () => 
           value: ReadableStream | ArrayBuffer | string,
           options?: R2PutTestOptions,
         ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
           if (key.startsWith("receipts/")) {
             assert.equal(typeof value, "string");
             receiptStates.push(JSON.parse(value).state);
@@ -2244,7 +2409,9 @@ test("inbound delivery directly projects when Queue enqueue fails", async () => 
       },
     );
 
-    assert.deepEqual(archivedKeys, ["raw/2026/07/13/queue-failure.eml"]);
+    assert.deepEqual(archivedKeys, [
+      "raw/2026/07/13/09/30/queue-failure.eml",
+    ]);
     assert.deepEqual(receiptStates, ["archived", "admitted"]);
     assert.equal(queueCalls, 1);
     assert.equal(projectedId, "queue-failure");
@@ -2359,6 +2526,9 @@ test("inbound delivery directly projects archived mail when the mailbox marker l
           value: ReadableStream | ArrayBuffer | string,
           options?: R2PutTestOptions,
         ) {
+          if (isActiveMarkerKey(key)) {
+            return activeMarkerObject(key, value, options);
+          }
           if (key.startsWith("receipts/")) {
             return r2Object(
               key,
@@ -2511,6 +2681,9 @@ for (const testCase of d1AdmissionCases) {
             value: ArrayBuffer | string,
             options?: R2PutTestOptions,
           ) {
+            if (isActiveMarkerKey(key)) {
+              return activeMarkerObject(key, value, options);
+            }
             if (key.startsWith("receipts/")) {
               const state = JSON.parse(String(value)).state as string;
               receiptStates.push(state);
@@ -2595,6 +2768,9 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
         value: ArrayBuffer | string,
         options?: R2PutTestOptions,
       ) {
+        if (isActiveMarkerKey(key)) {
+          return activeMarkerObject(key, value, options);
+        }
         if (!key.startsWith("receipts/")) rawWasArchived = true;
         return r2Object(
           key,
@@ -2678,6 +2854,9 @@ for (const recipientCase of [
             value: ArrayBuffer | string,
             options?: R2PutTestOptions,
           ) {
+            if (isActiveMarkerKey(key)) {
+              return activeMarkerObject(key, value, options);
+            }
             if (!key.startsWith("receipts/")) {
               assert.ok(value instanceof ArrayBuffer);
               return r2Object(key, value.byteLength, options);
@@ -2713,7 +2892,8 @@ for (const recipientCase of [
       { waitUntil() {} },
       {
         now: () => new Date("2026-07-15T10:00:00.000Z"),
-        randomUUID: () => `rejection-receipt-${recipientCase.name}`,
+        randomUUID: () =>
+          `rejection-receipt-${recipientCase.name.replaceAll(" ", "-")}`,
         sleep: () => Promise.resolve(),
       },
     );
@@ -2730,6 +2910,8 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
   let rejection: string | undefined;
   let mailboxWasChecked = false;
   let rawWasArchived = false;
+  let activeMarkerKey: string | undefined;
+  let deletedMarkerKey: string | undefined;
   const message = {
     from: "sender@example.com",
     to: "contact@wiserchat.ai",
@@ -2753,12 +2935,19 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
         value: ArrayBuffer | string,
         options?: R2PutTestOptions,
       ) {
+        if (isActiveMarkerKey(key)) {
+          activeMarkerKey = key;
+          return activeMarkerObject(key, value, options);
+        }
         if (!key.startsWith("receipts/")) rawWasArchived = true;
         return r2Object(
           key,
           typeof value === "string" ? value.length : value.byteLength,
           options,
         );
+      },
+      async delete(key: string) {
+        deletedMarkerKey = key;
       },
     },
     INBOUND_QUEUE: { async send() {} },
@@ -2769,6 +2958,7 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
   assert.match(rejection ?? "", /mailbox unavailable/i);
   assert.equal(mailboxWasChecked, false);
   assert.equal(rawWasArchived, true);
+  assert.equal(deletedMarkerKey, activeMarkerKey);
 });
 
 test("inbound delivery archives recipients outside configured mail domains before rejection", async () => {
@@ -2800,6 +2990,9 @@ test("inbound delivery archives recipients outside configured mail domains befor
         value: ArrayBuffer | string,
         options?: R2PutTestOptions,
       ) {
+        if (isActiveMarkerKey(key)) {
+          return activeMarkerObject(key, value, options);
+        }
         if (!key.startsWith("receipts/")) rawWasArchived = true;
         return r2Object(
           key,

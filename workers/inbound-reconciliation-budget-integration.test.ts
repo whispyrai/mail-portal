@@ -25,13 +25,34 @@ function attemptId(index: number) {
 test("a maximum scheduled reconciliation shape stays within the Worker service-subrequest budget", async () => {
 	let serviceSubrequests = 0;
 	let etagRevision = 0;
+	let recentListCount = 0;
 	const stored = new Map<string, { value: string; etag: string }>();
 	const repairKeys: string[] = [];
 	const cleanupKeys: string[] = [];
-	const archiveKeys = Array.from(
-		{ length: 7 },
-		(_, index) => `raw/2026/07/15/archive-${index}.eml`,
+	const recentKeys = Array.from(
+		{ length: 128 },
+		(_, index) => {
+			const minute = new Date(Date.UTC(2026, 6, 14, 10, Math.floor(index / 2)));
+			const year = minute.getUTCFullYear();
+			const month = String(minute.getUTCMonth() + 1).padStart(2, "0");
+			const day = String(minute.getUTCDate()).padStart(2, "0");
+			const hour = String(minute.getUTCHours()).padStart(2, "0");
+			const minutePart = String(minute.getUTCMinutes()).padStart(2, "0");
+			return `raw/${year}/${month}/${day}/${hour}/${minutePart}/archive-${index}.eml`;
+		},
 	);
+	const archiveKeys = [...recentKeys.slice(0, 8), "raw/2026/07/15/archive-8.eml"];
+	const activeMarkerKeys = archiveKeys.slice(0, 8).map(
+		(rawKey) => `system/inbound-active/${encodeURIComponent(rawKey)}.json`,
+	);
+	stored.set("system/inbound-recent-cursor.json", {
+		value: JSON.stringify({
+			minute: "2026-07-14T10:00:00.000Z",
+			cursor: null,
+			updatedAt: "2026-07-14T09:59:00.000Z",
+		}),
+		etag: "recent-cursor-etag",
+	});
 
 	for (let index = 0; index < 20; index += 1) {
 		const id = attemptId(index);
@@ -81,7 +102,7 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 		stored.set(key, { value: JSON.stringify(value), etag: `seed-cleanup-${index}` });
 	}
 
-	for (let index = 0; index < 7; index += 1) {
+	for (let index = 0; index < 9; index += 1) {
 		stored.set(`receipts/archive-${index}.json`, {
 			value: JSON.stringify({
 				schemaVersion: 1,
@@ -114,7 +135,7 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 	}
 
 	const rawBucket = {
-		async list(options: { prefix: string; limit: number }) {
+		async list(options: { prefix: string; limit: number; cursor?: string }) {
 			serviceSubrequests += 1;
 			if (options.prefix === "system/derived-content-repair-attempts/pending/") {
 				assert.equal(options.limit, 20);
@@ -124,12 +145,43 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 				assert.equal(options.limit, 7);
 				return { objects: cleanupKeys.map((key) => ({ key })), truncated: false };
 			}
+			if (options.prefix === "system/inbound-active/") {
+				assert.equal(options.limit, 8);
+				return {
+					objects: activeMarkerKeys.map((key) => ({ key })),
+					truncated: false,
+				};
+			}
+			if (/^raw\/2026\/07\/14\/\d{2}\/\d{2}\/$/.test(options.prefix)) {
+				assert.equal(options.limit, 128 - 2 * recentListCount);
+				const objects = recentKeys
+					.filter((key) => key.startsWith(options.prefix))
+					.map((key) => ({ key }));
+				assert.equal(objects.length, 2);
+				recentListCount += 1;
+				return { objects, truncated: false };
+			}
 			assert.equal(options.prefix, "raw/");
-			assert.equal(options.limit, 7);
-			return { objects: archiveKeys.map((key) => ({ key })), truncated: false };
+			assert.equal(options.limit, 1);
+			return { objects: [{ key: archiveKeys[8] }], truncated: false };
 		},
 		async head(key: string) {
 			serviceSubrequests += 1;
+			if (key.startsWith("receipts/")) {
+				const current = stored.get(`system/head-count/${key}`);
+				const count = current ? Number(current.value) + 1 : 1;
+				stored.set(`system/head-count/${key}`, {
+					value: String(count),
+					etag: `head-count-${count}`,
+				});
+				return {
+					key,
+					size: 1,
+					etag: `receipt-head-${count}`,
+					version: "receipt-version",
+					customMetadata: { state: count === 1 ? "enqueued" : "stored" },
+				};
+			}
 			const ingressId = key.slice(key.lastIndexOf("/") + 1, -4);
 			return {
 				key,
@@ -264,8 +316,8 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 	console.error = () => {};
 	try {
 		const result = await reconcileInboundArchives(env, { now: () => now });
-		assert.equal(result.scanned, 7);
-		assert.equal(result.pendingReview, 7);
+		assert.equal(result.scanned, 9);
+		assert.equal(result.pendingReview, 9);
 	} finally {
 		console.log = originalLog;
 		console.error = originalError;

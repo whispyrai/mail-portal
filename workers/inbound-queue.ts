@@ -28,6 +28,8 @@ import {
   mailTelemetryLogRef,
   mailTelemetryRef,
 } from "./lib/mail-telemetry.ts";
+import { clearInboundActiveMarker } from "./lib/inbound-active-index.ts";
+import { isInboundRawKeyForIngress } from "./lib/inbound-raw-key.ts";
 
 export const INBOUND_MAX_RETRIES = 10;
 
@@ -43,6 +45,7 @@ type ArchivedEmailObject = {
 };
 
 type InboundReceiptBucket = {
+  delete?(key: string): Promise<unknown>;
   get(key: string): Promise<ArchivedEmailObject | null>;
   head?(key: string): Promise<{
     etag: string;
@@ -58,6 +61,32 @@ type InboundReceiptBucket = {
     },
   ): Promise<unknown | null>;
 };
+
+async function clearTerminalActiveMarkerBestEffort(
+  bucket: InboundReceiptBucket,
+  pointer: InboundArchivePointer,
+): Promise<void> {
+  if (!bucket.delete) return;
+  try {
+    await clearInboundActiveMarker(
+      { delete: bucket.delete.bind(bucket) },
+      pointer.rawKey,
+    );
+  } catch {
+    const [ingressRef, objectRef] = await Promise.all([
+      mailTelemetryLogRef("ingress", pointer.ingressId),
+      mailTelemetryLogRef("object", pointer.rawKey),
+    ]);
+    console.error("[mail-projection] terminal active marker cleanup degraded", {
+      errorCode: "ACTIVE_RECOVERY_INDEX_DELETE_FAILED",
+      ingressRef,
+      objectRef,
+      operation: "active_recovery_index_delete",
+      recoveryAction: "scheduled_reconciliation",
+      status: "degraded",
+    });
+  }
+}
 
 type InboundMailboxNamespace = {
   idFromName(mailboxId: string): unknown;
@@ -281,7 +310,7 @@ export function isInboundArchivePointer(
     typeof ingressId === "string" &&
     /^[A-Za-z0-9_-]+$/.test(ingressId) &&
     typeof rawKey === "string" &&
-    new RegExp(`^raw/\\d{4}/\\d{2}/\\d{2}/${ingressId}\\.eml$`).test(rawKey) &&
+    isInboundRawKeyForIngress(rawKey, ingressId) &&
     typeof mailboxId === "string" &&
     mailboxId.length > 2 &&
     mailboxId.includes("@") &&
@@ -323,6 +352,9 @@ async function writeReceipt(
       !(currentState === "stored" && state === "deleted")) ||
       (currentState === "dead_letter_pending" && state === "retrying"))
   ) {
+    if (isTerminalReceiptState(currentState)) {
+      await clearTerminalActiveMarkerBestEffort(bucket, pointer);
+    }
     return false;
   }
 
@@ -342,6 +374,9 @@ async function writeReceipt(
         : { etagDoesNotMatch: "*" },
     },
   );
+  if (written !== null && isTerminalReceiptState(state)) {
+    await clearTerminalActiveMarkerBestEffort(bucket, pointer);
+  }
   return written !== null;
 }
 
@@ -459,6 +494,10 @@ export async function processInboundMessage(
         return;
       }
       if (isTerminalReceiptState(currentState)) {
+        await clearTerminalActiveMarkerBestEffort(
+          env.RAW_MAIL_BUCKET,
+          pointer,
+        );
         console.log("[mail-projection] terminal delivery acknowledged", {
           attempt: message.attempts,
           durationMs: durationMs(runtime, projectionStartedAt),
@@ -1065,6 +1104,10 @@ export async function processInboundDeadLetterBatch(
         );
         const currentState = currentReceipt?.customMetadata?.state;
         if (isTerminalReceiptState(currentState)) {
+          await clearTerminalActiveMarkerBestEffort(
+            env.RAW_MAIL_BUCKET,
+            message.body,
+          );
           console.log("[mail-projection] terminal DLQ delivery acknowledged", {
             attempt: message.attempts,
             ingressRef,

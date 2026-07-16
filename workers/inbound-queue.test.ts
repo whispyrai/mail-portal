@@ -5,10 +5,37 @@ import PostalMime from "postal-mime";
 import type { InboundArchivePointer } from "./inbound-email.ts";
 import type { InboundProjectionCommand } from "./lib/inbound-projection-contract.ts";
 import {
+  isInboundArchivePointer,
   processInboundBatch,
   processInboundDeadLetterBatch,
   processInboundMessage as processInboundMessageProduction,
 } from "./inbound-queue.ts";
+
+test("Queue pointer admission accepts legacy and minute raw keys but rejects lookalikes", () => {
+  const base = {
+    schemaVersion: 1,
+    ingressId: "pointer-key-matrix",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    archivedAt: "2026-07-16T09:57:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  for (const rawKey of [
+    "raw/2026/07/16/pointer-key-matrix.eml",
+    "raw/2026/07/16/09/57/pointer-key-matrix.eml",
+  ]) {
+    assert.equal(isInboundArchivePointer({ ...base, rawKey }), true, rawKey);
+  }
+  for (const rawKey of [
+    "raw/2026/07/16/09/pointer-key-matrix.eml",
+    "raw/2026/07/16/09/57/extra/pointer-key-matrix.eml",
+    "raw/2026/07/16/09/60/pointer-key-matrix.eml",
+    "raw/2026/07/16/09/57/different-id.eml",
+  ]) {
+    assert.equal(isInboundArchivePointer({ ...base, rawKey }), false, rawKey);
+  }
+});
 
 function assertTelemetryRef(value: unknown): void {
   assert.match(String(value), /^(?:[a-f0-9]{16}|unavailable)$/);
@@ -862,9 +889,11 @@ test("Queue consumption quarantines an unparseable archive without deleting raw 
           receipt = JSON.parse(value);
           return {};
         },
-        async delete() {
-          assert.fail(
-            "raw MIME must never be deleted by projection failure handling",
+        async delete(key: string) {
+          assert.equal(
+            key,
+            `system/inbound-active/${encodeURIComponent(pointer.rawKey)}.json`,
+            "terminal cleanup may delete only the active marker, never raw MIME",
           );
         },
       },
@@ -1184,6 +1213,7 @@ test("Queue delivery acknowledges a terminal receipt before touching projection 
   };
   let retried = false;
   let acknowledged = false;
+  let markerCleanupAttempted = false;
   const env = {
     RAW_MAIL_BUCKET: {
       async get() {
@@ -1195,6 +1225,14 @@ test("Queue delivery acknowledges a terminal receipt before touching projection 
       },
       async put() {
         assert.fail("a terminal stored receipt must not regress to retrying");
+      },
+      async delete(key: string) {
+        assert.equal(
+          key,
+          `system/inbound-active/${encodeURIComponent(pointer.rawKey)}.json`,
+        );
+        markerCleanupAttempted = true;
+        throw new Error("simulated active marker cleanup outage");
       },
     },
     BUCKET: {
@@ -1238,6 +1276,7 @@ test("Queue delivery acknowledges a terminal receipt before touching projection 
 
   assert.equal(retried, false);
   assert.equal(acknowledged, true);
+  assert.equal(markerCleanupAttempted, true);
 });
 
 test("Queue consumption retries when the Mailbox marker cannot be read", async () => {
@@ -2207,6 +2246,72 @@ test("DLQ consumption records a terminal dead-letter receipt before acknowledgin
     attempts: 1,
     errorCode: "QUEUE_RETRY_EXHAUSTED",
   });
+  assert.equal(acknowledged, true);
+});
+
+test("DLQ consumption clears a stale active marker when terminal receipt truth already exists", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "terminal-dlq-marker",
+    rawKey: "raw/2026/07/13/10/00/terminal-dlq-marker.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    archivedAt: "2026-07-13T10:00:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  let acknowledged = false;
+  let deletedKey: string | undefined;
+
+  await processInboundDeadLetterBatch(
+    {
+      messages: [{
+        id: "terminal-dlq-marker-message",
+        timestamp: new Date("2026-07-13T10:01:00.000Z"),
+        body: pointer,
+        attempts: 1,
+        ack() {
+          acknowledged = true;
+        },
+        retry() {
+          assert.fail("terminal receipt truth must acknowledge the DLQ message");
+        },
+      }],
+    },
+    {
+      RAW_MAIL_BUCKET: {
+        async get() {
+          assert.fail("terminal receipt truth must not read raw MIME");
+        },
+        async head(key: string) {
+          assert.equal(key, `receipts/${pointer.ingressId}.json`);
+          return {
+            etag: "stored-etag",
+            customMetadata: { state: "stored" },
+          };
+        },
+        async put() {
+          assert.fail("terminal receipt truth must not write another receipt");
+        },
+        async delete(key: string) {
+          deletedKey = key;
+        },
+      },
+      MAILBOX: {
+        idFromName() {
+          assert.fail("terminal receipt truth must not resolve a Mailbox");
+        },
+        get() {
+          assert.fail("terminal receipt truth must not resolve a Mailbox");
+        },
+      },
+    },
+  );
+
+  assert.equal(
+    deletedKey,
+    `system/inbound-active/${encodeURIComponent(pointer.rawKey)}.json`,
+  );
   assert.equal(acknowledged, true);
 });
 

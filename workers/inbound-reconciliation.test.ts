@@ -828,7 +828,7 @@ test("reconciliation preserves but never enqueues raw mail without a durable adm
         limit?: number;
         cursor?: string;
       }) {
-        assert.deepEqual(options, { prefix: "raw/", limit: 7 });
+        assert.deepEqual(options, { prefix: "raw/", limit: 1 });
         return {
           objects: [{ key: rawKey }],
           truncated: false,
@@ -3440,7 +3440,7 @@ test("reconciliation resumes from and persists the R2 continuation cursor", asyn
       async list(options: { prefix: string; limit: number; cursor?: string }) {
         assert.deepEqual(options, {
           prefix: "raw/",
-          limit: 7,
+          limit: 1,
           cursor: "previous-page-cursor",
         });
         return { objects: [], truncated: true, cursor: "next-page-cursor" };
@@ -3787,4 +3787,955 @@ test("reconciliation emits one bounded terminal sweep summary on every exit path
       /list-error-message-poison|cursor-error-message-poison|repair-attempt-poison|cleanup-intent-poison/,
     );
   }
+});
+
+test("active inbound recovery is reconciled before retained terminal raw history", async () => {
+  const activeIngressId = "active-orphan";
+  const activeRawKey = `raw/2026/07/16/${activeIngressId}.eml`;
+  const terminalIngressId = "terminal-history";
+  const terminalRawKey = `raw/2026/01/01/${terminalIngressId}.eml`;
+  const activeMarkerKey =
+    `system/inbound-active/${encodeURIComponent(activeRawKey)}.json`;
+  const queued: InboundArchivePointer[] = [];
+
+  const archive = (rawKey: string, ingressId: string) => ({
+    key: rawKey,
+    size: 321,
+    etag: `${ingressId}-etag`,
+    version: `${ingressId}-version`,
+    customMetadata: {
+      archivedAt:
+        ingressId === activeIngressId
+          ? "2026-07-16T09:55:00.000Z"
+          : "2026-01-01T00:00:00.000Z",
+      ingressId,
+      mailboxId: "hello@wiserchat.ai",
+      rawSize: "321",
+      schemaVersion: "1",
+    },
+  });
+
+  await reconcileInboundArchives(
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async list(options: { prefix: string }) {
+          if (options.prefix === "system/inbound-active/") {
+            return { objects: [{ key: activeMarkerKey }], truncated: false };
+          }
+          if (options.prefix === "raw/") {
+            return { objects: [{ key: terminalRawKey }], truncated: false };
+          }
+          return { objects: [], truncated: false };
+        },
+        async head(key: string) {
+          if (key === activeRawKey) return archive(activeRawKey, activeIngressId);
+          if (key === terminalRawKey) {
+            return archive(terminalRawKey, terminalIngressId);
+          }
+          if (key === `receipts/${activeIngressId}.json`) {
+            return {
+              etag: "active-enqueued-etag",
+              customMetadata: { state: "enqueued" },
+            };
+          }
+          return null;
+        },
+        async get(key: string) {
+          if (
+            key === "system/reconciliation-cursor.json" ||
+            key === "system/inbound-active-cursor.json"
+          ) return null;
+          if (key === `receipts/${activeIngressId}.json`) {
+            return {
+              etag: "active-receipt-etag",
+              async text() {
+                return inboundReceiptBody(
+                  {
+                    ingressId: activeIngressId,
+                    rawKey: activeRawKey,
+                    rawSize: 321,
+                    archivedAt: "2026-07-16T09:55:00.000Z",
+                    etag: `${activeIngressId}-etag`,
+                    version: `${activeIngressId}-version`,
+                  },
+                  "admitted",
+                  "2026-07-16T09:55:00.000Z",
+                );
+              },
+            };
+          }
+          if (key === `receipts/${terminalIngressId}.json`) {
+            return {
+              etag: "terminal-receipt-etag",
+              async text() {
+                return inboundReceiptBody(
+                  {
+                    ingressId: terminalIngressId,
+                    rawKey: terminalRawKey,
+                    rawSize: 321,
+                    archivedAt: "2026-01-01T00:00:00.000Z",
+                    etag: `${terminalIngressId}-etag`,
+                    version: `${terminalIngressId}-version`,
+                  },
+                  "rejected",
+                  "2026-01-01T00:00:00.000Z",
+                  { errorCode: "MAILBOX_INACTIVE" },
+                );
+              },
+            };
+          }
+          return null;
+        },
+        async put() {
+          return { etag: "written-etag" };
+        },
+        async delete() {},
+      },
+      INBOUND_QUEUE: {
+        async send(pointer: InboundArchivePointer) {
+          queued.push(pointer);
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return null;
+            },
+            async isEmailDeleted() {
+              return false;
+            },
+            async getInboundTerminalFailure() {
+              return null;
+            },
+          };
+        },
+      },
+    },
+    { now: () => new Date("2026-07-16T10:00:00.000Z") },
+  );
+
+  assert.deepEqual(
+    queued.map((pointer) => pointer.ingressId),
+    [activeIngressId],
+  );
+});
+
+test("a minute-partitioned raw archive without a marker is discovered behind retained terminal history", async () => {
+  const orphanIngressId = "marker-crash-gap";
+  const orphanRawKey =
+    `raw/2026/07/16/09/57/${orphanIngressId}.eml`;
+  const terminalIngressId = "retained-terminal-history";
+  const terminalRawKey = `raw/2026/01/01/${terminalIngressId}.eml`;
+  const markerKey =
+    `system/inbound-active/${encodeURIComponent(orphanRawKey)}.json`;
+  const writtenKeys: string[] = [];
+
+  await reconcileInboundArchives(
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      DB: mailboxDb(),
+      BUCKET: derivedBucketWithoutDelete,
+      RAW_MAIL_BUCKET: {
+        async list(options: {
+          prefix: string;
+          limit: number;
+          cursor?: string;
+        }) {
+          if (options.prefix === "raw/2026/07/16/09/57/") {
+            assert.equal(options.cursor, undefined);
+            return { objects: [{ key: orphanRawKey }], truncated: false };
+          }
+          if (options.prefix === "raw/") {
+            return { objects: [{ key: terminalRawKey }], truncated: false };
+          }
+          return { objects: [], truncated: false };
+        },
+        async head(key: string) {
+          if (key === `receipts/${orphanIngressId}.json`) return null;
+          if (key === terminalRawKey) {
+            return {
+              key: terminalRawKey,
+              size: 321,
+              etag: "terminal-archive-etag",
+              version: "terminal-archive-version",
+              customMetadata: {
+                archivedAt: "2026-01-01T00:00:00.000Z",
+                ingressId: terminalIngressId,
+                mailboxId: "hello@wiserchat.ai",
+                rawSize: "321",
+                schemaVersion: "1",
+              },
+            };
+          }
+          return null;
+        },
+        async get(key: string) {
+          if (key === "system/inbound-recent-cursor.json") {
+            return {
+              etag: "recent-cursor-etag",
+              async text() {
+                return JSON.stringify({
+                  minute: "2026-07-16T09:57:00.000Z",
+                  cursor: null,
+                  updatedAt: "2026-07-16T09:56:00.000Z",
+                });
+              },
+            };
+          }
+          if (
+            key === "system/inbound-active-cursor.json" ||
+            key === "system/reconciliation-cursor.json"
+          ) return null;
+          if (key === `receipts/${terminalIngressId}.json`) {
+            return {
+              etag: "terminal-receipt-etag",
+              async text() {
+                return inboundReceiptBody(
+                  {
+                    ingressId: terminalIngressId,
+                    rawKey: terminalRawKey,
+                    rawSize: 321,
+                    archivedAt: "2026-01-01T00:00:00.000Z",
+                    etag: "terminal-archive-etag",
+                    version: "terminal-archive-version",
+                  },
+                  "rejected",
+                  "2026-01-01T00:00:00.000Z",
+                  { errorCode: "MAILBOX_INACTIVE" },
+                );
+              },
+            };
+          }
+          return null;
+        },
+        async put(key: string) {
+          writtenKeys.push(key);
+          return { etag: "written-etag" };
+        },
+        async delete() {},
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          throw new Error("terminal history must not enqueue");
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return null;
+            },
+            async hasEmail() {
+              return false;
+            },
+            async isEmailDeleted() {
+              return false;
+            },
+          };
+        },
+      },
+    },
+    { now: () => new Date("2026-07-16T10:00:00.000Z") },
+  );
+
+  assert.ok(writtenKeys.includes(markerKey));
+});
+
+test("recent raw discovery crosses closed UTC minute boundaries without skipping either partition", async () => {
+  const rawKeys = [
+    "raw/2026/07/16/09/59/rollover-before.eml",
+    "raw/2026/07/16/10/00/rollover-after.eml",
+  ];
+  const markerKeys: string[] = [];
+  let persistedCursor: Record<string, unknown> | undefined;
+
+  await reconcileInboundArchives(
+    {
+      DOMAINS: "wiserchat.ai",
+      DB: mailboxDb(),
+      BUCKET: derivedBucketWithoutDelete,
+      RAW_MAIL_BUCKET: {
+        async list(options: { prefix: string }) {
+          if (options.prefix === "raw/2026/07/16/09/59/") {
+            return { objects: [{ key: rawKeys[0] }], truncated: false };
+          }
+          if (options.prefix === "raw/2026/07/16/10/00/") {
+            return { objects: [{ key: rawKeys[1] }], truncated: false };
+          }
+          return { objects: [], truncated: false };
+        },
+        async head() {
+          return null;
+        },
+        async get(key: string) {
+          if (key === "system/inbound-recent-cursor.json") {
+            return {
+              etag: "recent-cursor-etag",
+              async text() {
+                return JSON.stringify({
+                  minute: "2026-07-16T09:59:00.000Z",
+                  cursor: null,
+                  updatedAt: "2026-07-16T09:58:00.000Z",
+                });
+              },
+            };
+          }
+          return null;
+        },
+        async put(key: string, value: string) {
+          if (key.startsWith("system/inbound-active/")) markerKeys.push(key);
+          if (key === "system/inbound-recent-cursor.json") {
+            persistedCursor = JSON.parse(value);
+          }
+          return { etag: "written-etag" };
+        },
+        async delete() {},
+      },
+      INBOUND_QUEUE: { async send() {} },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return { async getEmail() { return null; } };
+        },
+      },
+    },
+    { now: () => new Date("2026-07-16T10:01:30.000Z") },
+  );
+
+  assert.deepEqual(
+    markerKeys,
+    rawKeys.map(
+      (rawKey) =>
+        `system/inbound-active/${encodeURIComponent(rawKey)}.json`,
+    ),
+  );
+  assert.deepEqual(persistedCursor, {
+    minute: "2026-07-16T10:01:00.000Z",
+    cursor: null,
+    updatedAt: "2026-07-16T10:01:30.000Z",
+  });
+});
+
+test("recent raw discovery resumes a truncated minute until more than 128 archives are indexed", async () => {
+  const rawKeys = Array.from(
+    { length: 129 },
+    (_, index) =>
+      `raw/2026/07/16/09/57/recent-${String(index).padStart(3, "0")}.eml`,
+  );
+  const markerKeys = new Set<string>();
+  let cursorValue = JSON.stringify({
+    minute: "2026-07-16T09:57:00.000Z",
+    cursor: null,
+    updatedAt: "2026-07-16T09:56:00.000Z",
+  });
+  let cursorEtag = "recent-cursor-0";
+  let recentLists = 0;
+
+  const env = {
+    DOMAINS: "wiserchat.ai",
+    DB: mailboxDb(),
+    BUCKET: derivedBucketWithoutDelete,
+    RAW_MAIL_BUCKET: {
+      async list(options: {
+        prefix: string;
+        limit: number;
+        cursor?: string;
+      }) {
+        if (options.prefix === "raw/2026/07/16/09/57/") {
+          recentLists += 1;
+          assert.equal(options.limit, 128);
+          if (!options.cursor) {
+            return {
+              objects: rawKeys.slice(0, 128).map((key) => ({ key })),
+              truncated: true,
+              cursor: "after-128",
+            };
+          }
+          assert.equal(options.cursor, "after-128");
+          return { objects: [{ key: rawKeys[128] }], truncated: false };
+        }
+        return { objects: [], truncated: false };
+      },
+      async head() {
+        return null;
+      },
+      async get(key: string) {
+        if (key === "system/inbound-recent-cursor.json") {
+          return {
+            etag: cursorEtag,
+            async text() {
+              return cursorValue;
+            },
+          };
+        }
+        return null;
+      },
+      async put(key: string, value: string) {
+        if (key.startsWith("system/inbound-active/")) markerKeys.add(key);
+        if (key === "system/inbound-recent-cursor.json") {
+          cursorValue = value;
+          cursorEtag = `recent-cursor-${recentLists}`;
+        }
+        return { etag: cursorEtag };
+      },
+      async delete() {},
+    },
+    INBOUND_QUEUE: { async send() {} },
+    MAILBOX: {
+      idFromName(mailboxId: string) {
+        return mailboxId;
+      },
+      get() {
+        return { async getEmail() { return null; } };
+      },
+    },
+  };
+  const runtime = { now: () => new Date("2026-07-16T10:00:00.000Z") };
+
+  await reconcileInboundArchives(env, runtime);
+  assert.deepEqual(JSON.parse(cursorValue), {
+    minute: "2026-07-16T09:57:00.000Z",
+    cursor: "after-128",
+    updatedAt: "2026-07-16T10:00:00.000Z",
+  });
+  assert.equal(markerKeys.size, 128);
+
+  await reconcileInboundArchives(env, runtime);
+  assert.deepEqual(JSON.parse(cursorValue), {
+    minute: "2026-07-16T10:00:00.000Z",
+    cursor: null,
+    updatedAt: "2026-07-16T10:00:00.000Z",
+  });
+  assert.equal(markerKeys.size, 129);
+});
+
+test("recent raw discovery holds its checkpoint when candidate evidence cannot be read or indexed", async () => {
+  for (const failure of ["receipt_head", "marker_write"]) {
+    const ingressId = `recent-${failure}`;
+    const rawKey = `raw/2026/07/16/09/57/${ingressId}.eml`;
+    let recentCursorWrites = 0;
+
+    await reconcileInboundArchives(
+      {
+        DOMAINS: "wiserchat.ai",
+        DB: mailboxDb(),
+        BUCKET: derivedBucketWithoutDelete,
+        RAW_MAIL_BUCKET: {
+          async list(options: { prefix: string }) {
+            return {
+              objects:
+                options.prefix === "raw/2026/07/16/09/57/"
+                  ? [{ key: rawKey }]
+                  : [],
+              truncated: false,
+            };
+          },
+          async head(key: string) {
+            if (
+              key === `receipts/${ingressId}.json` &&
+              failure === "receipt_head"
+            ) {
+              throw new Error("simulated receipt HEAD outage");
+            }
+            return null;
+          },
+          async get(key: string) {
+            if (key === "system/inbound-recent-cursor.json") {
+              return {
+                etag: "recent-cursor-etag",
+                async text() {
+                  return JSON.stringify({
+                    minute: "2026-07-16T09:57:00.000Z",
+                    cursor: null,
+                    updatedAt: "2026-07-16T09:56:00.000Z",
+                  });
+                },
+              };
+            }
+            if (key === "system/inbound-recent-backstop-cursor.json") {
+              return {
+                etag: "backstop-cursor-etag",
+                async text() {
+                  return JSON.stringify({
+                    minute: "2026-07-16T10:00:00.000Z",
+                    cursor: null,
+                    updatedAt: "2026-07-16T09:59:00.000Z",
+                  });
+                },
+              };
+            }
+            return null;
+          },
+          async put(key: string) {
+            if (
+              key.startsWith("system/inbound-active/") &&
+              failure === "marker_write"
+            ) {
+              throw new Error("simulated active marker outage");
+            }
+            if (key === "system/inbound-recent-cursor.json") {
+              recentCursorWrites += 1;
+            }
+            return { etag: "written-etag" };
+          },
+          async delete() {},
+        },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            return { async getEmail() { return null; } };
+          },
+        },
+      },
+      { now: () => new Date("2026-07-16T10:00:00.000Z") },
+    );
+
+    assert.equal(recentCursorWrites, 0, failure);
+  }
+});
+
+test("the first recent sweep covers the rollout propagation window in one run", async () => {
+  const ingressId = "first-deploy-gap";
+  const rawKey = `raw/2026/07/16/09/00/${ingressId}.eml`;
+  const prefixes: string[] = [];
+  let markerWritten = false;
+
+  await reconcileInboundArchives(
+    {
+      DOMAINS: "wiserchat.ai",
+      DB: mailboxDb(),
+      BUCKET: derivedBucketWithoutDelete,
+      RAW_MAIL_BUCKET: {
+        async list(options: { prefix: string }) {
+          if (/^raw\/\d{4}\//.test(options.prefix) && options.prefix !== "raw/") {
+            prefixes.push(options.prefix);
+          }
+          return {
+            objects:
+              options.prefix === "raw/2026/07/16/09/00/"
+                ? [{ key: rawKey }]
+                : [],
+            truncated: false,
+          };
+        },
+        async head() {
+          return null;
+        },
+        async get(key: string) {
+          if (key === "system/inbound-recent-backstop-cursor.json") {
+            return {
+              etag: "backstop-cursor-etag",
+              async text() {
+                return JSON.stringify({
+                  minute: "2026-07-16T10:00:00.000Z",
+                  cursor: null,
+                  updatedAt: "2026-07-16T09:59:00.000Z",
+                });
+              },
+            };
+          }
+          return null;
+        },
+        async put(key: string) {
+          if (
+            key ===
+            `system/inbound-active/${encodeURIComponent(rawKey)}.json`
+          ) {
+            markerWritten = true;
+          }
+          return { etag: "written-etag" };
+        },
+        async delete() {},
+      },
+      INBOUND_QUEUE: { async send() {} },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return { async getEmail() { return null; } };
+        },
+      },
+    },
+    { now: () => new Date("2026-07-16T10:00:30.000Z") },
+  );
+
+  assert.equal(prefixes[0], "raw/2026/07/16/09/00/");
+  assert.equal(prefixes.at(-1), "raw/2026/07/16/09/59/");
+  assert.equal(prefixes.length, 60);
+  assert.equal(markerWritten, true);
+});
+
+test("a future recent cursor degrades visibly without listing or replacing its checkpoint", async () => {
+  let recentLists = 0;
+  let recentCursorWrites = 0;
+  const logs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { logs.push(args); };
+
+  try {
+    await reconcileInboundArchives(
+      {
+        DOMAINS: "wiserchat.ai",
+        DB: mailboxDb(),
+        BUCKET: derivedBucketWithoutDelete,
+        RAW_MAIL_BUCKET: {
+          async list(options: { prefix: string }) {
+            if (/^raw\/\d{4}\//.test(options.prefix)) recentLists += 1;
+            return { objects: [], truncated: false };
+          },
+          async head() {
+            return null;
+          },
+          async get(key: string) {
+            if (key === "system/inbound-recent-cursor.json") {
+              return {
+                etag: "future-cursor-etag",
+                async text() {
+                  return JSON.stringify({
+                    minute: "2026-07-16T10:01:00.000Z",
+                    cursor: null,
+                    updatedAt: "2026-07-16T09:59:00.000Z",
+                  });
+                },
+              };
+            }
+            if (key === "system/inbound-recent-backstop-cursor.json") {
+              return {
+                etag: "backstop-cursor-etag",
+                async text() {
+                  return JSON.stringify({
+                    minute: "2026-07-16T10:00:00.000Z",
+                    cursor: null,
+                    updatedAt: "2026-07-16T09:59:00.000Z",
+                  });
+                },
+              };
+            }
+            return null;
+          },
+          async put(key: string) {
+            if (key === "system/inbound-recent-cursor.json") {
+              recentCursorWrites += 1;
+            }
+            return { etag: "written-etag" };
+          },
+          async delete() {},
+        },
+        INBOUND_QUEUE: { async send() {} },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            return { async getEmail() { return null; } };
+          },
+        },
+      },
+      { now: () => new Date("2026-07-16T10:00:30.000Z") },
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(recentLists, 0);
+  assert.equal(recentCursorWrites, 0);
+  assert.deepEqual(
+    logs.find(
+      (args) =>
+        args[0] === "[mail-reconciliation] recent raw sweep degraded",
+    ),
+    [
+      "[mail-reconciliation] recent raw sweep degraded",
+      {
+        errorCode: "RECENT_RAW_SWEEP_FAILED",
+        operation: "recent_raw_reconcile",
+        status: "degraded",
+      },
+    ],
+  );
+});
+
+test("the fixed recent backstop discovers an archive after it ages out of an uninitialized priority window", async () => {
+  const ingressId = "aged-marker-outage";
+  const rawKey = `raw/2026/07/16/00/00/${ingressId}.eml`;
+  const markerKey =
+    `system/inbound-active/${encodeURIComponent(rawKey)}.json`;
+  let backstopCursorValue = JSON.stringify({
+    minute: "2026-07-16T00:00:00.000Z",
+    cursor: null,
+    updatedAt: "2026-07-16T00:00:00.000Z",
+  });
+  let backstopCursorEtag = "backstop-cursor-0";
+  let markerAvailable = false;
+  let markerAttempts = 0;
+  let markerWritten = false;
+  let priorityCursorValue: string | undefined;
+  let priorityCursorEtag: string | undefined;
+  let now = new Date("2026-07-16T01:00:00.000Z");
+
+  const env = {
+    DOMAINS: "wiserchat.ai",
+    DB: mailboxDb(),
+    BUCKET: derivedBucketWithoutDelete,
+    RAW_MAIL_BUCKET: {
+      async list(options: { prefix: string }) {
+        return {
+          objects:
+            options.prefix === "raw/2026/07/16/00/00/"
+              ? [{ key: rawKey }]
+              : [],
+          truncated: false,
+        };
+      },
+      async head() {
+        return null;
+      },
+      async get(key: string) {
+        if (
+          key === "system/inbound-recent-cursor.json" &&
+          priorityCursorValue &&
+          priorityCursorEtag
+        ) {
+          return {
+            etag: priorityCursorEtag,
+            async text() {
+              return priorityCursorValue ?? "";
+            },
+          };
+        }
+        if (key === "system/inbound-recent-backstop-cursor.json") {
+          return {
+            etag: backstopCursorEtag,
+            async text() {
+              return backstopCursorValue;
+            },
+          };
+        }
+        return null;
+      },
+      async put(key: string, value: string) {
+        if (key === markerKey) {
+          markerAttempts += 1;
+          if (!markerAvailable) {
+            throw new Error("simulated prolonged marker outage");
+          }
+          markerWritten = true;
+          return { etag: "marker-etag" };
+        }
+        if (key === "system/inbound-recent-cursor.json") {
+          priorityCursorValue = value;
+          priorityCursorEtag = "priority-cursor-1";
+        }
+        if (key === "system/inbound-recent-backstop-cursor.json") {
+          backstopCursorValue = value;
+          backstopCursorEtag = "backstop-cursor-1";
+        }
+        return { etag: "written-etag" };
+      },
+      async delete() {},
+    },
+    INBOUND_QUEUE: { async send() {} },
+    MAILBOX: {
+      idFromName(mailboxId: string) {
+        return mailboxId;
+      },
+      get() {
+        return { async getEmail() { return null; } };
+      },
+    },
+  };
+  const runtime = { now: () => now };
+
+  await reconcileInboundArchives(env, runtime);
+  assert.equal(markerAttempts, 1);
+  assert.equal(markerWritten, false);
+  assert.equal(priorityCursorValue, undefined);
+  assert.equal(
+    JSON.parse(backstopCursorValue).minute,
+    "2026-07-16T00:00:00.000Z",
+  );
+
+  markerAvailable = true;
+  now = new Date("2026-07-16T02:05:00.000Z");
+  await reconcileInboundArchives(env, runtime);
+
+  assert.equal(markerWritten, true);
+  assert.equal(
+    JSON.parse(backstopCursorValue).minute,
+    "2026-07-16T00:04:00.000Z",
+  );
+});
+
+test("malformed active marker pages advance so a valid marker behind them is not starved", async () => {
+  const ingressId = "valid-marker-behind-malformed-page";
+  const rawKey = `raw/2026/07/16/09/55/${ingressId}.eml`;
+  const validMarkerKey =
+    `system/inbound-active/${encodeURIComponent(rawKey)}.json`;
+  const malformedMarkerKeys = Array.from(
+    { length: 8 },
+    (_, index) => `system/inbound-active/invalid-${index}.json`,
+  );
+  let activeCursorValue: string | undefined;
+  let activeCursorEtag: string | undefined;
+  const activeListCursors: Array<string | undefined> = [];
+  const queued: InboundArchivePointer[] = [];
+
+  const env = {
+    DOMAINS: "wiserchat.ai",
+    EMAIL_ADDRESSES: [],
+    DB: mailboxDb(),
+    BUCKET: {
+      async head() {
+        return {};
+      },
+    },
+    RAW_MAIL_BUCKET: {
+      async list(options: { prefix: string; cursor?: string }) {
+        if (options.prefix === "system/inbound-active/") {
+          activeListCursors.push(options.cursor);
+          return options.cursor
+            ? { objects: [{ key: validMarkerKey }], truncated: false }
+            : {
+                objects: malformedMarkerKeys.map((key) => ({ key })),
+                truncated: true,
+                cursor: "after-malformed-page",
+              };
+        }
+        return { objects: [], truncated: false };
+      },
+      async head(key: string) {
+        if (key === rawKey) {
+          return {
+            key: rawKey,
+            size: 321,
+            etag: "valid-archive-etag",
+            version: "valid-archive-version",
+            customMetadata: {
+              archivedAt: "2026-07-16T09:55:00.000Z",
+              ingressId,
+              mailboxId: "hello@wiserchat.ai",
+              rawSize: "321",
+              schemaVersion: "1",
+            },
+          };
+        }
+        if (key === `receipts/${ingressId}.json`) {
+          return {
+            key,
+            size: 1,
+            etag: "receipt-head-etag",
+            version: "receipt-version",
+            customMetadata: { state: "enqueued" },
+          };
+        }
+        return null;
+      },
+      async get(key: string) {
+        if (
+          key === "system/inbound-active-cursor.json" &&
+          activeCursorValue &&
+          activeCursorEtag
+        ) {
+          return {
+            etag: activeCursorEtag,
+            async text() {
+              return activeCursorValue ?? "";
+            },
+          };
+        }
+        if (
+          key === "system/inbound-recent-cursor.json" ||
+          key === "system/inbound-recent-backstop-cursor.json"
+        ) {
+          return {
+            etag: `${key}-etag`,
+            async text() {
+              return JSON.stringify({
+                minute: "2026-07-16T10:00:00.000Z",
+                cursor: null,
+                updatedAt: "2026-07-16T09:59:00.000Z",
+              });
+            },
+          };
+        }
+        if (key === `receipts/${ingressId}.json`) {
+          return {
+            etag: "receipt-etag",
+            async text() {
+              return inboundReceiptBody(
+                {
+                  ingressId,
+                  rawKey,
+                  rawSize: 321,
+                  archivedAt: "2026-07-16T09:55:00.000Z",
+                  etag: "valid-archive-etag",
+                  version: "valid-archive-version",
+                },
+                "admitted",
+                "2026-07-16T09:55:00.000Z",
+              );
+            },
+          };
+        }
+        return null;
+      },
+      async put(key: string, value: string) {
+        if (key === "system/inbound-active-cursor.json") {
+          activeCursorValue = value;
+          activeCursorEtag = activeCursorEtag
+            ? "active-cursor-2"
+            : "active-cursor-1";
+        }
+        return { etag: "written-etag" };
+      },
+      async delete() {},
+    },
+    INBOUND_QUEUE: {
+      async send(pointer: InboundArchivePointer) {
+        queued.push(pointer);
+      },
+    },
+    MAILBOX: {
+      idFromName(mailboxId: string) {
+        return mailboxId;
+      },
+      get() {
+        return { async getEmail() { return null; } };
+      },
+    },
+  };
+  const runtime = { now: () => new Date("2026-07-16T10:00:00.000Z") };
+
+  await reconcileInboundArchives(env, runtime);
+  assert.deepEqual(activeListCursors, [undefined]);
+  assert.deepEqual(queued, []);
+
+  await reconcileInboundArchives(env, runtime);
+  assert.deepEqual(activeListCursors, [undefined, "after-malformed-page"]);
+  assert.deepEqual(
+    queued.map((pointer) => pointer.ingressId),
+    [ingressId],
+  );
 });

@@ -20,6 +20,11 @@ import {
 import { arrayBufferToHex } from "./lib/checksum.ts";
 import { liveInboundProjectionOptions } from "./lib/live-inbound-projection.ts";
 import { mailTelemetryLogRef } from "./lib/mail-telemetry.ts";
+import {
+  clearInboundActiveMarker,
+  persistInboundActiveMarker,
+} from "./lib/inbound-active-index.ts";
+import { inboundRawArchiveKey } from "./lib/inbound-raw-key.ts";
 
 export const INBOUND_RECEIPT_SCHEMA_VERSION: 1 = 1;
 
@@ -65,7 +70,8 @@ type InboundEnvironment = {
   EMERGENCY_FORWARD_TO: string;
   DB: Pick<D1Database, "prepare">;
   BUCKET: EmailStorageDependencies["bucket"] & Pick<R2Bucket, "head">;
-  RAW_MAIL_BUCKET: Pick<R2Bucket, "get" | "put">;
+  RAW_MAIL_BUCKET: Pick<R2Bucket, "get" | "put"> &
+    Partial<Pick<R2Bucket, "delete">>;
   INBOUND_QUEUE: Pick<Queue<InboundArchivePointer>, "send">;
   MAILBOX: {
     idFromName(mailboxId: string): unknown;
@@ -98,19 +104,13 @@ const RAW_ARCHIVE_MAX_BACKOFF_MS = 2_000;
 const RECEIPT_MAX_ATTEMPTS = 10;
 const RECEIPT_INITIAL_BACKOFF_MS = 50;
 const RECEIPT_MAX_BACKOFF_MS = 1_000;
+const ACTIVE_MARKER_MAX_ATTEMPTS = 10;
 
 type DirectMailboxFallbackResult =
   | "stored"
   | "unprovisioned"
   | "unverified"
   | "failed";
-
-function archiveKey(archivedAt: Date, ingressId: string): string {
-  const year = archivedAt.getUTCFullYear();
-  const month = String(archivedAt.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(archivedAt.getUTCDate()).padStart(2, "0");
-  return `raw/${year}/${month}/${day}/${ingressId}.eml`;
-}
 
 function durationMs(runtime: InboundRuntime, startedAt: number): number {
   return Math.max(0, runtime.now().getTime() - startedAt);
@@ -346,6 +346,78 @@ async function recordReceiptState(
   return null;
 }
 
+async function recordActiveMarkerWithRetry(
+  env: InboundEnvironment,
+  pointer: InboundArchivePointer,
+  runtime: InboundRuntime,
+): Promise<boolean> {
+  const startedAt = runtime.now().getTime();
+  const [ingressRef, objectRef] = await Promise.all([
+    mailTelemetryLogRef("ingress", pointer.ingressId),
+    mailTelemetryLogRef("object", pointer.rawKey),
+  ]);
+  for (let attempt = 1; attempt <= ACTIVE_MARKER_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await persistInboundActiveMarker(env.RAW_MAIL_BUCKET, pointer);
+      console.log("[mail-ingress] active recovery marker persisted", {
+        attempt,
+        durationMs: durationMs(runtime, startedAt),
+        ingressRef,
+        objectRef,
+        operation: "active_recovery_index_write",
+        status: "succeeded",
+        target: "r2",
+      });
+      return true;
+    } catch {
+      const finalAttempt = attempt === ACTIVE_MARKER_MAX_ATTEMPTS;
+      console.error("[mail-ingress] active recovery marker write degraded", {
+        attempt,
+        durationMs: durationMs(runtime, startedAt),
+        errorCode: "ACTIVE_RECOVERY_INDEX_WRITE_FAILED",
+        ingressRef,
+        maxAttempts: ACTIVE_MARKER_MAX_ATTEMPTS,
+        objectRef,
+        operation: "active_recovery_index_write",
+        status: finalAttempt ? "failed" : "retrying",
+      });
+      if (finalAttempt) return false;
+      const delayMs = Math.min(
+        RECEIPT_INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
+        RECEIPT_MAX_BACKOFF_MS,
+      );
+      await runtime.sleep(delayMs);
+    }
+  }
+  return false;
+}
+
+async function clearActiveMarkerBestEffort(
+  env: InboundEnvironment,
+  pointer: InboundArchivePointer,
+): Promise<void> {
+  if (!env.RAW_MAIL_BUCKET.delete) return;
+  try {
+    await clearInboundActiveMarker(
+      { delete: env.RAW_MAIL_BUCKET.delete.bind(env.RAW_MAIL_BUCKET) },
+      pointer.rawKey,
+    );
+  } catch {
+    const [ingressRef, objectRef] = await Promise.all([
+      mailTelemetryLogRef("ingress", pointer.ingressId),
+      mailTelemetryLogRef("object", pointer.rawKey),
+    ]);
+    console.error("[mail-ingress] terminal active marker cleanup degraded", {
+      errorCode: "ACTIVE_RECOVERY_INDEX_DELETE_FAILED",
+      ingressRef,
+      objectRef,
+      operation: "active_recovery_index_delete",
+      recoveryAction: "scheduled_reconciliation",
+      status: "degraded",
+    });
+  }
+}
+
 async function recordDurableRejection(
   env: InboundEnvironment,
   pointer: InboundArchivePointer,
@@ -361,7 +433,10 @@ async function recordDurableRejection(
     runtime,
     archivedReceipt.etag,
   );
-  if (rejectedReceipt) return;
+  if (rejectedReceipt) {
+    await clearActiveMarkerBestEffort(env, pointer);
+    return;
+  }
 
   const [ingressRef, objectRef] = await Promise.all([
     mailTelemetryLogRef("ingress", pointer.ingressId),
@@ -735,7 +810,7 @@ export async function receiveEmail(
   const archivedAtDate = runtime.now();
   const archivedAt = archivedAtDate.toISOString();
   const ingressId = runtime.randomUUID();
-  const rawKey = archiveKey(archivedAtDate, ingressId);
+  const rawKey = inboundRawArchiveKey(archivedAtDate, ingressId);
   const envelopeRecipient = event.to.trim().toLowerCase();
   const [ingressRef, objectRef] = await Promise.all([
     mailTelemetryLogRef("ingress", ingressId),
@@ -976,6 +1051,18 @@ export async function receiveEmail(
     rawSize: rawBytes.byteLength,
     status: "archived",
   });
+  if (!(await recordActiveMarkerWithRetry(env, pointer, runtime))) {
+    await recoverWithDirectMailboxOrSmtpAction(
+      event,
+      env,
+      rawBytes,
+      ingressId,
+      archivedAt,
+      rawKey,
+      runtime,
+    );
+    return;
+  }
   const archivedReceipt = await recordReceiptState(
     env,
     pointer,
