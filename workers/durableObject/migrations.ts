@@ -1956,4 +1956,35 @@ export const mailboxMigrations: Migration[] = [
 				);
 		`),
   },
+	{
+		name: "37_harden_outbound_reliability",
+		sql: txn(`
+			ALTER TABLE outbound_deliveries ADD COLUMN command_fingerprint TEXT;
+			ALTER TABLE outbound_deliveries
+				ADD COLUMN preflight_deferral_count INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE outbound_deliveries ADD COLUMN dispatch_phase TEXT;
+			ALTER TABLE outbound_deliveries ADD COLUMN active_attempt_id TEXT;
+			ALTER TABLE outbound_deliveries
+				ADD COLUMN accepted_attempt_count INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE outbound_deliveries ADD COLUMN duplicate_acceptance_at TEXT;
+
+			ALTER TABLE outbound_delivery_attempts
+				ADD COLUMN provider_state TEXT NOT NULL DEFAULT 'none';
+			ALTER TABLE outbound_delivery_attempts ADD COLUMN provider_event_at TEXT;
+			ALTER TABLE outbound_delivery_attempts ADD COLUMN provider_event_id TEXT;
+
+			CREATE TABLE outbound_provider_events (
+				id TEXT PRIMARY KEY,
+				attempt_id TEXT NOT NULL,
+				ses_message_id TEXT NOT NULL,
+				event_class TEXT NOT NULL,
+				occurred_at TEXT NOT NULL,
+				received_at TEXT NOT NULL,
+				FOREIGN KEY(attempt_id)
+					REFERENCES outbound_delivery_attempts(id) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_outbound_provider_events_attempt
+				ON outbound_provider_events(attempt_id, occurred_at, id);
+		`),
+	},
 ];

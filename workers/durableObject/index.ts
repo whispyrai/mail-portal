@@ -106,6 +106,9 @@ import {
 } from "../lib/outbound-delivery-contract";
 import { CONVERSATION_ID_SQL } from "../lib/conversation-identity";
 import {
+  assertOutboundCommandFingerprint,
+  classifyOutboundReplay,
+  OutboundIdempotencyConflictError,
   OutboundRetryCapacityError,
   TruthfulOutboxService,
   type EnqueuedDelivery,
@@ -125,6 +128,7 @@ import {
   type BatchTriageCommand,
 } from "../../shared/batch-triage.ts";
 import { planBulkEnqueueReconciliation } from "../lib/outbound-enqueue-recovery.ts";
+import { withOutboundCommandFingerprint } from "../lib/outbound-command-fingerprint.ts";
 import {
   bulkCleanupBacklogCount,
   bulkCleanupNextAt,
@@ -6614,6 +6618,29 @@ export class MailboxDO extends DurableObject<Env> {
     return delivery;
   }
 
+  async resolveOutboundReplay(input: {
+    idempotencyKey: string;
+    commandFingerprint: string;
+    sourceDraft?: { draftId: string; draftVersion: number };
+  }) {
+    assertOutboundCommandFingerprint(input.commandFingerprint);
+    const service = this.#outboxService();
+    const delivery =
+      service.getByIdempotencyKey(input.idempotencyKey) ??
+      (input.sourceDraft
+        ? service.getBySourceDraft(
+            input.sourceDraft.draftId,
+            input.sourceDraft.draftVersion,
+          )
+        : null);
+    const resolution = classifyOutboundReplay(
+      delivery,
+      input.commandFingerprint,
+    );
+    await this.#ensureOutboundAlarm();
+    return resolution;
+  }
+
   async cancelOutboundDelivery(
     deliveryId: string,
     actor: OutboundDeliveryActor,
@@ -9949,6 +9976,29 @@ export class MailboxDO extends DurableObject<Env> {
       : undefined;
 
     const idempotencyKey = `bulk:${job.id}:${job.cursor}`;
+	const replayCommand = await withOutboundCommandFingerprint(
+	  {
+		idempotencyKey,
+		source: "bulk",
+		actor: { kind: "user", id: job.actorUserId },
+		snapshot: {
+		  mailboxId: job.fromEmail,
+		  kind: "bulk",
+		  to: [to.toLowerCase()],
+		  cc: [],
+		  bcc: [],
+		  from: job.fromEmail,
+		  subject,
+		  ...(html !== undefined ? { html } : {}),
+		  ...(text !== undefined ? { text } : {}),
+		  threadId: "generated",
+		  attachmentIds: [],
+		},
+		requestedAt: "1970-01-01T00:00:00.000Z",
+		undoUntil: "1970-01-01T00:00:00.000Z",
+	  },
+	  (job.attachments ?? []).map((attachment) => attachment.key),
+	);
     const recipientStartedAt = Date.now();
     let authoritative: StoredOutboundDelivery | null;
     try {
@@ -9972,6 +10022,14 @@ export class MailboxDO extends DurableObject<Env> {
     }
     let preparation: BulkRecipientPreparation | null = null;
     let messageId = authoritative?.emailId ?? "";
+    const replayResolution = classifyOutboundReplay(
+      authoritative,
+      replayCommand.commandFingerprint,
+    );
+    const replayConflict =
+      replayResolution.status === "conflict"
+        ? new OutboundIdempotencyConflictError(replayResolution.reason)
+        : null;
     if (authoritative) {
       try {
         this.ctx.storage.transactionSync(() => {
@@ -9982,7 +10040,7 @@ export class MailboxDO extends DurableObject<Env> {
           if (stalePreparation) {
             this.#finishBulkRecipientPreparationSync(
               stalePreparation,
-              authoritative!.emailId,
+			  replayConflict ? null : authoritative!.emailId,
             );
           }
         });
@@ -10005,6 +10063,7 @@ export class MailboxDO extends DurableObject<Env> {
     }
 
     try {
+	  if (replayConflict) throw replayConflict;
       if (!authoritative) {
         const fromDomain = job.fromEmail.split("@")[1] || "";
         const generated = generateMessageId(fromDomain).messageId;
@@ -10038,20 +10097,10 @@ export class MailboxDO extends DurableObject<Env> {
         const activePreparation = preparation;
         const requestedAt = new Date().toISOString();
         await this.#enqueueOutboundInternal(
-          {
-            idempotencyKey,
-            source: "bulk",
-            actor: { kind: "user", id: job.actorUserId },
+		  {
+			...replayCommand,
             snapshot: {
-              mailboxId: job.fromEmail,
-              kind: "bulk",
-              to: [to.toLowerCase()],
-              cc: [],
-              bcc: [],
-              from: job.fromEmail,
-              subject,
-              ...(html !== undefined ? { html } : {}),
-              ...(text !== undefined ? { text } : {}),
+			  ...replayCommand.snapshot,
               threadId: messageId,
               attachmentIds: pendingAttachments.map(
                 (attachment) => attachment.id,
@@ -10059,7 +10108,7 @@ export class MailboxDO extends DurableObject<Env> {
             },
             requestedAt,
             undoUntil: requestedAt,
-          },
+		  },
           pendingAttachments,
           messageId,
           activePreparation
@@ -10111,6 +10160,7 @@ export class MailboxDO extends DurableObject<Env> {
       const reconciliation = planBulkEnqueueReconciliation(
         authoritative,
         messageId,
+		replayCommand.commandFingerprint,
       );
       const disposition = planBulkRecipientEnqueueDisposition(
         reconciliation.status,

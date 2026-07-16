@@ -9,6 +9,8 @@ const mailboxId = "team@wiserchat.ai";
 function fixture(
 	existing: Record<string, unknown> | null = null,
 	storedAttachment: Record<string, unknown> | null = null,
+	rateLimitError: string | null = null,
+	replayConflictReason?: "command_mismatch" | "legacy_idempotency_unverifiable",
 ) {
 	const enqueued: unknown[] = [];
 	const enqueuedAttachments: Array<Array<{
@@ -16,9 +18,20 @@ function fixture(
 		disposition?: string;
 	}>> = [];
 	const stub = {
-		async getOutboundDeliveryByIdempotencyKey() { return existing; },
+		async resolveOutboundReplay() {
+			if (replayConflictReason) {
+				return {
+					status: "conflict" as const,
+					reason: replayConflictReason,
+					delivery: existing ?? {},
+				};
+			}
+			return existing
+				? { status: "exact" as const, delivery: existing }
+				: { status: "none" as const };
+		},
 		async getAttachment() { return storedAttachment; },
-		async checkSendRateLimit() { return null; },
+		async checkSendRateLimit() { return rateLimitError; },
 		async queueAttachmentCleanup() {},
 		async enqueueOutbound(
 			command: { undoUntil: string; scheduledFor?: string },
@@ -92,6 +105,74 @@ test("terminal idempotency replay returns an explicit non-enqueue outcome", asyn
 		outcome: "terminal_replay",
 	});
 	assert.equal(enqueued.length, 0);
+});
+
+test("exact replay wins before an expired schedule and current rate limit", async () => {
+	const { app, enqueued } = fixture(
+		{
+			id: "delivery-sent",
+			emailId: "outbox-sent",
+			status: "sent",
+			undoUntil: "2026-07-11T10:00:10.000Z",
+			scheduledFor: "2026-07-11T11:00:00.000Z",
+		},
+		null,
+		"Rate limit exceeded",
+	);
+	const response = await app.request(
+		`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				to: "customer@example.com",
+				from: mailboxId,
+				subject: "Already sent",
+				text: "Body",
+				idempotency_key: "scheduled-replay",
+				scheduled_for: "2026-07-11T11:00:00.000Z",
+			}),
+		},
+	);
+
+	assert.equal(response.status, 202);
+	assert.equal((await response.json()).replayed, true);
+	assert.equal(enqueued.length, 0);
+});
+
+test("changed and legacy send identities return explicit conflicts", async () => {
+	for (const reason of [
+		"command_mismatch",
+		"legacy_idempotency_unverifiable",
+	] as const) {
+		const { app, enqueued } = fixture(
+			{ id: "delivery-existing", emailId: "outbox-existing" },
+			null,
+			null,
+			reason,
+		);
+		const response = await app.request(
+			`http://mail.wiserchat.ai/api/v1/mailboxes/${mailboxId}/emails`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					to: "customer@example.com",
+					from: mailboxId,
+					subject: "Changed",
+					text: "Body",
+					idempotency_key: "conflicting-send",
+				}),
+			},
+		);
+
+		assert.equal(response.status, 409);
+		assert.deepEqual(await response.json(), {
+			error: "This send identity is already bound to another command.",
+			code: reason,
+		});
+		assert.equal(enqueued.length, 0);
+	}
 });
 
 test("compose rejects delayed and far-future schedules before enqueue", async () => {

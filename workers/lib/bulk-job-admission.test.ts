@@ -414,4 +414,8 @@ test("recipient enqueue retries transient failures and consumes only definitive 
 		planBulkRecipientEnqueueDisposition("committed", new Error("response lost")),
 		"committed",
 	);
+	assert.equal(
+		planBulkRecipientEnqueueDisposition("conflict", new Error("intent changed")),
+		"definitive_failure",
+	);
 });

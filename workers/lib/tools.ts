@@ -36,6 +36,7 @@ import type {
 	OutboundDeliverySource,
 } from "./outbound-delivery-contract.ts";
 import { validateResolvedInlineImages } from "./inline-image-authority.ts";
+import { withOutboundCommandFingerprint } from "./outbound-command-fingerprint.ts";
 import {
 	draftCreateFingerprint,
 	draftToolCreateKey,
@@ -58,14 +59,25 @@ type RateLimitStub = {
 };
 
 type OutboundEnqueueStub = {
-	getOutboundDeliveryByIdempotencyKey: (
-		idempotencyKey: string,
-	) => Promise<{
-		id: string;
-		emailId: string;
-		status: OutboundDeliveryStatus;
-		undoUntil: string;
-	} | null>;
+	resolveOutboundReplay: (input: {
+		idempotencyKey: string;
+		commandFingerprint: string;
+	}) => Promise<
+		| { status: "none" }
+		| {
+				status: "exact";
+				delivery: {
+					id: string;
+					emailId: string;
+					status: OutboundDeliveryStatus;
+					undoUntil: string;
+				};
+		  }
+		| {
+				status: "conflict";
+				reason: "command_mismatch" | "legacy_idempotency_unverifiable";
+			  }
+	>;
 	enqueueOutbound: (
 		command: EnqueueOutboundCommand,
 		attachments: readonly [],
@@ -121,6 +133,41 @@ function replayedOutboundResult(
 		replayed: true,
 		message: `This send action already exists with status ${delivery.status}.`,
 	};
+}
+
+function outboundConflictResult(
+	reason: "command_mismatch" | "legacy_idempotency_unverifiable",
+) {
+	return {
+		error: "This send identity is already bound to another command.",
+		code: reason,
+	};
+}
+
+async function reconcileToolOutboundEnqueueFailure(
+	stub: OutboundEnqueueStub,
+	idempotencyKey: string,
+	commandFingerprint: string,
+	originalError: unknown,
+) {
+	let resolution: Awaited<
+		ReturnType<OutboundEnqueueStub["resolveOutboundReplay"]>
+	>;
+	try {
+		resolution = await stub.resolveOutboundReplay({
+			idempotencyKey,
+			commandFingerprint,
+		});
+	} catch {
+		throw originalError;
+	}
+	if (resolution.status === "exact") {
+		return replayedOutboundResult(resolution.delivery);
+	}
+	if (resolution.status === "conflict") {
+		return outboundConflictResult(resolution.reason);
+	}
+	throw originalError;
 }
 
 type ToolDraftCreateError = {
@@ -810,19 +857,9 @@ export async function toolSendReply(
 	actor: ActivityActor = { kind: "system" },
 ): Promise<
 	| ToolOutboundResult
-	| { error: string }
+	| { error: string; code?: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
-	const existing = await (
-		stub as unknown as OutboundEnqueueStub
-	).getOutboundDeliveryByIdempotencyKey(params.idempotencyKey);
-	if (existing) return replayedOutboundResult(existing);
-
-	// Check send rate limit
-	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
-	if (rateLimitError) {
-		return { error: rateLimitError };
-	}
 
 	const originalEmail = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
 	if (!originalEmail) {
@@ -832,7 +869,6 @@ export async function toolSendReply(
 	const { originalMsgId, references, threadId } = buildReferencesChain(originalEmail);
 	const fromDomain = mailboxId.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
-	const { messageId } = generateMessageId(fromDomain);
 
 	// Verify and append quoted original message
 	const sanitizedBody = await verifyDraft(params.bodyHtml);
@@ -849,34 +885,57 @@ export async function toolSendReply(
 	const fullBodyHtml = sanitizedBody + quotedBlock;
 
 	const { requestedAt, undoUntil } = outboundTiming();
-	const result = await (stub as unknown as OutboundEnqueueStub).enqueueOutbound(
-		{
-			idempotencyKey: params.idempotencyKey,
-			source: outboundSource(actor),
-			actor,
-			snapshot: {
-				mailboxId: mailboxId.toLowerCase(),
-				kind: "reply",
-				to: [params.to.toLowerCase()],
-				cc: [],
-				bcc: [],
-				from: mailboxId.toLowerCase(),
-				subject: params.subject,
-				html: fullBodyHtml,
-				inReplyTo: originalMsgId,
-				references,
-				threadId,
-				attachmentIds: [],
-			},
-			requestedAt,
-			undoUntil,
+	const command = await withOutboundCommandFingerprint({
+		idempotencyKey: params.idempotencyKey,
+		source: outboundSource(actor),
+		actor,
+		snapshot: {
+			mailboxId: mailboxId.toLowerCase(),
+			kind: "reply",
+			to: [params.to.toLowerCase()],
+			cc: [],
+			bcc: [],
+			from: mailboxId.toLowerCase(),
+			subject: params.subject,
+			html: fullBodyHtml,
+			inReplyTo: originalMsgId,
+			references,
+			threadId,
+			attachmentIds: [],
 		},
-		[],
-		messageId,
-	);
+		requestedAt,
+		undoUntil,
+	}, [], { sourceEmailId: params.originalEmailId });
+	const replay = await (
+		stub as unknown as OutboundEnqueueStub
+	).resolveOutboundReplay({
+		idempotencyKey: params.idempotencyKey,
+		commandFingerprint: command.commandFingerprint,
+	});
+	if (replay.status === "exact") return replayedOutboundResult(replay.delivery);
+	if (replay.status === "conflict") {
+		return outboundConflictResult(replay.reason);
+	}
+	const rateLimitError = await (stub as unknown as RateLimitStub)
+		.checkSendRateLimit();
+	if (rateLimitError) return { error: rateLimitError };
+	const { messageId } = generateMessageId(fromDomain);
+	const outboundStub = stub as unknown as OutboundEnqueueStub;
+	let result;
+	try {
+		result = await outboundStub.enqueueOutbound(command, [], messageId);
+	} catch (error) {
+		return reconcileToolOutboundEnqueueFailure(
+			outboundStub,
+			params.idempotencyKey,
+			command.commandFingerprint,
+			error,
+		);
+	}
+	if (result.replayed) return replayedOutboundResult(result.delivery);
 
 	return {
-		status: "queued",
+		status: result.delivery.status,
 		deliveryId: result.delivery.id,
 		messageId: result.delivery.emailId,
 		undoUntil: result.delivery.undoUntil,
@@ -899,23 +958,12 @@ export async function toolSendEmail(
 	actor: ActivityActor = { kind: "system" },
 ): Promise<
 	| ToolOutboundResult
-	| { error: string }
+	| { error: string; code?: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
-	const existing = await (
-		stub as unknown as OutboundEnqueueStub
-	).getOutboundDeliveryByIdempotencyKey(params.idempotencyKey);
-	if (existing) return replayedOutboundResult(existing);
-
-	// Check send rate limit
-	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
-	if (rateLimitError) {
-		return { error: rateLimitError };
-	}
 
 	const fromDomain = mailboxId.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
-	const { messageId } = generateMessageId(fromDomain);
 
 	const sanitizedBody = await verifyDraft(params.bodyHtml);
 	if (!sanitizedBody) {
@@ -925,32 +973,62 @@ export async function toolSendEmail(
 	if (!inlineMapping.ok) return { error: inlineMapping.error };
 
 	const { requestedAt, undoUntil } = outboundTiming();
-	const result = await (stub as unknown as OutboundEnqueueStub).enqueueOutbound(
-		{
-			idempotencyKey: params.idempotencyKey,
-			source: outboundSource(actor),
-			actor,
-			snapshot: {
-				mailboxId: mailboxId.toLowerCase(),
-				kind: "compose",
-				to: [params.to.toLowerCase()],
-				cc: [],
-				bcc: [],
-				from: mailboxId.toLowerCase(),
-				subject: params.subject,
-				html: sanitizedBody,
-				threadId: messageId,
-				attachmentIds: [],
-			},
-			requestedAt,
-			undoUntil,
+	const command = await withOutboundCommandFingerprint({
+		idempotencyKey: params.idempotencyKey,
+		source: outboundSource(actor),
+		actor,
+		snapshot: {
+			mailboxId: mailboxId.toLowerCase(),
+			kind: "compose",
+			to: [params.to.toLowerCase()],
+			cc: [],
+			bcc: [],
+			from: mailboxId.toLowerCase(),
+			subject: params.subject,
+			html: sanitizedBody,
+			threadId: "generated",
+			attachmentIds: [],
 		},
-		[],
-		messageId,
-	);
+		requestedAt,
+		undoUntil,
+	}, []);
+	const replay = await (
+		stub as unknown as OutboundEnqueueStub
+	).resolveOutboundReplay({
+		idempotencyKey: params.idempotencyKey,
+		commandFingerprint: command.commandFingerprint,
+	});
+	if (replay.status === "exact") return replayedOutboundResult(replay.delivery);
+	if (replay.status === "conflict") {
+		return outboundConflictResult(replay.reason);
+	}
+	const rateLimitError = await (stub as unknown as RateLimitStub)
+		.checkSendRateLimit();
+	if (rateLimitError) return { error: rateLimitError };
+	const { messageId } = generateMessageId(fromDomain);
+	const outboundStub = stub as unknown as OutboundEnqueueStub;
+	let result;
+	try {
+		result = await outboundStub.enqueueOutbound(
+			{
+				...command,
+				snapshot: { ...command.snapshot, threadId: messageId },
+			},
+			[],
+			messageId,
+		);
+	} catch (error) {
+		return reconcileToolOutboundEnqueueFailure(
+			outboundStub,
+			params.idempotencyKey,
+			command.commandFingerprint,
+			error,
+		);
+	}
+	if (result.replayed) return replayedOutboundResult(result.delivery);
 
 	return {
-		status: "queued",
+		status: result.delivery.status,
 		deliveryId: result.delivery.id,
 		messageId: result.delivery.emailId,
 		undoUntil: result.delivery.undoUntil,

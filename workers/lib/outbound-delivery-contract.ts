@@ -67,6 +67,8 @@ export interface OutboundMessageSnapshot {
 export interface EnqueueOutboundCommand {
 	/** Unique per logical user action and required on every send entry point. */
 	idempotencyKey: string;
+	/** SHA-256 over the canonical stable logical send intent. */
+	commandFingerprint: string;
 	source: OutboundDeliverySource;
 	actor: OutboundDeliveryActor;
 	snapshot: OutboundMessageSnapshot;

@@ -50,11 +50,14 @@ function testApp(options: {
 		async checkSendRateLimit() {
 			return null;
 		},
-		async getOutboundDeliveryByIdempotencyKey() {
+		async resolveOutboundReplay() {
 			idempotencyLookups += 1;
-			return idempotencyLookups > 1
-				? options.authoritativeAfterError ?? null
-				: null;
+			return idempotencyLookups > 1 && options.authoritativeAfterError
+				? {
+						status: "exact" as const,
+						delivery: options.authoritativeAfterError,
+					}
+				: { status: "none" as const };
 		},
 		async enqueueOutbound(command: EnqueueOutboundCommand) {
 			if (options.enqueueError) throw options.enqueueError;

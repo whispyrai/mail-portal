@@ -11,12 +11,22 @@ function testEnvironment(options?: {
 		status: "queued" | "sending" | "retrying" | "sent" | "bounced" | "failed" | "unknown" | "cancelled";
 		undoUntil: string;
 	};
+	replayConflictReason?: "command_mismatch" | "legacy_idempotency_unverifiable";
+	enqueueReplayDelivery?: {
+		id: string;
+		emailId: string;
+		status: "queued" | "sending" | "retrying" | "sent" | "bounced" | "failed" | "unknown" | "cancelled";
+		undoUntil: string;
+	};
+	enqueueError?: Error;
+	postEnqueueConflictReason?: "command_mismatch" | "legacy_idempotency_unverifiable";
 }) {
 	const enqueued: Array<{
 		command: EnqueueOutboundCommand;
 		attachments: readonly unknown[];
 		emailId: string;
 	}> = [];
+	let replayLookups = 0;
 	const stub = {
 		async checkSendRateLimit() {
 			return null;
@@ -24,15 +34,37 @@ function testEnvironment(options?: {
 		async getEmail(id: string) {
 			return id === "original-1" ? options?.original ?? null : null;
 		},
-		async getOutboundDeliveryByIdempotencyKey() {
-			return options?.existingDelivery ?? null;
+		async resolveOutboundReplay() {
+			replayLookups += 1;
+			if (replayLookups > 1 && options?.postEnqueueConflictReason) {
+				return {
+					status: "conflict" as const,
+					reason: options.postEnqueueConflictReason,
+				};
+			}
+			if (options?.replayConflictReason) {
+				return {
+					status: "conflict" as const,
+					reason: options.replayConflictReason,
+				};
+			}
+			return options?.existingDelivery
+				? { status: "exact" as const, delivery: options.existingDelivery }
+				: { status: "none" as const };
 		},
 		async enqueueOutbound(
 			command: EnqueueOutboundCommand,
 			attachments: readonly unknown[],
 			emailId: string,
 		) {
+			if (options?.enqueueError) throw options.enqueueError;
 			enqueued.push({ command, attachments, emailId });
+			if (options?.enqueueReplayDelivery) {
+				return {
+					delivery: options.enqueueReplayDelivery,
+					replayed: true,
+				};
+			}
 			return {
 				delivery: {
 					id: "delivery-1",
@@ -170,6 +202,93 @@ test("an MCP transport retry returns the existing truthful state without enqueue
 		message: "This send action already exists with status sent.",
 	});
 	assert.equal(enqueued.length, 0);
+});
+
+test("send tools expose changed and legacy identity conflicts without enqueueing", async () => {
+	for (const reason of [
+		"command_mismatch",
+		"legacy_idempotency_unverifiable",
+	] as const) {
+		const { env, enqueued } = testEnvironment({ replayConflictReason: reason });
+		const result = await toolSendEmail(
+			env,
+			"team@example.com",
+			{
+				to: "customer@example.com",
+				subject: "Changed",
+				bodyHtml: "<p>Changed</p>",
+				idempotencyKey: "conflicting-tool-send",
+			},
+			{ kind: "mcp", id: "user-1" },
+		);
+
+		assert.deepEqual(result, {
+			error: "This send identity is already bound to another command.",
+			code: reason,
+		});
+		assert.equal(enqueued.length, 0);
+	}
+});
+
+test("a concurrent terminal replay returns authoritative tool state", async () => {
+	const { env, enqueued } = testEnvironment({
+		enqueueReplayDelivery: {
+			id: "delivery-concurrent",
+			emailId: "email-concurrent",
+			status: "cancelled",
+			undoUntil: "2026-07-11T08:00:10.000Z",
+		},
+	});
+	const result = await toolSendEmail(
+		env,
+		"team@example.com",
+		{
+			to: "customer@example.com",
+			subject: "Concurrent",
+			bodyHtml: "<p>Concurrent</p>",
+			idempotencyKey: "concurrent-replay",
+		},
+		{ kind: "mcp", id: "user-1" },
+	);
+
+	assert.deepEqual(result, {
+		status: "cancelled",
+		deliveryId: "delivery-concurrent",
+		messageId: "email-concurrent",
+		undoUntil: "2026-07-11T08:00:10.000Z",
+		replayed: true,
+		message: "This send action already exists with status cancelled.",
+	});
+	assert.equal(enqueued.length, 1);
+});
+
+test("a concurrent enqueue conflict is reconciled into the stable tool contract", async () => {
+	for (const reason of [
+		"command_mismatch",
+		"legacy_idempotency_unverifiable",
+	] as const) {
+		const { env, enqueued } = testEnvironment({
+			enqueueError: new Error("RPC rejected"),
+			postEnqueueConflictReason: reason,
+		});
+		const result = await toolSendEmail(
+			env,
+			"team@example.com",
+			{
+				to: "customer@example.com",
+				subject: "Concurrent conflict",
+				bodyHtml: "<p>Concurrent conflict</p>",
+				idempotencyKey: "concurrent-conflict",
+			},
+			{ kind: "mcp", id: "user-1" },
+		);
+
+		assert.deepEqual(result, {
+			error: "This send identity is already bound to another command.",
+			code: reason,
+		});
+		assert.equal(enqueued.length, 0);
+	}
 });
 
 test("agent reply preserves threading and actor attribution in the outbox snapshot", async () => {

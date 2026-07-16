@@ -18,6 +18,12 @@ export interface StoredOutboundDelivery extends OutboundDeliveryRecord {
 	kind: OutboundDeliveryKind;
 	draftVersion?: number;
 	maxAttempts: number;
+	commandFingerprint?: string;
+	preflightDeferralCount: number;
+	dispatchPhase?: "preflight" | "provider";
+	activeAttemptId?: string;
+	acceptedAttemptCount: number;
+	duplicateAcceptanceAt?: string;
 	leaseToken?: string;
 }
 
@@ -40,6 +46,9 @@ export interface OutboundDeliveryAttempt {
 	httpStatus?: number;
 	errorCode?: string;
 	errorMessage?: string;
+	providerState: "none" | "delivered" | "bounced" | "complained";
+	providerEventAt?: string;
+	providerEventId?: string;
 }
 
 /**
@@ -186,6 +195,76 @@ export class OutboundRetryCapacityError extends Error {
 	}
 }
 
+export class OutboundIdempotencyConflictError extends Error {
+	readonly reason: "command_mismatch" | "legacy_idempotency_unverifiable";
+
+	constructor(reason: OutboundIdempotencyConflictError["reason"]) {
+		super(
+			reason === "command_mismatch"
+				? "This send identity is already bound to different content."
+				: "This legacy send identity cannot be verified for safe replay.",
+		);
+		this.name = "OutboundIdempotencyConflictError";
+		this.reason = reason;
+	}
+}
+
+export type OutboundReplayConflictReason =
+	| "command_mismatch"
+	| "legacy_idempotency_unverifiable";
+
+export type OutboundReplayResolution =
+	| { status: "none" }
+	| { status: "exact"; delivery: StoredOutboundDelivery }
+	| {
+			status: "conflict";
+			reason: OutboundReplayConflictReason;
+			delivery: StoredOutboundDelivery;
+	  };
+
+export function assertOutboundCommandFingerprint(
+	commandFingerprint: string,
+): void {
+	if (!/^[0-9a-f]{64}$/.test(commandFingerprint)) {
+		throw new Error("Outbound command fingerprint is invalid");
+	}
+}
+
+function assertReplayFingerprint(
+	delivery: StoredOutboundDelivery,
+	command: EnqueueOutboundCommand,
+): void {
+	const resolution = classifyOutboundReplay(
+		delivery,
+		command.commandFingerprint,
+	);
+	if (resolution.status === "conflict") {
+		throw new OutboundIdempotencyConflictError(resolution.reason);
+	}
+}
+
+export function classifyOutboundReplay(
+	delivery: StoredOutboundDelivery | null,
+	commandFingerprint: string,
+): OutboundReplayResolution {
+	if (!delivery) return { status: "none" };
+	if (!delivery.commandFingerprint) {
+		return {
+			status: "conflict",
+			reason: "legacy_idempotency_unverifiable",
+			delivery,
+		};
+	}
+	if (delivery.commandFingerprint !== commandFingerprint) {
+		return {
+			status: "conflict",
+			reason: "command_mismatch",
+			delivery,
+		};
+	}
+	return { status: "exact", delivery };
+}
+
 export class SourceDraftConflictError extends Error {
 	readonly reason: "not_found" | "not_draft" | "version_conflict";
 	readonly currentVersion?: number;
@@ -223,12 +302,14 @@ export class TruthfulOutboxService {
 		onCommitted?: (result: EnqueuedDelivery) => void,
 	): EnqueuedDelivery {
 		return this.#storage.transaction((tx) => {
+			assertOutboundCommandFingerprint(command.commandFingerprint);
 			const finish = (result: EnqueuedDelivery): EnqueuedDelivery => {
 				onCommitted?.(result);
 				return result;
 			};
 			const existing = tx.findDeliveryByIdempotencyKey(command.idempotencyKey);
 			if (existing) {
+				assertReplayFingerprint(existing, command);
 				const snapshot = tx.getSnapshot(existing.emailId);
 				if (!snapshot) {
 					throw new Error(`Missing outbox snapshot for ${existing.id}`);
@@ -255,6 +336,7 @@ export class TruthfulOutboxService {
 								delivery.draftVersion === sourceDraft.draftVersion,
 							) ?? null);
 				if (sameDraft) {
+					assertReplayFingerprint(sameDraft, command);
 					const snapshot = tx.getSnapshot(sameDraft.emailId);
 					if (!snapshot) {
 						throw new Error(`Missing outbox snapshot for ${sameDraft.id}`);
@@ -295,6 +377,7 @@ export class TruthfulOutboxService {
 				kind: snapshot.kind,
 				status: "queued",
 				idempotencyKey: command.idempotencyKey,
+				commandFingerprint: command.commandFingerprint,
 				source: command.source,
 				actor,
 				createdAt: command.requestedAt,
@@ -307,6 +390,8 @@ export class TruthfulOutboxService {
 				scheduledFor: command.scheduledFor,
 				attemptCount: 0,
 				maxAttempts: this.#defaultMaxAttempts,
+				preflightDeferralCount: 0,
+				acceptedAttemptCount: 0,
 			};
 
 			tx.insertSnapshot(emailId, snapshot);
@@ -331,6 +416,20 @@ export class TruthfulOutboxService {
 	getByIdempotencyKey(key: string): StoredOutboundDelivery | null {
 		return this.#storage.transaction((tx) =>
 			tx.findDeliveryByIdempotencyKey(key),
+		);
+	}
+
+	getBySourceDraft(id: string, version: number): StoredOutboundDelivery | null {
+		return this.#storage.transaction((tx) =>
+			tx.findDeliveryBySourceDraft
+				? tx.findDeliveryBySourceDraft(id, version)
+				: (tx
+						.listDeliveries()
+						.find(
+							(delivery) =>
+								delivery.draftId === id &&
+								delivery.draftVersion === version,
+						) ?? null),
 		);
 	}
 
@@ -464,6 +563,7 @@ export class TruthfulOutboxService {
 				status: "sending",
 				leaseToken,
 				startedAt: now,
+				providerState: "none",
 			};
 
 			tx.updateDelivery(claimed);

@@ -25,9 +25,21 @@ function harness(authoritative: unknown, lookupError?: Error) {
 		},
 		stub: {
 			async getAttachment() { return null; },
-			async getOutboundDeliveryByIdempotencyKey() {
+			async resolveOutboundReplay() {
 				if (lookupError) throw lookupError;
-				return authoritative;
+				if (
+					authoritative &&
+					typeof authoritative === "object" &&
+					"status" in authoritative &&
+					["none", "exact", "conflict"].includes(
+						String((authoritative as { status: unknown }).status),
+					)
+				) {
+					return authoritative;
+				}
+				return authoritative
+					? { status: "exact", delivery: authoritative }
+					: { status: "none" };
 			},
 			async queueAttachmentCleanup() {},
 		},
@@ -40,6 +52,7 @@ test("a committed enqueue keeps its destination bytes after an ambiguous RPC err
 		bucket: h.bucket as never,
 		stub: h.stub as never,
 		idempotencyKey: "action-1",
+		commandFingerprint: "a".repeat(64),
 		attemptedEmailId: "email-1",
 		promotion: promotion(),
 		actor: { kind: "user", id: "user-1" },
@@ -55,6 +68,7 @@ test("a concurrent replay removes only this request's orphan destination", async
 		bucket: h.bucket as never,
 		stub: h.stub as never,
 		idempotencyKey: "action-1",
+		commandFingerprint: "a".repeat(64),
 		attemptedEmailId: "email-1",
 		promotion: promotion(),
 		actor: { kind: "user", id: "user-1" },
@@ -73,6 +87,7 @@ test("an unavailable authoritative read never deletes possibly committed bytes",
 		bucket: h.bucket as never,
 		stub: h.stub as never,
 		idempotencyKey: "action-1",
+		commandFingerprint: "a".repeat(64),
 		attemptedEmailId: "email-1",
 		promotion: promotion(),
 		actor: { kind: "user", id: "user-1" },
@@ -88,6 +103,7 @@ test("an authoritative miss proves rollback is safe", async () => {
 		bucket: h.bucket as never,
 		stub: h.stub as never,
 		idempotencyKey: "action-1",
+		commandFingerprint: "a".repeat(64),
 		attemptedEmailId: "email-1",
 		promotion: promotion(),
 		actor: { kind: "user", id: "user-1" },
@@ -97,11 +113,67 @@ test("an authoritative miss proves rollback is safe", async () => {
 	assert.deepEqual(h.deleted, [["attachments/email-1/attachment-1/file.pdf"]]);
 });
 
+test("a mismatched authoritative command rolls back only this request's owned destination", async () => {
+	const h = harness({
+		status: "conflict",
+		reason: "command_mismatch",
+		delivery: {
+			id: "delivery-existing",
+			emailId: "email-existing",
+			status: "queued",
+			undoUntil: "2026-07-11T10:00:10.000Z",
+		},
+	});
+	const result = await reconcileAmbiguousOutboundEnqueue({
+		bucket: h.bucket as never,
+		stub: h.stub as never,
+		idempotencyKey: "action-1",
+		commandFingerprint: "b".repeat(64),
+		attemptedEmailId: "email-1",
+		promotion: promotion(),
+		actor: { kind: "user", id: "user-1" },
+	});
+
+	assert.deepEqual(result, { status: "conflict", reason: "command_mismatch" });
+	assert.deepEqual(h.deleted, [
+		["attachments/email-1/attachment-1/file.pdf"],
+	]);
+});
+
+test("legacy replay conflict preserves an authoritative destination with the same identity", async () => {
+	const h = harness({
+		status: "conflict",
+		reason: "legacy_idempotency_unverifiable",
+		delivery: {
+			id: "delivery-existing",
+			emailId: "email-1",
+			status: "queued",
+			undoUntil: "2026-07-11T10:00:10.000Z",
+		},
+	});
+	const result = await reconcileAmbiguousOutboundEnqueue({
+		bucket: h.bucket as never,
+		stub: h.stub as never,
+		idempotencyKey: "action-1",
+		commandFingerprint: "a".repeat(64),
+		attemptedEmailId: "email-1",
+		promotion: promotion(),
+		actor: { kind: "user", id: "user-1" },
+	});
+
+	assert.deepEqual(result, {
+		status: "conflict",
+		reason: "legacy_idempotency_unverifiable",
+	});
+	assert.deepEqual(h.deleted, []);
+});
+
 test("bulk reconciliation preserves authoritative bytes and counts a post-commit failure as accepted", () => {
 	assert.deepEqual(
 		planBulkEnqueueReconciliation(
-			{ id: "delivery-1", emailId: "email-1", status: "queued", undoUntil: "later" },
+			{ id: "delivery-1", emailId: "email-1", status: "queued", undoUntil: "later", commandFingerprint: "a".repeat(64) },
 			"email-1",
+			"a".repeat(64),
 		),
 		{ status: "committed", deleteAttemptedBytes: false },
 	);
@@ -110,13 +182,52 @@ test("bulk reconciliation preserves authoritative bytes and counts a post-commit
 test("bulk reconciliation deletes only replay or definitively uncommitted bytes", () => {
 	assert.deepEqual(
 		planBulkEnqueueReconciliation(
-			{ id: "delivery-existing", emailId: "email-existing", status: "queued", undoUntil: "later" },
+			{ id: "delivery-existing", emailId: "email-existing", status: "queued", undoUntil: "later", commandFingerprint: "a".repeat(64) },
 			"email-1",
+			"a".repeat(64),
 		),
 		{ status: "committed", deleteAttemptedBytes: true },
 	);
 	assert.deepEqual(
-		planBulkEnqueueReconciliation(null, "email-1"),
+		planBulkEnqueueReconciliation(null, "email-1", "a".repeat(64)),
 		{ status: "not_committed", deleteAttemptedBytes: true },
+	);
+});
+
+test("bulk reconciliation never treats changed or legacy intent as committed", () => {
+	assert.deepEqual(
+		planBulkEnqueueReconciliation(
+			{
+				id: "delivery-existing",
+				emailId: "email-existing",
+				status: "queued",
+				undoUntil: "later",
+				commandFingerprint: "b".repeat(64),
+			},
+			"email-1",
+			"a".repeat(64),
+		),
+		{
+			status: "conflict",
+			reason: "command_mismatch",
+			deleteAttemptedBytes: true,
+		},
+	);
+	assert.deepEqual(
+		planBulkEnqueueReconciliation(
+			{
+				id: "delivery-existing",
+				emailId: "email-existing",
+				status: "queued",
+				undoUntil: "later",
+			},
+			"email-1",
+			"a".repeat(64),
+		),
+		{
+			status: "conflict",
+			reason: "legacy_idempotency_unverifiable",
+			deleteAttemptedBytes: true,
+		},
 	);
 });

@@ -8,6 +8,7 @@ import {
 import {
 	outboundEnqueueOutcome,
 	type OutboundEnqueueOutcome,
+	type OutboundReplayConflictReason,
 } from "./outbound-delivery-service.ts";
 
 type AuthoritativeDelivery = {
@@ -16,6 +17,7 @@ type AuthoritativeDelivery = {
 	status: string;
 	undoUntil: string;
 	scheduledFor?: string;
+	commandFingerprint?: string;
 };
 
 type RecoveryStub = {
@@ -25,9 +27,19 @@ type RecoveryStub = {
 		size: number;
 		email_id: string;
 	} | null>;
-	getOutboundDeliveryByIdempotencyKey(
-		key: string,
-	): Promise<AuthoritativeDelivery | null>;
+	resolveOutboundReplay(input: {
+		idempotencyKey: string;
+		commandFingerprint: string;
+		sourceDraft?: { draftId: string; draftVersion: number };
+	}): Promise<
+		| { status: "none" }
+		| { status: "exact"; delivery: AuthoritativeDelivery }
+		| {
+				status: "conflict";
+				reason: OutboundReplayConflictReason;
+				delivery: AuthoritativeDelivery;
+		  }
+	>;
 	queueAttachmentCleanup?: (
 		emailId: string,
 		keys: string[],
@@ -43,16 +55,37 @@ export type AmbiguousEnqueueResolution =
 			outcome: OutboundEnqueueOutcome;
 	  }
 	| { status: "not_committed" }
+	| { status: "conflict"; reason: OutboundReplayConflictReason }
 	| { status: "indeterminate" };
 
 export function planBulkEnqueueReconciliation(
 	delivery: AuthoritativeDelivery | null,
 	attemptedEmailId: string,
+	commandFingerprint: string,
 ):
 	| { status: "committed"; deleteAttemptedBytes: boolean }
+	| {
+			status: "conflict";
+			reason: OutboundReplayConflictReason;
+			deleteAttemptedBytes: boolean;
+	  }
 	| { status: "not_committed"; deleteAttemptedBytes: true } {
 	if (!delivery) {
 		return { status: "not_committed", deleteAttemptedBytes: true };
+	}
+	if (!("commandFingerprint" in delivery) || !delivery.commandFingerprint) {
+		return {
+			status: "conflict",
+			reason: "legacy_idempotency_unverifiable",
+			deleteAttemptedBytes: delivery.emailId !== attemptedEmailId,
+		};
+	}
+	if (delivery.commandFingerprint !== commandFingerprint) {
+		return {
+			status: "conflict",
+			reason: "command_mismatch",
+			deleteAttemptedBytes: delivery.emailId !== attemptedEmailId,
+		};
 	}
 	return {
 		status: "committed",
@@ -69,20 +102,24 @@ export async function reconcileAmbiguousOutboundEnqueue(input: {
 	bucket: Env["BUCKET"];
 	stub: RecoveryStub;
 	idempotencyKey: string;
+	commandFingerprint: string;
+	sourceDraft?: { draftId: string; draftVersion: number };
 	attemptedEmailId: string;
 	promotion: AttachmentPromotion;
 	actor: ActivityActor;
 }): Promise<AmbiguousEnqueueResolution> {
-	let delivery: AuthoritativeDelivery | null;
+	let resolution: Awaited<ReturnType<RecoveryStub["resolveOutboundReplay"]>>;
 	try {
-		delivery = await input.stub.getOutboundDeliveryByIdempotencyKey(
-			input.idempotencyKey,
-		);
+		resolution = await input.stub.resolveOutboundReplay({
+			idempotencyKey: input.idempotencyKey,
+			commandFingerprint: input.commandFingerprint,
+			...(input.sourceDraft ? { sourceDraft: input.sourceDraft } : {}),
+		});
 	} catch {
 		return { status: "indeterminate" };
 	}
 
-	if (!delivery) {
+	if (resolution.status === "none") {
 		await rollbackAttachmentPromotion(
 			input.bucket,
 			input.stub,
@@ -92,6 +129,7 @@ export async function reconcileAmbiguousOutboundEnqueue(input: {
 		);
 		return { status: "not_committed" };
 	}
+	const delivery = resolution.delivery;
 
 	if (delivery.emailId !== input.attemptedEmailId) {
 		await rollbackAttachmentPromotion(
@@ -101,6 +139,9 @@ export async function reconcileAmbiguousOutboundEnqueue(input: {
 			input.promotion,
 			input.actor,
 		);
+	}
+	if (resolution.status === "conflict") {
+		return { status: "conflict", reason: resolution.reason };
 	}
 	await completeAttachmentPromotion(
 		input.bucket,

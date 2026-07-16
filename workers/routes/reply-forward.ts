@@ -27,6 +27,10 @@ import {
 	type OutboundEnqueueOutcome,
 } from "../lib/outbound-delivery-service.ts";
 import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
+import {
+	stableOutboundAttachmentReferences,
+	withOutboundCommandFingerprint,
+} from "../lib/outbound-command-fingerprint.ts";
 
 type AppContext = Context<MailboxContext>;
 type RateLimitStub = { checkSendRateLimit: () => Promise<string | null> };
@@ -97,14 +101,6 @@ export async function handleReplyEmail(c: AppContext) {
 	} = body;
 
 	const stub = c.var.mailboxStub;
-	const existing = await stub.getOutboundDeliveryByIdempotencyKey(
-		idempotency_key,
-	);
-	if (existing) return c.json(deliveryResponse(existing, true), 202);
-	const schedulePreflight = validateOutboundSchedule(scheduled_for);
-	if (!schedulePreflight.ok) {
-		return c.json({ error: schedulePreflight.error }, 400);
-	}
 	const rawOriginal = (await stub.getEmail(id)) as EmailFull | null;
 
 	if (!rawOriginal) {
@@ -121,6 +117,67 @@ export async function handleReplyEmail(c: AppContext) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
 	}
+	const sourceDraft = source_draft_id
+		? { draftId: source_draft_id, draftVersion: source_draft_version! }
+		: undefined;
+	const actor = actorFromSession(c.get("session"));
+	const replayCommand = await withOutboundCommandFingerprint(
+		{
+			idempotencyKey: idempotency_key,
+			source: "ui",
+			actor,
+			snapshot: {
+				mailboxId: mailboxId.toLowerCase(),
+				...sourceDraft,
+				kind: "reply",
+				to: recipientList(to),
+				cc: recipientList(cc),
+				bcc: recipientList(bcc),
+				from: fromEmail,
+				subject,
+				...(html !== undefined ? { html } : {}),
+				...(text !== undefined ? { text } : {}),
+				inReplyTo: originalMsgId,
+				references,
+				threadId: thread_id,
+				attachmentIds: [],
+				...(source_draft_id
+					? {
+							sourceDraftAttachmentIds: sourceDraftAttachmentIds(
+								source_draft_id,
+								attachments,
+							),
+						}
+					: {}),
+			},
+			requestedAt: "1970-01-01T00:00:00.000Z",
+			undoUntil: "1970-01-01T00:00:00.000Z",
+			...(scheduled_for ? { scheduledFor: scheduled_for } : {}),
+		},
+		stableOutboundAttachmentReferences(attachments),
+		{ sourceEmailId: id },
+	);
+	const replay = await stub.resolveOutboundReplay({
+		idempotencyKey: idempotency_key,
+		commandFingerprint: replayCommand.commandFingerprint,
+		...(sourceDraft ? { sourceDraft } : {}),
+	});
+	if (replay.status === "exact") {
+		return c.json(deliveryResponse(replay.delivery, true), 202);
+	}
+	if (replay.status === "conflict") {
+		return c.json(
+			{
+				error: "This send identity is already bound to another command.",
+				code: replay.reason,
+			},
+			409,
+		);
+	}
+	const schedulePreflight = validateOutboundSchedule(scheduled_for);
+	if (!schedulePreflight.ok) {
+		return c.json({ error: schedulePreflight.error }, 400);
+	}
 
 	const { messageId } = generateMessageId(fromDomain);
 
@@ -129,15 +186,6 @@ export async function handleReplyEmail(c: AppContext) {
 	if (rateLimitError) {
 		return c.json({ error: rateLimitError }, 429);
 	}
-
-	let sourceDraft: { draftId: string; draftVersion: number } | undefined;
-	if (source_draft_id) {
-		sourceDraft = {
-			draftId: source_draft_id,
-			draftVersion: source_draft_version!,
-		};
-	}
-	const actor = actorFromSession(c.get("session"));
 
 	const resolved = await resolveAndPromoteAttachments(
 		c.env.BUCKET,
@@ -183,27 +231,12 @@ export async function handleReplyEmail(c: AppContext) {
 	try {
 		result = await stub.enqueueOutbound(
 			{
-				idempotencyKey: idempotency_key,
-				source: "ui",
-				actor,
+				...replayCommand,
 				snapshot: {
-				mailboxId: mailboxId.toLowerCase(),
-				...sourceDraft,
-				kind: "reply",
-				to: recipientList(to),
-				cc: recipientList(cc),
-				bcc: recipientList(bcc),
-				from: fromEmail,
-				subject,
-				...(html !== undefined ? { html } : {}),
-				...(text !== undefined ? { text } : {}),
-				inReplyTo: originalMsgId,
-				references,
-				threadId: thread_id,
-				attachmentIds: resolved.storedMetadata.map((attachment) => attachment.id),
-				...(source_draft_id
-					? { sourceDraftAttachmentIds: sourceDraftAttachmentIds(source_draft_id, attachments) }
-					: {}),
+					...replayCommand.snapshot,
+					attachmentIds: resolved.storedMetadata.map(
+						(attachment) => attachment.id,
+					),
 				},
 				requestedAt,
 				undoUntil,
@@ -217,6 +250,8 @@ export async function handleReplyEmail(c: AppContext) {
 			bucket: c.env.BUCKET,
 			stub,
 			idempotencyKey: idempotency_key,
+			commandFingerprint: replayCommand.commandFingerprint,
+			...(sourceDraft ? { sourceDraft } : {}),
 			attemptedEmailId: messageId,
 			promotion: resolved,
 			actor,
@@ -226,6 +261,15 @@ export async function handleReplyEmail(c: AppContext) {
 			promotionFinalized = true;
 		} else if (reconciliation.status === "indeterminate") {
 			throw error;
+		}
+		if (reconciliation.status === "conflict") {
+			return c.json(
+				{
+					error: "This send identity is already bound to another command.",
+					code: reconciliation.reason,
+				},
+				409,
+			);
 		}
 		if (reconciliation.status === "not_committed" && isSourceDraftConflict(error)) {
 			return c.json(
@@ -274,10 +318,68 @@ export async function handleForwardEmail(c: AppContext) {
 	} = body;
 
 	const stub = c.var.mailboxStub;
-	const existing = await stub.getOutboundDeliveryByIdempotencyKey(
-		idempotency_key,
+	let fromEmail: string, fromDomain: string;
+	try {
+		({ fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+	} catch (e) {
+		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
+		throw e;
+	}
+	const sourceDraft = source_draft_id
+		? { draftId: source_draft_id, draftVersion: source_draft_version! }
+		: undefined;
+	const actor = actorFromSession(c.get("session"));
+	const replayCommand = await withOutboundCommandFingerprint(
+		{
+			idempotencyKey: idempotency_key,
+			source: "ui",
+			actor,
+			snapshot: {
+				mailboxId: mailboxId.toLowerCase(),
+				...sourceDraft,
+				kind: "forward",
+				to: recipientList(to),
+				cc: recipientList(cc),
+				bcc: recipientList(bcc),
+				from: fromEmail,
+				subject,
+				...(html !== undefined ? { html } : {}),
+				...(text !== undefined ? { text } : {}),
+				threadId: "generated",
+				attachmentIds: [],
+				...(source_draft_id
+					? {
+							sourceDraftAttachmentIds: sourceDraftAttachmentIds(
+								source_draft_id,
+								attachments,
+							),
+						}
+					: {}),
+			},
+			requestedAt: "1970-01-01T00:00:00.000Z",
+			undoUntil: "1970-01-01T00:00:00.000Z",
+			...(scheduled_for ? { scheduledFor: scheduled_for } : {}),
+		},
+		stableOutboundAttachmentReferences(attachments),
+		{ sourceEmailId: id },
 	);
-	if (existing) return c.json(deliveryResponse(existing, true), 202);
+	const replay = await stub.resolveOutboundReplay({
+		idempotencyKey: idempotency_key,
+		commandFingerprint: replayCommand.commandFingerprint,
+		...(sourceDraft ? { sourceDraft } : {}),
+	});
+	if (replay.status === "exact") {
+		return c.json(deliveryResponse(replay.delivery, true), 202);
+	}
+	if (replay.status === "conflict") {
+		return c.json(
+			{
+				error: "This send identity is already bound to another command.",
+				code: replay.reason,
+			},
+			409,
+		);
+	}
 	const schedulePreflight = validateOutboundSchedule(scheduled_for);
 	if (!schedulePreflight.ok) {
 		return c.json({ error: schedulePreflight.error }, 400);
@@ -290,14 +392,6 @@ export async function handleForwardEmail(c: AppContext) {
 
 	await resolveOriginalEmail(stub, rawOriginal);
 
-	let fromEmail: string, fromDomain: string;
-	try {
-		({ fromEmail, fromDomain } = validateSender(to, from, mailboxId));
-	} catch (e) {
-		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
-		throw e;
-	}
-
 	const { messageId } = generateMessageId(fromDomain);
 
 	const rateLimitError = await (stub as unknown as RateLimitStub)
@@ -305,15 +399,6 @@ export async function handleForwardEmail(c: AppContext) {
 	if (rateLimitError) {
 		return c.json({ error: rateLimitError }, 429);
 	}
-
-	let sourceDraft: { draftId: string; draftVersion: number } | undefined;
-	if (source_draft_id) {
-		sourceDraft = {
-			draftId: source_draft_id,
-			draftVersion: source_draft_version!,
-		};
-	}
-	const actor = actorFromSession(c.get("session"));
 
 	const resolved = await resolveAndPromoteAttachments(
 		c.env.BUCKET,
@@ -359,25 +444,11 @@ export async function handleForwardEmail(c: AppContext) {
 	try {
 		result = await stub.enqueueOutbound(
 			{
-				idempotencyKey: idempotency_key,
-				source: "ui",
-				actor,
+				...replayCommand,
 				snapshot: {
-				mailboxId: mailboxId.toLowerCase(),
-				...sourceDraft,
-				kind: "forward",
-				to: recipientList(to),
-				cc: recipientList(cc),
-				bcc: recipientList(bcc),
-				from: fromEmail,
-				subject,
-				...(html !== undefined ? { html } : {}),
-				...(text !== undefined ? { text } : {}),
+					...replayCommand.snapshot,
 				threadId: messageId,
 				attachmentIds: resolved.storedMetadata.map((attachment) => attachment.id),
-				...(source_draft_id
-					? { sourceDraftAttachmentIds: sourceDraftAttachmentIds(source_draft_id, attachments) }
-					: {}),
 				},
 				requestedAt,
 				undoUntil,
@@ -391,6 +462,8 @@ export async function handleForwardEmail(c: AppContext) {
 			bucket: c.env.BUCKET,
 			stub,
 			idempotencyKey: idempotency_key,
+			commandFingerprint: replayCommand.commandFingerprint,
+			...(sourceDraft ? { sourceDraft } : {}),
 			attemptedEmailId: messageId,
 			promotion: resolved,
 			actor,
@@ -400,6 +473,15 @@ export async function handleForwardEmail(c: AppContext) {
 			promotionFinalized = true;
 		} else if (reconciliation.status === "indeterminate") {
 			throw error;
+		}
+		if (reconciliation.status === "conflict") {
+			return c.json(
+				{
+					error: "This send identity is already bound to another command.",
+					code: reconciliation.reason,
+				},
+				409,
+			);
 		}
 		if (reconciliation.status === "not_committed" && isSourceDraftConflict(error)) {
 			return c.json(

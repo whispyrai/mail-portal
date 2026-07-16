@@ -1,6 +1,7 @@
 import { validateInlineImageMappings } from "../../shared/inline-image-mappings.ts";
 import { escapeHtml } from "./email-helpers.ts";
 import { InlineImageMappingError } from "./inline-image-authority.ts";
+import { stableJson } from "./stable-json.ts";
 
 export const BULK_PREPARATION_MAX_AGE_MS = 10 * 60_000;
 export const BULK_STALE_WRITER_VERIFY_MS = 2 * BULK_PREPARATION_MAX_AGE_MS;
@@ -150,10 +151,11 @@ export function bulkPersonalizedHtmlValidationError(
 }
 
 export function planBulkRecipientEnqueueDisposition(
-	reconciliationStatus: "committed" | "not_committed",
+	reconciliationStatus: "committed" | "not_committed" | "conflict",
 	error: unknown,
 ): "committed" | "definitive_failure" | "retry" {
 	if (reconciliationStatus === "committed") return "committed";
+	if (reconciliationStatus === "conflict") return "definitive_failure";
 	return error instanceof BulkRecipientAttachmentUnavailableError ||
 		error instanceof InlineImageMappingError
 		? "definitive_failure"
@@ -228,16 +230,6 @@ type BulkFingerprintInput = {
 	recipients: Record<string, string>[];
 	attachmentUploadIds?: string[];
 };
-
-function stableJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.sort()
-		.map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
-		.join(",")}}`;
-}
 
 export async function bulkAdmissionFingerprint(
 	input: BulkFingerprintInput,

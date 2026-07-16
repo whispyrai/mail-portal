@@ -219,6 +219,7 @@ export function deliveryRowToStored(
 		kind: requiredEnum(row.kind, DELIVERY_KINDS, "delivery kind"),
 		status: requiredEnum(row.status, DELIVERY_STATUSES, "delivery status"),
 		idempotencyKey: row.idempotency_key,
+		commandFingerprint: optional(row.command_fingerprint),
 		source: requiredEnum(row.source, DELIVERY_SOURCES, "delivery source"),
 		actor: {
 			kind: requiredEnum(row.actor_kind, ACTOR_KINDS, "actor kind"),
@@ -232,6 +233,13 @@ export function deliveryRowToStored(
 		nextAttemptAt: optional(row.next_attempt_at),
 		attemptCount: row.attempt_count,
 		maxAttempts: row.max_attempts,
+		preflightDeferralCount: row.preflight_deferral_count,
+		dispatchPhase: optional(row.dispatch_phase) as
+			| StoredOutboundDelivery["dispatchPhase"]
+			| undefined,
+		activeAttemptId: optional(row.active_attempt_id),
+		acceptedAttemptCount: row.accepted_attempt_count,
+		duplicateAcceptanceAt: optional(row.duplicate_acceptance_at),
 		leaseToken: optional(row.lease_token),
 		leaseExpiresAt: optional(row.lease_expires_at),
 		sesMessageId: optional(row.ses_message_id),
@@ -257,6 +265,13 @@ export function attemptRowToStored(row: AttemptRow): OutboundDeliveryAttempt {
 		httpStatus: row.http_status ?? undefined,
 		errorCode: optional(row.error_code),
 		errorMessage: optional(row.error_message),
+		providerState: requiredEnum(
+			row.provider_state,
+			new Set(["none", "delivered", "bounced", "complained"] as const),
+			"attempt provider state",
+		),
+		providerEventAt: optional(row.provider_event_at),
+		providerEventId: optional(row.provider_event_id),
 	};
 }
 
@@ -506,6 +521,7 @@ export class DurableObjectOutboundDeliveryTransaction
 				source_draft_id: delivery.draftId ?? null,
 				source_draft_version: delivery.draftVersion ?? null,
 				idempotency_key: delivery.idempotencyKey,
+				command_fingerprint: delivery.commandFingerprint ?? null,
 				kind: delivery.kind,
 				source: delivery.source,
 				actor_kind: delivery.actor.kind,
@@ -517,6 +533,9 @@ export class DurableObjectOutboundDeliveryTransaction
 				next_attempt_at: delivery.nextAttemptAt ?? null,
 				attempt_count: delivery.attemptCount,
 				max_attempts: delivery.maxAttempts,
+				preflight_deferral_count: delivery.preflightDeferralCount,
+				dispatch_phase: delivery.dispatchPhase ?? null,
+				active_attempt_id: delivery.activeAttemptId ?? null,
 				lease_token: delivery.leaseToken ?? null,
 				lease_expires_at: delivery.leaseExpiresAt ?? null,
 				ses_message_id: delivery.sesMessageId ?? null,
@@ -528,6 +547,8 @@ export class DurableObjectOutboundDeliveryTransaction
 				failed_at: delivery.failedAt ?? null,
 				unknown_at: delivery.unknownAt ?? null,
 				cancelled_at: delivery.cancelledAt ?? null,
+				accepted_attempt_count: delivery.acceptedAttemptCount,
+				duplicate_acceptance_at: delivery.duplicateAcceptanceAt ?? null,
 			})
 			.run();
 		this.#db
@@ -549,6 +570,9 @@ export class DurableObjectOutboundDeliveryTransaction
 				next_attempt_at: delivery.nextAttemptAt ?? null,
 				attempt_count: delivery.attemptCount,
 				max_attempts: delivery.maxAttempts,
+				preflight_deferral_count: delivery.preflightDeferralCount,
+				dispatch_phase: delivery.dispatchPhase ?? null,
+				active_attempt_id: delivery.activeAttemptId ?? null,
 				lease_token: delivery.leaseToken ?? null,
 				lease_expires_at: delivery.leaseExpiresAt ?? null,
 				ses_message_id: delivery.sesMessageId ?? null,
@@ -559,6 +583,8 @@ export class DurableObjectOutboundDeliveryTransaction
 				failed_at: delivery.failedAt ?? null,
 				unknown_at: delivery.unknownAt ?? null,
 				cancelled_at: delivery.cancelledAt ?? null,
+				accepted_attempt_count: delivery.acceptedAttemptCount,
+				duplicate_acceptance_at: delivery.duplicateAcceptanceAt ?? null,
 			})
 			.where(eq(schema.outboundDeliveries.id, delivery.id))
 			.run();
@@ -628,6 +654,9 @@ export class DurableObjectOutboundDeliveryTransaction
 				http_status: attempt.httpStatus ?? null,
 				error_code: attempt.errorCode ?? null,
 				error_message: attempt.errorMessage ?? null,
+				provider_state: attempt.providerState,
+				provider_event_at: attempt.providerEventAt ?? null,
+				provider_event_id: attempt.providerEventId ?? null,
 			})
 			.run();
 	}
@@ -660,6 +689,9 @@ export class DurableObjectOutboundDeliveryTransaction
 				http_status: attempt.httpStatus ?? null,
 				error_code: attempt.errorCode ?? null,
 				error_message: attempt.errorMessage ?? null,
+				provider_state: attempt.providerState,
+				provider_event_at: attempt.providerEventAt ?? null,
+				provider_event_id: attempt.providerEventId ?? null,
 			})
 			.where(eq(schema.outboundDeliveryAttempts.id, attempt.id))
 			.run();

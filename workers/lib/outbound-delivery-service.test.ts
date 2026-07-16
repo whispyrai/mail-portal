@@ -4,6 +4,7 @@ import type { EnqueueOutboundCommand } from "./outbound-delivery-contract.ts";
 import {
 	DeliveryLeaseError,
 	DuplicateRiskAcknowledgementRequiredError,
+	OutboundIdempotencyConflictError,
 	TruthfulOutboxService,
 	type OutboundDeliveryAttempt,
 	type OutboundDeliveryStorage,
@@ -88,6 +89,7 @@ function command(
 ): EnqueueOutboundCommand {
 	return {
 		idempotencyKey: "send-click-1",
+		commandFingerprint: "a".repeat(64),
 		source: "ui",
 		actor: { kind: "user", id: "user-1" },
 		requestedAt: "2026-07-11T10:00:00.000Z",
@@ -128,11 +130,7 @@ test("repeating a mailbox-scoped idempotency key replays one atomic enqueue", ()
 	const { service } = createService();
 
 	const first = service.enqueue(command());
-	const replay = service.enqueue(
-		command({
-			snapshot: { ...command().snapshot, subject: "Changed after retry" },
-		}),
-	);
+	const replay = service.enqueue(command());
 
 	assert.equal(first.replayed, false);
 	assert.equal(replay.replayed, true);
@@ -141,6 +139,41 @@ test("repeating a mailbox-scoped idempotency key replays one atomic enqueue", ()
 	assert.equal(replay.delivery.status, "queued");
 	assert.equal(replay.snapshot.subject, "Hello");
 	assert.equal(service.list().length, 1);
+});
+
+test("a changed command cannot replay an existing idempotency key", () => {
+	const { service } = createService();
+	service.enqueue(command());
+
+	assert.throws(
+		() =>
+			service.enqueue(
+				command({
+					commandFingerprint: "b".repeat(64),
+					snapshot: { ...command().snapshot, subject: "Changed after retry" },
+				}),
+			),
+		(error: unknown) =>
+			error instanceof OutboundIdempotencyConflictError &&
+			error.reason === "command_mismatch",
+	);
+	assert.equal(service.list().length, 1);
+});
+
+test("a legacy delivery without a fingerprint is never claimed as verified replay", () => {
+	const { service, storage } = createService();
+	const first = service.enqueue(command());
+	storage.deliveries.set(first.delivery.id, {
+		...first.delivery,
+		commandFingerprint: undefined,
+	});
+
+	assert.throws(
+		() => service.enqueue(command()),
+		(error: unknown) =>
+			error instanceof OutboundIdempotencyConflictError &&
+			error.reason === "legacy_idempotency_unverifiable",
+	);
 });
 
 test("a source draft revision can authorize only one delivery even when the client key changes", () => {

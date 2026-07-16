@@ -788,6 +788,7 @@ export const outboundDeliveries = sqliteTable(
 		source_draft_id: text("source_draft_id"),
 		source_draft_version: integer("source_draft_version"),
 		idempotency_key: text("idempotency_key").notNull(),
+		command_fingerprint: text("command_fingerprint"),
 		kind: text("kind").notNull(),
 		source: text("source").notNull(),
 		actor_kind: text("actor_kind").notNull(),
@@ -799,6 +800,11 @@ export const outboundDeliveries = sqliteTable(
 		next_attempt_at: text("next_attempt_at"),
 		attempt_count: integer("attempt_count").notNull().default(0),
 		max_attempts: integer("max_attempts").notNull().default(4),
+		preflight_deferral_count: integer("preflight_deferral_count")
+			.notNull()
+			.default(0),
+		dispatch_phase: text("dispatch_phase"),
+		active_attempt_id: text("active_attempt_id"),
 		lease_token: text("lease_token"),
 		lease_expires_at: text("lease_expires_at"),
 		ses_message_id: text("ses_message_id"),
@@ -810,6 +816,10 @@ export const outboundDeliveries = sqliteTable(
 		failed_at: text("failed_at"),
 		unknown_at: text("unknown_at"),
 		cancelled_at: text("cancelled_at"),
+		accepted_attempt_count: integer("accepted_attempt_count")
+			.notNull()
+			.default(0),
+		duplicate_acceptance_at: text("duplicate_acceptance_at"),
 	},
 	(table) => [
 		uniqueIndex("idx_outbound_deliveries_email_id").on(table.email_id),
@@ -856,6 +866,9 @@ export const outboundDeliveryAttempts = sqliteTable(
 		http_status: integer("http_status"),
 		error_code: text("error_code"),
 		error_message: text("error_message"),
+		provider_state: text("provider_state").notNull().default("none"),
+		provider_event_at: text("provider_event_at"),
+		provider_event_id: text("provider_event_id"),
 	},
 	(table) => [
 		uniqueIndex("idx_outbound_attempts_delivery_number").on(
@@ -865,6 +878,27 @@ export const outboundDeliveryAttempts = sqliteTable(
 		index("idx_outbound_attempts_delivery").on(
 			table.delivery_id,
 			table.attempt_number,
+		),
+	],
+);
+
+export const outboundProviderEvents = sqliteTable(
+	"outbound_provider_events",
+	{
+		id: text("id").primaryKey(),
+		attempt_id: text("attempt_id")
+			.notNull()
+			.references(() => outboundDeliveryAttempts.id, { onDelete: "cascade" }),
+		ses_message_id: text("ses_message_id").notNull(),
+		event_class: text("event_class").notNull(),
+		occurred_at: text("occurred_at").notNull(),
+		received_at: text("received_at").notNull(),
+	},
+	(table) => [
+		index("idx_outbound_provider_events_attempt").on(
+			table.attempt_id,
+			table.occurred_at,
+			table.id,
 		),
 	],
 );

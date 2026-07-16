@@ -17,6 +17,10 @@ import { SendEmailRequestSchema } from "../lib/schemas.ts";
 import { validateOutboundSchedule } from "../../shared/outbound-schedule.ts";
 import { outboundEnqueueOutcome } from "../lib/outbound-delivery-service.ts";
 import { validateResolvedInlineImages } from "../lib/inline-image-authority.ts";
+import {
+	stableOutboundAttachmentReferences,
+	withOutboundCommandFingerprint,
+} from "../lib/outbound-command-fingerprint.ts";
 
 type AppContext = Context<MailboxContext>;
 
@@ -47,28 +51,6 @@ export async function handleSendEmail(c: AppContext) {
 		scheduled_for,
 	} = parsed.data;
 	const stub = c.var.mailboxStub;
-	const existing = await stub.getOutboundDeliveryByIdempotencyKey(
-		idempotency_key,
-	);
-	if (existing) {
-		return c.json(
-			{
-				deliveryId: existing.id,
-				id: existing.emailId,
-				emailId: existing.emailId,
-				status: existing.status,
-				undoUntil: existing.undoUntil,
-				scheduledFor: existing.scheduledFor ?? null,
-				replayed: true,
-				outcome: outboundEnqueueOutcome(existing, true),
-			},
-			202,
-		);
-	}
-	const schedulePreflight = validateOutboundSchedule(scheduled_for);
-	if (!schedulePreflight.ok) {
-		return c.json({ error: schedulePreflight.error }, 400);
-	}
 
 	let fromEmail: string;
 	let fromDomain: string;
@@ -80,16 +62,98 @@ export async function handleSendEmail(c: AppContext) {
 		}
 		throw error;
 	}
+	const sourceDraft = source_draft_id
+		? { draftId: source_draft_id, draftVersion: source_draft_version! }
+		: undefined;
+	const actor = actorFromSession(c.get("session"));
+	const stableAttachmentReferences = stableOutboundAttachmentReferences(
+		attachments,
+	);
+	const replayCommand = await withOutboundCommandFingerprint(
+		{
+			idempotencyKey: idempotency_key,
+			source: "ui",
+			actor,
+			snapshot: {
+				mailboxId: mailboxId.toLowerCase(),
+				...sourceDraft,
+				kind: "compose",
+				to: Array.isArray(to)
+					? to.map((address) => address.toLowerCase())
+					: [to.toLowerCase()],
+				cc: cc
+					? Array.isArray(cc)
+						? cc.map((address) => address.toLowerCase())
+						: [cc.toLowerCase()]
+					: [],
+				bcc: bcc
+					? Array.isArray(bcc)
+						? bcc.map((address) => address.toLowerCase())
+						: [bcc.toLowerCase()]
+					: [],
+				from: fromEmail,
+				subject,
+				...(html !== undefined ? { html } : {}),
+				...(text !== undefined ? { text } : {}),
+				...(in_reply_to ? { inReplyTo: in_reply_to } : {}),
+				...(references ? { references } : {}),
+				threadId: thread_id || in_reply_to || "generated",
+				attachmentIds: [],
+				...(source_draft_id
+					? {
+							sourceDraftAttachmentIds: sourceDraftAttachmentIds(
+								source_draft_id,
+								attachments,
+							),
+						}
+					: {}),
+			},
+			requestedAt: "1970-01-01T00:00:00.000Z",
+			undoUntil: "1970-01-01T00:00:00.000Z",
+			...(scheduled_for ? { scheduledFor: scheduled_for } : {}),
+		},
+		stableAttachmentReferences,
+		{ ...(thread_id ? { callerThreadId: thread_id } : {}) },
+	);
+	const replay = await stub.resolveOutboundReplay({
+		idempotencyKey: idempotency_key,
+		commandFingerprint: replayCommand.commandFingerprint,
+		...(sourceDraft ? { sourceDraft } : {}),
+	});
+	if (replay.status === "exact") {
+		return c.json(
+			{
+				deliveryId: replay.delivery.id,
+				id: replay.delivery.emailId,
+				emailId: replay.delivery.emailId,
+				status: replay.delivery.status,
+				undoUntil: replay.delivery.undoUntil,
+				scheduledFor: replay.delivery.scheduledFor ?? null,
+				replayed: true,
+				outcome: outboundEnqueueOutcome(replay.delivery, true),
+			},
+			202,
+		);
+	}
+	if (replay.status === "conflict") {
+		return c.json(
+			{
+				error: "This send identity is already bound to another command.",
+				code: replay.reason,
+			},
+			409,
+		);
+	}
+	const schedulePreflight = validateOutboundSchedule(scheduled_for);
+	if (!schedulePreflight.ok) {
+		return c.json({ error: schedulePreflight.error }, 400);
+	}
 
 	const { messageId } = generateMessageId(fromDomain);
 	const storedThreadId = thread_id || in_reply_to || messageId;
 	const rateLimitError = await stub.checkSendRateLimit();
 	if (rateLimitError) return c.json({ error: rateLimitError }, 429);
 
-	const sourceDraft = source_draft_id
-		? { draftId: source_draft_id, draftVersion: source_draft_version! }
-		: undefined;
-	const actor = actorFromSession(c.get("session"));
 	const resolved = await resolveAndPromoteAttachments(
 		c.env.BUCKET,
 		stub,
@@ -134,44 +198,13 @@ export async function handleSendEmail(c: AppContext) {
 	try {
 		result = await stub.enqueueOutbound(
 			{
-				idempotencyKey: idempotency_key,
-				source: "ui",
-				actor,
+				...replayCommand,
 				snapshot: {
-					mailboxId: mailboxId.toLowerCase(),
-					...sourceDraft,
-					kind: "compose",
-					to: Array.isArray(to)
-						? to.map((address) => address.toLowerCase())
-						: [to.toLowerCase()],
-					cc: cc
-						? Array.isArray(cc)
-							? cc.map((address) => address.toLowerCase())
-							: [cc.toLowerCase()]
-						: [],
-					bcc: bcc
-						? Array.isArray(bcc)
-							? bcc.map((address) => address.toLowerCase())
-							: [bcc.toLowerCase()]
-						: [],
-					from: fromEmail,
-					subject,
-					...(html !== undefined ? { html } : {}),
-					...(text !== undefined ? { text } : {}),
-					...(in_reply_to ? { inReplyTo: in_reply_to } : {}),
-					...(references ? { references } : {}),
+					...replayCommand.snapshot,
 					threadId: storedThreadId,
 					attachmentIds: resolved.storedMetadata.map(
 						(attachment) => attachment.id,
 					),
-					...(source_draft_id
-						? {
-								sourceDraftAttachmentIds: sourceDraftAttachmentIds(
-									source_draft_id,
-									attachments,
-								),
-							}
-						: {}),
 				},
 				requestedAt: timing.requestedAt,
 				undoUntil: timing.undoUntil,
@@ -187,6 +220,8 @@ export async function handleSendEmail(c: AppContext) {
 			bucket: c.env.BUCKET,
 			stub,
 			idempotencyKey: idempotency_key,
+			commandFingerprint: replayCommand.commandFingerprint,
+			...(sourceDraft ? { sourceDraft } : {}),
 			attemptedEmailId: messageId,
 			promotion: resolved,
 			actor,
@@ -196,6 +231,15 @@ export async function handleSendEmail(c: AppContext) {
 			promotionFinalized = true;
 		} else if (reconciliation.status === "indeterminate") {
 			throw error;
+		}
+		if (reconciliation.status === "conflict") {
+			return c.json(
+				{
+					error: "This send identity is already bound to another command.",
+					code: reconciliation.reason,
+				},
+				409,
+			);
 		}
 		if (
 			reconciliation.status === "not_committed" &&

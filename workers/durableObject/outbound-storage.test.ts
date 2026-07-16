@@ -78,6 +78,7 @@ test("delivery and attempt rows map nullable storage fields to service values", 
 			source_draft_id: "draft-1",
 			source_draft_version: 4,
 			idempotency_key: "click-1",
+			command_fingerprint: "a".repeat(64),
 			kind: "reply",
 			source: "ui",
 			actor_kind: "user",
@@ -89,6 +90,9 @@ test("delivery and attempt rows map nullable storage fields to service values", 
 			next_attempt_at: "2026-07-11T10:01:00.000Z",
 			attempt_count: 1,
 			max_attempts: 4,
+			preflight_deferral_count: 3,
+			dispatch_phase: "provider",
+			active_attempt_id: "attempt-1",
 			lease_token: null,
 			lease_expires_at: null,
 			ses_message_id: null,
@@ -100,6 +104,8 @@ test("delivery and attempt rows map nullable storage fields to service values", 
 			failed_at: null,
 			unknown_at: null,
 			cancelled_at: null,
+			accepted_attempt_count: 1,
+			duplicate_acceptance_at: null,
 		},
 		"team@example.com",
 	);
@@ -107,6 +113,11 @@ test("delivery and attempt rows map nullable storage fields to service values", 
 	assert.equal(delivery.draftVersion, 4);
 	assert.equal(delivery.nextAttemptAt, "2026-07-11T10:01:00.000Z");
 	assert.equal(delivery.leaseToken, undefined);
+	assert.equal(delivery.commandFingerprint, "a".repeat(64));
+	assert.equal(delivery.preflightDeferralCount, 3);
+	assert.equal(delivery.dispatchPhase, "provider");
+	assert.equal(delivery.activeAttemptId, "attempt-1");
+	assert.equal(delivery.acceptedAttemptCount, 1);
 
 	const attempt = attemptRowToStored({
 		id: "attempt-1",
@@ -120,10 +131,15 @@ test("delivery and attempt rows map nullable storage fields to service values", 
 		http_status: 200,
 		error_code: null,
 		error_message: null,
+		provider_state: "delivered",
+		provider_event_at: "2026-07-11T10:00:12.000Z",
+		provider_event_id: "event-1",
 	});
 	assert.equal(attempt.status, "accepted");
 	assert.equal(attempt.httpStatus, 200);
 	assert.equal(attempt.errorCode, undefined);
+	assert.equal(attempt.providerState, "delivered");
+	assert.equal(attempt.providerEventId, "event-1");
 });
 
 test("delivery rows preserve absent source draft linkage as absent", () => {
@@ -134,6 +150,7 @@ test("delivery rows preserve absent source draft linkage as absent", () => {
 			source_draft_id: null,
 			source_draft_version: null,
 			idempotency_key: "click-direct",
+			command_fingerprint: null,
 			kind: "compose",
 			source: "api",
 			actor_kind: "user",
@@ -145,6 +162,9 @@ test("delivery rows preserve absent source draft linkage as absent", () => {
 			next_attempt_at: null,
 			attempt_count: 0,
 			max_attempts: 4,
+			preflight_deferral_count: 0,
+			dispatch_phase: null,
+			active_attempt_id: null,
 			lease_token: null,
 			lease_expires_at: null,
 			ses_message_id: null,
@@ -156,6 +176,8 @@ test("delivery rows preserve absent source draft linkage as absent", () => {
 			failed_at: null,
 			unknown_at: null,
 			cancelled_at: null,
+			accepted_attempt_count: 0,
+			duplicate_acceptance_at: null,
 		},
 		"team@example.com",
 	);
