@@ -64,7 +64,7 @@ identity collision. It derives identity locally from the exact RFC822 bytes,
 maps folders locally, requires matching permanent server evidence for
 no-Message-ID duplicates, and
 writes a private exclusive log with a final `PASS` or `FAIL` reconciliation
-summary. The full Wiser migration/cutover order is in
+summary. The full Wiser migration and live-apex closeout order is in
 [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md).
 
 ## Deploy (production runbook â€” Whispyr environment)
@@ -90,9 +90,13 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    event evidence, and a default-disabled D1 control. Recovery is intentionally
    unavailable when the control table or row is absent. Use the shared
    [credential-recovery rollout runbook](docs/credential-recovery-rollout-runbook.md)
-   for both brands. Its fixed order is code-first frozen deploy, private
-   export/reconciliation, separately approved scrub, migration 0012, disabled
-   schema proof, callback/secret proof, explicit enable, then end-to-end proof.
+   for environments where migrations 0006 through 0011 are already deployed.
+   Its fixed order is code-first frozen deploy, private export/reconciliation,
+   separately approved scrub, migration 0012, disabled schema proof,
+   callback/secret proof, explicit enable, then end-to-end proof. Wiser's live
+   ledger currently contains only migrations 0001 and 0002, so its exact
+   migration-first closeout branch is documented separately in the
+   [Wiser go-live runbook](docs/wiser-go-live-runbook.md).
 
 2. **R2 bucket**
 

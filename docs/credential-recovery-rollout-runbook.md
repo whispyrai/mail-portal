@@ -6,6 +6,12 @@ the exact D1 row `credential_recovery_control('global')` exists with `enabled =
 returns private no-store 503 from all public recovery routes and skips every
 recovery maintenance lane. Unrelated agent-revocation maintenance continues.
 
+The code-first order below assumes migrations 0006 through 0011 are already in
+the remote ledger. Wiser's live database currently has only migrations 0001 and
+0002. For that exact baseline, follow the migration-first branch in
+[`docs/wiser-go-live-runbook.md`](wiser-go-live-runbook.md) before returning here
+for the callback, control-enable, and end-to-end proof gates.
+
 Every remote write in this document requires separate same-turn approval naming
 the exact brand, account, and action. Local builds, verifier dry-runs, and
 read-only inventory do not authorize AWS, Cloudflare, D1, DNS, secret, or deploy

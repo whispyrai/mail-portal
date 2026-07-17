@@ -51,7 +51,24 @@ export async function getUserByMcpTokenHash(
 }
 
 export async function listUsers(env: Env): Promise<User[]> {
-  return db(env).select().from(schema.users).all();
+  const result = await env.DB.prepare(
+    `SELECT
+       u.id, u.email, u.password_hash, u.password_salt, u.session_version,
+       u.role, u.is_active, u.mailbox_address, u.mcp_token_hash,
+       u.recovery_email, u.ownership_confirmed_at, u.created_at, u.updated_at
+     FROM users AS u
+     WHERE u.is_active = 1
+       OR EXISTS (
+         SELECT 1
+         FROM mailboxes AS m
+         WHERE m.owner_user_id = u.id
+           AND m.type = 'PERSONAL'
+           AND m.id = u.mailbox_address
+           AND m.address = u.mailbox_address
+       )
+     ORDER BY u.email ASC`,
+  ).all<User>();
+  return result.results;
 }
 
 export async function countUsers(env: Env): Promise<number> {

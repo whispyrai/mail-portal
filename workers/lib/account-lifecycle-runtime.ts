@@ -83,14 +83,36 @@ export function accountLifecycle(
       },
       async activate(userId) {
         const now = Date.now();
-        await env.DB.batch([
+        const results = await env.DB.batch([
           env.DB.prepare(
-            "UPDATE users SET is_active = 1, updated_at = ? WHERE id = ?",
+            `UPDATE users
+             SET is_active = 1, updated_at = ?
+             WHERE id = ?
+               AND EXISTS (
+                 SELECT 1
+                 FROM mailboxes
+                 WHERE mailboxes.owner_user_id = users.id
+                   AND mailboxes.type = 'PERSONAL'
+                   AND mailboxes.id = users.mailbox_address
+                   AND mailboxes.address = users.mailbox_address
+               )`,
           ).bind(now, userId),
           env.DB.prepare(
-            "UPDATE mailboxes SET is_active = 1, updated_at = ? WHERE owner_user_id = ?",
+            `UPDATE mailboxes
+             SET is_active = 1, updated_at = ?
+             WHERE owner_user_id = ?
+               AND type = 'PERSONAL'
+               AND id = address`,
           ).bind(now, userId),
         ]);
+        if (
+          (results[0]?.meta.changes ?? 0) !== 1 ||
+          (results[1]?.meta.changes ?? 0) !== 1
+        ) {
+          throw new Error(
+            "User cannot be reactivated without one canonical Personal Mailbox",
+          );
+        }
       },
     },
     async purgePush(userId, mailboxId) {

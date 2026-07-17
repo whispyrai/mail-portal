@@ -188,7 +188,7 @@ test("manual application queries cannot satisfy the external monitoring gate", a
 	}
 });
 
-test("independent monitor proof precedes recovery enable and Wiser MX cutover", async () => {
+test("independent monitor proof precedes recovery enable and Wiser production closeout", async () => {
 	const recovery = await readFile(recoveryPath, "utf8");
 	const monitorStep = recovery.indexOf(
 		"### 7. Attach and approve the independent monitor proof record",
@@ -216,15 +216,90 @@ test("independent monitor proof precedes recovery enable and Wiser MX cutover", 
 	}
 
 	const wiser = await readFile(wiserPath, "utf8");
-	const preMxGate = wiser.indexOf("### Mandatory Pre-MX Monitor Proof Gate");
+	const preMxGate = wiser.indexOf("### Mandatory Production Monitor Proof Gate");
 	const stageTwo = wiser.indexOf(
-		"## Stage 2: Separately Approved Apex MX Cutover",
+		"## Stage 2: Separately Approved Production Closeout",
 	);
 	assert.ok(preMxGate >= 0);
 	assert.ok(stageTwo > preMxGate);
 	assert.match(
 		wiser.slice(preMxGate, stageTwo),
 		/14-row CloudWatch\s+alarm action proof/,
+	);
+});
+
+test("Wiser runbook follows the actual old ledger and already-live apex", async () => {
+	const wiser = await readFile(wiserPath, "utf8");
+	for (const required of [
+		"apex Email Routing and MX are already active",
+		"0003_create_mailbox_access.sql",
+		"0012_create_credential_recovery_jobs.sql",
+		"npx wrangler d1 migrations list DB --env wiser --remote",
+		"npx wrangler d1 migrations apply DB --env wiser --remote",
+		"npm run transition:wiser-shared-mailboxes",
+		"hesham@wiserchat.ai",
+		"ibrahem@wiserchat.ai",
+		"Do not create a third user",
+	]) {
+		assert.ok(wiser.includes(required), required);
+	}
+	assert.doesNotMatch(wiser, /while Zoho still owns apex inbound mail/);
+	assert.doesNotMatch(wiser, /Separately Approved Apex MX Cutover/);
+	const exactBranch = wiser.indexOf("### Exact Wiser Migration Branch");
+	const migrationApply = wiser.indexOf(
+		"npx wrangler d1 migrations apply DB --env wiser --remote",
+		exactBranch,
+	);
+	const productionDeploy = wiser.indexOf("npm run deploy:wiser", migrationApply);
+	const transition = wiser.indexOf(
+		"npm run transition:wiser-shared-mailboxes",
+		productionDeploy,
+	);
+	assert.ok(exactBranch >= 0);
+	assert.ok(migrationApply > exactBranch);
+	assert.ok(productionDeploy > migrationApply);
+	assert.ok(transition > productionDeploy);
+});
+
+test("Wiser email authorization canary is executable, bounded, and self-cleaning", async () => {
+	const wiser = await readFile(wiserPath, "utf8");
+	for (const required of [
+		"CLOUDFLARE_WISER_ZONE_ID",
+		"CLOUDFLARE_WHISPYR_ZONE_ID",
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"npm run canary:email-authorization",
+		"--apply --confirm run-email-authorization-canary",
+		"eight probe IDs",
+		"temporary Worker",
+		"temporary KV namespace",
+		"temporary exact-address Email Routing rule",
+		"5.1 MiB",
+		"24,960,359-byte",
+	]) {
+		assert.ok(wiser.includes(required), required);
+	}
+	assert.ok(
+		wiser.indexOf("npm run canary:email-authorization") <
+			wiser.indexOf("--apply --confirm run-email-authorization-canary"),
+	);
+});
+
+test("Wiser resource, secret, and push proof steps are executable", async () => {
+	const wiser = await readFile(wiserPath, "utf8");
+	for (const required of [
+		"wrangler queues create wiser-mail-emergency-forward",
+		"--message-retention-period-secs 1209600",
+		"wrangler queues update wiser-mail-inbound",
+		"wrangler secret list --env wiser --format json",
+		"wrangler secret delete",
+		"real subscribed desktop or mobile device",
+	]) {
+		assert.ok(wiser.includes(required), required);
+	}
+	assert.match(
+		wiser,
+		/Playwright cannot prove delivery of an\s+operating-system push notification/,
 	);
 });
 

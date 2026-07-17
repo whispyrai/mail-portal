@@ -200,3 +200,51 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
   );
   db.close();
 });
+
+test("a Shared Mailbox tombstone cannot be reactivated as a login account", async () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  for (const migration of [
+    "0001_create_users.sql",
+    "0003_create_mailbox_access.sql",
+    "0005_auth_security.sql",
+    "0006_credential_recovery.sql",
+    "0010_create_agent_connection_revocations.sql",
+    "0012_create_credential_recovery_jobs.sql",
+  ]) {
+    db.exec(
+      readFileSync(
+        new URL(`../../migrations/${migration}`, import.meta.url),
+        "utf8",
+      ),
+    );
+  }
+  db.prepare(
+    `INSERT INTO users
+     (id, email, password_hash, password_salt, session_version, role, is_active,
+      mailbox_address, mcp_token_hash, recovery_email, ownership_confirmed_at,
+      created_at, updated_at)
+     VALUES ('usr_hello', 'hello@wiserchat.ai', 'retired-hash', 'retired-salt',
+             2, 'AGENT', 0, 'hello@wiserchat.ai', NULL, NULL, 1, 1, 1)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO mailboxes
+     (id, address, type, owner_user_id, is_active, created_at, updated_at)
+     VALUES ('hello@wiserchat.ai', 'hello@wiserchat.ai', 'SHARED', NULL, 1, 1, 1)`,
+  ).run();
+
+  const lifecycle = accountLifecycle({
+    DB: d1(db),
+  } as unknown as Env);
+  await assert.rejects(
+    () => lifecycle.activate("usr_hello"),
+    /canonical Personal Mailbox/,
+  );
+  assert.equal(
+    db
+      .prepare("SELECT is_active FROM users WHERE id = 'usr_hello'")
+      .get()!.is_active,
+    0,
+  );
+  db.close();
+});

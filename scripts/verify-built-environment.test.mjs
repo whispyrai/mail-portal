@@ -108,45 +108,45 @@ function validArtifact(brand) {
 				allowed_sender_addresses: [identity.emergencyFrom],
 			},
 		],
-		queues: {
-			producers: [
-				{ binding: "INBOUND_QUEUE", queue: identity.queue },
-				{ binding: "EMERGENCY_FORWARD_QUEUE", queue: identity.emergencyQueue },
-			],
+			queues: {
+				producers: [
+					{ binding: "INBOUND_QUEUE", queue: identity.queue },
+					{ binding: "EMERGENCY_FORWARD_QUEUE", queue: identity.emergencyQueue },
+				],
 			consumers: [
 				{
 					queue: identity.queue,
-					max_batch_size: 2,
-					max_concurrency: 8,
-					max_batch_timeout: 1,
+					max_batch_size: 1,
+					max_concurrency: 1,
+					max_batch_timeout: 5,
 					max_retries: 10,
-					retry_delay: 30,
+					retry_delay: 1,
 					dead_letter_queue: identity.dlq,
 				},
 				{
 					queue: identity.dlq,
-					max_batch_size: 4,
-					max_concurrency: 4,
-					max_batch_timeout: 1,
+					max_batch_size: 1,
+					max_concurrency: 1,
+					max_batch_timeout: 5,
 					max_retries: 10,
-					retry_delay: 30,
+					retry_delay: 60,
 					dead_letter_queue: identity.parking,
 				},
 				{
 					queue: identity.parking,
-					max_batch_size: 4,
-					max_concurrency: 4,
-					max_batch_timeout: 1,
+					max_batch_size: 1,
+					max_concurrency: 1,
+					max_batch_timeout: 5,
 					max_retries: 100,
-					retry_delay: 300,
+					retry_delay: 3600,
 				},
 				{
 					queue: identity.emergencyQueue,
-					max_batch_size: 2,
-					max_concurrency: 4,
-					max_batch_timeout: 1,
+					max_batch_size: 1,
+					max_concurrency: 1,
+					max_batch_timeout: 5,
 					max_retries: 100,
-					retry_delay: 30,
+					retry_delay: 300,
 				},
 			],
 		},
@@ -249,19 +249,22 @@ test("rejects a missing Queue edge", async () => {
 	await assert.rejects(fixture.invocation, /Queue graph and consumer settings/);
 });
 
-test("rejects Queue isolation and recovery-latency regressions", async () => {
-	for (const mutate of [
-		(artifact) => {
-			artifact.queues.consumers[0].max_batch_size = 1;
-			artifact.queues.consumers[0].max_concurrency = 1;
-		},
-		(artifact) => {
-			artifact.queues.consumers[0].max_batch_size = 100;
-		},
-		(artifact) => {
-			artifact.queues.consumers[3].retry_delay = 300;
-		},
-	]) {
+test("rejects Queue isolation, concurrency, and recovery-latency regressions", async () => {
+	const mutations = [
+		...Array.from({ length: 4 }, (_, index) => (artifact) => {
+			artifact.queues.consumers[index].max_batch_size = 2;
+		}),
+		...Array.from({ length: 4 }, (_, index) => (artifact) => {
+			artifact.queues.consumers[index].max_concurrency = 2;
+		}),
+		...Array.from({ length: 4 }, (_, index) => (artifact) => {
+			artifact.queues.consumers[index].max_batch_timeout = 1;
+		}),
+		...Array.from({ length: 4 }, (_, index) => (artifact) => {
+			artifact.queues.consumers[index].retry_delay += 1;
+		}),
+	];
+	for (const mutate of mutations) {
 		const fixture = await runFixture("wiser", mutate);
 		await assert.rejects(
 			fixture.invocation,

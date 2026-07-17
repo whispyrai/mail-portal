@@ -5,8 +5,9 @@ This runbook is for WISER-242, the Wiser deployment of the shared Mail Portal co
 ## Production Shape
 
 - App domain: `mail.wiserchat.ai`
-- Inbound mail domain: `wiserchat.ai`. The locked direct-cutover plan does not use a temporary test domain.
-- Launch mailboxes: `hesham@wiserchat.ai` (ADMIN/personal), `hello@wiserchat.ai`, `contact@wiserchat.ai`
+- Inbound mail domain: `wiserchat.ai`. The apex Email Routing and MX are already active. No temporary test domain is used.
+- Human users: `hesham@wiserchat.ai` (ADMIN/personal) and `ibrahem@wiserchat.ai` (AGENT/personal)
+- Shared Mailboxes: `hello@wiserchat.ai` and `contact@wiserchat.ai`
 - Unknown recipients: permanent SMTP reject via the Worker email handler
 - Cloudflare Worker: `wiser-mail-portal`
 - D1 database: `wiser_mail_portal_users` (`87c3de98-d31b-4ec3-8e05-d26b4dc71d92`)
@@ -25,17 +26,15 @@ This runbook is for WISER-242, the Wiser deployment of the shared Mail Portal co
 
 ## Ordered Launch Path
 
-The launch has three ordered stages. Do not interleave them:
+The closeout has three ordered stages. Do not interleave them:
 
-1. Complete local verification and all separately approved production
-   provisioning while Zoho still owns apex inbound mail. This includes the
-   rebuilt Whispyr and Wiser artifact checks, read-only inventory, approved D1
-   migration, approved resource and secret changes, deploy, admin/mailbox setup,
-   outbound proof, push proof, and Zoho history import.
-2. Request a separate approval naming the `wiserchat.ai` apex MX and Email
-   Routing cutover. Only then change apex routing.
-3. Validate production inbound delivery, isolation, rejection, recovery,
-   monitoring, and rollback readiness before declaring go-live complete.
+1. Complete local verification and read-only production inventory while the
+   active apex route remains unchanged.
+2. Execute only the separately approved resource provisioning, D1 migrations,
+   Worker deployment, Shared Mailbox transition, secrets cleanup, and production
+   canaries in the exact order below.
+3. Validate the already-live apex, reconcile Zoho history, then run the clean
+   two-user 72-hour pilot with Hesham and Ibrahem.
 
 ## Approval Gates
 
@@ -43,23 +42,21 @@ Each of these is a separate production mutation and needs explicit approval befo
 
 1. Create any missing Wiser R2 bucket or Queue, or update the locked 14-day
    Queue retention.
-2. Decide the `raw/`-prefix R2 lifecycle and Bucket Lock behavior, then mutate
-   either prefix-scoped policy under a separate approval. A whole-bucket rule is
-   forbidden because receipts and recovery authority are mutable.
-3. Privately export and reconcile legacy recovery destinations, explicitly
-   scrub `users.recovery_email`, and apply remote D1 migrations to
-   `wiser_mail_portal_users`. The scrub and migration are separate approved
-   production writes.
-4. Create or update the dedicated Wiser SES IAM credentials.
-5. Deploy `wiser-mail-portal`.
-6. Write Worker production secrets.
-7. Create or change the Cloudflare custom domain, DNS, or Email Routing records.
-8. Import Zoho exports into production mailboxes.
-9. Change apex `wiserchat.ai` MX away from Zoho.
+2. Apply remote D1 migrations to `wiser_mail_portal_users`.
+3. Deploy `wiser-mail-portal`.
+4. Run the Wiser role-account to Shared Mailbox transition.
+5. Create, update, or delete Worker production secrets.
+6. Create or update the dedicated Wiser SES IAM credentials.
+7. Run the both-brand email authorization canary. Approval must name the two
+   temporary Workers, two temporary KV namespaces, two temporary exact-address
+   Email Routing rules, eight emails, and automatic cleanup.
+8. Create or change the Cloudflare custom domain, DNS, or permanent Email
+   Routing records. No such change is currently planned.
+9. Import Zoho exports into production Shared Mailboxes.
 10. Disable or delete Zoho mailboxes/routing after final reconciliation.
 11. Push a deployment branch, create or merge a PR, or change the deployed branch.
 
-## Stage 1: Pre-Cutover Verification And Provisioning
+## Stage 1: Local Verification And Read-Only Production Inventory
 
 ### Local Preflight
 
@@ -96,15 +93,78 @@ single `mail.wiserchat.ai` route. `DOMAINS` must be exactly `wiserchat.ai` with 
 `*/5 * * * *`, and `17 * * * *`. Each dry-run must use the exact generated
 configuration and contain no resource belonging to the other brand.
 
-### Cloudflare Database And Recovery Freeze
+### Exact Wiser Migration Branch
 
-Use the shared [credential-recovery rollout runbook](credential-recovery-rollout-runbook.md)
-with `BRAND=wiser`. Its mandatory order is code-first frozen deploy, private
-legacy export and exact directory reconciliation, separately approved scrub,
-migration 0012, schema plus `global | 0` proof, AWS callback/secret/canary proof,
-the separately approved independent monitor proof record, explicit control
-enable, and exact end-to-end proof. Migration 0012 is never paired with an
-immediate enable. A missing or unreadable control remains disabled.
+The live Wiser D1 ledger contains only migrations 0001 and 0002. This exact
+baseline must not follow the shared runbook's code-first branch because the
+final Worker reads tables introduced by migrations 0003 through 0012. Confirm
+the remote pending list before requesting a migration write:
+
+```bash
+npx wrangler d1 migrations list DB --env wiser --remote
+```
+
+The pending list must be exactly:
+
+```text
+0003_create_mailbox_access.sql
+0004_create_ai_cost_controls.sql
+0005_auth_security.sql
+0006_credential_recovery.sql
+0007_create_saved_views.sql
+0008_create_follow_up_reminders.sql
+0009_create_global_today_brief_claims.sql
+0010_create_agent_connection_revocations.sql
+0011_create_saved_view_create_operations.sql
+0012_create_credential_recovery_jobs.sql
+```
+
+If the ledger differs, stop. Do not manually execute migration files or edit the
+Wrangler migration ledger.
+
+For this exact 0001 and 0002 baseline, migration 0006 creates
+`users.recovery_email` as `NULL` for every existing row, so migration 0012's
+legacy-destination guard remains zero without a destructive scrub. The private
+legacy export and scrub branch in the shared credential-recovery runbook applies
+only to an environment where migration 0006 is already present and non-null
+legacy destinations can exist.
+
+During the separately approved migration and deploy window, freeze login,
+account administration, and user creation. Then run the following in order:
+
+```bash
+npx wrangler d1 migrations apply DB --env wiser --remote
+npx wrangler d1 migrations list DB --env wiser --remote
+npx wrangler d1 execute DB --env wiser --remote --command \
+  "SELECT control_id, enabled FROM credential_recovery_control ORDER BY control_id"
+npm run deploy:wiser
+npm run transition:wiser-shared-mailboxes
+```
+
+The second migration-list command must report no pending migrations, and the
+control query must return exactly `global | 0`. The transition command is
+read-only preflight. After separate approval naming the Wiser production D1
+transition, apply it:
+
+```bash
+npm run transition:wiser-shared-mailboxes -- \
+  --apply \
+  --confirm transition-wiser-role-mailboxes
+```
+
+The transition keeps `hello@wiserchat.ai` and `contact@wiserchat.ai` as
+permanently inactive credential tombstones, converts their canonical Personal
+Mailboxes to Shared Mailboxes, and grants both Shared Mailboxes to
+`hesham@wiserchat.ai` and `ibrahem@wiserchat.ai`. It preserves immutable audit
+and unrelated data. Do not create a third user. If the command reports
+`COMMITTED cleanup pending`, allow the minutely Cron to drain exact Agent
+revocations and rerun the read-only preflight until it reports `PASS`.
+
+After this Wiser-specific migration and deploy branch is complete, use the
+shared [credential-recovery rollout runbook](credential-recovery-rollout-runbook.md)
+for AWS callback proof, independent monitoring, explicit recovery-control enable,
+and end-to-end recovery proof. Migration 0012 is never paired with an immediate
+enable. A missing or unreadable control remains disabled.
 
 ### Scheduled Maintenance
 
@@ -145,6 +205,7 @@ npx wrangler queues info wiser-mail-inbound --env wiser
 npx wrangler queues info wiser-mail-inbound-dlq --env wiser
 npx wrangler queues info wiser-mail-inbound-parking --env wiser
 npx wrangler queues info wiser-mail-emergency-forward --env wiser
+npx wrangler secret list --env wiser --format json
 ```
 
 Both attachment buckets must exist before any remote Wiser development session.
@@ -167,19 +228,37 @@ Older Queue deliveries acknowledge as stale, so overlapping Queue retry and
 Cron recovery cannot create more than one live delivery generation.
 
 `wrangler queues info` proves that a Queue exists, but it cannot prove retention
-or consumer settings. Confirm retention separately in the Cloudflare control
-plane; the rebuilt artifact verifier proves the configured consumer settings and
-edges. Queue creation and retention updates are production mutations requiring
-separate approval.
+or consumer settings. The current read-only inventory shows the Wiser primary,
+DLQ, and parking Queues but not `wiser-mail-emergency-forward`. After separate
+approval naming the missing Queue and all four retention updates, run:
 
-Raw R2 lifecycle and Bucket Lock retention are not product-locked. The read-only
-list commands establish current state only. Any future rule must use the exact
-`raw/` prefix, never the whole bucket or `receipts/`, `system/`, cursors,
-markers, anomalies, or audits. Before apex cutover, choose and record the raw
-retention behavior, obtain separate approval, then prove a `raw/` canary is
-protected while receipt and emergency-marker canaries can still be created,
-conditionally updated, and deleted. No duration or executable mutation
-placeholder in this runbook is approved for use.
+```bash
+npx wrangler queues create wiser-mail-emergency-forward \
+  --env wiser \
+  --message-retention-period-secs 1209600
+npx wrangler queues update wiser-mail-inbound \
+  --env wiser \
+  --message-retention-period-secs 1209600
+npx wrangler queues update wiser-mail-inbound-dlq \
+  --env wiser \
+  --message-retention-period-secs 1209600
+npx wrangler queues update wiser-mail-inbound-parking \
+  --env wiser \
+  --message-retention-period-secs 1209600
+npx wrangler queues update wiser-mail-emergency-forward \
+  --env wiser \
+  --message-retention-period-secs 1209600
+```
+
+Repeat all four `queues info` commands afterward. The rebuilt artifact verifier
+proves the configured consumer settings and edges. The Cloudflare control plane
+must show 14-day retention for every Queue before deploy.
+
+The current `wiser-mail-raw-archive` inventory has an enabled indefinite Bucket
+Lock on `raw/`. Verify that state before and after closeout and do not change it
+as part of this run. Any future lifecycle or Bucket Lock change needs a new
+decision and separate approval, must use the exact `raw/` prefix, and must never
+cover `receipts/`, `system/`, cursors, markers, anomalies, or audits.
 
 ### AWS SES
 
@@ -343,6 +422,25 @@ npx wrangler secret put VAPID_PRIVATE_KEY --env wiser
 
 Note: `wrangler secret put` creates and deploys a new Worker version immediately. Use `wrangler versions secret put` only if we deliberately move to staged Workers versions/gradual deployments.
 
+After the approved deploy, inventory names without reading values:
+
+```bash
+npx wrangler secret list --env wiser --format json
+```
+
+The final set must contain exactly the nine required names above. If an obsolete
+name remains, identify it in a separate secret-deletion approval, then delete
+only that exact name:
+
+```bash
+EXACT_OBSOLETE_SECRET="${EXACT_OBSOLETE_SECRET:?set one separately approved obsolete secret name}"
+npx wrangler secret delete "$EXACT_OBSOLETE_SECRET" --env wiser
+npx wrangler secret list --env wiser --format json
+unset EXACT_OBSOLETE_SECRET
+```
+
+Never delete a required name, and never infer obsolescence from age alone.
+
 ### HTTP Smoke Test
 
 After deploy:
@@ -354,17 +452,19 @@ curl -s https://mail.wiserchat.ai/manifest.webmanifest
 
 The manifest must use Wiser icons and Wiser theme values. The login page must render Wiser branding, not Whispyr.
 
-### First Admin And Mailboxes
+### Human Users And Shared Mailboxes
 
 1. Visit `https://mail.wiserchat.ai/login`.
-2. Sign in as `hesham@wiserchat.ai` with the chosen password to bootstrap the first ADMIN user.
-3. In `/admin/users`, create or confirm:
-   - `hello@wiserchat.ai`
-   - `contact@wiserchat.ai`
-4. Confirm each mailbox opens and creates its Durable Object state.
-5. Confirm no non-launch mailbox exists.
+2. Sign in as `hesham@wiserchat.ai`.
+3. Confirm `/admin/users` shows the two human accounts,
+   `hesham@wiserchat.ai` and `ibrahem@wiserchat.ai`. The inactive role-account
+   tombstones must not appear as manageable users.
+4. Confirm both humans can open `hello@wiserchat.ai` and
+   `contact@wiserchat.ai` as Shared Mailboxes.
+5. Confirm neither role address can authenticate and no non-launch Mailbox
+   exists.
 
-Do not enable catch-all routing to production until these mailboxes exist. The inbound handler rejects unprovisioned recipients.
+Do not add another account to satisfy the pilot. Do not create a third user.
 
 ### Outbound Proof
 
@@ -379,14 +479,93 @@ Confirm SPF, DKIM, and DMARC pass in the external recipient headers. Confirm sen
 
 ### Push Proof
 
-Use the repository's Playwright runner for browser validation at desktop and
-mobile widths:
+Use the repository's Playwright runner at desktop and mobile widths to verify
+the notification controls, permission states, subscription persistence, Wiser
+assets, and disabled state. Playwright cannot prove delivery of an
+operating-system push notification.
 
-1. Install/enable notifications from `mail.wiserchat.ai`.
-2. Confirm the subscription is stored in the user settings view.
-3. Receive a message for a subscribed mailbox.
-4. Confirm the notification uses Wiser icon/badge assets.
-5. Disable notifications and confirm no new push is sent.
+Complete the live proof on a real subscribed desktop or mobile device:
+
+1. Enable notifications from `mail.wiserchat.ai` and confirm the subscription
+   appears in the product.
+2. Put the portal in the background, send one uniquely referenced message to a
+   Shared Mailbox, and confirm one notification appears on the intended device.
+3. Open it and confirm it returns to the correct Wiser Mailbox without exposing
+   content from another Mailbox.
+4. Disable notifications in the product, send a second uniquely referenced
+   message, and confirm mail still arrives but no later push is delivered.
+
+### Email Authorization Boundary Canary
+
+This canary proves both Cloudflare mechanisms for both brands at 5.1 MiB and at
+the established 24,960,359-byte near-limit fixture. It sends exactly eight
+uniquely identified messages:
+
+- Wiser `message.forward()` at both sizes.
+- Wiser `send_email` at both sizes.
+- Whispyr `message.forward()` at both sizes.
+- Whispyr `send_email` at both sizes.
+
+The operator token needs only the scoped Cloudflare permissions required to
+read Email Routing state and verified addresses and to create and remove
+temporary Workers, KV namespaces, and Email Routing rules. The AWS identity
+needs SES v2 `SendEmail` for the two verified source domains in `eu-west-2`.
+Load the exact account and zone identifiers, then enter credentials without
+printing them:
+
+```bash
+set +x
+export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:?set the exact Cloudflare account ID}"
+export CLOUDFLARE_WISER_ZONE_ID="${CLOUDFLARE_WISER_ZONE_ID:?set the wiserchat.ai zone ID}"
+export CLOUDFLARE_WHISPYR_ZONE_ID="${CLOUDFLARE_WHISPYR_ZONE_ID:?set the whispyrcrm.com zone ID}"
+export AWS_REGION=eu-west-2
+printf 'Cloudflare API token: ' >&2
+IFS= read -r -s CLOUDFLARE_API_TOKEN </dev/tty
+printf '\nAWS access key ID: ' >&2
+IFS= read -r -s AWS_ACCESS_KEY_ID </dev/tty
+printf '\nAWS secret access key: ' >&2
+IFS= read -r -s AWS_SECRET_ACCESS_KEY </dev/tty
+printf '\n' >&2
+export CLOUDFLARE_API_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+npm run canary:email-authorization
+```
+
+The no-argument command is read-only preflight. It verifies both zones, the
+fixed destination, free routing-rule capacity, and absence of every generated
+resource name. It performs no sends and creates nothing.
+
+After same-turn approval naming both brands, two temporary Workers, two
+temporary KV namespaces, two temporary exact-address Email Routing rules,
+eight emails, and automatic cleanup, run:
+
+```bash
+npm run canary:email-authorization -- \
+  --apply --confirm run-email-authorization-canary
+CANARY_STATUS="$?"
+unset CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID
+unset CLOUDFLARE_WISER_ZONE_ID CLOUDFLARE_WHISPYR_ZONE_ID
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+test "$CANARY_STATUS" -eq 0
+unset CANARY_STATUS
+```
+
+Each brand's rule is created disabled, read back, enabled only for the two
+forward probes, disabled, and deleted before the `send_email` probes. The script
+does not retry an ambiguous SES, forward, or send operation. On failure or
+interruption it stops new probes, disables and deletes the exact temporary
+rule, removes the temporary Worker and KV namespace, and verifies the original
+rule list and catch-all are unchanged.
+
+Provider `messageId` evidence proves acceptance, not final inbox delivery.
+For forward probes, the private log records both the exact submitted fixture
+size and Cloudflare's observed raw size. SES replaces transport headers, so the
+observed size must remain within the script's bounded transport delta rather
+than equal the submitted bytes.
+Confirm all eight probe IDs arrived at `heshamelmahdi@gmail.com`, inspect their
+SPF, DKIM, and DMARC results, and attach the private log plus the eight
+privacy-safe probe IDs to the production evidence. Email Routing may label a
+successful `send_email` operation as dropped, so use Email Sending evidence and
+the external inbox, not that Routing label.
 
 ### Credential Recovery Proof And Monitoring
 
@@ -398,7 +577,7 @@ sequence.
 
 Use an approved disposable production account whose external destination is in
 `ACCOUNT_RECOVERY_DIRECTORY`. Request recovery from the public page and require
-all of the following before cutover:
+all of the following before recovery enable or pilot start:
 
 1. The public response is the same generic 202 shape for an eligible address and
    for an unknown address.
@@ -504,33 +683,41 @@ terminal. On the second exact-export run, require
 folder item must remain excluded. Do not continue to Zoho decommissioning on an
 unreconciled count or identity failure.
 
-### Mandatory Pre-MX Monitor Proof Gate
+### Mandatory Production Monitor Proof Gate
 
-Stage 2 is forbidden until the Wiser-specific immutable monitor proof record
-from shared rollout Step 7 is attached and separately approved, every named
-monitor rule has an independently received page, the complete 14-row CloudWatch
-alarm action proof is attached, and the last successful one-minute external poll
-is no more than two minutes old. Recovery control must already have followed the
-same proof gate. Recheck the proof references and current poll before requesting
-the MX approval.
+Recovery enable and Stage 3 are forbidden until the Wiser-specific immutable
+monitor proof record from shared rollout Step 7 is attached and separately
+approved, every named monitor rule has an independently received page, the
+complete 14-row CloudWatch alarm action proof is attached, and the last
+successful one-minute external poll is no more than two minutes old. Recheck
+the proof references and current poll before requesting recovery enable or
+starting the pilot.
 
-## Stage 2: Separately Approved Apex MX Cutover
+## Stage 2: Separately Approved Production Closeout
 
-Only after that monitor gate, Stage 1 outbound proof, import reconciliation, the
-raw R2 policy decision and approved application, and a separate same-turn
-approval naming the apex routing mutations:
+The apex route is already live. Do not change MX, the permanent catch-all, DNS,
+or SPF during this stage. Execute each separately approved action in this order:
 
-1. Record current Zoho MX/TXT records and TTLs.
-2. Lower relevant TTLs if needed and wait for propagation.
-3. Enable Cloudflare Email Routing for `wiserchat.ai`.
-4. Add a catch-all routing rule to `wiser-mail-portal`.
-5. Replace Zoho MX records with Cloudflare Email Routing MX records.
-6. Preserve/adjust SPF so both SES outbound and Cloudflare inbound forwarding needs are covered while the transition is active.
-7. Stop. Stage 2 changes routing only; perform all live-message proof in Stage 3.
+1. Create the missing Wiser emergency Queue and set all four Wiser Queue
+   retention periods to 14 days.
+2. Run the exact Wiser migration branch, verify no pending migration and
+   `global | 0`, then deploy the verified Wiser artifact.
+3. Run the Shared Mailbox transition, wait for Agent revocations to drain, and
+   require the read-only rerun to report `PASS`.
+4. Verify the exact nine-secret inventory and remove only separately approved
+   obsolete names.
+5. Complete HTTP, outbound, real-device push, and both-brand eight-message
+   authorization canaries.
+6. Complete the AWS callback graph, monitoring evidence, and explicit recovery
+   enable sequence from the shared runbook.
+7. Import and reconcile the exact `hello@` and `contact@` Zoho exports.
 
-## Stage 3: Production Validation And Monitoring
+Stop after any failed gate. A completed step is not permission to start the
+next production mutation without its own approval.
 
-After the apex cutover is active, validate only production addresses under the
+## Stage 3: Production Validation, Monitoring, And Pilot
+
+Validate the already-live apex using only production addresses under the
 approved external test-message scope:
 
 1. Confirm the active apex catch-all delivers to `wiser-mail-portal`.
@@ -543,6 +730,14 @@ approved external test-message scope:
 5. Confirm the Queue graph drains normally and the parking Queue stays empty.
 6. Monitor Worker logs, Cloudflare Email Routing activity, SES send metrics, and
    external inbox headers.
+
+Start the 72-hour pilot only after every validation and import gate passes.
+`hesham@wiserchat.ai` and `ibrahem@wiserchat.ai` must both operate
+`hello@wiserchat.ai` and `contact@wiserchat.ai` through ordinary receive, read,
+reply, new-send, attachment, desktop or mobile, and push workflows. Do not add a
+third pilot user. Lost mail, duplicate sending, unauthorized access, or hidden
+delivery failure stops the pilot and restarts the full clock after the defect
+and affected gates are closed.
 
 Do not create or operate `test.wiserchat.ai` mailboxes or Email Routing records.
 
@@ -616,7 +811,7 @@ no delivery-time bound while Cron is unavailable or while sustained ingress in
 any lane exceeds that lane's admitted throughput; Queue delivery and its retry
 policy continue independently during a Cron outage.
 
-During proof and cutover, monitor these conditions:
+During production proof and closeout, monitor these conditions:
 
 The independent application and inbound monitoring gate in the shared
 [credential-recovery rollout runbook](credential-recovery-rollout-runbook.md)
@@ -705,11 +900,18 @@ path in the incident record. Keep exact R2 identities inside the private receipt
 and server-side recovery flow. Never delete or overwrite the R2 raw object or
 recovery audit objects as part of replay.
 
-Before either environment is deployed, create or verify all four Queues, set message retention to the paid-plan maximum 14 days, and verify every binding and consumer. Verify `heshamelmahdi@gmail.com` as the fixed destination, onboard `emergency-forward@wiserchat.ai` and `emergency-forward@whispyrcrm.com` as sender addresses, and confirm the resolved artifact pins the same destination for both mechanisms. Queue creation, retention changes, Email Service onboarding, secret changes, and deployment require separate same-turn approval. Before cutover, each brand needs separate live 5.1 MiB and near-25 MiB proofs for ingress-time Email Routing `forward()` and post-ingress Email Service `send_email`; local dry-runs cannot prove account-level destination or sender authorization.
+Before the verified artifact is deployed, create or verify all four Queues, set
+message retention to 14 days, and verify every binding and consumer. Verify
+`heshamelmahdi@gmail.com` as the fixed destination, onboard
+`emergency-forward@wiserchat.ai` and
+`emergency-forward@whispyrcrm.com` as sender addresses, and confirm the resolved
+artifact pins the same destination for both mechanisms. Queue creation,
+retention changes, Email Service onboarding, secret changes, deployment, and
+the live eight-message canary each require their exact same-turn approval.
 
 ## Rollback
 
-Rollback before Zoho decommission:
+If an apex rollback is separately approved before Zoho decommission:
 
 1. Restore recorded Zoho MX records for `wiserchat.ai`.
 2. Disable or bypass the Cloudflare Email Routing rule for apex.
@@ -719,14 +921,15 @@ Rollback before Zoho decommission:
 Do not delete Wiser D1/R2/KV resources during rollback. Preserve imported mail and logs for reconciliation.
 Do not delete the raw-mail bucket, Queue, DLQ, receipt sidecars, or raw objects during rollback.
 Migration 0012 is forward-only. First disable the exact Wiser
-`credential_recovery_control` row, then roll forward a fix. After the explicit legacy scrub, do not restore
+`credential_recovery_control` row, then roll forward a fix. Do not restore
 private destinations to `users.recovery_email` and do not roll back to a Worker
-that reads or writes that column. Keep the private preflight export, the exact
-approved `ACCOUNT_RECOVERY_DIRECTORY`, `CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1`, and
-all recovery evidence tables intact. If the matching Worker cannot remain live,
-disable public recovery and roll forward a fix. Never delete or rotate the V1
-payload key as a rollback action because pending and parked ciphertext would
-become undecryptable.
+that reads or writes that column. Keep the exact approved
+`ACCOUNT_RECOVERY_DIRECTORY`, `CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1`, and all
+recovery evidence tables intact. If a private legacy export exists for another
+environment branch, keep it through that branch's rollback window. If the
+matching Worker cannot remain live, disable public recovery and roll forward a
+fix. Never delete or rotate the V1 payload key as a rollback action because
+pending and parked ciphertext would become undecryptable.
 
 ## Post-Go-Live Cleanup
 
@@ -753,14 +956,14 @@ Stop and rollback or ask for direction if any of these happen:
 
 - Wiser build or dry-run references a Whispyr resource.
 - Unknown recipients are accepted instead of rejected.
-- Any route other than the approved apex catch-all receives live Wiser mail.
+- Any route other than the approved apex catch-all or the canary script's exact
+  temporary recipient receives live Wiser mail.
 - SES headers fail DKIM or SPF for Wiser.
 - The UI shows Whispyr branding on `mail.wiserchat.ai`.
 - Imported mail count reconciliation fails without an explained duplicate/skip reason.
 - Any raw archive write fails or the raw object size does not match the Email Worker envelope size.
 - The inbound Queue, DLQ, parking Queue, or emergency-forward Queue is missing, paused unexpectedly, has the wrong retention, or has an unexplained backlog.
 - A receipt reports `dead_lettered`, `quarantined`, or `STORED_PROJECTION_MISSING` without an active incident and verified recovery decision.
-- Apex cutover is requested before exact-`raw/`-prefix R2 lifecycle and Bucket
-  Lock behavior is product-locked, recorded, separately approved, applied, and
-  verified without blocking mutable receipt or recovery-marker operations.
+- The enabled indefinite `raw/` Bucket Lock is missing or changes during
+  closeout.
 - Any secret appears in terminal output, files under git, Jira, or documentation.
