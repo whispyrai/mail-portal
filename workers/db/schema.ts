@@ -270,6 +270,91 @@ export const emailDeletionTombstones = sqliteTable("email_deletion_tombstones", 
 	deleted_at: text("deleted_at").notNull().default(sql`(datetime('now'))`),
 });
 
+export const inboundDeliveryAuthorities = sqliteTable(
+	"inbound_delivery_authorities",
+	{
+		id: text("id").primaryKey(),
+		schema_version: integer("schema_version").notNull(),
+		raw_key: text("raw_key").notNull(),
+		mailbox_id: text("mailbox_id").notNull(),
+		raw_size: integer("raw_size").notNull(),
+		raw_sha256: text("raw_sha256").notNull(),
+		archived_at: text("archived_at").notNull(),
+		archive_etag: text("archive_etag").notNull(),
+		archive_version: text("archive_version").notNull(),
+		generation: integer("generation").notNull().default(1),
+		state: text("state", { enum: ["projected", "deleted"] }).notNull(),
+		deleted_at: text("deleted_at"),
+	},
+	(table) => [
+		check(
+			"inbound_delivery_authorities_schema_version",
+			sql`${table.schema_version} = 1`,
+		),
+		check(
+			"inbound_delivery_authorities_raw_size",
+			sql`${table.raw_size} > 0 AND ${table.raw_size} <= 26214400`,
+		),
+		check(
+			"inbound_delivery_authorities_sha256",
+			sql`length(${table.raw_sha256}) = 64 AND ${table.raw_sha256} NOT GLOB '*[^0-9a-f]*'`,
+		),
+		check(
+			"inbound_delivery_authorities_generation",
+			sql`${table.generation} >= 1`,
+		),
+		check(
+			"inbound_delivery_authorities_state",
+			sql`${table.state} IN ('projected', 'deleted')`,
+		),
+		check(
+			"inbound_delivery_authorities_deleted_at",
+			sql`(${table.state} = 'projected' AND ${table.deleted_at} IS NULL) OR (${table.state} = 'deleted' AND ${table.deleted_at} IS NOT NULL)`,
+		),
+	],
+);
+
+export const directInboundDeliveryAuthorities = sqliteTable(
+	"direct_inbound_delivery_authorities",
+	{
+		id: text("id").primaryKey(),
+		schema_version: integer("schema_version").notNull(),
+		mailbox_id: text("mailbox_id").notNull(),
+		raw_size: integer("raw_size").notNull(),
+		raw_sha256: text("raw_sha256").notNull(),
+		received_at: text("received_at").notNull(),
+		generation: integer("generation").notNull().default(1),
+		state: text("state", { enum: ["projected", "deleted"] }).notNull(),
+		deleted_at: text("deleted_at"),
+	},
+	(table) => [
+		check(
+			"direct_inbound_delivery_authorities_schema_version",
+			sql`${table.schema_version} = 1`,
+		),
+		check(
+			"direct_inbound_delivery_authorities_raw_size",
+			sql`${table.raw_size} > 0 AND ${table.raw_size} <= 26214400`,
+		),
+		check(
+			"direct_inbound_delivery_authorities_sha256",
+			sql`length(${table.raw_sha256}) = 64 AND ${table.raw_sha256} NOT GLOB '*[^0-9a-f]*'`,
+		),
+		check(
+			"direct_inbound_delivery_authorities_generation",
+			sql`${table.generation} >= 1`,
+		),
+		check(
+			"direct_inbound_delivery_authorities_state",
+			sql`${table.state} IN ('projected', 'deleted')`,
+		),
+		check(
+			"direct_inbound_delivery_authorities_deleted_at",
+			sql`(${table.state} = 'projected' AND ${table.deleted_at} IS NULL) OR (${table.state} = 'deleted' AND ${table.deleted_at} IS NOT NULL)`,
+		),
+	],
+);
+
 export const inboundTerminalFailures = sqliteTable(
 	"inbound_terminal_failures",
 	{

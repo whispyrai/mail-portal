@@ -33,15 +33,25 @@ export const MAX_ARCHIVE_SERVICE_SUBREQUESTS_PER_ITEM = 521;
 export const MAX_ACTIVE_ARCHIVE_SERVICE_SUBREQUESTS_PER_ITEM =
 	MAX_ARCHIVE_SERVICE_SUBREQUESTS_PER_ITEM + 2;
 
-export const INBOUND_RECENT_RAW_RECONCILIATION_BATCH_SIZE = 128;
+export const INBOUND_RECENT_RAW_RECONCILIATION_BATCH_SIZE = 64;
 export const INBOUND_RECENT_RAW_MAX_PREFIX_LIST_CALLS = 64;
-// One receipt HEAD and one create-only active-marker put. Terminal receipts use
-// only the HEAD, but two calls is the admitted worst case.
-export const MAX_RECENT_RAW_SERVICE_SUBREQUESTS_PER_ITEM = 2;
+// Receipt HEAD + exact quarantine receipt GET + create-only active-marker put.
+// Non-quarantine items skip the GET, but all three calls are admitted so a
+// historical forward-eligible quarantine cannot be hidden by terminal metadata.
+export const MAX_RECENT_RAW_SERVICE_SUBREQUESTS_PER_ITEM = 3;
 // The priority and fixed backstop cursors each use one read and one write. They
 // share at most 64 closed-minute lists and 128 candidate objects per run.
 export const RECENT_RAW_LANE_OVERHEAD_SERVICE_SUBREQUESTS =
 	INBOUND_RECENT_RAW_MAX_PREFIX_LIST_CALLS + 4;
+
+// Emergency-forward reconciliation uses one cursor read, one active-marker
+// list, one cursor write, and a corrupt-cursor audit write. Per marker the
+// corrupt-marker + exact forward-eligible-quarantine branch may read marker,
+// receipt, and raw, CAS-repair/reread both sidecars, best-effort audit both
+// repairs, CAS-claim/reread a generation, enqueue, and retain cleanup authority.
+export const EMERGENCY_FORWARD_RECONCILIATION_BATCH_SIZE = 8;
+export const EMERGENCY_FORWARD_LANE_OVERHEAD_SERVICE_SUBREQUESTS = 4;
+export const MAX_EMERGENCY_FORWARD_SERVICE_SUBREQUESTS_PER_ITEM = 13;
 
 // Each lane spends one read, one list, and one cursor write outside its item
 // loop. The per-item ceilings mirror the actual worst-case call graphs so an
@@ -59,7 +69,10 @@ export const INBOUND_RECONCILIATION_WORST_CASE_SERVICE_SUBREQUESTS =
 	INBOUND_RECENT_RAW_RECONCILIATION_BATCH_SIZE *
 		MAX_RECENT_RAW_SERVICE_SUBREQUESTS_PER_ITEM +
 	INBOUND_RAW_BACKSTOP_RECONCILIATION_BATCH_SIZE *
-		MAX_ARCHIVE_SERVICE_SUBREQUESTS_PER_ITEM;
+		MAX_ARCHIVE_SERVICE_SUBREQUESTS_PER_ITEM +
+	EMERGENCY_FORWARD_LANE_OVERHEAD_SERVICE_SUBREQUESTS +
+	EMERGENCY_FORWARD_RECONCILIATION_BATCH_SIZE *
+		MAX_EMERGENCY_FORWARD_SERVICE_SUBREQUESTS_PER_ITEM;
 
 if (
 	INBOUND_RECONCILIATION_WORST_CASE_SERVICE_SUBREQUESTS >

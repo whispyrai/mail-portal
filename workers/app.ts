@@ -10,6 +10,7 @@ import { routeAgentRequest } from "agents";
 import { Hono, type Context } from "hono";
 import { createRequestHandler } from "react-router";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { EmailMessage } from "cloudflare:email";
 import { app as apiApp } from "./index";
 import { receiveEmail } from "./inbound-email";
 import {
@@ -17,6 +18,10 @@ import {
   processInboundDeadLetterBatch,
 } from "./inbound-queue.ts";
 import { reconcileInboundArchives } from "./inbound-reconciliation.ts";
+import {
+  processEmergencyForwardBatch,
+  reconcileEmergencyForwardMarkers,
+} from "./lib/emergency-forward.ts";
 import { EmailMCP } from "./mcp";
 import { adminApp } from "./routes/admin";
 import { bulkPage } from "./routes/bulk";
@@ -426,7 +431,16 @@ export default {
     // Per Cloudflare Workers Cron Triggers docs, every configured schedule invokes
     // this handler and controller.cron identifies the exact maintenance lane.
 	if (controller.cron === "*/5 * * * *") {
-		await reconcileInboundArchives(env);
+		const results = await Promise.allSettled([
+			reconcileInboundArchives(env),
+			reconcileEmergencyForwardMarkers(env),
+		]);
+		const failures = results
+			.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+			.map((result) => result.reason);
+		if (failures.length > 0) {
+			throw new AggregateError(failures, "Inbound recovery maintenance failed");
+		}
 		return;
 	}
 	await runScheduledMaintenance(env, controller);
@@ -441,6 +455,14 @@ export default {
 		batch.queue === env.INBOUND_PARKING_NAME
 	) {
 		await processInboundDeadLetterBatch(batch, env);
+		return;
+	}
+	if (batch.queue === env.EMERGENCY_FORWARD_QUEUE_NAME) {
+		await processEmergencyForwardBatch(batch, env, {
+			now: () => new Date(),
+			createEmailMessage: (from, to, raw) =>
+				new EmailMessage(from, to, raw),
+		});
 		return;
 	}
 	throw new Error(`Unknown Queue binding: ${batch.queue}`);

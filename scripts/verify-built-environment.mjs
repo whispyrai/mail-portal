@@ -3,16 +3,18 @@
 // mistakes, so this script inspects the exact artifact Wrangler will deploy.
 
 import assert from "node:assert/strict";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createPrivateOperationLogger } from "./private-operation-logger.mjs";
 
-const REQUIRED_SECRETS = [
+export const REQUIRED_SECRETS = [
 	"ACCOUNT_RECOVERY_DIRECTORY",
 	"ADMIN_BOOTSTRAP_EMAIL",
 	"AWS_ACCESS_KEY_ID",
 	"AWS_SECRET_ACCESS_KEY",
-	"EMERGENCY_FORWARD_TO",
+	"CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1",
 	"JWT_SECRET",
 	"SES_EVENT_WEBHOOK_SECRET",
 	"VAPID_PRIVATE_KEY",
@@ -20,6 +22,10 @@ const REQUIRED_SECRETS = [
 ];
 
 const CRONS = ["* * * * *", "*/5 * * * *", "17 * * * *"];
+const COMPATIBILITY_DATE = "2025-11-28";
+const GENERATED_MODULE_RULES = [
+	{ type: "ESModule", globs: ["**/*.js", "**/*.mjs"] },
+];
 
 const ENVIRONMENTS = {
 	whispyr: {
@@ -36,6 +42,8 @@ const ENVIRONMENTS = {
 		inboundQueue: "sales-mail-inbound",
 		inboundDlq: "sales-mail-inbound-dlq",
 		inboundParking: "sales-mail-inbound-parking",
+		emergencyQueue: "sales-mail-emergency-forward",
+		emergencyFrom: "emergency-forward@whispyrcrm.com",
 		kvId: "cd541026bdf949d9ac63b3b5fdff4969",
 		route: "mail.whispyrcrm.com",
 		forbidden: [
@@ -46,6 +54,8 @@ const ENVIRONMENTS = {
 			"c934d803c2f8430d9088f4a5d9f29d55",
 			"wiser-mail-raw-archive",
 			"wiser-mail-inbound",
+			"wiser-mail-emergency-forward",
+			"emergency-forward@wiserchat.ai",
 			"wiserchat.ai",
 		],
 	},
@@ -63,6 +73,8 @@ const ENVIRONMENTS = {
 		inboundQueue: "wiser-mail-inbound",
 		inboundDlq: "wiser-mail-inbound-dlq",
 		inboundParking: "wiser-mail-inbound-parking",
+		emergencyQueue: "wiser-mail-emergency-forward",
+		emergencyFrom: "emergency-forward@wiserchat.ai",
 		kvId: "c934d803c2f8430d9088f4a5d9f29d55",
 		route: "mail.wiserchat.ai",
 		forbidden: [
@@ -73,6 +85,8 @@ const ENVIRONMENTS = {
 			"cd541026bdf949d9ac63b3b5fdff4969",
 			"sales-mail-raw-archive",
 			"sales-mail-inbound",
+			"sales-mail-emergency-forward",
+			"emergency-forward@whispyrcrm.com",
 			"whispyrcrm.com",
 			"test.wiserchat.ai",
 		],
@@ -88,7 +102,6 @@ const EMPTY_RESOURCE_COLLECTIONS = [
 	"pipelines",
 	"ratelimits",
 	"secrets_store_secrets",
-	"send_email",
 	"services",
 	"tail_consumers",
 	"unsafe_hello_world",
@@ -102,34 +115,21 @@ const FORBIDDEN_RESOURCE_OBJECTS = ["browser", "images", "version_metadata"];
 
 function defaultLogFilePath(brand, now = new Date()) {
 	const timestamp = now.toISOString().replace(/[:.]/g, "-");
+	const suffix = randomBytes(6).toString("hex");
 	return resolve(
 		"script-logs",
-		`verify-built-environment-${brand || "unknown"}-${timestamp}.log`,
+		`verify-built-environment-${brand || "unknown"}-${timestamp}-${process.pid}-${suffix}.log`,
 	);
 }
 
 async function createLogger({ brand, logFilePath, stdout, stderr }) {
 	const resolvedLogFilePath = resolve(logFilePath ?? defaultLogFilePath(brand));
-	await mkdir(dirname(resolvedLogFilePath), { recursive: true });
-	await writeFile(
-		resolvedLogFilePath,
-		`verify-built-environment\nbrand=${brand || "<missing>"}\nstarted_at=${new Date().toISOString()}\n`,
-		"utf8",
-	);
-
-	const detail = async (message) => {
-		await appendFile(resolvedLogFilePath, `${message}\n`, "utf8");
-	};
-	const progress = async (message) => {
-		stdout(message);
-		await detail(message);
-	};
-	const failure = async (message) => {
-		stderr(message);
-		await detail(message);
-	};
-
-	return { detail, failure, logFilePath: resolvedLogFilePath, progress };
+	return createPrivateOperationLogger({
+		logFilePath: resolvedLogFilePath,
+		header: `verify-built-environment\nbrand=${brand || "<missing>"}\nstarted_at=${new Date().toISOString()}`,
+		stdout,
+		stderr,
+	});
 }
 
 async function checkEqual(logger, actual, expected, label) {
@@ -143,33 +143,42 @@ function expectedQueueTopology(expected) {
 	return {
 		producers: [
 			{ binding: "INBOUND_QUEUE", queue: expected.inboundQueue },
+			{ binding: "EMERGENCY_FORWARD_QUEUE", queue: expected.emergencyQueue },
 		],
 		consumers: [
 			{
 				queue: expected.inboundQueue,
-				max_batch_size: 1,
-				max_concurrency: 1,
-				max_batch_timeout: 5,
+				max_batch_size: 2,
+				max_concurrency: 8,
+				max_batch_timeout: 1,
 				max_retries: 10,
-				retry_delay: 1,
+				retry_delay: 30,
 				dead_letter_queue: expected.inboundDlq,
 			},
 			{
 				queue: expected.inboundDlq,
-				max_batch_size: 1,
-				max_concurrency: 1,
-				max_batch_timeout: 5,
+				max_batch_size: 4,
+				max_concurrency: 4,
+				max_batch_timeout: 1,
 				max_retries: 10,
-				retry_delay: 60,
+				retry_delay: 30,
 				dead_letter_queue: expected.inboundParking,
 			},
 			{
 				queue: expected.inboundParking,
-				max_batch_size: 1,
-				max_concurrency: 1,
-				max_batch_timeout: 5,
+				max_batch_size: 4,
+				max_concurrency: 4,
+				max_batch_timeout: 1,
 				max_retries: 100,
-				retry_delay: 3600,
+				retry_delay: 300,
+			},
+			{
+				queue: expected.emergencyQueue,
+				max_batch_size: 2,
+				max_concurrency: 4,
+				max_batch_timeout: 1,
+				max_retries: 100,
+				retry_delay: 30,
 			},
 		],
 	};
@@ -203,10 +212,42 @@ export async function verifyBuiltEnvironment({
 		await logger.detail(`resolved_configuration=${JSON.stringify(config)}`);
 
 		await logger.progress("Phase 2/4: checking identity and exact bindings");
+		await checkEqual(logger, config.main, "index.js", "generated main module");
+		await checkEqual(
+			logger,
+			config.rules,
+			GENERATED_MODULE_RULES,
+			"generated module rules",
+		);
+		await checkEqual(logger, config.no_bundle, true, "generated no_bundle shape");
+		await checkEqual(
+			logger,
+			config.compatibility_date,
+			COMPATIBILITY_DATE,
+			"compatibility_date",
+		);
+		await checkEqual(
+			logger,
+			config.observability,
+			{ enabled: true },
+			"observability",
+		);
 		await checkEqual(logger, config.name, expected.name, "Worker name");
 		await checkEqual(logger, config.vars?.BRAND, expected.brand, "BRAND");
 		await checkEqual(logger, config.vars?.DOMAINS, expected.domains, "DOMAINS");
 		await checkEqual(logger, config.vars?.FEATURES, expected.features, "FEATURES");
+		await checkEqual(
+			logger,
+			config.vars?.AWS_REGION,
+			"eu-west-2",
+			"AWS_REGION",
+		);
+		await checkEqual(
+			logger,
+			config.vars?.SES_CONFIGURATION_SET,
+			"mail-portal-events",
+			"SES_CONFIGURATION_SET",
+		);
 		await checkEqual(
 			logger,
 			config.vars?.INBOUND_QUEUE_NAME,
@@ -224,6 +265,24 @@ export async function verifyBuiltEnvironment({
 			config.vars?.INBOUND_PARKING_NAME,
 			expected.inboundParking,
 			"INBOUND_PARKING_NAME",
+		);
+		await checkEqual(
+			logger,
+			config.vars?.EMERGENCY_FORWARD_QUEUE_NAME,
+			expected.emergencyQueue,
+			"EMERGENCY_FORWARD_QUEUE_NAME",
+		);
+		await checkEqual(
+			logger,
+			config.vars?.EMERGENCY_FORWARD_FROM,
+			expected.emergencyFrom,
+			"EMERGENCY_FORWARD_FROM",
+		);
+		await checkEqual(
+			logger,
+			config.vars?.EMERGENCY_FORWARD_DESTINATION,
+			"heshamelmahdi@gmail.com",
+			"EMERGENCY_FORWARD_DESTINATION",
 		);
 		await checkEqual(
 			logger,
@@ -276,6 +335,18 @@ export async function verifyBuiltEnvironment({
 				},
 			],
 			"R2 bindings",
+		);
+		await checkEqual(
+			logger,
+			config.send_email,
+			[
+				{
+					name: "EMERGENCY_EMAIL",
+					destination_address: "heshamelmahdi@gmail.com",
+					allowed_sender_addresses: [expected.emergencyFrom],
+				},
+			],
+			"fixed emergency Email Service binding",
 		);
 		await checkEqual(
 			logger,
@@ -349,6 +420,8 @@ export async function verifyBuiltEnvironment({
 			`${brand || "Environment"} built environment verification failed. See ${logger.logFilePath}`,
 		);
 		throw error;
+	} finally {
+		await logger.close();
 	}
 }
 

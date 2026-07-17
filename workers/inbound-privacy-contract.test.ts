@@ -119,6 +119,9 @@ const allowedTelemetryFields = new Set([
   "projectionMissing",
   "queueRef",
   "rawSize",
+  "recentDiscovered",
+  "recentScanned",
+  "recentSweepStatus",
   "recoveryAction",
   "reenqueued",
   "repairResolved",
@@ -146,6 +149,7 @@ const telemetryRefFields = new Set([
 
 const approvedMailTelemetryPrefixes = new Set([
   "[mail-cleanup]",
+  "[mail-emergency-forward]",
   "[mail-import]",
   "[mail-ingress]",
   "[mail-projection]",
@@ -2168,7 +2172,30 @@ function isExactNamedCall(
     unwrapped.expression.text === name &&
     (name === "projectionTelemetryRefs"
       ? hasVerifiedProjectionTelemetryRefsHelper(source, call)
-      : isTrustedNamedHelper(source, unwrapped, name))
+      : name === "bestEffortMailTelemetryLogRef"
+        ? hasVerifiedBestEffortMailTelemetryLogRefHelper(source)
+        : isTrustedNamedHelper(source, unwrapped, name))
+  );
+}
+
+function hasVerifiedBestEffortMailTelemetryLogRefHelper(
+  source: ts.SourceFile,
+): boolean {
+  const helpers = source.statements.filter(
+    (statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) &&
+      statement.name?.text === "bestEffortMailTelemetryLogRef",
+  );
+  if (helpers.length !== 1 || !helpers[0].body) return false;
+  const text = helpers[0].body.getText(source);
+  return (
+    /Promise\.race\(\[/.test(text) &&
+    (/mailTelemetryLogRef\(kind, value\)/.test(text) ||
+      /runtime\.telemetryLogRef\(kind, value\)/.test(text)) &&
+    (/setTimeout\(\(\) => resolve\("unavailable"\), 25\)/.test(text) ||
+      /runtime\.bestEffortTimeoutMs/.test(text)) &&
+    /catch\s*\{\s*return "unavailable";\s*\}/s.test(text) &&
+    /clearTimeout\(timeout\)/.test(text)
   );
 }
 
@@ -2243,14 +2270,23 @@ function initializerHasExactOpaqueRefOrigin(
 ): boolean {
   if (!declaration.initializer) return false;
   if (ts.isIdentifier(declaration.name)) {
+    const initializer = unwrapOpaqueInitializer(declaration.initializer);
     return (
       declaration.name.text === refName &&
-      isExactNamedCall(
-        source,
-        call,
-        declaration.initializer,
-        "mailTelemetryLogRef",
-      )
+      ((ts.isStringLiteral(initializer) &&
+        initializer.text === "unavailable") ||
+        isExactNamedCall(
+          source,
+          call,
+          declaration.initializer,
+          "mailTelemetryLogRef",
+        ) ||
+        isExactNamedCall(
+          source,
+          call,
+          declaration.initializer,
+          "bestEffortMailTelemetryLogRef",
+        ))
     );
   }
   if (ts.isObjectBindingPattern(declaration.name)) {
@@ -2287,7 +2323,13 @@ function initializerHasExactOpaqueRefOrigin(
   const refSource = initializer.arguments[0].elements[index];
   return Boolean(
     refSource &&
-      isExactNamedCall(source, call, refSource, "mailTelemetryLogRef"),
+      (isExactNamedCall(source, call, refSource, "mailTelemetryLogRef") ||
+        isExactNamedCall(
+          source,
+          call,
+          refSource,
+          "bestEffortMailTelemetryLogRef",
+        )),
   );
 }
 

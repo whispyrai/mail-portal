@@ -20,6 +20,15 @@ import {
 	type ReplyRefinementRuntimeResponse,
 } from "../lib/reply-refinement-runtime.ts";
 import type { Env } from "../types.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+} from "../lib/live-authorized-read.ts";
+import {
+	hasExactLiveMailboxAccess,
+	runLiveMailboxAuthorizedRead,
+	type LiveMailboxAccessAuthorizer,
+} from "../lib/live-mailbox-authorization.ts";
 
 export type ReplyRefinementRouteContext = {
 	Bindings: Env;
@@ -125,11 +134,13 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 
 export function createReplyRefinementRoutes(
 	dependencies: ReplyRefinementRouteDependencies = productionDependencies,
+	authorize: LiveMailboxAccessAuthorizer = hasExactLiveMailboxAccess,
 ) {
 	const app = new Hono<ReplyRefinementRouteContext>();
 	const path =
 		"/api/v1/mailboxes/:mailboxId/emails/:emailId/reply-refinement";
 	app.use(path, async (c, next) => {
+		c.header("Cache-Control", "private, no-store");
 		if (!c.get("session")) return c.json({ error: "Unauthorized" }, 401);
 		if (!c.get("mailboxStub")) {
 			return c.json({ error: "Mailbox access is required" }, 403);
@@ -157,16 +168,31 @@ export function createReplyRefinementRoutes(
 		const session = c.get("session")!;
 		try {
 			return c.json(
-				await dependencies.run({
-					env: c.env,
-					actorUserId: session.sub,
-					mailboxId,
-					sourceEmailId,
-					request,
-					stub: c.get("mailboxStub")!,
-				}),
+				await runLiveMailboxAuthorizedRead(
+					c.env,
+					{
+						mailboxId,
+						userId: session.sub,
+						sessionVersion: session.sessionVersion,
+					},
+					() => dependencies.run({
+						env: c.env,
+						actorUserId: session.sub,
+						mailboxId,
+						sourceEmailId,
+						request,
+						stub: c.get("mailboxStub")!,
+					}),
+					authorize,
+				),
 			);
 		} catch (error) {
+			if (error instanceof LiveReadAuthorizationError) {
+				return c.json({ error: "Forbidden" }, 403);
+			}
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return c.json({ error: "Authorization unavailable" }, 503);
+			}
 			if (error instanceof ReplyRefinementAccessRevokedError) {
 				return c.json({ error: "Mailbox access is no longer active." }, 403);
 			}

@@ -73,6 +73,151 @@ async function recipientHash(address: string): Promise<string> {
 		.join("");
 }
 
+async function recordCredentialRecoveryEvent(
+	c: SesContext,
+	input: {
+		eventId: string;
+		outboxId: string;
+		attemptId: string;
+		providerMessageId: string;
+		eventType: "delivery" | "bounce" | "complaint";
+		occurredAt: number;
+		receivedAt: number;
+	},
+) {
+	if (
+		[input.eventId, input.outboxId, input.attemptId, input.providerMessageId].some(
+			(value) => value.length === 0 || value.length > 255,
+		)
+	) {
+		return c.json({ error: "Invalid SES event correlation" }, 400);
+	}
+	await c.env.DB.batch([
+		c.env.DB.prepare(
+			`UPDATE credential_recovery_delivery_outbox
+			 SET state = 'accepted', lease_token = NULL, lease_expires_at = NULL,
+			     payload_key_version = NULL, payload_iv = NULL, payload_ciphertext = NULL,
+			     provider_message_id = ?, accepted_attempt_id = ?, accepted_at = ?,
+			     completed_at = ?, updated_at = ?, last_error_code = NULL
+			 WHERE id = ? AND state IN ('pending', 'leased', 'dispatching', 'cancelled', 'expired', 'parked')
+			   AND EXISTS (
+			     SELECT 1 FROM credential_recovery_delivery_attempts
+			     WHERE attempt_id = ? AND outbox_id = ?
+			       AND state IN ('dispatching', 'ambiguous', 'http_rejected')
+			   )`,
+		).bind(
+			input.providerMessageId,
+			input.attemptId,
+			input.receivedAt,
+			input.receivedAt,
+			input.receivedAt,
+			input.outboxId,
+			input.attemptId,
+			input.outboxId,
+		),
+		c.env.DB.prepare(
+			`UPDATE credential_recovery_delivery_attempts
+			 SET state = 'accepted', provider_message_id = ?, resolved_at = ?, updated_at = ?
+			 WHERE attempt_id = ? AND outbox_id = ?
+			   AND state IN ('dispatching', 'ambiguous', 'http_rejected')
+			   AND EXISTS (
+			     SELECT 1 FROM credential_recovery_delivery_outbox
+			     WHERE id = ? AND state = 'accepted'
+			   )`,
+		).bind(
+			input.providerMessageId,
+			input.receivedAt,
+			input.receivedAt,
+			input.attemptId,
+			input.outboxId,
+			input.outboxId,
+		),
+		c.env.DB.prepare(
+			`INSERT OR IGNORE INTO credential_recovery_delivery_events
+			 (event_id, outbox_id, attempt_id, provider_message_id, event_type, occurred_at, recorded_at)
+			 SELECT ?, o.id, a.attempt_id, ?, ?, ?, ?
+			 FROM credential_recovery_delivery_outbox o
+			 JOIN credential_recovery_delivery_attempts a
+			   ON a.outbox_id = o.id AND a.attempt_id = ?
+			 WHERE o.id = ? AND o.state = 'accepted' AND a.state = 'accepted'
+			   AND a.provider_message_id = ?`,
+		).bind(
+			input.eventId,
+			input.providerMessageId,
+			input.eventType,
+			input.occurredAt,
+			input.receivedAt,
+			input.attemptId,
+			input.outboxId,
+			input.providerMessageId,
+		),
+		c.env.DB.prepare(
+			`UPDATE credential_recovery_delivery_outbox
+			 SET provider_event_status = ?, provider_event_at = ?, updated_at = ?
+			 WHERE id = ? AND state = 'accepted'
+			   AND accepted_attempt_id = ? AND provider_message_id = ?
+			   AND (provider_event_at IS NULL OR provider_event_at <= ?)
+			   AND EXISTS (
+			     SELECT 1 FROM credential_recovery_delivery_events
+			     WHERE event_id = ? AND outbox_id = ? AND attempt_id = ?
+			       AND provider_message_id = ?
+			       AND event_type = ?
+			   )`,
+		).bind(
+			input.eventType,
+			input.occurredAt,
+			input.receivedAt,
+			input.outboxId,
+			input.attemptId,
+			input.providerMessageId,
+			input.occurredAt,
+			input.eventId,
+			input.outboxId,
+			input.attemptId,
+			input.providerMessageId,
+			input.eventType,
+		),
+	]);
+	const recorded = await c.env.DB.prepare(
+		`SELECT event_type FROM credential_recovery_delivery_events
+		 WHERE event_id = ? AND outbox_id = ? AND attempt_id = ?
+		   AND provider_message_id = ?`,
+	)
+		.bind(input.eventId, input.outboxId, input.attemptId, input.providerMessageId)
+		.first<{ event_type: string }>();
+	if (!recorded) {
+		const current = await c.env.DB.prepare(
+			`SELECT o.state, o.accepted_attempt_id, o.provider_message_id,
+			        a.state AS attempt_state
+			 FROM credential_recovery_delivery_outbox o
+			 LEFT JOIN credential_recovery_delivery_attempts a
+			   ON a.outbox_id = o.id AND a.attempt_id = ?
+			 WHERE o.id = ?`,
+		)
+			.bind(input.attemptId, input.outboxId)
+			.first<{
+				state: string;
+				accepted_attempt_id: string | null;
+				provider_message_id: string | null;
+				attempt_state: string | null;
+			}>();
+		return current
+			? c.json({ error: "Invalid SES event correlation" }, 400)
+			: c.json({ error: "SES event correlation is not ready" }, 503);
+	}
+	if (recorded.event_type !== input.eventType) {
+		return c.json({ error: "Invalid SES event correlation" }, 400);
+	}
+	console.info("[credential-recovery] provider event recorded", {
+		operation: "credential_recovery_provider_event",
+		deliveryId: input.outboxId,
+		attemptId: input.attemptId,
+		eventType: input.eventType,
+		outcome: "recorded",
+	});
+	return c.json({ status: "recorded" }, 202);
+}
+
 export async function handleSesEvent(c: SesContext) {
 	const token = readBearerToken(c.req.header("authorization"));
 	if (
@@ -83,7 +228,24 @@ export async function handleSesEvent(c: SesContext) {
 		return c.json({ error: "Unauthorized" }, 401);
 	}
 
-	const body = (await c.req.json()) as Record<string, unknown>;
+	const declaredLength = Number(c.req.header("content-length") ?? "0");
+	if (Number.isFinite(declaredLength) && declaredLength > 256 * 1024) {
+		return c.json({ error: "SES event body is too large" }, 413);
+	}
+	const rawBody = await c.req.text();
+	if (new TextEncoder().encode(rawBody).byteLength > 256 * 1024) {
+		return c.json({ error: "SES event body is too large" }, 413);
+	}
+	let body: Record<string, unknown>;
+	try {
+		const parsed = JSON.parse(rawBody) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return c.json({ error: "Invalid SES event" }, 400);
+		}
+		body = parsed as Record<string, unknown>;
+	} catch {
+		return c.json({ error: "Invalid SES event" }, 400);
+	}
 	const detail =
 		body.detail && typeof body.detail === "object"
 			? (body.detail as Record<string, unknown>)
@@ -107,7 +269,29 @@ export async function handleSesEvent(c: SesContext) {
 	const mailboxKey = firstTag(tags, "MailboxKey");
 	const deliveryId = firstTag(tags, "DeliveryId");
 	const attemptId = firstTag(tags, "AttemptId");
+	const credentialRecoveryId = firstTag(tags, "CredentialRecoveryId");
+	const credentialRecoveryAttempt = firstTag(tags, "CredentialRecoveryAttempt");
 	const eventId = typeof body.id === "string" ? body.id.trim() : "";
+	const receivedAtDate = new Date();
+	const occurredAtRaw =
+		typeof body.time === "string" ? body.time : receivedAtDate.toISOString();
+	const occurredAtMs = Number.isFinite(Date.parse(occurredAtRaw))
+		? Date.parse(occurredAtRaw)
+		: receivedAtDate.getTime();
+	if (credentialRecoveryId || credentialRecoveryAttempt) {
+		if (!sesMessageId || !eventId || !credentialRecoveryId || !credentialRecoveryAttempt) {
+			return c.json({ error: "Invalid SES event correlation" }, 400);
+		}
+		return recordCredentialRecoveryEvent(c, {
+			eventId,
+			outboxId: credentialRecoveryId,
+			attemptId: credentialRecoveryAttempt,
+			providerMessageId: sesMessageId,
+			eventType: rawType,
+			occurredAt: occurredAtMs,
+			receivedAt: receivedAtDate.getTime(),
+		});
+	}
 	const mailboxId = mailboxKey
 		? normalizeMailAddress(decodeBase64UrlText(mailboxKey) ?? "")
 		: null;
@@ -123,9 +307,7 @@ export async function handleSesEvent(c: SesContext) {
 	}
 
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
-	const receivedAt = new Date().toISOString();
-	const occurredAtRaw =
-		typeof body.time === "string" ? body.time : receivedAt;
+	const receivedAt = receivedAtDate.toISOString();
 	const occurredAt = Number.isFinite(Date.parse(occurredAtRaw))
 		? new Date(Date.parse(occurredAtRaw)).toISOString()
 		: receivedAt;

@@ -25,9 +25,12 @@ type ImportMailboxStore = MailboxEmailStore & {
 		emailId: string,
 		legacyId: string,
 		token: string,
+		identitySource: "message-id" | "raw-sha256",
+		rawSha256: string | null,
 	): Promise<
 		| { status: "claimed" }
-		| { status: "existing"; id: string }
+		| { status: "existing"; id: string; folder: string; rawSha256?: string }
+		| { status: "identity_conflict"; id: string }
 		| { status: "busy" }
 	>;
 	releaseImportedEmailClaim(emailId: string, token: string): Promise<boolean>;
@@ -59,7 +62,10 @@ type ImportMailboxStore = MailboxEmailStore & {
 		mailboxAddress: string | undefined,
 		claimToken: string,
 		proofFingerprint: string,
-	): Promise<{ status?: string }>;
+		identitySource: "message-id" | "raw-sha256",
+		rawSha256: string | null,
+		legacyId: string,
+	): Promise<{ status?: string; folder?: unknown }>;
 	hasEmailOrThreadIdentity(identity: string): Promise<boolean>;
 };
 
@@ -79,33 +85,61 @@ export async function importParsedEmail(
 	parsed: Email,
 	folder: FolderId,
 	mailboxId: string,
+	rawSha256?: string,
 ) {
+	const identitySource = parsed.messageId?.trim()
+		? "message-id" as const
+		: "raw-sha256" as const;
 	const recipients = [...(parsed.to ?? []), ...(parsed.cc ?? []), ...(parsed.bcc ?? [])]
 		.flatMap((recipient) => (recipient.address ? [recipient.address.toLowerCase()] : []))
 		.sort()
 		.join(",");
 	const identity = {
 		messageId: parsed.messageId,
+		rawSha256,
 		from: parsed.from?.address?.toLowerCase(),
 		to: recipients,
 		date: parsed.date,
 		subject: parsed.subject,
 		content: parsed.html ?? parsed.text ?? "",
 	};
-	const [id, legacyId] = await Promise.all([
-		deriveImportId(identity, mailboxId),
-		deriveLegacyImportId(identity),
-	]);
+	const id = await deriveImportId(identity, mailboxId);
+	// The historical no-Message-ID fingerprint omitted exact source bytes. Its
+	// duplicate claim is therefore unknowable and must not suppress this import.
+	const legacyId = identitySource === "message-id"
+		? await deriveLegacyImportId(identity)
+		: id;
 	const claimToken = crypto.randomUUID();
 	let sealedFingerprint: string | null = null;
 	let intendedObjectCount = 0;
-	const claim = await dependencies.mailbox.claimImportedEmail(id, legacyId, claimToken);
+	let durableDuplicateFolder: string | null = null;
+	const exactRawSha256 = identitySource === "raw-sha256" ? rawSha256 ?? null : null;
+	const claim = await dependencies.mailbox.claimImportedEmail(
+		id,
+		legacyId,
+		claimToken,
+		identitySource,
+		exactRawSha256,
+	);
 	if (claim.status === "existing") {
 		return {
 			status: "skipped" as const,
 			reason: "duplicate" as const,
 			id: claim.id,
+			folder: claim.folder,
+			identitySource,
+			...(identitySource === "raw-sha256"
+				? { rawSha256: claim.rawSha256 }
+				: {}),
+		};
+	}
+	if (claim.status === "identity_conflict") {
+		return {
+			status: "skipped" as const,
+			reason: "identity_conflict" as const,
+			id: claim.id,
 			folder,
+			identitySource,
 		};
 	}
 	if (claim.status === "busy") {
@@ -114,6 +148,7 @@ export async function importParsedEmail(
 			reason: "in_progress" as const,
 			id,
 			folder,
+			identitySource,
 		};
 	}
 
@@ -123,11 +158,17 @@ export async function importParsedEmail(
 			inReplyTo: parsed.inReplyTo,
 			references: parsed.references,
 		};
-		const [scopedThreadId, legacyThreadId] = await Promise.all([
-			deriveImportThreadId(threadIdentity, mailboxId),
-			deriveLegacyImportThreadId(threadIdentity),
-		]);
-		const threadId = await dependencies.mailbox.hasEmailOrThreadIdentity(legacyThreadId)
+		const scopedThreadId = await deriveImportThreadId(threadIdentity, mailboxId);
+		const hasRfcThreadIdentity = Boolean(
+			parsed.references?.trim() ||
+			parsed.inReplyTo?.trim() ||
+			parsed.messageId?.trim(),
+		);
+		const legacyThreadId = hasRfcThreadIdentity
+			? await deriveLegacyImportThreadId(threadIdentity)
+			: null;
+		const threadId = legacyThreadId &&
+			await dependencies.mailbox.hasEmailOrThreadIdentity(legacyThreadId)
 			? legacyThreadId
 			: scopedThreadId;
 		const pendingObjects = new Map<string, ArrayBuffer | string>();
@@ -202,15 +243,29 @@ export async function importParsedEmail(
 					args[4],
 					claimToken,
 					sealedFingerprint,
+					identitySource,
+					exactRawSha256,
+					legacyId,
 				);
 				if (result.status === "cleanup_conflict") {
 					throw new Error("Import promotion cleanup ownership conflicted");
+				}
+				if (result.status !== "stored" && result.status !== "duplicate") {
+					throw new Error("Import projection returned an unexpected status");
+				}
+				if (result.status === "duplicate") {
+					if (typeof result.folder !== "string" || !result.folder) {
+						throw new Error(
+							"Import duplicate projection omitted its authoritative folder",
+						);
+					}
+					durableDuplicateFolder = result.folder;
 				}
 				return result;
 			},
 		};
 
-		await storeParsedEmail({ bucket: importBucket, mailbox: importMailbox }, parsed, {
+		const stored = await storeParsedEmail({ bucket: importBucket, mailbox: importMailbox }, parsed, {
 			folder,
 			date: normalizeEmailDate(parsed.date),
 			messageId: id,
@@ -221,7 +276,26 @@ export async function importParsedEmail(
 			mailboxAddress: mailboxId,
 		});
 
-		return { status: "imported" as const, id, folder };
+		return stored.status === "duplicate"
+			? {
+					status: "skipped" as const,
+					reason: "duplicate" as const,
+					id,
+					folder: durableDuplicateFolder!,
+					identitySource,
+					...(identitySource === "raw-sha256"
+						? { rawSha256: exactRawSha256! }
+						: {}),
+				}
+			: {
+					status: "imported" as const,
+					id,
+					folder,
+					identitySource,
+					...(identitySource === "raw-sha256"
+						? { rawSha256: exactRawSha256! }
+						: {}),
+				};
 		} finally {
 			const messageRef = await mailTelemetryLogRef("message", id);
 			if (sealedFingerprint) {

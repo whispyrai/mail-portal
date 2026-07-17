@@ -9,7 +9,10 @@ import {
   recoverInboundEmailWithAudit,
   type AuditedProjectionResult,
 } from "../lib/import/audited-inbound-recovery.ts";
-import { recoverStreamingInboundEmail } from "../lib/import/recover-inbound.ts";
+import {
+  exactRecoveryArchiveAuthority,
+  recoverStreamingInboundEmail,
+} from "../lib/import/recover-inbound.ts";
 import { liveInboundProjectionOptions } from "../lib/live-inbound-projection.ts";
 import {
   isAddressInConfiguredMailDomains,
@@ -226,6 +229,12 @@ adminInboundRecoveryApp.post("/recover-inbound/:mailboxId", async (c) => {
     return c.json({ error: "Inbound recovery pointer is invalid" }, 409);
   }
   if (!pointer) return c.json({ error: "Inbound recovery pointer not found" }, 404);
+  let archiveAuthority;
+  try {
+    archiveAuthority = exactRecoveryArchiveAuthority(pointer);
+  } catch {
+    return c.json({ error: "Inbound recovery pointer lacks exact authority" }, 409);
+  }
 
   const mailbox = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
   if (!mailbox.getInboundDerivedContentManifest) {
@@ -403,9 +412,7 @@ adminInboundRecoveryApp.post("/recover-inbound/:mailboxId", async (c) => {
               { bucket: c.env.BUCKET, mailbox },
               raw.body,
               {
-                ingressId,
-                archivedAt: pointer.archivedAt,
-                mailboxId,
+                archiveAuthority,
                 brand: c.env.BRAND,
               },
               c.env.RAW_MAIL_BUCKET,

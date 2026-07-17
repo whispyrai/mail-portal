@@ -46,6 +46,8 @@ export interface SendEmailParams {
 	headers?: Record<string, string>;
 	/** Correlation tags returned by SES event publishing for bounce handling. */
 	tracking?: { mailboxId: string; deliveryId: string; attemptId: string };
+	/** Dedicated D1 correlation for credential recovery provider events. */
+	credentialRecoveryTracking?: { deliveryId: string; attemptId: string };
 }
 
 /** Thrown when SES rejects or fails a send. `status` is the HTTP status if any. */
@@ -78,7 +80,7 @@ export interface SesSendDependencies {
 }
 
 export type PreparedSesSend = {
-	dispatch: () => Promise<Response>;
+	dispatch: (signal?: AbortSignal) => Promise<Response>;
 };
 
 export type SesPreparationResult =
@@ -130,17 +132,19 @@ function errorDetail(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function preparedSend(dispatch: () => Promise<Response>): PreparedSesSend {
+function preparedSend(
+	dispatch: (signal?: AbortSignal) => Promise<Response>,
+): PreparedSesSend {
 	let dispatched = false;
 	return {
-		dispatch: () => {
+		dispatch: (signal) => {
 			if (dispatched) {
 				return Promise.reject(
 					new Error("The prepared SES request was already dispatched"),
 				);
 			}
 			dispatched = true;
-			return dispatch();
+			return dispatch(signal);
 		},
 	};
 }
@@ -279,7 +283,7 @@ export async function prepareSesSend(
 		const payload = {
 			FromEmailAddress: formatAddress(params.from),
 			Destination: destination,
-			...(params.tracking
+			...(params.tracking || params.credentialRecoveryTracking
 				? { ConfigurationSetName: env.SES_CONFIGURATION_SET }
 				: {}),
 			...(params.replyTo
@@ -304,6 +308,20 @@ export async function prepareSesSend(
 						],
 					}
 				: {}),
+			...(params.credentialRecoveryTracking
+				? {
+						EmailTags: [
+							{
+								Name: "CredentialRecoveryId",
+								Value: params.credentialRecoveryTracking.deliveryId,
+							},
+							{
+								Name: "CredentialRecoveryAttempt",
+								Value: params.credentialRecoveryTracking.attemptId,
+							},
+						],
+					}
+				: {}),
 		};
 		url = `https://email.${env.AWS_REGION}.amazonaws.com/v2/email/outbound-emails`;
 		request = {
@@ -324,7 +342,9 @@ export async function prepareSesSend(
 			const transport = dependencies.createTransport(env);
 			return {
 				ok: true,
-				prepared: preparedSend(() => transport.fetch(url, request)),
+				prepared: preparedSend((signal) =>
+					transport.fetch(url, { ...request, signal }),
+				),
 			};
 		}
 		const signedRequest = await (
@@ -335,7 +355,9 @@ export async function prepareSesSend(
 		const fetchRequest = dependencies.fetchRequest ?? fetch;
 		return {
 			ok: true,
-			prepared: preparedSend(() => fetchRequest(signedRequest)),
+			prepared: preparedSend((signal) =>
+				fetchRequest(signal ? new Request(signedRequest, { signal }) : signedRequest),
+			),
 		};
 	} catch (error) {
 		return {
@@ -348,10 +370,11 @@ export async function prepareSesSend(
 
 export async function dispatchPreparedSesSend(
 	prepared: PreparedSesSend,
+	signal?: AbortSignal,
 ): Promise<SesObservedOutcome> {
 	let res: Response;
 	try {
-		res = await prepared.dispatch();
+		res = await prepared.dispatch(signal);
 	} catch (error) {
 		return { kind: "transport_ambiguous", detail: errorDetail(error) };
 	}

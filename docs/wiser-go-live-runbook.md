@@ -11,11 +11,13 @@ This runbook is for WISER-242, the Wiser deployment of the shared Mail Portal co
 - Cloudflare Worker: `wiser-mail-portal`
 - D1 database: `wiser_mail_portal_users` (`87c3de98-d31b-4ec3-8e05-d26b4dc71d92`)
 - Attachment R2 bucket: `wiser-mail-portal`
+- Isolated attachment development preview bucket: `wiser-mail-portal-preview`
 - Authoritative raw-mail R2 bucket: `wiser-mail-raw-archive`
 - Isolated raw-mail development preview bucket: `wiser-mail-raw-archive-preview`
 - Inbound Queue: `wiser-mail-inbound`
 - Dead-letter Queue: `wiser-mail-inbound-dlq`
 - Terminal-ledger parking Queue: `wiser-mail-inbound-parking`
+- Automatic post-ingress emergency Queue: `wiser-mail-emergency-forward`
 - Archive reconciler: every five minutes
 - OAuth KV namespace: `wiser-mail-portal-oauth` (`c934d803c2f8430d9088f4a5d9f29d55`)
 - AWS region: `eu-west-2`
@@ -41,9 +43,13 @@ Each of these is a separate production mutation and needs explicit approval befo
 
 1. Create any missing Wiser R2 bucket or Queue, or update the locked 14-day
    Queue retention.
-2. Decide the raw R2 lifecycle and Bucket Lock behavior, then mutate either
-   policy under a separate approval.
-3. Apply remote D1 migrations to `wiser_mail_portal_users`.
+2. Decide the `raw/`-prefix R2 lifecycle and Bucket Lock behavior, then mutate
+   either prefix-scoped policy under a separate approval. A whole-bucket rule is
+   forbidden because receipts and recovery authority are mutable.
+3. Privately export and reconcile legacy recovery destinations, explicitly
+   scrub `users.recovery_email`, and apply remote D1 migrations to
+   `wiser_mail_portal_users`. The scrub and migration are separate approved
+   production writes.
 4. Create or update the dedicated Wiser SES IAM credentials.
 5. Deploy `wiser-mail-portal`.
 6. Write Worker production secrets.
@@ -63,6 +69,7 @@ Run these before any production mutation:
 npm install
 npm run assets:wiser
 npm test
+npm run test:workerd:inbound-exact-size
 npm run typecheck
 npm run typecheck:wiser
 npm run verify:env:whispyr
@@ -71,48 +78,33 @@ npm run deploy:whispyr -- --dry-run --outdir /tmp/mail-portal-dry-run/whispyr
 npm run deploy:wiser -- --dry-run --outdir /tmp/mail-portal-dry-run/wiser
 ```
 
-Each `verify:env` command rebuilds its brand before inspecting the resolved
-`build/server/wrangler.json`; together they rebuild and verify both brands. The
-verifier prints bounded progress and owns a detailed
-`script-logs/verify-built-environment-<brand>-<timestamp>.log` file. The Wiser
+The exact-size workerd proof is mandatory before either dry-run. A sandbox that
+cannot bind its listener is an environmental failure, not a waiver. Run it on an
+approved host where workerd can bind and record the passing result.
+
+Each `verify:env` command holds the exact shared primary/guard artifact lock while
+rebuilding, copies the complete fresh build into a private immutable staging
+directory, and inspects that staged configuration. The deployment driver prints
+bounded progress and owns detailed `script-logs/environment-artifact-*` and
+verifier logs. Concurrent Whispyr/Wiser artifact operations fail closed. The Wiser
 artifact must contain only `wiser-mail-portal`, `wiser_mail_portal_users`, the
-`wiser-mail-portal` attachment bucket, the isolated
-`wiser-mail-raw-archive`/`wiser-mail-raw-archive-preview` pair, the three Wiser
+isolated `wiser-mail-portal`/`wiser-mail-portal-preview` attachment bucket pair,
+the isolated `wiser-mail-raw-archive`/`wiser-mail-raw-archive-preview` pair, the four Wiser
 Queues, Wiser OAuth KV, Workers AI, the three Durable Object bindings, and the
 single `mail.wiserchat.ai` route. `DOMAINS` must be exactly `wiserchat.ai` with no
 `test.wiserchat.ai` reference. Scheduled triggers must be exactly `* * * * *`,
-`*/5 * * * *`, and `17 * * * *`. The isolated dry-run output directories prevent
-one brand's bundle from overwriting the other's evidence. Each dry-run must use
-the redirected artifact and contain no resource belonging to the other brand.
+`*/5 * * * *`, and `17 * * * *`. Each dry-run must use the exact generated
+configuration and contain no resource belonging to the other brand.
 
-### Cloudflare Database
+### Cloudflare Database And Recovery Freeze
 
-After explicit approval for the Wiser production database, run:
-
-```bash
-npx wrangler d1 migrations apply DB --env wiser --remote
-```
-
-Apply every migration through `0011_create_saved_view_create_operations.sql`
-before deploying the Worker version or Cron Trigger configuration in this
-checkpoint. The ordering is mandatory because user, membership, and mailbox
-lifecycle writes enqueue Agent connection reconciliation through migration 0010
-triggers, while saved-view creation relies on the migration 0011 idempotency
-ledger.
-
-Validate with a read-only query:
-
-```bash
-npx wrangler d1 execute DB --env wiser --remote --command "SELECT type, name FROM sqlite_master WHERE name IN ('agent_connection_revocations', 'saved_view_create_operations', 'users_enqueue_agent_connection_reconciliation', 'mailbox_memberships_enqueue_agent_connection_reconciliation', 'mailboxes_enqueue_agent_connection_reconciliation') ORDER BY type, name"
-```
-
-The result must contain the `agent_connection_revocations` and
-`saved_view_create_operations` tables and all three named triggers. This
-`sqlite_master` SELECT is the strictly read-only migration proof. Do not use
-`wrangler d1 migrations list` for preflight because the installed CLI may create
-the migration ledger it is meant to inspect. Quiz tables may exist because the
-migration directory is shared, but Wiser keeps the quiz feature disabled with
-`FEATURES=[]`.
+Use the shared [credential-recovery rollout runbook](credential-recovery-rollout-runbook.md)
+with `BRAND=wiser`. Its mandatory order is code-first frozen deploy, private
+legacy export and exact directory reconciliation, separately approved scrub,
+migration 0012, schema plus `global | 0` proof, AWS callback/secret/canary proof,
+the separately approved independent monitor proof record, explicit control
+enable, and exact end-to-end proof. Migration 0012 is never paired with an
+immediate enable. A missing or unreadable control remains disabled.
 
 ### Scheduled Maintenance
 
@@ -122,6 +114,9 @@ The deployment artifact must contain exactly three schedules:
   fails during the invocation or remains immediately due fails that Cron turn,
   while the D1 outbox retains future-backoff items for later retries. Monitor the
   outbox separately because deferred work does not make every interim turn fail.
+  When credential recovery control is disabled or unreadable, this same Cron
+  still drains agent work but does not access any recovery request, delivery,
+  attempt, event, or retention table.
 - `*/5 * * * *` reconciles authoritative raw R2 receipts with Queue and Mailbox
   projection state. It repairs safe gaps and durably records anomalies that need
   operator review.
@@ -141,6 +136,7 @@ inspection commands:
 
 ```bash
 npx wrangler r2 bucket info wiser-mail-portal --env wiser
+npx wrangler r2 bucket info wiser-mail-portal-preview --env wiser
 npx wrangler r2 bucket info wiser-mail-raw-archive --env wiser
 npx wrangler r2 bucket info wiser-mail-raw-archive-preview --env wiser
 npx wrangler r2 bucket lifecycle list wiser-mail-raw-archive --env wiser
@@ -148,14 +144,27 @@ npx wrangler r2 bucket lock list wiser-mail-raw-archive --env wiser
 npx wrangler queues info wiser-mail-inbound --env wiser
 npx wrangler queues info wiser-mail-inbound-dlq --env wiser
 npx wrangler queues info wiser-mail-inbound-parking --env wiser
+npx wrangler queues info wiser-mail-emergency-forward --env wiser
 ```
+
+Both attachment buckets must exist before any remote Wiser development session.
+If `wiser-mail-portal-preview` is missing, obtain the separate R2 provisioning
+approval from gate 1, then create exactly that bucket before running the remote
+preview. Never substitute `wiser-mail-portal`, because that is the production
+attachment store.
 
 The exact Queue graph is `wiser-mail-inbound` → `wiser-mail-inbound-dlq` →
 `wiser-mail-inbound-parking`. The primary and DLQ consumers each use batch size
 1, concurrency 1, batch timeout 5 seconds, and 10 retries; their retry delays are
 1 and 60 seconds. The parking consumer uses batch size 1, concurrency 1, batch
 timeout 5 seconds, 100 retries, and a 3600-second delay, with no further DLQ.
-All three Queues are product-locked to 14-day retention.
+All four Queues are product-locked to 14-day retention. The emergency consumer
+uses batch size 1, concurrency 1, 100 platform retries, and a five-minute retry
+delay. Its durable R2 active marker carries a 20-minute lease and monotonically
+increasing generation. The independent five-minute scan admits at most eight
+markers, skips live leases, and re-enqueues only a new generation after expiry.
+Older Queue deliveries acknowledge as stale, so overlapping Queue retry and
+Cron recovery cannot create more than one live delivery generation.
 
 `wrangler queues info` proves that a Queue exists, but it cannot prove retention
 or consumer settings. Confirm retention separately in the Cloudflare control
@@ -164,10 +173,13 @@ edges. Queue creation and retention updates are production mutations requiring
 separate approval.
 
 Raw R2 lifecycle and Bucket Lock retention are not product-locked. The read-only
-list commands establish current state only. Before apex cutover, choose and
-record the retention behavior as a future product decision, then obtain separate
-approval before any lifecycle or lock mutation. No retention value or executable
-mutation placeholder in this runbook is approved for use.
+list commands establish current state only. Any future rule must use the exact
+`raw/` prefix, never the whole bucket or `receipts/`, `system/`, cursors,
+markers, anomalies, or audits. Before apex cutover, choose and record the raw
+retention behavior, obtain separate approval, then prove a `raw/` canary is
+protected while receipt and emergency-marker canaries can still be created,
+conditionally updated, and deleted. No duration or executable mutation
+placeholder in this runbook is approved for use.
 
 ### AWS SES
 
@@ -175,37 +187,145 @@ mutation placeholder in this runbook is approved for use.
 
 Create a dedicated Wiser IAM access key with least privilege for SES send only. The policy should allow `ses:SendEmail` against the Wiser SES identity and should restrict From addresses to `*@wiserchat.ai` where AWS condition keys are available. Do not reuse Whispyr SES keys.
 
+Configure and prove the Wiser source-domain EventBridge rule, API Destination,
+bearer Connection, 24-hour/185-attempt retry envelope, SQS DLQ, CloudWatch alarms,
+exact callback, and five-minute synthetic callback canary using the shared
+[credential-recovery rollout runbook](credential-recovery-rollout-runbook.md).
+
 Production secrets required by `env.wiser`:
 
 ```text
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 SES_EVENT_WEBHOOK_SECRET
+CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1
 JWT_SECRET
-EMERGENCY_FORWARD_TO
 ADMIN_BOOTSTRAP_EMAIL
 ACCOUNT_RECOVERY_DIRECTORY
 VAPID_PUBLIC_KEY
 VAPID_PRIVATE_KEY
 ```
 
-Use `ADMIN_BOOTSTRAP_EMAIL=hesham@wiserchat.ai`. Generate `JWT_SECRET` with at least 48 random base64 bytes. Generate a separate high-entropy `SES_EVENT_WEBHOOK_SECRET`. Store the approved JSON mapping from portal addresses to external recovery addresses in `ACCOUNT_RECOVERY_DIRECTORY`. Generate one VAPID keypair for Wiser push.
+Use `ADMIN_BOOTSTRAP_EMAIL=hesham@wiserchat.ai`. Generate `JWT_SECRET` with at least 48 random base64 bytes. Generate separate high-entropy `SES_EVENT_WEBHOOK_SECRET` and `CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1` values. The V1 payload key encrypts durable recovery jobs and creates opaque correlation refs. It must remain separate from `JWT_SECRET` and must not be rotated in place or deleted while any version-1 ciphertext exists. A future rotation needs a new versioned key binding and an explicit decrypt/re-encrypt rollout. Store the approved JSON mapping from portal addresses to external recovery addresses in `ACCOUNT_RECOVERY_DIRECTORY`. Generate one VAPID keypair for Wiser push.
 
 ### First Deploy And Secrets
 
 Wrangler validates `secrets.required` on deploy. For the first production deploy, use a temporary secrets file so the Worker is deployed with its required secrets in one operation:
 
 ```bash
-umask 077
-SECRETS_FILE="$(mktemp /tmp/wiser-mail-portal-secrets.XXXXXX)"
-$EDITOR "$SECRETS_FILE"
+set -euo pipefail
+set +x
+REQUIRED_SECRET_NAMES=(
+ACCOUNT_RECOVERY_DIRECTORY
+ADMIN_BOOTSTRAP_EMAIL
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1
+JWT_SECRET
+SES_EVENT_WEBHOOK_SECRET
+VAPID_PRIVATE_KEY
+VAPID_PUBLIC_KEY
+)
+SECRETS_FILE=""
+SECRETS_DIRECTORY=""
+cleanup_secrets_file() {
+  unset SECRET_NAME SECRET_VALUE
+  for SECRET_NAME in "${REQUIRED_SECRET_NAMES[@]}"; do
+    unset "$SECRET_NAME"
+  done
+  unset SECRET_NAME
+  if [ -n "${SECRETS_FILE:-}" ] &&
+    { [ -e "$SECRETS_FILE" ] || [ -L "$SECRETS_FILE" ]; }; then
+    rm -- "$SECRETS_FILE"
+  fi
+  SECRETS_FILE=""
+  if [ -n "${SECRETS_DIRECTORY:-}" ] && [ -d "$SECRETS_DIRECTORY" ]; then
+    rmdir -- "$SECRETS_DIRECTORY"
+  fi
+  SECRETS_DIRECTORY=""
+}
+abort_secret_deploy() {
+  SIGNAL_STATUS="$1"
+  trap - EXIT HUP INT TERM
+  cleanup_secrets_file
+  exit "$SIGNAL_STATUS"
+}
+create_private_secrets_envelope() (
+  set -euo pipefail
+  set +x
+  cleanup_prompt_secrets() {
+    unset SECRET_NAME SECRET_VALUE
+    for SECRET_NAME in "${REQUIRED_SECRET_NAMES[@]}"; do
+      unset "$SECRET_NAME"
+    done
+    unset SECRET_NAME
+  }
+  abort_secret_prompt() {
+    SIGNAL_STATUS="$1"
+    trap - EXIT HUP INT TERM
+    cleanup_prompt_secrets
+    exit "$SIGNAL_STATUS"
+  }
+  trap cleanup_prompt_secrets EXIT
+  trap 'abort_secret_prompt 129' HUP
+  trap 'abort_secret_prompt 130' INT
+  trap 'abort_secret_prompt 143' TERM
+
+  for SECRET_NAME in "${REQUIRED_SECRET_NAMES[@]}"; do
+    printf 'Enter %s: ' "$SECRET_NAME" >&2
+    if ! IFS= read -r -s SECRET_VALUE </dev/tty; then
+      printf '\nSecret prompt failed before envelope creation.\n' >&2
+      exit 1
+    fi
+    printf '\n' >&2
+    test -n "$SECRET_VALUE"
+    export "$SECRET_NAME=$SECRET_VALUE"
+    unset SECRET_VALUE
+  done
+
+  CREATED_SECRETS_FILE="$(node scripts/create-secrets-envelope.mjs wiser)"
+  cleanup_prompt_secrets
+  printf '%s\n' "$CREATED_SECRETS_FILE"
+)
+
+# The operator shell starts clean. Prompt values and exports exist only in the
+# command-substitution process; the parent receives only the created path.
+cleanup_secrets_file
+trap cleanup_secrets_file EXIT
+trap 'abort_secret_deploy 129' HUP
+trap 'abort_secret_deploy 130' INT
+trap 'abort_secret_deploy 143' TERM
+if ! SECRETS_FILE="$(create_private_secrets_envelope)"; then
+  printf 'Secret envelope creation failed.\n' >&2
+  exit 1
+fi
+SECRETS_DIRECTORY="$(dirname -- "$SECRETS_FILE")"
+
 npm run deploy:wiser -- --secrets-file "$SECRETS_FILE"
-rm "$SECRETS_FILE"
+cleanup_secrets_file
+SECRETS_FILE=""
+SECRETS_DIRECTORY=""
+trap - EXIT HUP INT TERM
 ```
 
-The temporary file must use dotenv syntax and contain only the nine secret names
-above. Do not commit it, paste it into tickets, or store it in the repo.
-`.secrets*` is ignored as an extra local guard, but `/tmp` is preferred.
+The temporary file must remain an owned regular non-symlink single-link 0600
+JSON envelope with exact schema version 1, exact brand `wiser`, and exactly the
+nine non-empty string secrets above. The deployment driver validates and
+snapshots it, then gives Wrangler only a derived 0400 secret map in a private
+0700 temporary directory that is removed on success or failure. Do not commit
+the envelope, paste it into tickets, or store it in the repo. `.secrets*` is
+ignored as an extra local guard, but `/tmp` is preferred. Paste
+`ACCOUNT_RECOVERY_DIRECTORY` as its exact compact single-line JSON mapping
+without outer quotes or manual escaping. The creator JSON-encodes that mapping
+as an outer envelope string and prints only the unpredictable path.
+Run the block as a Bash process, never source it into an interactive shell. The
+hidden prompt and every secret export live only in an isolated
+command-substitution process. Failed input, `HUP`, `INT`, and `TERM` unset all
+nine names and exit nonzero. Before path handoff, the creator waits for any
+issued file operation to settle, closes the handle, removes the file and
+directory, then re-raises the original `HUP`, `INT`, or `TERM`. Once the parent
+receives the path, its own signal handlers remove the envelope and directory
+before terminating.
 
 For secret rotation after the Worker exists, use:
 
@@ -213,8 +333,8 @@ For secret rotation after the Worker exists, use:
 npx wrangler secret put AWS_ACCESS_KEY_ID --env wiser
 npx wrangler secret put AWS_SECRET_ACCESS_KEY --env wiser
 npx wrangler secret put SES_EVENT_WEBHOOK_SECRET --env wiser
+npx wrangler secret put CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1 --env wiser
 npx wrangler secret put JWT_SECRET --env wiser
-npx wrangler secret put EMERGENCY_FORWARD_TO --env wiser
 npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL --env wiser
 npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY --env wiser
 npx wrangler secret put VAPID_PUBLIC_KEY --env wiser
@@ -268,6 +388,67 @@ mobile widths:
 4. Confirm the notification uses Wiser icon/badge assets.
 5. Disable notifications and confirm no new push is sent.
 
+### Credential Recovery Proof And Monitoring
+
+The authoritative both-brand procedure, AWS graph, enable gate, exact proof,
+aggregate SLA queries, and roll-forward rollback are in the shared
+[credential-recovery rollout runbook](credential-recovery-rollout-runbook.md).
+The Wiser proof below is an additional launch checklist, not an alternative
+sequence.
+
+Use an approved disposable production account whose external destination is in
+`ACCOUNT_RECOVERY_DIRECTORY`. Request recovery from the public page and require
+all of the following before cutover:
+
+1. The public response is the same generic 202 shape for an eligible address and
+   for an unknown address.
+2. The eligible request produces one external recovery message with the expected
+   Wiser sender and a single-use HTTPS link on `mail.wiserchat.ai`.
+3. The link sets a new password, invalidates prior sessions and MCP credentials,
+   and cannot be consumed a second time.
+4. The delivery outbox reaches `accepted`; the matching attempt reaches
+   `accepted`; an SES delivery, bounce, or complaint callback is recorded once
+   per event ID. Do not interpret the absence of a callback as proof that the
+   provider rejected the send.
+5. A retry or timeout drill is complete only when the same durable request or
+   delivery remains pending, becomes terminal with an operator error code, or
+   later exact SES evidence promotes the preserved attempt to accepted. Never
+   delete or manually rewrite request, delivery, attempt, or event rows.
+
+Use only these aggregate read-only queries for routine inspection. They select
+no account, destination, token, ciphertext, provider message ID, delivery ID, or
+attempt ID:
+
+```bash
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT state, COUNT(*) AS count FROM credential_recovery_request_jobs GROUP BY state ORDER BY state"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT state, COUNT(*) AS count FROM credential_recovery_delivery_outbox GROUP BY state ORDER BY state"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT state, COUNT(*) AS count FROM credential_recovery_delivery_attempts GROUP BY state ORDER BY state"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT event_type, COUNT(*) AS count FROM credential_recovery_delivery_events WHERE recorded_at >= unixepoch('now', '-24 hours') * 1000 GROUP BY event_type ORDER BY event_type"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT last_error_code, COUNT(*) AS count FROM credential_recovery_request_jobs WHERE state IN ('pending', 'expired', 'parked') GROUP BY last_error_code ORDER BY last_error_code"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT last_error_code, COUNT(*) AS count FROM credential_recovery_delivery_outbox WHERE state IN ('pending', 'cancelled', 'expired', 'parked') GROUP BY last_error_code ORDER BY last_error_code"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT COUNT(*) AS stale_dispatches FROM credential_recovery_delivery_outbox WHERE state = 'dispatching' AND lease_expires_at < unixepoch('now') * 1000"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT COUNT(*) AS ambiguous_attempts_over_sla FROM credential_recovery_delivery_attempts WHERE state = 'ambiguous' AND updated_at <= (unixepoch('now') - 300) * 1000"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT (SELECT COUNT(*) FROM credential_recovery_request_jobs WHERE state IN ('pending', 'leased') AND created_at <= (unixepoch('now') - 300) * 1000) AS pending_requests_over_5_minutes, (SELECT COUNT(*) FROM credential_recovery_delivery_outbox WHERE state IN ('pending', 'leased', 'dispatching') AND created_at <= (unixepoch('now') - 300) * 1000) AS pending_deliveries_over_5_minutes"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT (SELECT COUNT(*) FROM credential_recovery_request_jobs WHERE state IN ('pending', 'leased') AND last_error_code IS NOT NULL AND last_error_code NOT IN ('SES_TRANSPORT_AMBIGUOUS', 'SES_INVALID_SUCCESS_RESPONSE')) AS active_request_non_ambiguous_errors, (SELECT COUNT(*) FROM credential_recovery_delivery_outbox WHERE state IN ('pending', 'leased', 'dispatching') AND last_error_code IS NOT NULL AND last_error_code NOT IN ('SES_TRANSPORT_AMBIGUOUS', 'SES_INVALID_SUCCESS_RESPONSE')) AS active_delivery_non_ambiguous_errors, (SELECT COUNT(*) FROM (SELECT attempts.outbox_id FROM credential_recovery_delivery_attempts attempts JOIN credential_recovery_delivery_outbox outbox ON outbox.id = attempts.outbox_id WHERE attempts.state = 'http_rejected' AND outbox.state IN ('pending', 'leased', 'dispatching') GROUP BY attempts.outbox_id HAVING COUNT(*) >= 2)) AS active_deliveries_with_repeated_http_rejections"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT COUNT(*) AS over_age_requests FROM credential_recovery_request_jobs WHERE state IN ('pending', 'leased') AND created_at <= (unixepoch('now') - 86400) * 1000"
+npx wrangler d1 execute DB --env wiser --remote --command "SELECT (SELECT COUNT(*) FROM credential_recovery_request_jobs WHERE state = 'parked' AND payload_ciphertext IS NOT NULL AND completed_at <= (unixepoch('now') - 604800) * 1000) AS stale_request_ciphertexts, (SELECT COUNT(*) FROM credential_recovery_delivery_outbox WHERE state = 'parked' AND payload_ciphertext IS NOT NULL AND completed_at <= (unixepoch('now') - 604800) * 1000) AS stale_delivery_ciphertexts"
+```
+
+Page on any parked job, any dispatching lease past its stored expiry, every
+attempt that remains ambiguous after five minutes even if a sibling attempt was
+later accepted, either independent request or delivery age aggregate after five
+minutes, any active delivery with two `http_rejected` attempts, a pending
+request older than 24 hours, retained parked ciphertext older than seven days,
+or a minutely maintenance failure. Page an active non-ambiguous error aggregate
+on its third consecutive positive one-minute poll and clear only after two
+consecutive zero polls. Safe test pages and clears must cover `SES_HTTP_503`,
+`SES_NOT_DISPATCHED`, `PAYLOAD_KEY_UNAVAILABLE`, and
+`RECOVERY_DIRECTORY_INVALID_CONFIG` before recovery is enabled. `UNMAPPED`
+means an eligible portal address lacks a directory entry. `INVALID_CONFIG`
+means the directory secret itself is malformed or violates its closed limits.
+They require different operator action and must not be collapsed into one outage
+code.
+
 ### Zoho Import
 
 Export each Zoho mailbox as `.eml`. Keep exports outside the repo. Import only after the corresponding production mailbox exists:
@@ -285,11 +466,59 @@ unset IMPORT_PASSWORD
 
 Repeat for `contact@wiserchat.ai`. The approved history scope is only `hello@wiserchat.ai` and `contact@wiserchat.ai`; importing `hesham@wiserchat.ai` requires a new explicit product decision. Re-running the same export is safe; the importer is expected to skip duplicates. Reconcile counts by folder, spot-check attachments, and confirm Trash/Spam are excluded.
 
+The endpoint hashes the exact uploaded RFC822 bytes before parsing. Messages
+with an RFC `Message-ID` keep the existing mailbox-scoped Message-ID identity.
+Messages without one use the mailbox-scoped exact raw SHA-256, so any header,
+body, MIME, or attachment-byte difference is a distinct source message while a
+byte-identical rerun remains idempotent. The old parsed-field fallback is not
+consulted for no-Message-ID history because it cannot prove a duplicate; if an
+export was already imported by an older build, a one-time duplicate is safer
+than silently dropping a distinct message.
+
+When a no-Message-ID import claim wins, the same Mailbox transaction permanently
+reserves its exact raw SHA-256 under the derived portal ID before promotion
+starts. Busy, existing, or integrity-blocked losers cannot create a reservation.
+This authority survives a lost claim response, claim expiry, abandoned
+promotion, and Message deletion. The exact source can resume or reconstruct a
+deleted Message, but a missing or different digest for an existing ID is an
+identity conflict and can never be reported as a duplicate. The driver
+independently parses each source file with the installed PostalMime version,
+maps the source folder locally, and rejects any endpoint identity, internal
+folder, or derived ID that contradicts its local result.
+
+Every driver run must finish with explicit `source_total`, `result_total`,
+`unprocessed`, `imported`, `duplicate`, `excluded`, `error`, and
+`identity_collisions` counts. Treat the run as failed unless
+`source_total=result_total`, `unprocessed=0`, `error=0`, and
+`identity_collisions=0`. The driver also fails closed if the deployed endpoint
+does not return bounded identity evidence, violates the documented HTTP status
+contract, or reports a durable identity conflict. The private detailed log is
+created with exclusive `0600` permissions. Every normal completion, handled
+signal, or handled operational failure prints one bounded `PASS` or `FAIL`
+summary; an uncatchable runtime or operating-system termination cannot promise
+cleanup or a final write. Handled `SIGINT` and `SIGTERM` stop new source work,
+abort the active request, write `FAIL`, and close the held log handle. Unexpected
+endpoint JSON is bounded and written only to the private log, never the
+terminal. On the second exact-export run, require
+`imported=0`; every included source file must be a duplicate and every excluded
+folder item must remain excluded. Do not continue to Zoho decommissioning on an
+unreconciled count or identity failure.
+
+### Mandatory Pre-MX Monitor Proof Gate
+
+Stage 2 is forbidden until the Wiser-specific immutable monitor proof record
+from shared rollout Step 7 is attached and separately approved, every named
+monitor rule has an independently received page, the complete 14-row CloudWatch
+alarm action proof is attached, and the last successful one-minute external poll
+is no more than two minutes old. Recovery control must already have followed the
+same proof gate. Recheck the proof references and current poll before requesting
+the MX approval.
+
 ## Stage 2: Separately Approved Apex MX Cutover
 
-Only after Stage 1 outbound proof, import reconciliation, the raw R2 policy
-decision and approved application, and a separate same-turn approval naming the
-apex routing mutations:
+Only after that monitor gate, Stage 1 outbound proof, import reconciliation, the
+raw R2 policy decision and approved application, and a separate same-turn
+approval naming the apex routing mutations:
 
 1. Record current Zoho MX/TXT records and TTLs.
 2. Lower relevant TTLs if needed and wait for propagation.
@@ -328,7 +557,8 @@ After exact raw MIME persistence succeeds, the Email Worker may return normally
 only after one of four outcomes: a durable admitted receipt and successful Queue
 send, an idempotent projection of the same `ingressId` into the verified active
 Mailbox, a resolved Cloudflare `forward()` of the original inbound Message to
-`EMERGENCY_FORWARD_TO` whose result contains a usable, nonblank string
+the pinned `EMERGENCY_FORWARD_DESTINATION` whose result contains a usable,
+nonblank string
 `messageId`, or
 `setReject()` so SMTP reports failure and the sender can resend. This applies to
 archived-receipt, Mailbox-marker, active-state, admitted-receipt, and Queue-send
@@ -338,64 +568,109 @@ disallowed, unprovisioned, and inactive recipients must reject even when the
 rejected receipt sidecar cannot commit; they must never be projected or
 emergency-forwarded.
 
+After Queue processing begins, any forward-eligible terminal projection failure
+first writes `system/emergency-forward/active/<encoded-raw-key>.json` and a
+`forward_pending` receipt, then enqueues the immutable archive pointer. The
+consumer checks exact stored/deleted truth and the
+exact R2 key, version, ETag, size, custom metadata, and SHA-256 before passing
+the R2 body stream to Cloudflare Email Service. It records `forwarded` only for
+a nonblank provider `messageId`, which is the documented
+[Workers binding success result](https://developers.cloudflare.com/email-service/api/send-emails/workers-api/).
+Provider acceptance is first fenced into the active marker with a privacy-safe
+reference derived from the provider `messageId`, then an exact `forwarded`
+receipt with `providerAccepted: true` and the same reference is committed. If that receipt
+CAS fails, the retry finishes the receipt from the accepted marker without
+resending. The protocol is still deliberately at-least-once, not exactly-once:
+the Email Service API exposes no idempotency key, and a provider may accept a
+send while the Worker loses the response or cannot commit the accepted marker.
+That ambiguity may produce a duplicate on retry, but it is never silently
+treated as delivered. Cloudflare documents a
+[25 MiB total-message limit](https://developers.cloudflare.com/email-service/platform/limits/)
+for fixed verified destination addresses, matching the 25 MiB inbound routing
+limit. The general Email Service limit is 5 MiB. A Worker `send_email` operation
+can appear as dropped in the Email Routing summary even when delivery succeeded,
+so prove post-ingress emergency sends from Email Sending metrics/logs and the
+returned `messageId`, never from the Routing summary status.
+Exact stored messages, deletion tombstones, ingress-time admission/policy
+rejections, and raw-integrity mismatch are never forwarded. Mailbox inactivity,
+unownership, or `MAILBOX_UNAVAILABLE` discovered after raw acceptance is not an
+SMTP policy receipt and therefore converges to automatic forwarding.
+
+`setReject()` is authoritative only while the original Email Worker invocation
+still owns the synchronous SMTP disposition. That path may write a rejected
+receipt, or suppress that diagnostic write if storage is failing, while still
+rejecting the message. Once raw acceptance has completed and the original SMTP
+disposition can no longer be proven, later Queue, Cron, Mailbox inactivity, or
+ownership discovery cannot invent a retroactive rejection. Automatic emergency
+forwarding owns every eligible post-acceptance delivery gap.
+
+The combined five-minute scheduled shape is structurally capped at 8,865
+service subrequests below the 9,000 application budget and 10,000 Workers limit.
+Each run admits 20 repair attempts, 7 cleanup intents, 8 active archives, 64
+recent minute-partitioned raw archives, 1 exhaustive raw backstop archive, and
+8 emergency-forward markers. Recent discovery reads exact quarantine receipts:
+MIME, `EMAXLEN`, and post-acceptance `MAILBOX_UNAVAILABLE` failures are reindexed
+for automatic forwarding, while raw-integrity quarantine remains suppressed. These
+capacities guarantee bounded work, not a wall-clock delivery deadline. There is
+no delivery-time bound while Cron is unavailable or while sustained ingress in
+any lane exceeds that lane's admitted throughput; Queue delivery and its retry
+policy continue independently during a Cron outage.
+
 During proof and cutover, monitor these conditions:
 
+The independent application and inbound monitoring gate in the shared
+[credential-recovery rollout runbook](credential-recovery-rollout-runbook.md)
+is mandatory. Manual queries, Worker logs, Queue dashboards, and this Worker's
+own Cron are diagnostics, not an alert service. Until the separately approved
+external one-minute monitor and independent test-page proof exist, recovery must
+remain disabled and Wiser mail go-live is blocked.
+
 - Any `RAW_ARCHIVE_FAILED`, `RAW_ARCHIVE_SIZE_MISMATCH`, `RAW_ARCHIVE_CHECKSUM_UNAVAILABLE`, `RAW_ARCHIVE_CHECKSUM_MISMATCH`, or `RAW_ARCHIVE_CHECKSUM_PREPARATION_FAILED`: page immediately. Confirm the same `ingressId` then records either `direct_mailbox_fallback` status `succeeded`, or `emergency_forward` status `succeeded`. If neither exists, confirm `smtp_rejection` status `rejected` and investigate all three failed paths.
-- Any `dead_letter_pending`, `dead_lettered`, `quarantined`, `RECEIPT_STATE_UNKNOWN`, `STORED_PROJECTION_MISSING`, `ADMISSION_DECISION_MISSING`, `TERMINAL_FALLBACK_LEDGER_FAILED`, `RECONCILIATION_RUN_FAILED`, or `ARCHIVE_RECONCILIATION_FAILED`: investigate the same day. `dead_letter_pending` means Cloudflare has not yet confirmed the DLQ consumer. `dead_lettered` means the DLQ consumer or reconciler durably recorded the terminal failure. `RECEIPT_STATE_UNKNOWN` means a receipt object exists but its pointer, timestamp, state-specific fields, or R2 identity cannot be trusted. The DLQ consumer records terminal failure in both the R2 receipt and an independent Mailbox Durable Object ledger when available; either durable commit prevents the failure from disappearing. Neither dead-letter state is automatically re-enqueued.
+- Any `dead_letter_pending`, `dead_lettered`, `forward_pending`, forward-eligible `quarantined`, `RECEIPT_STATE_UNKNOWN`, `STORED_PROJECTION_MISSING`, `ADMISSION_DECISION_MISSING`, `TERMINAL_FALLBACK_LEDGER_FAILED`, `RECONCILIATION_RUN_FAILED`, or `ARCHIVE_RECONCILIATION_FAILED` must page immediately through alerting that is independent of the affected Queue and scheduled Worker. A new `forward_pending` receipt has one five-minute reconciliation interval to reach `forwarded`; page if it remains pending for more than ten minutes so one missed Cron tick does not create noise while two missed opportunities become an incident. Page immediately, without the grace period, when any primary, DLQ, parking, or emergency Queue consumer fails, a scheduled reconciliation run fails, Cron does not execute, or either recovery authority cannot be created. `dead_letter_pending` means Cloudflare has not yet confirmed the DLQ consumer. `forward_pending` means the dual R2 recovery authority exists but Email Service acceptance has not yet been durably recorded. The Mailbox terminal ledger is diagnostic only and never owns forwarding progress. `RECEIPT_STATE_UNKNOWN` means a receipt object exists but its pointer, timestamp, state-specific fields, or R2 identity cannot be trusted.
 - Any `QUEUE_ENQUEUE_FAILED`: confirm the same `ingressId` immediately records `direct_mailbox_fallback` status `succeeded`, `emergency_forward` status `succeeded`, or `smtp_rejection` status `rejected`. A later reconciliation pass may still repair the admitted receipt, but it is not the SMTP acceptance guarantee.
 - Any `R2_DERIVED_UPLOAD_INTEGRITY_FAILED`: page the mail operator. The exact raw MIME remains authoritative, but the Mailbox projection needs retry or audited replay.
 - Any `R2_DELETION_OUTBOX_FAILED`: investigate until a later `R2 deletion batch completed` proves cleanup. Mail is already deleted from the user view, but superseded attachment/body objects remain pending in the Mailbox Durable Object outbox.
-- Non-zero backlog in either primary Queue or DLQ must be explained before declaring inbound healthy. Any message in a parking Queue is an immediate incident. Wiser uses `wiser-mail-inbound`, `wiser-mail-inbound-dlq`, and `wiser-mail-inbound-parking`. Whispyr uses `sales-mail-inbound`, `sales-mail-inbound-dlq`, and `sales-mail-inbound-parking`. Parking consumers retry terminal ledger persistence up to the platform maximum 100 times with an hourly delay.
+- Non-zero backlog in the primary, DLQ, parking, or emergency-forward Queue must be explained before declaring inbound healthy. Any message in a parking Queue is an immediate incident. The Wiser emergency Queue is `wiser-mail-emergency-forward`; the Whispyr equivalent is `sales-mail-emergency-forward`.
 - Normal-path success is proved by `raw_archive` status `succeeded`, a durable admitted receipt, `queue_enqueue` status `succeeded` or `archive_reconcile` status `reenqueued`, and finally `mailbox_projection` status `succeeded` or `duplicate`. Any post-archive ingress failure is recovered only by a successful direct Mailbox fallback, successful emergency forwarding, or explicit SMTP rejection for the same `ingressId`.
 
-The reconciler walks the raw archive with a conditionally updated continuation
-cursor so old pages cannot starve and overlapping cron runs cannot move the
-cursor backward. It automatically re-enqueues `archived` and `admitted`
-receipts, plus `enqueued` or `retrying` receipts stale for at least fifteen
-minutes. It never re-enqueues `dead_letter_pending`, `dead_lettered`, `deleted`,
-`quarantined`, or `rejected` receipts. Before trusting stale dead-letter state,
-it checks authoritative Mailbox truth in this order: deletion tombstone,
-existing Message projection, then the independent terminal-failure ledger. A
-Mailbox terminal ledger reconstructs `dead_lettered`; a stale
-`dead_letter_pending` receipt without that ledger remains pending, creates
-durable `pending_operator_review` anomaly evidence, and is not re-enqueued.
-Elapsed time alone never creates terminal truth. A genuinely missing `stored`
-projection reports `STORED_PROJECTION_MISSING`. Conditional receipt writes
-prevent reconciliation from overwriting a state concurrently advanced by
-another worker. An object-level failure is written to a durable failure ledger
-before the main cursor advances. If the ledger write also fails, the cursor
-stays on the page.
+The normal projection reconciler walks the raw archive with a conditionally
+updated continuation cursor so old pages cannot starve and overlapping runs
+cannot move the cursor backward. It re-enqueues trustworthy `archived`,
+`admitted`, and stale `enqueued` or `retrying` receipts. It does not send
+delivery-gap states back through normal projection: `forward_pending`, stale
+`dead_letter_pending`, `dead_lettered`, forward-eligible quarantine,
+`MAILBOX_UNAVAILABLE`, and a genuinely missing `stored` projection establish or
+repair emergency-forward authority automatically. The Queue handoff must resolve
+before the item can advance. The independent Mailbox terminal ledger and R2
+anomaly/failure ledgers are diagnostics only, are bounded, and cannot delay or
+own delivery progress.
 
-Reconciliation trusts a present receipt only when it has a usable R2 ETag, a
-canonical timestamp, a complete archived pointer that exactly matches the raw
-object, and the closed field set written for its state. A present but malformed,
-partial, mismatched, or otherwise invalid receipt is never treated as missing.
-The reconciler writes durable `RECEIPT_STATE_UNKNOWN` operator-review evidence
-without reading Mailbox truth, reconstructing the receipt, creating an
-admission-missing recovery pointer, or enqueuing the message. If that evidence
-cannot commit, the normal reconciliation failure ledger must commit before the
-cursor advances; otherwise the cursor remains on the page for retry.
-The same fail-closed path applies when an `archived` receipt is conditionally
-advanced to `admitted` but its immediate reread is absent or invalid. A valid
-concurrent forward or terminal state remains authoritative and is never
-overwritten or enqueued by that admission attempt.
+Reconciliation trusts a present receipt only when its exact body has a usable R2
+ETag, canonical timestamp, complete archived pointer matching the raw object,
+and the closed field set for its state. A malformed, partial, mismatched, absent,
+or post-CAS-loss receipt cannot authorize normal projection. Once the raw pointer
+and SHA-256 are trustworthy, reconciliation first establishes emergency-forward
+authority, then records `RECEIPT_STATE_UNKNOWN` or
+`ADMISSION_DECISION_MISSING` as best-effort diagnostic evidence. The same rule
+applies when an `archived` to `admitted` transition cannot be proven by its
+immediate exact reread. An exact concurrent terminal winner remains
+authoritative; every incompatible winner converges to emergency forwarding.
 
-Raw objects without a receipt are never auto-admitted. Before creating
-`ADMISSION_DECISION_MISSING` evidence, reconciliation checks authoritative
-Mailbox truth for the exact `ingressId` in this order: deletion tombstone,
-existing Message projection through `hasEmail` or `getEmail`, then a valid
-independent terminal-failure ledger. It reconstructs `deleted`, `stored`, or
-`dead_lettered` with create-only receipt semantics and resolves any pending
-anomaly only when that reconstruction commits. A conditional-write loser
-preserves the concurrent receipt winner and does not claim terminalization.
-Malformed terminal-ledger values remain operator-visible and fail closed. Only
-when no authoritative Mailbox truth exists does reconciliation write
-`ADMISSION_DECISION_MISSING` plus
-`system/inbound-recovery-pointers/<ingressId>.json`. The pointer contains the
-immutable R2 identity validated from raw-object metadata and lets an operator
-use the normal audited recovery command without supplying a raw key. Raw
-metadata alone never authorizes admission or Queue enqueue. Do not manufacture
-or edit recovery pointers manually.
+Primary and DLQ consumers never acknowledge from receipt custom metadata alone.
+They read and validate the exact receipt body, archived pointer, canonical
+timestamp, closed state fields, object identity, and matching metadata. A
+`forwarded` fast path additionally requires `providerAccepted: true`; rejected
+or quarantined fast paths require an exact suppression reason. `stored` and
+`deleted` also require the authoritative Mailbox Message or deletion tombstone.
+Missing Mailbox truth retries without clearing the active recovery marker.
+
+For a raw object without a receipt, reconciliation first performs bounded checks
+for an exact deletion tombstone or stored Message and reconstructs that terminal
+receipt when proven. False, unavailable, malformed, or timed-out optional truth
+cannot create a manual limbo state. It establishes emergency-forward authority
+before best-effort `ADMISSION_DECISION_MISSING` evidence and the recovery pointer.
+Raw metadata alone never authorizes normal admission or Queue projection. Do not
+manufacture or edit recovery pointers manually.
 
 Messages whose selected body exceeds 512 KiB keep a bounded preview in the Mailbox Durable Object and store the complete UTF-8 body in attempt-scoped R2 objects. Attachment objects are also attempt-scoped. Unknown-length decoded streams use R2 multipart upload with one bounded 5 MiB part buffer because workerd requires a declared length for a one-shot R2 stream. Every derived R2 write verifies the returned byte length before the SQL projection can commit.
 
@@ -404,7 +679,9 @@ Deleting an email atomically tombstones the ingress identity and inserts all att
 For a manual recovery, first inspect the receipt without modifying it:
 
 ```bash
-npx wrangler r2 object get wiser-mail-raw-archive/receipts/<ingressId>.json --env wiser --remote --pipe
+INGRESS_ID="${INGRESS_ID:?set the exact incident ingress identity}"
+TARGET_MAILBOX="${TARGET_MAILBOX:?set the exact verified Wiser mailbox}"
+npx wrangler r2 object get "wiser-mail-raw-archive/receipts/${INGRESS_ID}.json" --env wiser --remote --pipe
 ```
 
 After confirming the intended mailbox in the receipt, recover with the dedicated one-message command. It sends only the ingress identity and target mailbox to the server. The authenticated admin endpoint loads the receipt and exact raw object directly from R2, validates the pointer schema, mailbox, size, ETag, and object version, then preserves the original `ingressId`. Do not use the Zoho importer because its historical-import identity would create a second Message when a live projection partially succeeded.
@@ -415,8 +692,8 @@ export IMPORT_PASSWORD
 node scripts/recover-inbound.mjs \
   --base https://mail.wiserchat.ai \
   --email hesham@wiserchat.ai \
-  --mailbox <target-mailbox@wiserchat.ai> \
-  --ingress-id <ingressId>
+  --mailbox "$TARGET_MAILBOX" \
+  --ingress-id "$INGRESS_ID"
 unset IMPORT_PASSWORD
 ```
 
@@ -428,7 +705,7 @@ path in the incident record. Keep exact R2 identities inside the private receipt
 and server-side recovery flow. Never delete or overwrite the R2 raw object or
 recovery audit objects as part of replay.
 
-Before either environment is deployed, create or verify all three Queues, set message retention to the paid-plan maximum 14 days, and verify every binding and consumer. Cloudflare may create a missing configured DLQ during deployment, so pre-creation and inspection prevent an unreviewed resource from appearing implicitly. Queue creation, retention changes, secret changes, and deployment require separate same-turn approval. Set the `EMERGENCY_FORWARD_TO` secret only after `heshamelmahdi@gmail.com` is a verified Cloudflare Email Routing destination.
+Before either environment is deployed, create or verify all four Queues, set message retention to the paid-plan maximum 14 days, and verify every binding and consumer. Verify `heshamelmahdi@gmail.com` as the fixed destination, onboard `emergency-forward@wiserchat.ai` and `emergency-forward@whispyrcrm.com` as sender addresses, and confirm the resolved artifact pins the same destination for both mechanisms. Queue creation, retention changes, Email Service onboarding, secret changes, and deployment require separate same-turn approval. Before cutover, each brand needs separate live 5.1 MiB and near-25 MiB proofs for ingress-time Email Routing `forward()` and post-ingress Email Service `send_email`; local dry-runs cannot prove account-level destination or sender authorization.
 
 ## Rollback
 
@@ -441,6 +718,15 @@ Rollback before Zoho decommission:
 
 Do not delete Wiser D1/R2/KV resources during rollback. Preserve imported mail and logs for reconciliation.
 Do not delete the raw-mail bucket, Queue, DLQ, receipt sidecars, or raw objects during rollback.
+Migration 0012 is forward-only. First disable the exact Wiser
+`credential_recovery_control` row, then roll forward a fix. After the explicit legacy scrub, do not restore
+private destinations to `users.recovery_email` and do not roll back to a Worker
+that reads or writes that column. Keep the private preflight export, the exact
+approved `ACCOUNT_RECOVERY_DIRECTORY`, `CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1`, and
+all recovery evidence tables intact. If the matching Worker cannot remain live,
+disable public recovery and roll forward a fix. Never delete or rotate the V1
+payload key as a rollback action because pending and parked ciphertext would
+become undecryptable.
 
 ## Post-Go-Live Cleanup
 
@@ -451,6 +737,15 @@ After an agreed observation window:
 3. Confirm `DOMAINS` remains exactly `wiserchat.ai` and that no temporary test-domain routing exists.
 4. Decommission Zoho routing/mailboxes only after explicit approval.
 5. Write the final launch note in `~/Documents/hesham-os/wiserchat/logs/notes/`.
+6. After the live credential-recovery proof and rollback observation window are
+   both complete, delete the exact private `LEGACY_RECOVERY_EXPORT` file and
+   verify that path no longer exists. Never paste, commit, upload, or back up
+   this temporary export.
+
+   ```bash
+   rm -- "$LEGACY_RECOVERY_EXPORT"
+   test ! -e "$LEGACY_RECOVERY_EXPORT"
+   ```
 
 ## Stop Conditions
 
@@ -463,8 +758,9 @@ Stop and rollback or ask for direction if any of these happen:
 - The UI shows Whispyr branding on `mail.wiserchat.ai`.
 - Imported mail count reconciliation fails without an explained duplicate/skip reason.
 - Any raw archive write fails or the raw object size does not match the Email Worker envelope size.
-- The inbound Queue, DLQ, or parking Queue is missing, paused unexpectedly, has the wrong retention, or has an unexplained backlog.
+- The inbound Queue, DLQ, parking Queue, or emergency-forward Queue is missing, paused unexpectedly, has the wrong retention, or has an unexplained backlog.
 - A receipt reports `dead_lettered`, `quarantined`, or `STORED_PROJECTION_MISSING` without an active incident and verified recovery decision.
-- Apex cutover is requested before raw R2 lifecycle and Bucket Lock behavior is
-  product-locked, recorded, separately approved, and applied.
+- Apex cutover is requested before exact-`raw/`-prefix R2 lifecycle and Bucket
+  Lock behavior is product-locked, recorded, separately approved, applied, and
+  verified without blocking mutable receipt or recovery-marker operations.
 - Any secret appears in terminal output, files under git, Jira, or documentation.

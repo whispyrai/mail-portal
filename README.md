@@ -58,7 +58,14 @@ node scripts/import-zoho.mjs \
 unset IMPORT_PASSWORD
 ```
 
-Repeat for `contact@wiserchat.ai`. The driver exits non-zero if any message fails. The full Wiser migration/cutover order is in [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md).
+Repeat for `contact@wiserchat.ai`. The driver reconciles the exact source and
+result totals, and exits non-zero on any message failure, unprocessed source, or
+identity collision. It derives identity locally from the exact RFC822 bytes,
+maps folders locally, requires matching permanent server evidence for
+no-Message-ID duplicates, and
+writes a private exclusive log with a final `PASS` or `FAIL` reconciliation
+summary. The full Wiser migration/cutover order is in
+[`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md).
 
 ## Deploy (production runbook â€” Whispyr environment)
 
@@ -76,15 +83,16 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler d1 migrations apply sales_portal_users --env whispyr --remote
    ```
 
-   Apply all migrations through
-   `0011_create_saved_view_create_operations.sql` before deploying the current
-   Worker. Migration 0010 creates the durable Agent connection-reconciliation
-   outbox and lifecycle triggers required by live access revocation. Migration
-   0011 adds the idempotency ledger required by saved-view creation. Apply them
-   before enabling the minutely connection reconciler, five-minute inbound
-   archive reconciler, and hourly AI cache-retention schedules. The application
-   fails closed when required D1 authorization or reconciliation state is
-   unavailable.
+   Migration 0010 creates the durable Agent connection-reconciliation outbox and
+   lifecycle triggers required by live access revocation. Migration 0011 adds
+   the idempotency ledger required by saved-view creation. Migration 0012 adds
+   encrypted durable recovery intake, delivery, per-attempt provider correlation,
+   event evidence, and a default-disabled D1 control. Recovery is intentionally
+   unavailable when the control table or row is absent. Use the shared
+   [credential-recovery rollout runbook](docs/credential-recovery-rollout-runbook.md)
+   for both brands. Its fixed order is code-first frozen deploy, private
+   export/reconciliation, separately approved scrub, migration 0012, disabled
+   schema proof, callback/secret proof, explicit enable, then end-to-end proof.
 
 2. **R2 bucket**
 
@@ -96,6 +104,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler queues create sales-mail-inbound --env whispyr --message-retention-period-secs 1209600
    npx wrangler queues create sales-mail-inbound-dlq --env whispyr --message-retention-period-secs 1209600
    npx wrangler queues create sales-mail-inbound-parking --env whispyr --message-retention-period-secs 1209600
+   npx wrangler queues create sales-mail-emergency-forward --env whispyr --message-retention-period-secs 1209600
    ```
 
    `sales-mail-raw-archive` is the private authoritative copy of every accepted
@@ -104,12 +113,25 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    from writing to either production bucket. The Queue graph is exactly
    `sales-mail-inbound` â†’ `sales-mail-inbound-dlq` â†’
    `sales-mail-inbound-parking`, with the configured terminal parking consumer.
-   All three Queues must use the locked 14-day retention.
+   All four Queues must use the locked 14-day retention. The dedicated
+   emergency-forward Queue sends exact archived RFC 5322 streams only to the
+   fixed verified destination configured by the `EMERGENCY_EMAIL` binding. Its
+   R2 marker uses a 20-minute lease and generation fence, so the five-minute
+   reconciler can recover expired delivery without creating multiple live
+   attempts. Provider acceptance is committed to the marker before the exact
+   `forwarded` receipt, allowing a receipt-CAS retry to finish without resending.
+   The combined scheduled reconciliation shape is capped at 8,865 service
+   subrequests per run. This bounds work but does not promise a delivery time
+   during a Cron outage or sustained ingress above a lane's admitted capacity.
 
    Raw-archive lifecycle and Bucket Lock retention are not yet product-locked.
-   Before routing live mail, make that product decision, record it, obtain
-   separate approval, and only then apply the selected policies. Do not copy a
-   placeholder retention value into production.
+   Any future rule must target the exact `raw/` prefix only. It must never target
+   the whole bucket or mutable `receipts/`, `system/`, cursor, marker, anomaly,
+   or audit objects. Before routing live mail, choose the raw retention behavior,
+   record it, obtain separate approval, and verify both that a `raw/` object is
+   protected and that a receipt plus emergency marker can still be created,
+   conditionally updated, and deleted. Do not copy a placeholder duration into
+   production.
 
    For existing Queues, inspect and correct retention before deployment:
 
@@ -117,6 +139,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler queues info sales-mail-inbound --env whispyr
    npx wrangler queues info sales-mail-inbound-dlq --env whispyr
    npx wrangler queues info sales-mail-inbound-parking --env whispyr
+   npx wrangler queues info sales-mail-emergency-forward --env whispyr
    npx wrangler r2 bucket info sales-mail-raw-archive --env whispyr
    npx wrangler r2 bucket lifecycle list sales-mail-raw-archive --env whispyr
    npx wrangler r2 bucket lock list sales-mail-raw-archive --env whispyr
@@ -134,6 +157,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler queues update sales-mail-inbound --env whispyr --message-retention-period-secs 1209600
    npx wrangler queues update sales-mail-inbound-dlq --env whispyr --message-retention-period-secs 1209600
    npx wrangler queues update sales-mail-inbound-parking --env whispyr --message-retention-period-secs 1209600
+   npx wrangler queues update sales-mail-emergency-forward --env whispyr --message-retention-period-secs 1209600
    ```
 
 3. **Secrets**
@@ -142,10 +166,10 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    npx wrangler secret put AWS_ACCESS_KEY_ID --env whispyr       # SES IAM user (ses:SendEmail)
    npx wrangler secret put AWS_SECRET_ACCESS_KEY --env whispyr
    npx wrangler secret put SES_EVENT_WEBHOOK_SECRET --env whispyr
+   npx wrangler secret put CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1 --env whispyr
    npx wrangler secret put JWT_SECRET --env whispyr              # openssl rand -base64 48
    npx wrangler secret put ADMIN_BOOTSTRAP_EMAIL --env whispyr   # e.g. hesham@whispyrcrm.com
    npx wrangler secret put ACCOUNT_RECOVERY_DIRECTORY --env whispyr
-   npx wrangler secret put EMERGENCY_FORWARD_TO --env whispyr
    npx wrangler secret put VAPID_PUBLIC_KEY --env whispyr
    npx wrangler secret put VAPID_PRIVATE_KEY --env whispyr
    ```
@@ -157,9 +181,19 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
    until they consume the emailed setup link; claimed users request recovery from
    the sign-in page and receive a generic response that does not reveal account
    existence.
+   `CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1` is a separate high-entropy encryption
+   key for durable recovery jobs. It is not the JWT signing secret. Keep this
+   V1 value available without rotation or deletion while any request or
+   delivery ciphertext created with key version 1 exists. A future rotation
+   requires a new versioned binding and an explicit decrypt/re-encrypt plan.
    `AWS_REGION` and `DOMAINS` are plain vars already set in `wrangler.jsonc`.
+   Before deployment, verify `heshamelmahdi@gmail.com` as an Email Routing
+   destination and onboard `emergency-forward@whispyrcrm.com` as an allowed
+   Email Service sender. The binding and Worker var both pin the destination;
+   `EMERGENCY_FORWARD_DESTINATION` is the single pinned authority used by both
+   raw-first ingress `forward()` and post-ingress Email Service delivery.
 
-4. **Deploy** â€” provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `env.whispyr`). `CLOUDFLARE_ENV=whispyr` is baked in by the script, so the build resolves the `env.whispyr` block and the deploy lands on the `sales-mail-portal` Worker:
+4. **Deploy** â€” provisions the Worker and the `mail.whispyrcrm.com` custom domain (the `routes` entry in `env.whispyr`). The script holds an atomic local lock across build, resolved-artifact verification, and deploy. It rejects config/environment overrides and invokes Wrangler only with `--config build/server/wrangler.json`:
 
    ```bash
    npm run deploy:whispyr
@@ -167,7 +201,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
 
 5. **Inbound â€” Cloudflare Email Routing** (dashboard â†’ `whispyrcrm.com` â†’ Email Routing): enable it (accept the MX records), then add a **catch-all** rule that delivers to this Worker.
 
-6. **Outbound â€” AWS SES** (`eu-west-2`): add `whispyrcrm.com` as a verified domain identity. SES issues 3 DKIM CNAMEs â€” add them to Cloudflare DNS. Then add:
+6. **Outbound â€” AWS SES** (`eu-west-2`): add `whispyrcrm.com` as a verified domain identity. SES issues 3 DKIM CNAMEs â€” add them to Cloudflare DNS. Configure the brand-filtered SES configuration-set, EventBridge API Destination, bearer Connection, retry/DLQ, alarms, exact callback proof, and synthetic canary from the shared [credential-recovery rollout runbook](docs/credential-recovery-rollout-runbook.md). Then add:
    - `TXT whispyrcrm.com` â†’ `v=spf1 include:amazonses.com include:_spf.mx.cloudflare.net -all`
    - `TXT _dmarc.whispyrcrm.com` â†’ `v=DMARC1; p=quarantine; rua=mailto:hesham@whispyrcrm.com`
 
@@ -177,7 +211,7 @@ Each brand is a named Wrangler environment in `wrangler.jsonc` (`env.whispyr`, â
 
 ## Deploy (production runbook - Wiser environment)
 
-Wiser has its own named Wrangler environment, resources, secrets, SES identity, and DNS/routing sequence. Use [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md) for the exact approval-gated end-to-end launch checklist.
+Wiser has its own named Wrangler environment, resources, secrets, SES identity, and DNS/routing sequence. Use [`docs/wiser-go-live-runbook.md`](docs/wiser-go-live-runbook.md) for the full launch checklist and the shared [`docs/credential-recovery-rollout-runbook.md`](docs/credential-recovery-rollout-runbook.md) for the mandatory both-brand recovery sequence.
 
 ## License
 

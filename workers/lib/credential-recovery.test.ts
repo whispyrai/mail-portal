@@ -2,28 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createCredentialRecoveryWorkflow } from "./credential-recovery.ts";
 
-test("an invitation stores only a hash and delivers the raw token to the recovery address", async () => {
+test("an invitation durably queues the raw token without returning it", async () => {
   const stored: Array<Record<string, unknown>> = [];
-  const deliveries: Array<Record<string, unknown>> = [];
   const workflow = createCredentialRecoveryWorkflow({
     now: () => 1_000,
     generateToken: () => "raw-secret-token",
     hashToken: async () => "opaque-hash",
     store: {
-      async issue(record) {
-        stored.push(record);
+      async issue(record, delivery) {
+        stored.push({ record, delivery });
+        return "issued" as const;
       },
       async consume() {
         return null;
       },
     },
-    async deliver(input) {
-      deliveries.push(input);
-      return "accepted";
-    },
   });
 
-  await workflow.issue({
+  const result = await workflow.issue({
     purpose: "setup",
     userId: "user-1",
     loginEmail: "user@wiserchat.ai",
@@ -32,10 +28,16 @@ test("an invitation stores only a hash and delivers the raw token to the recover
     origin: "https://mail.wiserchat.ai",
   });
 
-  assert.equal(stored[0]?.tokenHash, "opaque-hash");
-  assert.doesNotMatch(JSON.stringify(stored), /raw-secret-token/);
-  assert.equal(deliveries[0]?.to, "user@personal.example");
-  assert.match(String(deliveries[0]?.recoveryUrl), /raw-secret-token/);
+  const record = stored[0]?.record as Record<string, unknown>;
+  const delivery = stored[0]?.delivery as Record<string, unknown>;
+  assert.equal(record.tokenHash, "opaque-hash");
+  assert.equal(delivery.to, "user@personal.example");
+  assert.match(String(delivery.recoveryUrl), /raw-secret-token/);
+  assert.deepEqual(result, {
+    issuance: "issued",
+    delivery: "queued",
+    expiresAt: 86_401_000,
+  });
 });
 
 test("a recovery token is expiring and single-use at the workflow boundary", async () => {
@@ -45,7 +47,7 @@ test("a recovery token is expiring and single-use at the workflow boundary", asy
     generateToken: () => "token",
     hashToken: async (token) => `hash:${token}`,
     store: {
-      async issue() {},
+      async issue() { return "issued" as const; },
       async consume(input) {
         if (!available || input.tokenHash !== "hash:token") return null;
         available = false;
@@ -55,9 +57,6 @@ test("a recovery token is expiring and single-use at the workflow boundary", asy
           outcome: "claimed" as const,
         };
       },
-    },
-    async deliver() {
-      return "accepted";
     },
   });
 
@@ -92,15 +91,13 @@ test("setup and recovery issuance are recorded as distinct audit-safe purposes",
     generateToken: () => "raw-token",
     hashToken: async () => "hash-only",
     store: {
-      async issue(record) {
-        stored.push(record);
+      async issue(record, delivery) {
+        stored.push({ record, delivery });
+        return "issued" as const;
       },
       async consume() {
         return null;
       },
-    },
-    async deliver() {
-      return "accepted";
     },
   });
 
@@ -112,7 +109,7 @@ test("setup and recovery issuance are recorded as distinct audit-safe purposes",
     origin: "https://mail.wiserchat.ai",
   });
 
-  assert.equal(stored[0]?.purpose, "recovery");
-  assert.equal(stored[0]?.issuedBy, undefined);
-  assert.doesNotMatch(JSON.stringify(stored), /raw-token|personal\.example/);
+  const record = stored[0]?.record as Record<string, unknown>;
+  assert.equal(record.purpose, "recovery");
+  assert.equal(record.issuedBy, undefined);
 });

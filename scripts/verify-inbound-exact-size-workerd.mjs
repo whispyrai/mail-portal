@@ -22,6 +22,8 @@ const COMPATIBILITY_DATE = "2026-07-15";
 const MINIFLARE_COMPATIBILITY_DATE = "2026-03-12";
 const GLOBAL_TIMEOUT_MS = 15 * 60_000;
 const PHASE_TIMEOUT_MS = 180_000;
+const PHASE_HEARTBEAT_MS = 10_000;
+const DISPOSE_TIMEOUT_MS = 10_000;
 const BOUNDARY = "canary-boundary";
 
 export const FIXTURE_LAYOUT = Object.freeze({
@@ -305,7 +307,7 @@ function baseBindings(phase, concurrency, queueName) {
     FEATURES: [],
     DOMAINS: "wiserchat.ai",
     EMAIL_ADDRESSES: [],
-    EMERGENCY_FORWARD_TO: "forbidden@example.invalid",
+    EMERGENCY_FORWARD_DESTINATION: "forbidden@example.invalid",
     AWS_REGION: "eu-west-2",
     AWS_ACCESS_KEY_ID: "local-only",
     AWS_SECRET_ACCESS_KEY: "local-only",
@@ -606,16 +608,73 @@ async function disposeRuntime(runtimeState, runtime = runtimeState.active) {
   if (runtimeState.active === runtime) runtimeState.active = null;
   // Cloudflare's Miniflare API docs require every instance to be disposed so
   // its local listeners and workerd process are stopped after the test run.
-  const disposal = runtime.dispose().catch((error) => {
+  const disposalWork = runtime.dispose().catch((error) => {
     if (!(error instanceof Error && error.code === "ERR_SERVER_NOT_RUNNING")) {
       throw error;
     }
   });
+  let disposalTimer;
+  const disposal = Promise.race([
+    disposalWork,
+    new Promise((_, reject) => {
+      disposalTimer = setTimeout(
+        () => reject(new Error("Miniflare disposal timed out")),
+        DISPOSE_TIMEOUT_MS,
+      );
+    }),
+  ]).finally(() => clearTimeout(disposalTimer));
   runtimeState.disposing = disposal;
   try {
     await disposal;
   } finally {
     if (runtimeState.disposing === disposal) runtimeState.disposing = null;
+  }
+}
+
+function phaseProgress(runtimeState, concurrency, value, logger) {
+  runtimeState.phaseProgress = { concurrency, value, updatedAt: Date.now() };
+  logger.detail(`phase_${concurrency}_progress=${value}`);
+}
+
+export async function runWithPhaseDeadline({
+  concurrency,
+  logger,
+  runtimeState,
+  timeoutMs = PHASE_TIMEOUT_MS,
+  work,
+}) {
+  const startedAt = Date.now();
+  let timeout;
+  const heartbeat = setInterval(() => {
+    const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1_000);
+    const lastProgress = runtimeState.phaseProgress?.value ?? "starting";
+    logger.progress(
+      `Phase ${concurrency}: heartbeat elapsed=${elapsedSeconds}s concurrency=${concurrency} last=${lastProgress}`,
+    );
+  }, Math.min(PHASE_HEARTBEAT_MS, Math.max(1, Math.floor(timeoutMs / 2))));
+  try {
+    return await Promise.race([
+      work(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          const lastProgress = runtimeState.phaseProgress?.value ?? "starting";
+          logger.failure(
+            `Phase ${concurrency}: TIMEOUT after ${timeoutMs}ms; last progress: ${lastProgress}`,
+          );
+          void disposeRuntime(runtimeState).catch((error) => {
+            logger.detail(`phase_${concurrency}_timeout_dispose=${error.stack ?? error}`);
+          });
+          reject(
+            new Error(
+              `Exact-size phase ${concurrency} timed out after ${timeoutMs}ms; last progress: ${lastProgress}`,
+            ),
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearInterval(heartbeat);
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -634,12 +693,14 @@ async function runPhase(
   );
   runtimeState.active = runtime;
   try {
+    phaseProgress(runtimeState, concurrency, "runtime_constructed", logger);
     logger.detail(`phase_${concurrency}_runtime_constructed`);
     const mainWorker = {
       fetch: (input, init) => runtime.dispatchFetch(input, init),
     };
     logger.detail(`phase_${concurrency}_main_worker_ready`);
     const runtimeUrl = await runtime.ready;
+    phaseProgress(runtimeState, concurrency, "runtime_listening", logger);
     logger.detail(`phase_${concurrency}_runtime_listening=${runtimeUrl.origin}`);
     const mailboxIds = Array.from(
       { length: concurrency },
@@ -654,6 +715,7 @@ async function runPhase(
       "canary setup",
     );
     logger.detail(`phase_${concurrency}_local_resources_seeded`);
+    phaseProgress(runtimeState, concurrency, "local_resources_seeded", logger);
     let archivedCount = 0;
     const pointers = await Promise.all(
       mailboxIds.map(async (mailboxId, index) => {
@@ -676,6 +738,12 @@ async function runPhase(
           pointer: await readJsonResponse(response, `ingress ${mailboxId}`),
         };
         archivedCount += 1;
+        phaseProgress(
+          runtimeState,
+          concurrency,
+          `ingress_archived_${archivedCount}_of_${concurrency}`,
+          logger,
+        );
         logger.progress(
           `Phase ${concurrency}: ingress archived ${archivedCount}/${concurrency}`,
         );
@@ -720,6 +788,7 @@ async function runPhase(
       }),
     );
     const control = await waitForControl(mainWorker, concurrency, fatalState);
+    phaseProgress(runtimeState, concurrency, "queue_barrier_completed", logger);
     assert.equal(control.maxActive, concurrency, "all Queue invocations reached the barrier");
     assert.equal(control.active, 0);
     assert.deepEqual([...control.entered].sort(), [...queueNames].sort());
@@ -741,6 +810,12 @@ async function runPhase(
       });
       logger.progress(
         `Phase ${concurrency}: independently verified ${index + 1}/${concurrency}`,
+      );
+      phaseProgress(
+        runtimeState,
+        concurrency,
+        `verified_${index + 1}_of_${concurrency}`,
+        logger,
       );
     }
 
@@ -838,14 +913,19 @@ export async function verifyInboundExactSizeWorkerd({
         `Phase 4/6: local Queue pressure ${index + 1}/${phases.length}, concurrency ${concurrency}`,
       );
       await Promise.race([
-        runPhase(
-          bundle,
+        runWithPhaseDeadline({
           concurrency,
-          fixture,
           logger,
-          fatalState,
           runtimeState,
-        ),
+          work: () => runPhase(
+            bundle,
+            concurrency,
+            fixture,
+            logger,
+            fatalState,
+            runtimeState,
+          ),
+        }),
         fatalPromise,
         timeoutPromise,
       ]);

@@ -12,6 +12,16 @@ import {
 } from "../lib/global-semantic-search.ts";
 import { resolveBrand } from "./brand.ts";
 import type { Env } from "../types.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+	LiveReadSessionAuthorizationError,
+} from "../lib/live-authorized-read.ts";
+import {
+	loadExactLiveMailboxRoster,
+	runExactLiveMailboxRosterRead,
+	type ExactLiveMailboxRosterLoader,
+} from "../lib/live-mailbox-authorization.ts";
 
 const REQUEST_BYTES = 2_048;
 
@@ -91,6 +101,7 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 
 export function createGlobalSemanticSearchRoutes(
 	dependencies: GlobalSemanticSearchRouteDependencies = productionDependencies,
+	loadRoster: ExactLiveMailboxRosterLoader = loadExactLiveMailboxRoster,
 ) {
 	const app = new Hono<GlobalSemanticSearchRouteContext>();
 	app.post("/api/v1/semantic-search", async (c) => {
@@ -118,13 +129,30 @@ export function createGlobalSemanticSearchRoutes(
 		}
 
 		try {
-			return c.json(await dependencies.run({
-				env: c.env,
-				actorUserId: session.sub,
-				query,
-				waitUntil: (work) => c.executionCtx.waitUntil(work),
-			}));
+			return c.json(await runExactLiveMailboxRosterRead(
+				c.env,
+				{
+					userId: session.sub,
+					sessionVersion: session.sessionVersion,
+				},
+				() => dependencies.run({
+					env: c.env,
+					actorUserId: session.sub,
+					query,
+					waitUntil: (work) => c.executionCtx.waitUntil(work),
+				}),
+				loadRoster,
+			));
 		} catch (error) {
+			if (error instanceof LiveReadSessionAuthorizationError) {
+				return c.json({ error: "Unauthorized" }, 401);
+			}
+			if (error instanceof LiveReadAuthorizationError) {
+				return c.json({ error: "Forbidden" }, 403);
+			}
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return c.json({ error: "Authorization unavailable" }, 503);
+			}
 			if (error instanceof SemanticSearchCapacityError) {
 				return c.json({
 					error: "Meaning search currently supports up to 20 accessible Mailboxes",

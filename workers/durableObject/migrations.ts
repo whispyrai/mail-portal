@@ -2420,4 +2420,108 @@ export const mailboxMigrations: Migration[] = [
 				ON r2_deletion_outbox(parked_at, recovery_ref);
 		`),
 	},
-];
+	{
+		name: "41_add_exact_import_source_identity",
+		classify: (sql) => {
+			if (!hasTable(sql, "import_source_identities")) return "apply";
+			const columns = tableColumns(sql, "import_source_identities");
+			return columns.has("email_id") &&
+				columns.has("raw_sha256") &&
+				columns.has("created_at") &&
+				tableColumns(sql, "import_generation_claims").has("identity_source") &&
+				tableColumns(sql, "import_generation_claims").has("legacy_id") &&
+				tableColumns(sql, "import_generation_claims").has("raw_sha256")
+				? "satisfied"
+				: "invalid";
+		},
+		sql: txn(`
+			CREATE TABLE import_source_identities (
+				email_id TEXT PRIMARY KEY,
+				raw_sha256 TEXT NOT NULL CHECK(
+					length(raw_sha256) = 64
+					AND raw_sha256 NOT GLOB '*[^0-9a-f]*'
+				),
+				created_at INTEGER NOT NULL
+			);
+			ALTER TABLE import_generation_claims ADD COLUMN legacy_id TEXT;
+			ALTER TABLE import_generation_claims ADD COLUMN identity_source TEXT
+				CHECK(identity_source IS NULL OR identity_source IN ('message-id', 'raw-sha256'));
+			ALTER TABLE import_generation_claims ADD COLUMN raw_sha256 TEXT CHECK(
+				raw_sha256 IS NULL OR (
+					length(raw_sha256) = 64
+					AND raw_sha256 NOT GLOB '*[^0-9a-f]*'
+				)
+			);
+		`),
+	},
+		{
+			name: "42_add_exact_inbound_deletion_authority",
+		classify: (sql) => {
+			if (!hasTable(sql, "inbound_delivery_authorities")) return "apply";
+			const columns = tableColumns(sql, "inbound_delivery_authorities");
+			return [
+				"id", "schema_version", "raw_key", "mailbox_id", "raw_size",
+				"raw_sha256", "archived_at", "archive_etag", "archive_version",
+				"generation", "state", "deleted_at",
+			].every((column) => columns.has(column))
+				? "satisfied"
+				: "invalid";
+		},
+		sql: txn(`
+			CREATE TABLE inbound_delivery_authorities (
+				id TEXT PRIMARY KEY,
+				schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+				raw_key TEXT NOT NULL,
+				mailbox_id TEXT NOT NULL,
+				raw_size INTEGER NOT NULL CHECK(raw_size > 0 AND raw_size <= 26214400),
+				raw_sha256 TEXT NOT NULL CHECK(
+					length(raw_sha256) = 64
+					AND raw_sha256 NOT GLOB '*[^0-9a-f]*'
+				),
+				archived_at TEXT NOT NULL,
+				archive_etag TEXT NOT NULL,
+				archive_version TEXT NOT NULL,
+				generation INTEGER NOT NULL DEFAULT 1 CHECK(generation >= 1),
+				state TEXT NOT NULL CHECK(state IN ('projected', 'deleted')),
+				deleted_at TEXT,
+				CHECK(
+					(state = 'projected' AND deleted_at IS NULL)
+					OR (state = 'deleted' AND deleted_at IS NOT NULL)
+				)
+			);
+			`),
+		},
+		{
+			name: "43_add_direct_inbound_delivery_authority",
+			classify: (sql) => {
+				if (!hasTable(sql, "direct_inbound_delivery_authorities")) return "apply";
+				const columns = tableColumns(sql, "direct_inbound_delivery_authorities");
+				return [
+					"id", "schema_version", "mailbox_id", "raw_size", "raw_sha256",
+					"received_at", "generation", "state", "deleted_at",
+				].every((column) => columns.has(column))
+					? "satisfied"
+					: "invalid";
+			},
+			sql: txn(`
+				CREATE TABLE direct_inbound_delivery_authorities (
+					id TEXT PRIMARY KEY,
+					schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+					mailbox_id TEXT NOT NULL,
+					raw_size INTEGER NOT NULL CHECK(raw_size > 0 AND raw_size <= 26214400),
+					raw_sha256 TEXT NOT NULL CHECK(
+						length(raw_sha256) = 64
+						AND raw_sha256 NOT GLOB '*[^0-9a-f]*'
+					),
+					received_at TEXT NOT NULL,
+					generation INTEGER NOT NULL DEFAULT 1 CHECK(generation >= 1),
+					state TEXT NOT NULL CHECK(state IN ('projected', 'deleted')),
+					deleted_at TEXT,
+					CHECK(
+						(state = 'projected' AND deleted_at IS NULL)
+						OR (state = 'deleted' AND deleted_at IS NOT NULL)
+					)
+				);
+			`),
+		},
+	];

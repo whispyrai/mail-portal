@@ -11,7 +11,9 @@ import { test } from "node:test";
 import {
 	deriveImportId,
 	deriveImportThreadId,
+	sha256RawEmail,
 	mapZohoFolder,
+	normalizeZohoFolderPath,
 	normalizeEmailDate,
 } from "./parse.ts";
 
@@ -41,6 +43,46 @@ test("mapZohoFolder drops Trash / Spam and their aliases → null", () => {
 	}
 });
 
+test("mapZohoFolder keeps excluded ancestors sticky across the full relative path", () => {
+	for (const path of [
+		"Trash/2024",
+		"Customers/Spam/Recovered",
+		"Deleted/Inbox",
+		"Projects/Junk/Sent",
+	]) {
+		assert.equal(mapZohoFolder(path), null, `${path} should be dropped`);
+	}
+	assert.equal(mapZohoFolder("Projects/2024"), "archive");
+	assert.equal(mapZohoFolder("Projects/Inbox"), "archive");
+	assert.equal(mapZohoFolder("Exports/Sent"), "archive");
+});
+
+test("only exact single-segment Inbox and Sent paths receive special routing", () => {
+	for (const path of ["Inbox", " inbox ", "INBOX", "InBoX"]) {
+		assert.equal(mapZohoFolder(path), "inbox", path);
+	}
+	for (const path of ["Sent", " sent ", "SENT", "SeNt"]) {
+		assert.equal(mapZohoFolder(path), "sent", path);
+	}
+	for (const path of [
+		"Projects/Inbox",
+		" projects / INBOX ",
+		"Exports/Sent",
+		" exports / sEnT ",
+		"Inbox/2024",
+		"Sent/2024",
+	]) {
+		assert.equal(mapZohoFolder(path), "archive", path);
+	}
+});
+
+test("folder normalization preserves the meaningful full relative path and rejects ambiguity", () => {
+	assert.equal(normalizeZohoFolderPath(" Customers \\ 2024 "), "Customers/2024");
+	for (const path of ["", "/Inbox", "Inbox/", "Inbox//2024", ".", "../Inbox"]) {
+		assert.throws(() => normalizeZohoFolderPath(path), /folder path is invalid/i);
+	}
+});
+
 // ── normalizeEmailDate ─────────────────────────────────────────────
 
 test("normalizeEmailDate parses an RFC 2822 Date header to ISO", () => {
@@ -66,8 +108,12 @@ test("normalizeEmailDate falls back to epoch for empty / unparseable input", () 
 
 test("deriveImportId is deterministic for the same Message-ID", async () => {
 	const a = await deriveImportId({ messageId: "<abc123@zoho.example>" }, "team@example.com");
-	const b = await deriveImportId({ messageId: "<abc123@zoho.example>" }, "TEAM@EXAMPLE.COM");
+	const b = await deriveImportId({
+		messageId: "<abc123@zoho.example>",
+		rawSha256: "f".repeat(64),
+	}, "TEAM@EXAMPLE.COM");
 	assert.equal(a, b);
+	assert.equal(a, "310dcd79d78b3d1e771852d65c58f2c4");
 	assert.match(a, /^[0-9a-f]{32}$/); // hex, filesystem/URL-safe
 });
 
@@ -77,27 +123,32 @@ test("deriveImportId differs for different Message-IDs", async () => {
 	assert.notEqual(a, b);
 });
 
-test("deriveImportId falls back to a stable message fingerprint when no Message-ID", async () => {
-	const parts = { from: "john@acme.com", date: "2026-04-15T15:42:00Z", subject: "Hi" };
-	const a = await deriveImportId(parts, "team@example.com");
-	const b = await deriveImportId(parts, "team@example.com");
-	assert.equal(a, b); // stable across runs
-	assert.match(a, /^[0-9a-f]{32}$/);
-
-	const c = await deriveImportId({ ...parts, subject: "Different" }, "team@example.com");
-	assert.notEqual(a, c); // subject participates in the fallback key
+test("deriveImportId distinguishes no-Message-ID messages by exact raw digest", async () => {
+	const first = await deriveImportId({
+		rawSha256: "1".repeat(64),
+	}, "team@example.com");
+	const second = await deriveImportId({
+		rawSha256: "2".repeat(64),
+	}, "team@example.com");
+	assert.notEqual(first, second);
+	assert.equal(first, "00ad8dc36cd7099f7156ee7293c31972");
+	assert.equal(second, "71bac594e1e9836dd8b08fc1587a2c93");
+	assert.match(first, /^[0-9a-f]{32}$/);
+	assert.match(second, /^[0-9a-f]{32}$/);
 });
 
-test("deriveImportId distinguishes same-header messages by their content", async () => {
-	const parts = {
-		from: "john@acme.com",
-		to: "hello@wiserchat.ai",
-		date: "2026-04-15T15:42:00Z",
-		subject: "Hi",
-	};
-	const first = await deriveImportId({ ...parts, content: "First message" }, "team@example.com");
-	const second = await deriveImportId({ ...parts, content: "Second message" }, "team@example.com");
-	assert.notEqual(first, second);
+test("sha256RawEmail hashes the exact RFC822 bytes", async () => {
+	assert.equal(
+		await sha256RawEmail(new TextEncoder().encode("abc").buffer),
+		"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+	);
+});
+
+test("deriveImportId refuses a lossy no-Message-ID fallback", async () => {
+	await assert.rejects(
+		() => deriveImportId({}, "team@example.com"),
+		/valid raw SHA-256/i,
+	);
 });
 
 test("deriveImportThreadId groups RFC-referenced messages regardless of import order", async () => {

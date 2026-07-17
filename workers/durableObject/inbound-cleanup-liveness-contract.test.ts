@@ -17,6 +17,14 @@ const createInboundEnd = source.indexOf(
   createInboundStart,
 );
 const createInbound = source.slice(createInboundStart, createInboundEnd);
+const createDirectStart = source.indexOf("async createDirectInboundEmail(");
+const createDirectEnd = source.indexOf(
+  "async createImportedEmail(",
+  createDirectStart,
+);
+const createDirect = source.slice(createDirectStart, createDirectEnd);
+const createEmailStart = source.indexOf("async createEmail(");
+const createEmail = source.slice(createEmailStart, createInboundEnd);
 const reconciliationSource = readFileSync(
   new URL("../inbound-reconciliation.ts", import.meta.url),
   "utf8",
@@ -82,25 +90,49 @@ test("deletion-outbox failures persist and log only bounded error codes", () => 
 });
 
 test("normal inbound acceptance transaction owns discarded derived-object cleanup", () => {
-  const alarm = createInbound.indexOf(
+  const alarm = createEmail.indexOf(
     "await this.#scheduleAlarmAt(Date.now() + 100)",
   );
-  const transaction = createInbound.indexOf(
+  const transaction = createEmail.indexOf(
     "transactionSync<InboundProjectionResult>",
   );
-  const classify = createInbound.indexOf(
+  const classify = createEmail.indexOf(
     "classifyInboundProjectionDerivedContent",
   );
-  const outbox = createInbound.indexOf("this.#enqueueUnownedR2DeletionSync(");
+  const outbox = createEmail.indexOf("this.#enqueueUnownedR2DeletionSync(");
   assert.notEqual(alarm, -1);
   assert.notEqual(transaction, -1);
   assert.ok(alarm < transaction);
   assert.ok(transaction < classify);
   assert.ok(classify < outbox);
-  assert.doesNotMatch(createInbound.slice(alarm, transaction), /catch/);
-  assert.match(createInbound, /#adoptR2OwnershipSync\(/);
-  assert.match(createInbound, /status: "cleanup_conflict"/);
-  assert.match(createInbound, /cleanupKeys/);
+  assert.doesNotMatch(createEmail.slice(alarm, transaction), /catch/);
+  assert.match(createEmail, /#adoptR2OwnershipSync\(/);
+  assert.match(createEmail, /status: "cleanup_conflict"/);
+  assert.match(createEmail, /cleanupKeys/);
+});
+
+test("live-inbound projection expiry is checked at admission and again before its transaction", () => {
+  const archiveAdmissionCheck = createInbound.indexOf(
+    "assertInboundProjectionDeadlineIsActive(command.projectionExpiresAt)",
+  );
+  const directAdmissionCheck = createDirect.indexOf(
+    "assertInboundProjectionDeadlineIsActive(command.projectionExpiresAt)",
+  );
+  const alarm = createEmail.indexOf(
+    "await this.#scheduleAlarmAt(Date.now() + 100)",
+  );
+  const transactionCheck = createEmail.indexOf(
+    "assertInboundProjectionDeadlineIsActive(",
+  );
+  const transaction = createEmail.indexOf(
+    "transactionSync<InboundProjectionResult>",
+  );
+
+  assert.ok(archiveAdmissionCheck >= 0);
+  assert.ok(directAdmissionCheck >= 0);
+  assert.ok(alarm >= 0);
+  assert.ok(transactionCheck > alarm);
+  assert.ok(transactionCheck < transaction);
 });
 
 test("scheduled reconciliation terminalizes repair attempts before cleanup intents", () => {

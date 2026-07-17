@@ -7,9 +7,16 @@ import {
 	currentAgentActorSessionVersion,
 	hasExactLiveMailboxAccess,
 	isAgentMailboxActive,
+	loadExactLiveMailboxRoster,
 	listExactLiveMailboxes,
 	listStableLiveMailboxes,
+	runExactLiveMailboxRosterRead,
+	runLiveMailboxAuthorizedRead,
 } from "./live-mailbox-authorization.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadSessionAuthorizationError,
+} from "./live-authorized-read.ts";
 import { mcpCredentialSessionVersion } from "./mcp-authorization.ts";
 
 class Statement {
@@ -160,5 +167,146 @@ test("mailbox reconciliation preserves only active mailboxes", async () => {
 	db.prepare("UPDATE mailboxes SET is_active = 0 WHERE id = 'team@example.com'").run();
 	assert.equal(await isAgentMailboxActive(env, "team@example.com"), false);
 	assert.equal(await isAgentMailboxActive(env, "missing@example.com"), false);
+	db.close();
+});
+
+test("global roster snapshots distinguish active users with no mailboxes from stale sessions", async () => {
+	const { db, env } = fixture();
+	assert.deepEqual(await loadExactLiveMailboxRoster(env, "user-1", 7), {
+		mailboxIds: ["one@example.com", "team@example.com"],
+	});
+	db.prepare("UPDATE mailboxes SET is_active = 0").run();
+	assert.deepEqual(await loadExactLiveMailboxRoster(env, "user-1", 7), {
+		mailboxIds: [],
+	});
+	assert.equal(await loadExactLiveMailboxRoster(env, "user-1", 6), null);
+	db.prepare("UPDATE users SET is_active = 0 WHERE id = 'user-1'").run();
+	assert.equal(await loadExactLiveMailboxRoster(env, "user-1", 7), null);
+	db.close();
+});
+
+test("per-mailbox disclosure reads discard every form of in-flight access loss", async () => {
+	for (const revoke of [
+		(db: DatabaseSync) => db.prepare(
+			"DELETE FROM mailbox_memberships WHERE mailbox_id = 'team@example.com' AND user_id = 'user-1'",
+		).run(),
+		(db: DatabaseSync) => db.prepare(
+			"UPDATE mailboxes SET is_active = 0 WHERE id = 'team@example.com'",
+		).run(),
+		(db: DatabaseSync) => db.prepare(
+			"UPDATE users SET is_active = 0 WHERE id = 'user-1'",
+		).run(),
+		(db: DatabaseSync) => db.prepare(
+			"UPDATE users SET session_version = 8 WHERE id = 'user-1'",
+		).run(),
+	]) {
+		const { db, env } = fixture();
+		await assert.rejects(
+			() => runLiveMailboxAuthorizedRead(
+				env,
+				{ mailboxId: "TEAM@EXAMPLE.COM", userId: "user-1", sessionVersion: 7 },
+				async () => {
+					revoke(db);
+					return { subject: "private mail" };
+				},
+			),
+			LiveReadAuthorizationError,
+		);
+		db.close();
+	}
+});
+
+test("global disclosure reads require the exact same canonical mailbox set", async () => {
+	for (const change of [
+		(db: DatabaseSync) => db.prepare(
+			"DELETE FROM mailbox_memberships WHERE mailbox_id = 'team@example.com' AND user_id = 'user-1'",
+		).run(),
+		(db: DatabaseSync) => {
+			db.prepare(
+				`INSERT INTO mailboxes
+				   (id, address, type, owner_user_id, is_active, created_at, updated_at)
+				 VALUES ('added@example.com', 'added@example.com', 'SHARED', NULL, 1, 1, 1)`,
+			).run();
+			db.prepare(
+				"INSERT INTO mailbox_memberships (mailbox_id, user_id, created_at) VALUES ('added@example.com', 'user-1', 1)",
+			).run();
+		},
+		(db: DatabaseSync) => {
+			db.prepare(
+				"DELETE FROM mailbox_memberships WHERE mailbox_id = 'team@example.com' AND user_id = 'user-1'",
+			).run();
+			db.prepare(
+				`INSERT INTO mailboxes
+				   (id, address, type, owner_user_id, is_active, created_at, updated_at)
+				 VALUES ('replacement@example.com', 'replacement@example.com', 'SHARED', NULL, 1, 1, 1)`,
+			).run();
+			db.prepare(
+				"INSERT INTO mailbox_memberships (mailbox_id, user_id, created_at) VALUES ('replacement@example.com', 'user-1', 1)",
+			).run();
+		},
+	]) {
+		const { db, env } = fixture();
+		await assert.rejects(
+			() => runExactLiveMailboxRosterRead(env, {
+				userId: "user-1",
+				sessionVersion: 7,
+			}, async () => {
+				change(db);
+				return { secret: "private result" };
+			}),
+			(error: unknown) => {
+				assert.ok(error instanceof LiveReadAuthorizationError);
+				assert.equal(error instanceof LiveReadSessionAuthorizationError, false);
+				return true;
+			},
+		);
+		db.close();
+	}
+});
+
+test("global disclosure permits stable ordering and an active empty roster, but not a stale session", async () => {
+	const stable = fixture();
+	let reads = 0;
+	assert.equal(await runExactLiveMailboxRosterRead(
+		stable.env,
+		{ userId: "user-1", sessionVersion: 7 },
+		async () => "safe",
+		async () => ({
+			mailboxIds: (++reads === 1
+				? ["z@example.com", "a@example.com"]
+				: ["a@example.com", "z@example.com"]
+			).sort(),
+		}),
+	), "safe");
+
+	assert.equal(await runExactLiveMailboxRosterRead(
+		stable.env,
+		{ userId: "user-1", sessionVersion: 7 },
+		async () => "safe",
+		async () => ({ mailboxIds: [] }),
+	), "safe");
+
+	await assert.rejects(
+		() => runExactLiveMailboxRosterRead(
+			stable.env,
+			{ userId: "user-1", sessionVersion: 7 },
+			async () => "private",
+			async () => null,
+		),
+		LiveReadSessionAuthorizationError,
+	);
+	stable.db.close();
+
+	const { db, env } = fixture();
+	await assert.rejects(
+		() => runExactLiveMailboxRosterRead(env, {
+			userId: "user-1",
+			sessionVersion: 7,
+		}, async () => {
+			db.prepare("UPDATE users SET session_version = 8 WHERE id = 'user-1'").run();
+			return "private";
+		}),
+		LiveReadSessionAuthorizationError,
+	);
 	db.close();
 });

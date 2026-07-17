@@ -2,14 +2,19 @@ import type { Context } from "hono";
 import { generateMcpToken, hashPassword, hashToken } from "../lib/auth.ts";
 import { credentialRecoveryWorkflow } from "../lib/credential-recovery-runtime.ts";
 import { recoveryRequestProcessor } from "../lib/recovery-request-runtime.ts";
+import { runCredentialRecoveryMaintenance } from "../lib/recovery-request-runtime.ts";
 import { escapeHtml } from "../lib/email-helpers.ts";
 import type { Env } from "../types.ts";
+import { privacySafeErrorName } from "../lib/privacy-safe-error.ts";
 import { brandLogo, pageShell, resolveBrand } from "./brand.ts";
 import { requireAgentConnectionReconciliation } from "../lib/agent-connection-revocation-outbox.ts";
+import { readBoundedUrlencodedForm } from "../lib/bounded-urlencoded-form.ts";
+import { isCredentialRecoveryEnabled } from "../lib/credential-recovery-control.ts";
 
 type RecoveryContext = Context<{ Bindings: Env }>;
 
 export type CredentialRecoveryHandlerDependencies = {
+  isEnabled(env: Env): Promise<boolean>;
   hashPassword: typeof hashPassword;
   generateMcpToken: typeof generateMcpToken;
   hashToken: typeof hashToken;
@@ -37,6 +42,7 @@ export type CredentialRecoveryHandlerDependencies = {
 };
 
 const productionDependencies: CredentialRecoveryHandlerDependencies = {
+  isEnabled: isCredentialRecoveryEnabled,
   hashPassword,
   generateMcpToken,
   hashToken,
@@ -67,12 +73,21 @@ const productionDependencies: CredentialRecoveryHandlerDependencies = {
 
 const GENERIC_RECOVERY_MESSAGE =
   "If the account is eligible, a secure recovery link will be sent to its configured external address.";
+const MAX_RECOVERY_REQUEST_BODY_BYTES = 1_024;
+const MAX_RECOVERY_EMAIL_BYTES = 254;
 
-function safeErrorName(error: unknown): string {
-  if (!(error instanceof Error)) return "UnknownError";
-  return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name)
-    ? error.name
-    : "UnknownError";
+async function recoveryRequestEmail(c: RecoveryContext): Promise<string | null> {
+  try {
+    const form = await readBoundedUrlencodedForm(c.req.raw, {
+      maxBytes: MAX_RECOVERY_REQUEST_BODY_BYTES,
+      fields: {
+        email: { required: true, maxBytes: MAX_RECOVERY_EMAIL_BYTES },
+      },
+    });
+    return form.email ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function recoveryPage(
@@ -119,26 +134,65 @@ function recoveryPage(
   );
 }
 
-export function credentialRecoveryPage(c: RecoveryContext) {
-  c.header("Referrer-Policy", "no-referrer");
-  c.header("Cache-Control", "no-store");
-  const token = c.req.query("token")?.trim() ?? "";
-  return c.html(
-    recoveryPage(c, {
-      token,
-      ...(token ? {} : { error: "This recovery link is incomplete." }),
-    }),
-  );
+type CredentialRecoveryControlReader = (env: Env) => Promise<boolean>;
+
+async function recoveryIsEnabled(
+  c: RecoveryContext,
+  readControl: CredentialRecoveryControlReader,
+): Promise<boolean> {
+  try {
+    return (await readControl(c.env)) === true;
+  } catch {
+    return false;
+  }
 }
 
-function recoveryRequestPage(c: RecoveryContext, submitted = false) {
+function recoveryUnavailable(c: RecoveryContext) {
+  return c.text("Credential recovery is temporarily unavailable.", 503);
+}
+
+export function createCredentialRecoveryPage(
+  readControl: CredentialRecoveryControlReader = isCredentialRecoveryEnabled,
+) {
+  return async function credentialRecoveryPage(c: RecoveryContext) {
+    c.header("Referrer-Policy", "no-referrer");
+    c.header("Cache-Control", "private, no-store");
+    if (!(await recoveryIsEnabled(c, readControl))) {
+      return recoveryUnavailable(c);
+    }
+    const token = c.req.query("token")?.trim() ?? "";
+    return c.html(
+      recoveryPage(c, {
+        token,
+        ...(token ? {} : { error: "This recovery link is incomplete." }),
+      }),
+    );
+  };
+}
+
+export const credentialRecoveryPage = createCredentialRecoveryPage();
+
+/*
+ * The control check above deliberately precedes reading the query token. This
+ * keeps a code-first rollout frozen even when migration 0012 does not exist.
+ */
+function setRecoveryPrivateHeaders(c: RecoveryContext) {
+  c.header("Referrer-Policy", "no-referrer");
+  c.header("Cache-Control", "private, no-store");
+}
+
+function recoveryRequestPage(
+  c: RecoveryContext,
+  submitted = false,
+  unavailable = false,
+) {
   const brand = resolveBrand(c.env.BRAND);
   return pageShell(
     brand,
     `Request recovery · ${brand.appName}`,
     `<div class="wrap--center">
 			<div class="card card--auth">${brandLogo(brand, { href: "/login" })}<h2 class="auth-heading">Recover your account</h2>
-		${submitted ? `<div class="flash ok" role="status">${GENERIC_RECOVERY_MESSAGE}</div>` : `<p class="sub">Enter your portal sign-in email. We never reveal whether an account or recovery address exists.</p>`}
+		${submitted ? `<div class="flash ok" role="status">${GENERIC_RECOVERY_MESSAGE}</div>` : unavailable ? `<div class="flash err" role="alert">Recovery requests are temporarily unavailable. Please retry.</div>` : `<p class="sub">Enter your portal sign-in email. We never reveal whether an account or recovery address exists.</p>`}
 		<form method="post" action="/account/recover/request">
 		<label for="email">Portal email</label>
 		<input id="email" name="email" type="email" required autocomplete="username" autocapitalize="off">
@@ -147,40 +201,119 @@ function recoveryRequestPage(c: RecoveryContext, submitted = false) {
   );
 }
 
-export function credentialRecoveryRequestPage(c: RecoveryContext) {
-  c.header("Referrer-Policy", "no-referrer");
-  c.header("Cache-Control", "no-store");
-  return c.html(recoveryRequestPage(c));
+export function createCredentialRecoveryRequestPage(
+  readControl: CredentialRecoveryControlReader = isCredentialRecoveryEnabled,
+) {
+  return async function credentialRecoveryRequestPage(c: RecoveryContext) {
+    setRecoveryPrivateHeaders(c);
+    if (!(await recoveryIsEnabled(c, readControl))) {
+      return recoveryUnavailable(c);
+    }
+    return c.html(recoveryRequestPage(c));
+  };
 }
 
-export async function handleCredentialRecoveryRequest(c: RecoveryContext) {
-  c.header("Referrer-Policy", "no-referrer");
-  c.header("Cache-Control", "no-store");
-  const form = await c.req.parseBody();
-  const email = String(form.email ?? "");
-  const ip = c.req.header("cf-connecting-ip") || "unknown";
-  const origin = new URL(c.req.url).origin;
-  // Keep the public response generic and timing-stable. All lookup, throttling,
-  // directory resolution, and delivery happens after the response is ready.
-  c.executionCtx.waitUntil(
-    recoveryRequestProcessor(c.env)
-      .process({ email, ip, origin })
-      .catch(() => undefined),
-  );
-  return c.html(recoveryRequestPage(c, true));
+export const credentialRecoveryRequestPage =
+  createCredentialRecoveryRequestPage();
+
+export type CredentialRecoveryRequestHandlerDependencies = {
+  isEnabled(env: Env): Promise<boolean>;
+  enqueue(
+    env: Env,
+    input: { email: string; ip: string },
+  ): Promise<{ kind: "queued" } | { kind: "suppressed" }>;
+  runMaintenance(env: Env): Promise<void>;
+};
+
+const productionRecoveryRequestDependencies: CredentialRecoveryRequestHandlerDependencies = {
+  isEnabled: isCredentialRecoveryEnabled,
+  enqueue: (env, input) => recoveryRequestProcessor(env).enqueue(input),
+  runMaintenance: runCredentialRecoveryMaintenance,
+};
+
+export function createCredentialRecoveryRequestHandler(
+  dependencies: CredentialRecoveryRequestHandlerDependencies = productionRecoveryRequestDependencies,
+) {
+  return async function handleCredentialRecoveryRequest(c: RecoveryContext) {
+    c.header("Referrer-Policy", "no-referrer");
+    c.header("Cache-Control", "private, no-store");
+    if (!(await recoveryIsEnabled(c, dependencies.isEnabled))) {
+      return recoveryUnavailable(c);
+    }
+    try {
+      const email = await recoveryRequestEmail(c);
+      if (email === null) return c.html(recoveryRequestPage(c, true), 202);
+      const ip = c.req.header("cf-connecting-ip") || "unknown";
+      const accepted = await dependencies.enqueue(c.env, { email, ip });
+      console.info("[credential-recovery] request intake complete", {
+        operation: "credential_recovery_request_intake",
+        outcome: accepted.kind,
+      });
+      if (accepted.kind === "queued") {
+        // The request is already durable. This only reduces latency; minute cron
+        // remains authoritative if waitUntil never starts or the Worker crashes.
+        try {
+          const maintenance = dependencies.runMaintenance(c.env);
+          c.executionCtx.waitUntil(maintenance);
+        } catch {
+          // The durable job is authoritative. Scheduling is only an accelerator.
+        }
+      }
+      return c.html(recoveryRequestPage(c, true), 202);
+    } catch {
+      // Infrastructure failure is distinct from account eligibility but remains
+      // privacy-safe: no account or directory lookup happens on this route.
+      return c.html(recoveryRequestPage(c, false, true), 503);
+    }
+  };
 }
+
+export const handleCredentialRecoveryRequest =
+  createCredentialRecoveryRequestHandler();
 
 export function createCredentialRecoveryHandler(
   dependencies: CredentialRecoveryHandlerDependencies = productionDependencies,
 ) {
   return async function handleCredentialRecovery(c: RecoveryContext) {
     c.header("Referrer-Policy", "no-referrer");
-    c.header("Cache-Control", "no-store");
-    const form = await c.req.parseBody();
+    c.header("Cache-Control", "private, no-store");
+    if (!(await recoveryIsEnabled(c, dependencies.isEnabled))) {
+      return recoveryUnavailable(c);
+    }
+    let form: {
+      token?: string;
+      password?: string;
+      confirm?: string;
+      createMcp?: string;
+    };
+    try {
+      form = await readBoundedUrlencodedForm(c.req.raw, {
+        maxBytes: 8 * 1024,
+        fields: {
+          token: { required: true, maxBytes: 512 },
+          password: { required: true, maxBytes: 1_024 },
+          confirm: { required: true, maxBytes: 1_024 },
+          createMcp: { required: false, maxBytes: 3 },
+        },
+      });
+    } catch {
+      return c.html(
+        recoveryPage(c, {
+          token: "",
+          error: "This recovery submission is invalid.",
+        }),
+        400,
+      );
+    }
     const token = String(form.token ?? "").trim();
     const password = String(form.password ?? "");
     const confirm = String(form.confirm ?? "");
-    if (!token || password.length < 12 || password !== confirm) {
+    if (
+      !token ||
+      password.length < 12 ||
+      password !== confirm ||
+      (form.createMcp !== undefined && form.createMcp !== "yes")
+    ) {
       return c.html(
         recoveryPage(c, {
           token,
@@ -224,7 +357,7 @@ export function createCredentialRecoveryHandler(
       await dependencies.reconcileAgentConnections(c.env, consumed.userId);
     } catch (error) {
       reconciliationPending = true;
-      reconciliationErrorName = safeErrorName(error);
+      reconciliationErrorName = privacySafeErrorName(error);
     }
     const reconciliationStatus: "success" | "partial_success" = reconciliationPending
       ? "partial_success"

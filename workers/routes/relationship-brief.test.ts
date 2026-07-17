@@ -15,6 +15,7 @@ const session: SessionClaims = {
 	email: "user@example.com",
 	role: "AGENT",
 	mailbox: "user@example.com",
+	sessionVersion: 1,
 };
 
 const unavailable = { state: "unavailable" as const };
@@ -23,7 +24,7 @@ function app(input: {
 	session?: SessionClaims;
 	stub?: unknown;
 	run?: RelationshipBriefRouteDependencies["run"];
-	revalidate?: () => Promise<boolean>;
+	authorize?: () => Promise<boolean>;
 }) {
 	const root = new Hono<MailboxContext>();
 	root.use("*", async (c, next) => {
@@ -34,8 +35,7 @@ function app(input: {
 	});
 	root.route("/", createRelationshipBriefRoutes({
 		run: input.run ?? (async () => unavailable),
-		revalidateAccess: input.revalidate ?? (async () => true),
-	}));
+	}, input.authorize ?? (async () => true)));
 	return root;
 }
 
@@ -96,17 +96,19 @@ test("in-flight revocation suppresses successful, failed, and malformed runtime 
 		async (): Promise<never> => { throw new Error("private provider prompt"); },
 		async () => ({ state: "generated" as const, secret: "malformed" } as never),
 	]) {
+		let checks = 0;
 		const response = await app({
 			session,
 			stub: {},
 			run,
-			revalidate: async () => false,
+			authorize: async () => ++checks === 1,
 		}).request(path, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ refresh: false }),
 		}, {} as Env);
 		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
 		assert.deepEqual(await response.json(), { error: "Forbidden" });
 	}
 });

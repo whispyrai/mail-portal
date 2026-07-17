@@ -48,10 +48,14 @@ import type {
   InboundDerivedContentRepairAttemptTerminal,
   InboundDerivedContentRepairCommand,
   InboundDerivedContentRepairResult,
+  DirectInboundAuthority,
+  DirectInboundProjectionCommand,
+  InboundArchiveAuthority,
   InboundProjectionCommand,
   InboundProjectionResult,
   StoredEmailBodyObject,
 } from "../lib/inbound-projection-contract.ts";
+import { isInboundRawKeyForIngress } from "../lib/inbound-raw-key.ts";
 import { inboundDerivedContentRepairCommandFingerprint } from "../lib/inbound-derived-content-repair-attempt.ts";
 import {
   classifyInboundDerivedContentCleanup,
@@ -615,6 +619,20 @@ function insertSqliteRowsBounded<T>(
     Math.floor(MAX_DO_SQL_BOUND_PARAMETERS / maximumBindingsPerRow),
   );
   for (const chunk of sqlParameterChunks(rows, rowsPerStatement)) insert(chunk);
+}
+
+function assertInboundProjectionDeadlineIsActive(
+  projectionExpiresAt: number | undefined,
+): void {
+  if (projectionExpiresAt === undefined) return;
+  if (
+    !Number.isSafeInteger(projectionExpiresAt) ||
+    projectionExpiresAt <= Date.now()
+  ) {
+    throw Object.assign(new Error("Inbound projection command expired"), {
+      code: "INBOUND_PROJECTION_EXPIRED",
+    });
+  }
 }
 
 export class MailboxDO extends DurableObject<Env> {
@@ -1311,14 +1329,371 @@ export class MailboxDO extends DurableObject<Env> {
     );
   }
 
+  #directInboundAuthorityInputIsValid(
+    input: DirectInboundAuthority,
+  ): boolean {
+    return (
+      input.schemaVersion === 1 &&
+      /^[A-Za-z0-9_-]{1,300}$/.test(input.ingressId) &&
+      input.mailboxId.length > 2 &&
+      input.mailboxId.length <= 320 &&
+      Number.isSafeInteger(input.rawSize) &&
+      input.rawSize > 0 &&
+      input.rawSize <= 25 * 1024 * 1024 &&
+      /^[a-f0-9]{64}$/.test(input.rawSha256) &&
+      Number.isFinite(Date.parse(input.receivedAt)) &&
+      new Date(input.receivedAt).toISOString() === input.receivedAt
+    );
+  }
+
+  #directInboundAuthorityMatches(
+    existing: typeof schema.directInboundDeliveryAuthorities.$inferSelect,
+    input: DirectInboundAuthority,
+    state: "deleted" | "projected",
+  ): boolean {
+    return (
+      existing.state === state &&
+      existing.schema_version === input.schemaVersion &&
+      existing.id === input.ingressId &&
+      existing.mailbox_id === input.mailboxId &&
+      existing.raw_size === input.rawSize &&
+      existing.raw_sha256 === input.rawSha256 &&
+      existing.received_at === input.receivedAt &&
+      (state === "projected"
+        ? existing.generation === 1 && existing.deleted_at === null
+        : existing.generation >= 2 && existing.deleted_at !== null)
+    );
+  }
+
+  #archiveInboundAuthorityMatches(
+    existing: typeof schema.inboundDeliveryAuthorities.$inferSelect,
+    input: InboundArchiveAuthority,
+    state: "deleted" | "projected",
+  ): boolean {
+    return (
+      existing.state === state &&
+      existing.schema_version === input.schemaVersion &&
+      existing.id === input.ingressId &&
+      existing.raw_key === input.rawKey &&
+      existing.mailbox_id === input.mailboxId &&
+      existing.raw_size === input.rawSize &&
+      existing.raw_sha256 === input.rawSha256 &&
+      existing.archived_at === input.archivedAt &&
+      existing.archive_etag === input.etag &&
+      existing.archive_version === input.version &&
+      (state === "projected"
+        ? existing.generation === 1 && existing.deleted_at === null
+        : existing.generation >= 2 && existing.deleted_at !== null)
+    );
+  }
+
+  #directAuthorityMatchesArchiveIdentity(
+    existing: typeof schema.directInboundDeliveryAuthorities.$inferSelect,
+    input: InboundArchiveAuthority,
+    state: "deleted" | "projected",
+  ): boolean {
+    return (
+      existing.state === state &&
+      existing.schema_version === input.schemaVersion &&
+      existing.id === input.ingressId &&
+      existing.mailbox_id === input.mailboxId &&
+      existing.raw_size === input.rawSize &&
+      existing.raw_sha256 === input.rawSha256 &&
+      existing.received_at === input.archivedAt &&
+      (state === "projected"
+        ? existing.generation === 1 && existing.deleted_at === null
+        : existing.generation >= 2 && existing.deleted_at !== null)
+    );
+  }
+
+  #archiveAuthorityMatchesDirectIdentity(
+    existing: typeof schema.inboundDeliveryAuthorities.$inferSelect,
+    input: DirectInboundAuthority,
+    state: "deleted" | "projected",
+  ): boolean {
+    return (
+      existing.state === state &&
+      existing.schema_version === input.schemaVersion &&
+      existing.id === input.ingressId &&
+      existing.mailbox_id === input.mailboxId &&
+      existing.raw_size === input.rawSize &&
+      existing.raw_sha256 === input.rawSha256 &&
+      existing.archived_at === input.receivedAt &&
+      (state === "projected"
+        ? existing.generation === 1 && existing.deleted_at === null
+        : existing.generation >= 2 && existing.deleted_at !== null)
+    );
+  }
+
+  async getInboundDeletionAuthority(
+    input: InboundArchiveAuthority,
+  ): Promise<{ generation: number; deletedAt: string } | null> {
+    if (
+      input.schemaVersion !== 1 ||
+      !input.ingressId ||
+      !isInboundRawKeyForIngress(input.rawKey, input.ingressId) ||
+      !input.mailboxId ||
+      !Number.isSafeInteger(input.rawSize) ||
+      input.rawSize <= 0 ||
+      input.rawSize > 25 * 1024 * 1024 ||
+      !/^[a-f0-9]{64}$/.test(input.rawSha256) ||
+      !Number.isFinite(Date.parse(input.archivedAt)) ||
+      new Date(input.archivedAt).toISOString() !== input.archivedAt ||
+      !input.etag ||
+      !input.version
+    ) {
+      return null;
+    }
+    const authority = this.db
+      .select()
+      .from(schema.inboundDeliveryAuthorities)
+      .where(eq(schema.inboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const directAuthority = this.db
+      .select()
+      .from(schema.directInboundDeliveryAuthorities)
+      .where(eq(schema.directInboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const tombstone = this.db
+      .select({ deletedAt: schema.emailDeletionTombstones.deleted_at })
+      .from(schema.emailDeletionTombstones)
+      .where(eq(schema.emailDeletionTombstones.id, input.ingressId))
+      .get();
+    const liveEmail = this.db
+      .select({ id: schema.emails.id })
+      .from(schema.emails)
+      .where(eq(schema.emails.id, input.ingressId))
+      .get();
+    if (authority && directAuthority) return null;
+    const exactArchive = Boolean(
+      authority &&
+        authority.state === "deleted" &&
+        authority.schema_version === input.schemaVersion &&
+        authority.raw_key === input.rawKey &&
+        authority.mailbox_id === input.mailboxId &&
+        authority.raw_size === input.rawSize &&
+        authority.raw_sha256 === input.rawSha256 &&
+        authority.archived_at === input.archivedAt &&
+        authority.archive_etag === input.etag &&
+        authority.archive_version === input.version &&
+        Number.isSafeInteger(authority.generation) &&
+        authority.generation >= 2 &&
+        authority.deleted_at,
+    );
+    const exactDirect = Boolean(
+      directAuthority &&
+        this.#directAuthorityMatchesArchiveIdentity(
+          directAuthority,
+          input,
+          "deleted",
+        ),
+    );
+    const terminalAuthority = exactArchive ? authority : exactDirect ? directAuthority : null;
+    if (
+      !terminalAuthority ||
+      !terminalAuthority.deleted_at ||
+      tombstone?.deletedAt !== terminalAuthority.deleted_at ||
+      Boolean(liveEmail)
+    ) {
+      return null;
+    }
+    return {
+      generation: terminalAuthority.generation,
+      deletedAt: terminalAuthority.deleted_at,
+    };
+  }
+
+  async getInboundProjectionAuthority(
+    input: InboundArchiveAuthority,
+  ): Promise<{ generation: number } | null> {
+    if (
+      input.schemaVersion !== 1 ||
+      !input.ingressId ||
+      !isInboundRawKeyForIngress(input.rawKey, input.ingressId) ||
+      !input.mailboxId ||
+      !Number.isSafeInteger(input.rawSize) ||
+      input.rawSize <= 0 ||
+      input.rawSize > 25 * 1024 * 1024 ||
+      !/^[a-f0-9]{64}$/.test(input.rawSha256) ||
+      !Number.isFinite(Date.parse(input.archivedAt)) ||
+      new Date(input.archivedAt).toISOString() !== input.archivedAt ||
+      !input.etag ||
+      !input.version
+    ) {
+      return null;
+    }
+    const authority = this.db
+      .select()
+      .from(schema.inboundDeliveryAuthorities)
+      .where(eq(schema.inboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const directAuthority = this.db
+      .select()
+      .from(schema.directInboundDeliveryAuthorities)
+      .where(eq(schema.directInboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const liveEmail = this.db
+      .select({
+        origin: schema.emails.recipient_memory_origin,
+      })
+      .from(schema.emails)
+      .where(eq(schema.emails.id, input.ingressId))
+      .get();
+    const tombstone = this.db
+      .select({ id: schema.emailDeletionTombstones.id })
+      .from(schema.emailDeletionTombstones)
+      .where(eq(schema.emailDeletionTombstones.id, input.ingressId))
+      .get();
+    if (authority && directAuthority) return null;
+    const exactArchive = Boolean(
+      authority &&
+        authority.state === "projected" &&
+        authority.schema_version === input.schemaVersion &&
+        authority.raw_key === input.rawKey &&
+        authority.mailbox_id === input.mailboxId &&
+        authority.raw_size === input.rawSize &&
+        authority.raw_sha256 === input.rawSha256 &&
+        authority.archived_at === input.archivedAt &&
+        authority.archive_etag === input.etag &&
+        authority.archive_version === input.version &&
+        authority.generation === 1 &&
+        authority.deleted_at === null,
+    );
+    const exactDirect = Boolean(
+      directAuthority &&
+        this.#directAuthorityMatchesArchiveIdentity(
+          directAuthority,
+          input,
+          "projected",
+        ),
+    );
+    const terminalAuthority = exactArchive ? authority : exactDirect ? directAuthority : null;
+    if (
+      !terminalAuthority ||
+      liveEmail?.origin !== RecipientMemoryOrigins.LIVE_INBOUND ||
+      tombstone
+    ) {
+      return null;
+    }
+    return { generation: terminalAuthority.generation };
+  }
+
+  async getDirectInboundDeletionAuthority(
+    input: DirectInboundAuthority,
+  ): Promise<{ generation: number; deletedAt: string } | null> {
+    if (!this.#directInboundAuthorityInputIsValid(input)) return null;
+    const authority = this.db
+      .select()
+      .from(schema.directInboundDeliveryAuthorities)
+      .where(eq(schema.directInboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const archiveAuthority = this.db
+      .select()
+      .from(schema.inboundDeliveryAuthorities)
+      .where(eq(schema.inboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const tombstone = this.db
+      .select({ deletedAt: schema.emailDeletionTombstones.deleted_at })
+      .from(schema.emailDeletionTombstones)
+      .where(eq(schema.emailDeletionTombstones.id, input.ingressId))
+      .get();
+    const liveEmail = this.db
+      .select({ id: schema.emails.id })
+      .from(schema.emails)
+      .where(eq(schema.emails.id, input.ingressId))
+      .get();
+    if (authority && archiveAuthority) return null;
+    const exactDirect = Boolean(
+      authority &&
+        this.#directInboundAuthorityMatches(authority, input, "deleted"),
+    );
+    const exactArchive = Boolean(
+      archiveAuthority &&
+        this.#archiveAuthorityMatchesDirectIdentity(
+          archiveAuthority,
+          input,
+          "deleted",
+        ),
+    );
+    const terminalAuthority = exactDirect ? authority : exactArchive ? archiveAuthority : null;
+    if (
+      !terminalAuthority ||
+      !terminalAuthority.deleted_at ||
+      tombstone?.deletedAt !== terminalAuthority.deleted_at ||
+      liveEmail
+    ) {
+      return null;
+    }
+    return {
+      generation: terminalAuthority.generation,
+      deletedAt: terminalAuthority.deleted_at,
+    };
+  }
+
+  async getDirectInboundProjectionAuthority(
+    input: DirectInboundAuthority,
+  ): Promise<{ generation: number } | null> {
+    if (!this.#directInboundAuthorityInputIsValid(input)) return null;
+    const authority = this.db
+      .select()
+      .from(schema.directInboundDeliveryAuthorities)
+      .where(eq(schema.directInboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const archiveAuthority = this.db
+      .select()
+      .from(schema.inboundDeliveryAuthorities)
+      .where(eq(schema.inboundDeliveryAuthorities.id, input.ingressId))
+      .get();
+    const liveEmail = this.db
+      .select({ origin: schema.emails.recipient_memory_origin })
+      .from(schema.emails)
+      .where(eq(schema.emails.id, input.ingressId))
+      .get();
+    const tombstone = this.db
+      .select({ id: schema.emailDeletionTombstones.id })
+      .from(schema.emailDeletionTombstones)
+      .where(eq(schema.emailDeletionTombstones.id, input.ingressId))
+      .get();
+    if (authority && archiveAuthority) return null;
+    const exactDirect = Boolean(
+      authority &&
+        this.#directInboundAuthorityMatches(authority, input, "projected"),
+    );
+    const exactArchive = Boolean(
+      archiveAuthority &&
+        this.#archiveAuthorityMatchesDirectIdentity(
+          archiveAuthority,
+          input,
+          "projected",
+        ),
+    );
+    const terminalAuthority = exactDirect ? authority : exactArchive ? archiveAuthority : null;
+    if (
+      !terminalAuthority ||
+      liveEmail?.origin !== RecipientMemoryOrigins.LIVE_INBOUND ||
+      tombstone
+    ) {
+      return null;
+    }
+    return { generation: terminalAuthority.generation };
+  }
+
   async recordInboundTerminalFailure(input: {
     id: string;
+    archiveAuthority: InboundArchiveAuthority;
     queueRef: string;
     attempts: number;
     errorCode: "QUEUE_RETRY_EXHAUSTED";
   }): Promise<"deleted" | "ledgered" | "stored"> {
     if (
       input.errorCode !== "QUEUE_RETRY_EXHAUSTED" ||
+      input.archiveAuthority.ingressId !== input.id ||
+      input.archiveAuthority.schemaVersion !== 1 ||
+      !isInboundRawKeyForIngress(
+        input.archiveAuthority.rawKey,
+        input.archiveAuthority.ingressId,
+      ) ||
+      !/^[a-f0-9]{64}$/.test(input.archiveAuthority.rawSha256) ||
       !/^[a-f0-9]{16}$/.test(input.queueRef) ||
       !Number.isSafeInteger(input.attempts) ||
       input.attempts < 0
@@ -1326,12 +1701,48 @@ export class MailboxDO extends DurableObject<Env> {
       throw new Error("Inbound terminal failure is invalid");
     }
     return this.ctx.storage.transactionSync(() => {
+      const authority = this.db
+        .select()
+        .from(schema.inboundDeliveryAuthorities)
+        .where(eq(schema.inboundDeliveryAuthorities.id, input.id))
+        .get();
+      const directAuthority = this.db
+        .select()
+        .from(schema.directInboundDeliveryAuthorities)
+        .where(eq(schema.directInboundDeliveryAuthorities.id, input.id))
+        .get();
+      const email = this.db
+        .select({ origin: schema.emails.recipient_memory_origin })
+        .from(schema.emails)
+        .where(eq(schema.emails.id, input.id))
+        .get();
+      const tombstone = this.db
+        .select({ deletedAt: schema.emailDeletionTombstones.deleted_at })
+        .from(schema.emailDeletionTombstones)
+        .where(eq(schema.emailDeletionTombstones.id, input.id))
+        .get();
+      const exactDeletedOwner =
+        authority && !directAuthority
+          ? this.#archiveInboundAuthorityMatches(
+              authority,
+              input.archiveAuthority,
+              "deleted",
+            )
+            ? authority
+            : null
+          : directAuthority && !authority
+            ? this.#directAuthorityMatchesArchiveIdentity(
+                directAuthority,
+                input.archiveAuthority,
+                "deleted",
+              )
+              ? directAuthority
+              : null
+            : null;
       if (
-        this.db
-          .select({ id: schema.emailDeletionTombstones.id })
-          .from(schema.emailDeletionTombstones)
-          .where(eq(schema.emailDeletionTombstones.id, input.id))
-          .get()
+        exactDeletedOwner?.deleted_at &&
+        tombstone?.deletedAt === exactDeletedOwner.deleted_at &&
+        !email
       ) {
         this.db
           .delete(schema.inboundTerminalFailures)
@@ -1339,12 +1750,24 @@ export class MailboxDO extends DurableObject<Env> {
           .run();
         return "deleted";
       }
+      const exactProjectedOwner =
+        authority && !directAuthority
+          ? this.#archiveInboundAuthorityMatches(
+              authority,
+              input.archiveAuthority,
+              "projected",
+            )
+          : directAuthority && !authority
+            ? this.#directAuthorityMatchesArchiveIdentity(
+                directAuthority,
+                input.archiveAuthority,
+                "projected",
+              )
+            : false;
       if (
-        this.db
-          .select({ id: schema.emails.id })
-          .from(schema.emails)
-          .where(eq(schema.emails.id, input.id))
-          .get()
+        exactProjectedOwner &&
+        email?.origin === RecipientMemoryOrigins.LIVE_INBOUND &&
+        !tombstone
       ) {
         this.db
           .delete(schema.inboundTerminalFailures)
@@ -3131,6 +3554,37 @@ export class MailboxDO extends DurableObject<Env> {
       );
       this.#refreshTerminalDraftSaveRetention(id, occurredAt);
       if (tombstoneLiveInbound) {
+        const archiveAuthority = this.db
+          .select({
+            id: schema.inboundDeliveryAuthorities.id,
+            state: schema.inboundDeliveryAuthorities.state,
+          })
+          .from(schema.inboundDeliveryAuthorities)
+          .where(eq(schema.inboundDeliveryAuthorities.id, id))
+          .get();
+        const directAuthority = this.db
+          .select({
+            id: schema.directInboundDeliveryAuthorities.id,
+            state: schema.directInboundDeliveryAuthorities.state,
+          })
+          .from(schema.directInboundDeliveryAuthorities)
+          .where(eq(schema.directInboundDeliveryAuthorities.id, id))
+          .get();
+        if (archiveAuthority && directAuthority) {
+          throw new Error("Inbound email has conflicting authority owners");
+        }
+        if (
+          archiveAuthority?.state !== undefined &&
+          archiveAuthority.state !== "projected"
+        ) {
+          throw new Error("Inbound archive authority is not projected");
+        }
+        if (
+          directAuthority?.state !== undefined &&
+          directAuthority.state !== "projected"
+        ) {
+          throw new Error("Direct inbound authority is not projected");
+        }
         const keys = [
           ...emailAttachments.map((attachment) =>
             storedAttachmentKey(attachment),
@@ -3156,10 +3610,33 @@ export class MailboxDO extends DurableObject<Env> {
             set: { deleted_at: occurredAt },
           })
           .run();
-        this.db
-          .delete(schema.inboundTerminalFailures)
-          .where(eq(schema.inboundTerminalFailures.id, id))
-          .run();
+        if (archiveAuthority?.state === "projected") {
+          this.db
+            .update(schema.inboundDeliveryAuthorities)
+            .set({
+              state: "deleted",
+              generation: sql`${schema.inboundDeliveryAuthorities.generation} + 1`,
+              deleted_at: occurredAt,
+            })
+            .where(eq(schema.inboundDeliveryAuthorities.id, id))
+            .run();
+        } else if (directAuthority?.state === "projected") {
+          this.db
+            .update(schema.directInboundDeliveryAuthorities)
+            .set({
+              state: "deleted",
+              generation: sql`${schema.directInboundDeliveryAuthorities.generation} + 1`,
+              deleted_at: occurredAt,
+            })
+            .where(eq(schema.directInboundDeliveryAuthorities.id, id))
+            .run();
+        }
+        if (archiveAuthority?.state === "projected") {
+          this.db
+            .delete(schema.inboundTerminalFailures)
+            .where(eq(schema.inboundTerminalFailures.id, id))
+            .run();
+        }
       }
       this.db.delete(schema.emails).where(eq(schema.emails.id, id)).run();
     });
@@ -5156,14 +5633,26 @@ export class MailboxDO extends DurableObject<Env> {
     );
   }
 
-  async claimImportedEmail(emailId: string, legacyId: string, token: string) {
+  async claimImportedEmail(
+    emailId: string,
+    legacyId: string,
+    token: string,
+    identitySource: "message-id" | "raw-sha256",
+    rawSha256: string | null,
+  ) {
     if (
       !emailId ||
       emailId.length > 300 ||
       !legacyId ||
       legacyId.length > 300 ||
       token.length < 16 ||
-      token.length > 100
+      token.length > 100 ||
+      !["message-id", "raw-sha256"].includes(identitySource) ||
+      (identitySource === "raw-sha256" &&
+        (legacyId !== emailId ||
+          !rawSha256 ||
+          !/^[0-9a-f]{64}$/.test(rawSha256))) ||
+      (identitySource === "message-id" && rawSha256 !== null)
     )
       throw new Error("Import claim identity is invalid");
     const now = Date.now();
@@ -5176,6 +5665,8 @@ export class MailboxDO extends DurableObject<Env> {
         token,
         now,
         now + 15 * 60_000,
+        identitySource,
+        rawSha256,
       ),
     );
   }
@@ -6589,16 +7080,39 @@ export class MailboxDO extends DurableObject<Env> {
   async createInboundEmail(
     command: InboundProjectionCommand,
   ): Promise<InboundProjectionResult> {
+    assertInboundProjectionDeadlineIsActive(command.projectionExpiresAt);
     if (
       command.folder !== Folders.INBOX ||
       command.email.recipient_memory_origin !==
         RecipientMemoryOrigins.LIVE_INBOUND ||
       command.email.automation_trigger !== "live_inbound" ||
-      !command.mailboxAddress
+      !command.mailboxAddress ||
+      !command.archiveAuthority
     ) {
       throw new Error(
         "Inbound projection is not eligible for atomic acceptance",
       );
+    }
+    const archiveAuthority = command.archiveAuthority;
+    if (
+      archiveAuthority.schemaVersion !== 1 ||
+      archiveAuthority.ingressId !== command.email.id ||
+      archiveAuthority.mailboxId !== command.mailboxAddress ||
+      !isInboundRawKeyForIngress(
+        archiveAuthority.rawKey,
+        archiveAuthority.ingressId,
+      ) ||
+      !Number.isSafeInteger(archiveAuthority.rawSize) ||
+      archiveAuthority.rawSize <= 0 ||
+      archiveAuthority.rawSize > 25 * 1024 * 1024 ||
+      !/^[a-f0-9]{64}$/.test(archiveAuthority.rawSha256) ||
+      !Number.isFinite(Date.parse(archiveAuthority.archivedAt)) ||
+      new Date(archiveAuthority.archivedAt).toISOString() !==
+        archiveAuthority.archivedAt ||
+      !archiveAuthority.etag ||
+      !archiveAuthority.version
+    ) {
+      throw new Error("Inbound projection archive authority is invalid");
     }
     const hasProjectionAttempt = command.projectionAttemptId !== undefined;
     const hasDerivedContentProof = command.derivedContentProof !== undefined;
@@ -6624,6 +7138,63 @@ export class MailboxDO extends DurableObject<Env> {
       {
         bodyObjects: command.bodyObjects,
         allowTerminalRecovery: command.allowTerminalRecovery,
+        kind: "archive",
+        archiveAuthority,
+        projectionExpiresAt: command.projectionExpiresAt,
+        projectionAttemptId,
+        derivedContentProof,
+      },
+    );
+  }
+
+  async createDirectInboundEmail(
+    command: DirectInboundProjectionCommand,
+  ): Promise<InboundProjectionResult> {
+    assertInboundProjectionDeadlineIsActive(command.projectionExpiresAt);
+    const directAuthority = command.directAuthority;
+    if (
+      command.folder !== Folders.INBOX ||
+      command.email.recipient_memory_origin !==
+        RecipientMemoryOrigins.LIVE_INBOUND ||
+      command.email.automation_trigger !== "live_inbound" ||
+      !command.mailboxAddress ||
+      command.projectionExpiresAt === undefined ||
+      !this.#directInboundAuthorityInputIsValid(directAuthority) ||
+      directAuthority.ingressId !== command.email.id ||
+      directAuthority.mailboxId !== command.mailboxAddress ||
+      directAuthority.receivedAt !== command.email.date
+    ) {
+      throw new Error(
+        "Direct inbound projection is not eligible for atomic acceptance",
+      );
+    }
+    const hasProjectionAttempt = command.projectionAttemptId !== undefined;
+    const hasDerivedContentProof = command.derivedContentProof !== undefined;
+    if (hasProjectionAttempt !== hasDerivedContentProof) {
+      throw new Error("Direct inbound projection cleanup proof is incomplete");
+    }
+    const projectionAttemptId = command.projectionAttemptId;
+    const rawDerivedContentProof = command.derivedContentProof;
+    const derivedContentProof =
+      projectionAttemptId !== undefined && rawDerivedContentProof !== undefined
+        ? validateInboundDerivedContentProjectionProof({
+            emailId: command.email.id,
+            projectionAttemptId,
+            objects: rawDerivedContentProof,
+          })
+        : undefined;
+    return this.createEmail(
+      command.folder,
+      command.email,
+      command.attachments,
+      undefined,
+      command.mailboxAddress,
+      {
+        bodyObjects: command.bodyObjects,
+        allowTerminalRecovery: command.allowTerminalRecovery,
+        kind: "direct",
+        directAuthority,
+        projectionExpiresAt: command.projectionExpiresAt,
         projectionAttemptId,
         derivedContentProof,
       },
@@ -6637,9 +7208,24 @@ export class MailboxDO extends DurableObject<Env> {
     mailboxAddress: string | undefined,
     claimToken: string,
     proofFingerprint: string,
+    identitySource: "message-id" | "raw-sha256",
+    rawSha256: string | null,
+    legacyId: string,
   ): Promise<InboundProjectionResult> {
     if (email.recipient_memory_origin !== RecipientMemoryOrigins.ADMIN_IMPORT) {
       throw new Error("Imported Message origin is invalid");
+    }
+    if (
+      !legacyId ||
+      legacyId.length > 300 ||
+      !["message-id", "raw-sha256"].includes(identitySource) ||
+      (identitySource === "raw-sha256" &&
+        (legacyId !== email.id ||
+          !rawSha256 ||
+          !/^[0-9a-f]{64}$/.test(rawSha256))) ||
+      (identitySource === "message-id" && rawSha256 !== null)
+    ) {
+      throw new Error("Imported Message source identity is invalid");
     }
     return this.createEmail(
       folder,
@@ -6648,7 +7234,7 @@ export class MailboxDO extends DurableObject<Env> {
       undefined,
       mailboxAddress,
       undefined,
-      { claimToken, proofFingerprint },
+      { claimToken, proofFingerprint, identitySource, rawSha256, legacyId },
     );
   }
 
@@ -6661,12 +7247,19 @@ export class MailboxDO extends DurableObject<Env> {
     inboundProjection?: {
       bodyObjects: StoredEmailBodyObject[];
       allowTerminalRecovery: boolean;
+      projectionExpiresAt?: number;
       projectionAttemptId?: string;
       derivedContentProof?: InboundDerivedContentCleanupCandidate[];
-    },
+    } & (
+      | { kind: "archive"; archiveAuthority: InboundArchiveAuthority }
+      | { kind: "direct"; directAuthority: DirectInboundAuthority }
+    ),
     importProjection?: {
       claimToken: string;
       proofFingerprint: string;
+      identitySource: "message-id" | "raw-sha256";
+      rawSha256: string | null;
+      legacyId: string;
     },
   ): Promise<InboundProjectionResult> {
     if (
@@ -6714,10 +7307,101 @@ export class MailboxDO extends DurableObject<Env> {
     const inboundCleanupCreatedAt = new Date().toISOString();
     const importValidationNow = Date.now();
 
+    assertInboundProjectionDeadlineIsActive(
+      inboundProjection?.projectionExpiresAt,
+    );
     // Sent emails are always read — the sender obviously knows what they wrote.
     // This prevents sent replies from inflating thread_unread_count.
     const result = this.ctx.storage.transactionSync<InboundProjectionResult>(
       () => {
+        const inboundArchiveAuthorityMatches = (
+          existing: typeof schema.inboundDeliveryAuthorities.$inferSelect,
+          authority: InboundArchiveAuthority,
+        ): boolean =>
+          this.#archiveInboundAuthorityMatches(
+            existing,
+            authority,
+            "projected",
+          );
+        const sealInboundAuthority = () => {
+          if (!inboundProjection) return;
+          if (inboundProjection.kind === "archive") {
+            const authority = inboundProjection.archiveAuthority;
+            const direct = this.db
+              .select({ id: schema.directInboundDeliveryAuthorities.id })
+              .from(schema.directInboundDeliveryAuthorities)
+              .where(eq(schema.directInboundDeliveryAuthorities.id, email.id))
+              .get();
+            if (direct) throw new Error("Direct inbound authority conflicts");
+            const existing = this.db
+              .select()
+              .from(schema.inboundDeliveryAuthorities)
+              .where(eq(schema.inboundDeliveryAuthorities.id, email.id))
+              .get();
+            if (existing) {
+              if (!inboundArchiveAuthorityMatches(existing, authority)) {
+                throw new Error("Inbound archive authority conflicts");
+              }
+              return;
+            }
+            this.db
+              .insert(schema.inboundDeliveryAuthorities)
+              .values({
+                id: authority.ingressId,
+                schema_version: authority.schemaVersion,
+                raw_key: authority.rawKey,
+                mailbox_id: authority.mailboxId,
+                raw_size: authority.rawSize,
+                raw_sha256: authority.rawSha256,
+                archived_at: authority.archivedAt,
+                archive_etag: authority.etag,
+                archive_version: authority.version,
+                generation: 1,
+                state: "projected",
+                deleted_at: null,
+              })
+              .run();
+            return;
+          }
+          const authority = inboundProjection.directAuthority;
+          const archived = this.db
+            .select({ id: schema.inboundDeliveryAuthorities.id })
+            .from(schema.inboundDeliveryAuthorities)
+            .where(eq(schema.inboundDeliveryAuthorities.id, email.id))
+            .get();
+          if (archived) throw new Error("Archived inbound authority conflicts");
+          const existing = this.db
+            .select()
+            .from(schema.directInboundDeliveryAuthorities)
+            .where(eq(schema.directInboundDeliveryAuthorities.id, email.id))
+            .get();
+          if (existing) {
+            if (
+              !this.#directInboundAuthorityMatches(
+                existing,
+                authority,
+                "projected",
+              )
+            ) {
+              throw new Error("Direct inbound authority conflicts");
+            }
+            return;
+          }
+          this.db
+            .insert(schema.directInboundDeliveryAuthorities)
+            .values({
+              id: authority.ingressId,
+              schema_version: authority.schemaVersion,
+              mailbox_id: authority.mailboxId,
+              raw_size: authority.rawSize,
+              raw_sha256: authority.rawSha256,
+              received_at: authority.receivedAt,
+              generation: 1,
+              state: "projected",
+              deleted_at: null,
+            })
+            .run();
+        };
         const finishInboundProjection = (
           status: InboundProjectionResult["status"],
           intendedOwnedSizes?: ReadonlyMap<string, number>,
@@ -6801,6 +7485,27 @@ export class MailboxDO extends DurableObject<Env> {
           return { status, cleanupKeys: cleanup.cleanupKeys };
         };
         if (importProjection) {
+		  const candidateIds = importProjection.legacyId === email.id
+			? [email.id]
+			: [email.id, importProjection.legacyId];
+		  const sourceEvidence = new Map<string, string>();
+		  for (const candidateId of candidateIds) {
+			const evidence = [
+			  ...this.ctx.storage.sql.exec<{ raw_sha256: string }>(
+				`SELECT raw_sha256 FROM import_source_identities
+				 WHERE email_id = ? LIMIT 1`,
+				candidateId,
+			  ),
+			][0];
+			if (evidence) sourceEvidence.set(candidateId, evidence.raw_sha256);
+		  }
+		  if (
+			(importProjection.identitySource === "message-id" && sourceEvidence.size > 0) ||
+			(importProjection.identitySource === "raw-sha256" &&
+			  sourceEvidence.get(email.id) !== importProjection.rawSha256)
+		  ) {
+			throw new Error("Import source identity conflict");
+		  }
           const intent = [
             ...this.ctx.storage.sql.exec<{
               object_count: number;
@@ -6815,8 +7520,13 @@ export class MailboxDO extends DurableObject<Env> {
             ),
           ][0];
           const claim = [
-            ...this.ctx.storage.sql.exec<{ found: number }>(
-              `SELECT 1 AS found FROM import_generation_claims
+            ...this.ctx.storage.sql.exec<{
+              legacy_id: string | null;
+              identity_source: string | null;
+              raw_sha256: string | null;
+            }>(
+              `SELECT legacy_id, identity_source, raw_sha256
+               FROM import_generation_claims
                WHERE message_id = ? AND claim_token = ? AND expires_at > ? LIMIT 1`,
               email.id,
               importProjection.claimToken,
@@ -6825,6 +7535,9 @@ export class MailboxDO extends DurableObject<Env> {
           ][0];
           if (
             !claim ||
+			claim.legacy_id !== importProjection.legacyId ||
+			claim.identity_source !== importProjection.identitySource ||
+			claim.raw_sha256 !== importProjection.rawSha256 ||
             !intent ||
             intent.state !== "recorded" ||
             intent.proof_fingerprint !== importProjection.proofFingerprint ||
@@ -6887,36 +7600,177 @@ export class MailboxDO extends DurableObject<Env> {
             }
           }
           const existingImportedEmail = this.db
-            .select({ id: schema.emails.id })
+            .select({ id: schema.emails.id, folder: schema.emails.folder_id })
             .from(schema.emails)
             .where(eq(schema.emails.id, email.id))
             .get();
           if (existingImportedEmail) {
-            return { status: "duplicate" };
+            return {
+              status: "duplicate",
+              folder: existingImportedEmail.folder,
+            };
           }
         }
         if (inboundProjection) {
           const deleted = this.db
-            .select({ id: schema.emailDeletionTombstones.id })
+            .select({ deletedAt: schema.emailDeletionTombstones.deleted_at })
             .from(schema.emailDeletionTombstones)
             .where(eq(schema.emailDeletionTombstones.id, email.id))
             .get();
-          if (deleted) return finishInboundProjection("deleted");
+          if (deleted) {
+            if (inboundProjection.kind === "direct") {
+              const directAuthority = this.db
+                .select()
+                .from(schema.directInboundDeliveryAuthorities)
+                .where(
+                  eq(schema.directInboundDeliveryAuthorities.id, email.id),
+                )
+                .get();
+              const archiveAuthority = this.db
+                .select()
+                .from(schema.inboundDeliveryAuthorities)
+                .where(eq(schema.inboundDeliveryAuthorities.id, email.id))
+                .get();
+              if (
+                (directAuthority && archiveAuthority) ||
+                !(
+                  (directAuthority &&
+                    this.#directInboundAuthorityMatches(
+                      directAuthority,
+                      inboundProjection.directAuthority,
+                      "deleted",
+                    ) &&
+                    directAuthority.deleted_at === deleted.deletedAt) ||
+                  (archiveAuthority &&
+                    this.#archiveAuthorityMatchesDirectIdentity(
+                      archiveAuthority,
+                      inboundProjection.directAuthority,
+                      "deleted",
+                    ) &&
+                    archiveAuthority.deleted_at === deleted.deletedAt)
+                )
+              ) {
+                return finishInboundProjection("identity_conflict");
+              }
+            } else {
+              const directAuthority = this.db
+                .select()
+                .from(schema.directInboundDeliveryAuthorities)
+                .where(
+                  eq(schema.directInboundDeliveryAuthorities.id, email.id),
+                )
+                .get();
+              const archiveAuthority = this.db
+                .select()
+                .from(schema.inboundDeliveryAuthorities)
+                .where(eq(schema.inboundDeliveryAuthorities.id, email.id))
+                .get();
+              const authorityMatches = Boolean(
+                !(directAuthority && archiveAuthority) &&
+                  ((archiveAuthority &&
+                    this.#archiveInboundAuthorityMatches(
+                      archiveAuthority,
+                      inboundProjection.archiveAuthority,
+                      "deleted",
+                    ) &&
+                    archiveAuthority.deleted_at === deleted.deletedAt) ||
+                    (directAuthority &&
+                      this.#directAuthorityMatchesArchiveIdentity(
+                        directAuthority,
+                        inboundProjection.archiveAuthority,
+                        "deleted",
+                      ) &&
+                      directAuthority.deleted_at === deleted.deletedAt)),
+              );
+              if (!authorityMatches) {
+                return finishInboundProjection("identity_conflict");
+              }
+            }
+            return finishInboundProjection("deleted");
+          }
 
           const existing = this.db
-            .select({ id: schema.emails.id })
+            .select({
+              id: schema.emails.id,
+              origin: schema.emails.recipient_memory_origin,
+            })
             .from(schema.emails)
             .where(eq(schema.emails.id, email.id))
             .get();
           if (existing) {
+            let authorityMatches = false;
+            if (inboundProjection.kind === "archive") {
+              const archiveAuthority = this.db
+                .select()
+                .from(schema.inboundDeliveryAuthorities)
+                .where(eq(schema.inboundDeliveryAuthorities.id, email.id))
+                .get();
+              const directAuthority = this.db
+                .select()
+                .from(schema.directInboundDeliveryAuthorities)
+                .where(
+                  eq(schema.directInboundDeliveryAuthorities.id, email.id),
+                )
+                .get();
+              authorityMatches = Boolean(
+                !(archiveAuthority && directAuthority) &&
+                  ((archiveAuthority &&
+                    inboundArchiveAuthorityMatches(
+                      archiveAuthority,
+                      inboundProjection.archiveAuthority,
+                    )) ||
+                    (directAuthority &&
+                      this.#directAuthorityMatchesArchiveIdentity(
+                        directAuthority,
+                        inboundProjection.archiveAuthority,
+                        "projected",
+                      ))),
+              );
+            } else {
+              const directAuthority = this.db
+                .select()
+                .from(schema.directInboundDeliveryAuthorities)
+                .where(
+                  eq(schema.directInboundDeliveryAuthorities.id, email.id),
+                )
+                .get();
+              const archiveAuthority = this.db
+                .select()
+                .from(schema.inboundDeliveryAuthorities)
+                .where(eq(schema.inboundDeliveryAuthorities.id, email.id))
+                .get();
+              authorityMatches = Boolean(
+                !(archiveAuthority && directAuthority) &&
+                  ((directAuthority &&
+                    this.#directInboundAuthorityMatches(
+                      directAuthority,
+                      inboundProjection.directAuthority,
+                      "projected",
+                    )) ||
+                    (archiveAuthority &&
+                      this.#archiveAuthorityMatchesDirectIdentity(
+                        archiveAuthority,
+                        inboundProjection.directAuthority,
+                        "projected",
+                      ))),
+              );
+            }
+            if (
+              existing.origin !== RecipientMemoryOrigins.LIVE_INBOUND ||
+              !authorityMatches
+            ) {
+              return finishInboundProjection("identity_conflict");
+            }
             const duplicateResult = finishInboundProjection("duplicate");
             if (duplicateResult.status === "cleanup_conflict") {
               return duplicateResult;
             }
-            this.db
-              .delete(schema.inboundTerminalFailures)
-              .where(eq(schema.inboundTerminalFailures.id, email.id))
-              .run();
+            if (inboundProjection.kind === "archive") {
+              this.db
+                .delete(schema.inboundTerminalFailures)
+                .where(eq(schema.inboundTerminalFailures.id, email.id))
+                .run();
+            }
             return duplicateResult;
           }
 
@@ -6925,7 +7779,11 @@ export class MailboxDO extends DurableObject<Env> {
             .from(schema.inboundTerminalFailures)
             .where(eq(schema.inboundTerminalFailures.id, email.id))
             .get();
-          if (terminal && !inboundProjection.allowTerminalRecovery)
+          if (
+            inboundProjection.kind === "archive" &&
+            terminal &&
+            !inboundProjection.allowTerminalRecovery
+          )
             return finishInboundProjection("terminal");
         }
         let storedProjectionResult: InboundProjectionResult | undefined;
@@ -6970,6 +7828,7 @@ export class MailboxDO extends DurableObject<Env> {
             return { status: "cleanup_conflict" };
           }
         }
+        sealInboundAuthority();
         this.db
           .insert(schema.emails)
           .values({
@@ -6993,6 +7852,9 @@ export class MailboxDO extends DurableObject<Env> {
             recipient_memory_origin: email.recipient_memory_origin ?? null,
           })
           .run();
+        if (importProjection?.identitySource === "message-id" && importProjection.rawSha256 !== null) {
+          throw new Error("Message-ID imports cannot persist raw identity authority");
+        }
         if (inboundProjection) {
           this.db
             .insert(schema.inboundDerivedContentState)
@@ -7098,7 +7960,7 @@ export class MailboxDO extends DurableObject<Env> {
             now: email.date,
           }).targetCount;
         }
-        if (inboundProjection) {
+        if (inboundProjection?.kind === "archive") {
           this.db
             .delete(schema.inboundTerminalFailures)
             .where(eq(schema.inboundTerminalFailures.id, email.id))

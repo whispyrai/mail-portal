@@ -20,6 +20,25 @@ import {
   persistPendingRepairAttempt,
 } from "./inbound-derived-content-repair-attempt.ts";
 import type { InboundCleanupIntentBucket } from "./inbound-derived-content-cleanup-intent.ts";
+import type { InboundArchiveAuthority } from "./inbound-projection-contract.ts";
+import { inboundRawArchiveKey } from "./inbound-raw-key.ts";
+
+function archiveAuthority(
+  messageId: string,
+  archivedAt: string,
+): InboundArchiveAuthority {
+  return {
+    schemaVersion: 1,
+    ingressId: messageId,
+    rawKey: inboundRawArchiveKey(new Date(archivedAt), messageId),
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    rawSha256: "a".repeat(64),
+    archivedAt,
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+}
 
 async function storeStreamingEmail(
   dependencies: Parameters<typeof storeStreamingEmailProduction>[0] & {
@@ -33,6 +52,7 @@ async function storeStreamingEmail(
       mailboxId: "hello@wiserchat.ai",
       messageId: options.messageId,
       date: options.date,
+      archiveAuthority: archiveAuthority(options.messageId, options.date),
     }),
     ...options,
   }, dependencies.cleanupIntentBucket);
@@ -254,6 +274,7 @@ function storageHarness(
         bodyObjects: Array<Record<string, unknown>>;
         projectionAttemptId?: string;
         derivedContentProof?: Array<{ r2Key: string; byteLength: number }>;
+        archiveAuthority?: InboundArchiveAuthority;
       }
     | undefined;
   let puts = 0;
@@ -332,6 +353,7 @@ function storageHarness(
           bodyObjects: Array<Record<string, unknown>>;
           projectionAttemptId?: string;
           derivedContentProof?: Array<{ r2Key: string; byteLength: number }>;
+          archiveAuthority?: InboundArchiveAuthority;
         }) {
           options.events?.push("mailbox:create");
           if (options.createError) throw options.createError;
@@ -342,6 +364,7 @@ function storageHarness(
             bodyObjects: command.bodyObjects,
             projectionAttemptId: command.projectionAttemptId,
             derivedContentProof: command.derivedContentProof,
+            archiveAuthority: command.archiveAuthority,
           };
           const ownedKeys = new Set([
             ...command.attachments.flatMap((attachment) =>
@@ -476,6 +499,14 @@ test("streaming projection applies format=flowed after transfer and charset deco
   });
 
   assert.equal(harness.createInput?.email.body, "joinedwithout-gap");
+  assert.deepEqual(
+    harness.createInput?.archiveAuthority,
+    archiveAuthority("flowed-pipeline", "2026-07-14T00:00:00.000Z"),
+  );
+  assert.equal(
+    harness.createInput?.archiveAuthority?.rawKey,
+    "raw/2026/07/14/00/00/flowed-pipeline.eml",
+  );
 });
 
 test("duplicate projection leaves attempt-scoped cleanup to the durable outbox", async () => {

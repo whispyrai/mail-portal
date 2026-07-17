@@ -69,7 +69,6 @@ export interface CreateUserInput {
   role: UserRole;
   mailboxAddress: string;
   mcpTokenHash?: string | null;
-  recoveryEmail?: string | null;
   ownershipConfirmedAt?: number | null;
 }
 
@@ -89,7 +88,7 @@ export async function createUser(
     is_active: 1,
     mailbox_address: mailboxAddress,
     mcp_token_hash: input.mcpTokenHash ?? null,
-    recovery_email: input.recoveryEmail?.toLowerCase() ?? null,
+    recovery_email: null,
     ownership_confirmed_at: input.ownershipConfirmedAt ?? null,
     created_at: now,
     updated_at: now,
@@ -125,25 +124,28 @@ export async function revokeUserCredentials(
     env.DB.prepare(
       "UPDATE credential_recovery_tokens SET consumed_at = ? WHERE user_id = ? AND consumed_at IS NULL",
     ).bind(now, id),
+    env.DB.prepare(
+      `UPDATE credential_recovery_delivery_outbox
+       SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL,
+           payload_key_version = NULL, payload_iv = NULL, payload_ciphertext = NULL,
+           completed_at = ?, updated_at = ?, last_error_code = 'CREDENTIALS_REVOKED',
+           cancellation_reason = 'CREDENTIALS_REVOKED', cancellation_observed_at = ?
+       WHERE token_id IN (
+         SELECT id FROM credential_recovery_tokens WHERE user_id = ?
+       ) AND state IN ('pending', 'leased')`,
+    ).bind(now, now, now, id),
+    env.DB.prepare(
+      `UPDATE credential_recovery_delivery_outbox
+       SET cancellation_reason = COALESCE(cancellation_reason, 'CREDENTIALS_REVOKED'),
+           cancellation_observed_at = COALESCE(cancellation_observed_at, ?),
+           updated_at = ?
+       WHERE token_id IN (
+         SELECT id FROM credential_recovery_tokens WHERE user_id = ?
+       ) AND state = 'dispatching'`,
+    ).bind(now, now, id),
   ]);
 }
 
 export async function deleteUser(env: Env, id: string): Promise<void> {
   await db(env).delete(schema.users).where(eq(schema.users.id, id)).run();
-}
-
-/** Synchronize a platform-directory recovery address without exposing an admin mutation. */
-export async function updateUserRecoveryEmail(
-  env: Env,
-  id: string,
-  recoveryEmail: string,
-): Promise<void> {
-  await db(env)
-    .update(schema.users)
-    .set({
-      recovery_email: recoveryEmail.toLowerCase(),
-      updated_at: Date.now(),
-    })
-    .where(eq(schema.users.id, id))
-    .run();
 }

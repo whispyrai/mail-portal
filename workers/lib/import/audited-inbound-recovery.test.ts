@@ -11,6 +11,7 @@ const pointer: InboundArchivePointer = {
   rawKey: "raw/2026/07/15/repair-partial-success.eml",
   mailboxId: "hello@wiserchat.ai",
   rawSize: 100,
+  rawSha256: "a".repeat(64),
   archivedAt: "2026-07-15T09:30:00.000Z",
   etag: "archive-etag",
   version: "archive-version",
@@ -186,6 +187,7 @@ test("audited recovery commits request before projection and completion after it
     rawKey: "raw/2026/07/13/audited-recovery.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "a".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -209,6 +211,12 @@ test("audited recovery commits request before projection and completion after it
       dependencies: {
         bucket: { async put() {}, async delete() {} },
         mailbox: {
+          async getInboundDeletionAuthority() {
+            return null;
+          },
+          async getInboundProjectionAuthority() {
+            return stored ? { generation: 1 } : null;
+          },
           async getEmail() {
             return stored ?? null;
           },
@@ -220,6 +228,7 @@ test("audited recovery commits request before projection and completion after it
             assert.equal(command.folder, "inbox");
             assert.equal(command.mailboxAddress, pointer.mailboxId);
             assert.equal(command.allowTerminalRecovery, true);
+            assert.deepEqual(command.archiveAuthority, pointer);
             stored = command.email as unknown as Record<string, unknown>;
             return { status: "stored" };
           },

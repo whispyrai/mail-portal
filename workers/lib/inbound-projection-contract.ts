@@ -9,6 +9,27 @@ import type { PushPayload } from "./push/types.ts";
 
 export const MAX_INBOUND_EMAIL_BYTES = 25 * 1024 * 1024;
 
+export type InboundArchiveAuthority = {
+	schemaVersion: 1;
+	ingressId: string;
+	rawKey: string;
+	mailboxId: string;
+	rawSize: number;
+	rawSha256: string;
+	archivedAt: string;
+	etag: string;
+	version: string;
+};
+
+export type DirectInboundAuthority = {
+	schemaVersion: 1;
+	ingressId: string;
+	mailboxId: string;
+	rawSize: number;
+	rawSha256: string;
+	receivedAt: string;
+};
+
 export type InboundStoredEmail = {
 	id: string;
 	subject: string;
@@ -49,8 +70,18 @@ export type InboundProjectionCommand = {
 	bodyObjects: StoredEmailBodyObject[];
 	mailboxAddress: string;
 	allowTerminalRecovery: boolean;
+	projectionExpiresAt?: number;
 	projectionAttemptId?: string;
 	derivedContentProof?: InboundDerivedContentCleanupCandidate[];
+	archiveAuthority?: InboundArchiveAuthority;
+};
+
+export type DirectInboundProjectionCommand = Omit<
+	InboundProjectionCommand,
+	"archiveAuthority"
+> & {
+	directAuthority: DirectInboundAuthority;
+	archiveAuthority?: never;
 };
 
 export type InboundProjectionResult = {
@@ -58,9 +89,12 @@ export type InboundProjectionResult = {
 		| "cleanup_conflict"
 		| "deleted"
 		| "duplicate"
+		| "identity_conflict"
 		| "stored"
 		| "terminal";
 	cleanupKeys?: string[];
+	/** Authoritative persisted folder for a duplicate import projection. */
+	folder?: string;
 };
 
 export type InboundDerivedContentManifest =

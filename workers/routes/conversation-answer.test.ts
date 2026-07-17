@@ -18,12 +18,14 @@ const session = {
 	sub: "user-a",
 	email: "user@example.com",
 	role: "AGENT",
+	sessionVersion: 1,
 } as SessionClaims;
 
 function app(input: {
 	session?: SessionClaims;
 	stub?: unknown;
 	run?: ConversationAnswerRouteDependencies["run"];
+	authorize?: () => Promise<boolean>;
 }) {
 	const root = new Hono<ConversationAnswerRouteContext>();
 	root.use("*", async (c, next) => {
@@ -41,7 +43,7 @@ function app(input: {
 					state: "budget_paused",
 					reason: "admin_review_required",
 				})),
-		}),
+		}, input.authorize ?? (async () => true)),
 	);
 	return root;
 }
@@ -152,4 +154,22 @@ test("route maps revoked, missing, and unsupported states without content leaks"
 	const text = await failed.text();
 	assert.doesNotMatch(text, /secret question|prompt|sender content/);
 	assert.match(text, /Mail remains fully usable/);
+});
+
+test("later live revocation overrides both a conversation answer and its private failure", async () => {
+	for (const run of [
+		async () => ({ state: "stale" as const }),
+		async (): Promise<never> => { throw new Error("private answer failure"); },
+	]) {
+		let checks = 0;
+		const response = await app({
+			session,
+			stub: {},
+			run,
+			authorize: async () => ++checks === 1,
+		}).request(request(JSON.stringify({ question: "What was promised?" })));
+		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+		assert.doesNotMatch(await response.text(), /private answer failure/);
+	}
 });

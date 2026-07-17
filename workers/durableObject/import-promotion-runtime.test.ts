@@ -6,9 +6,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { Log, LogLevel, Miniflare } from "miniflare";
+import { deriveImportId } from "../lib/import/parse.ts";
 
 const execFileAsync = promisify(execFile);
 const ROOT = process.cwd();
+const PRODUCTION_COMPATIBILITY_DATE = "2025-11-28";
 type JsonRecord = Record<string, unknown>;
 
 function objectKey(emailId: string, claimToken: string, ordinal: number): string {
@@ -22,6 +24,15 @@ test(
     const outputDirectory = await mkdtemp(join(tmpdir(), "mail-import-intent-"));
     let runtime: Miniflare | undefined;
     try {
+      const wranglerConfig = await readFile(join(ROOT, "wrangler.jsonc"), "utf8");
+      const configuredCompatibilityDate = wranglerConfig.match(
+        /^\s*"compatibility_date"\s*:\s*"(\d{4}-\d{2}-\d{2})"\s*,?\s*$/m,
+      )?.[1];
+      assert.equal(
+        configuredCompatibilityDate,
+        PRODUCTION_COMPATIBILITY_DATE,
+        "import runtime compatibility date must match production wrangler.jsonc",
+      );
       await execFileAsync(
         join(ROOT, "node_modules/.bin/wrangler"),
         [
@@ -31,7 +42,7 @@ test(
           "--outdir",
           outputDirectory,
           "--compatibility-date",
-          "2026-07-15",
+          PRODUCTION_COMPATIBILITY_DATE,
           "--compatibility-flag",
           "nodejs_compat",
           "--config",
@@ -55,7 +66,7 @@ test(
         log: new Log(LogLevel.ERROR),
         modules: true,
         script: bundle,
-        compatibilityDate: "2026-07-15",
+        compatibilityDate: PRODUCTION_COMPATIBILITY_DATE,
         compatibilityFlags: ["nodejs_compat"],
         durableObjects: {
           MAILBOX: {
@@ -129,6 +140,152 @@ test(
         return result;
       }
 
+		const claimOnlyRaw = {
+			emailId: await deriveImportId(
+				{ rawSha256: "0".repeat(64) },
+				"import-runtime@example.com",
+			),
+			legacyId: "",
+			claimToken: "00110011-0011-4011-8011-001100110011",
+			identitySource: "raw-sha256" as const,
+			rawSha256: "0".repeat(64),
+		};
+		claimOnlyRaw.legacyId = claimOnlyRaw.emailId;
+		assert.deepEqual(await rpc("/import-claim", claimOnlyRaw), { status: "claimed" });
+		assert.equal(
+			(await rpc<JsonRecord>("/import-source-evidence", claimOnlyRaw)).raw_sha256,
+			claimOnlyRaw.rawSha256,
+			"a lost claim response cannot lose permanent source authority",
+		);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				...claimOnlyRaw,
+				claimToken: "00220022-0022-4022-8022-002200220022",
+			}),
+			{ status: "busy" },
+		);
+		await rpc("/import-expire", claimOnlyRaw);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				...claimOnlyRaw,
+				claimToken: "00330033-0033-4033-8033-003300330033",
+			}),
+			{ status: "claimed" },
+			"the exact source resumes after a claim-only crash and expiry",
+		);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				...claimOnlyRaw,
+				claimToken: "00440044-0044-4044-8044-004400440044",
+				rawSha256: "1".repeat(64),
+			}),
+			{ status: "identity_conflict", id: claimOnlyRaw.emailId },
+		);
+
+		const abandonedRaw = {
+			emailId: await deriveImportId(
+				{ rawSha256: "9".repeat(64) },
+				"import-runtime@example.com",
+			),
+			claimToken: "00990099-0099-4099-8099-009900990099",
+			rawSha256: "9".repeat(64),
+		};
+		await seed(abandonedRaw, 1);
+		await rpc("/import-expire", abandonedRaw);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				emailId: abandonedRaw.emailId,
+				legacyId: abandonedRaw.emailId,
+				claimToken: "01990199-0199-4199-8199-019901990199",
+				identitySource: "raw-sha256",
+				rawSha256: abandonedRaw.rawSha256,
+			}),
+			{ status: "claimed" },
+		);
+		assert.equal(
+			((await state(abandonedRaw)).intent as JsonRecord).state,
+			"abandoned_watching",
+		);
+
+      const rawOnlyIdentity = {
+        emailId: await deriveImportId(
+          { rawSha256: "a".repeat(64) },
+          "import-runtime@example.com",
+        ),
+        claimToken: "01010101-0101-4101-8101-010101010101",
+		rawSha256: "a".repeat(64),
+      };
+      assert.match(rawOnlyIdentity.emailId, /^[0-9a-f]{32}$/);
+		const rawOnlySeed = await seed(rawOnlyIdentity, 0);
+      assert.match(rawOnlySeed.proofFingerprint, /^[0-9a-f]{64}$/);
+		assert.deepEqual(
+			await rpc("/import-create", {
+				...rawOnlyIdentity,
+				...rawOnlySeed,
+				count: 0,
+			}),
+			{ status: "stored" },
+		);
+		await finalizeUntilTerminal(rawOnlyIdentity, rawOnlySeed.proofFingerprint, 4);
+		assert.equal(
+			(await rpc<JsonRecord>("/import-source-evidence", rawOnlyIdentity)).raw_sha256,
+			rawOnlyIdentity.rawSha256,
+		);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				emailId: rawOnlyIdentity.emailId,
+				legacyId: rawOnlyIdentity.emailId,
+				claimToken: "02020202-0202-4202-8202-020202020202",
+				identitySource: "raw-sha256",
+				rawSha256: rawOnlyIdentity.rawSha256,
+			}),
+			{
+				status: "existing",
+				id: rawOnlyIdentity.emailId,
+				folder: "archive",
+				rawSha256: rawOnlyIdentity.rawSha256,
+			},
+		);
+		await rpc("/import-delete-email", rawOnlyIdentity);
+		assert.equal(
+			(await rpc<JsonRecord>("/import-source-evidence", rawOnlyIdentity)).raw_sha256,
+			rawOnlyIdentity.rawSha256,
+			"hard Message deletion cannot erase source identity authority",
+		);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				emailId: rawOnlyIdentity.emailId,
+				legacyId: rawOnlyIdentity.emailId,
+				claimToken: "03030303-0303-4303-8303-030303030303",
+				identitySource: "raw-sha256",
+				rawSha256: "b".repeat(64),
+			}),
+			{ status: "identity_conflict", id: rawOnlyIdentity.emailId },
+		);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				emailId: rawOnlyIdentity.emailId,
+				legacyId: rawOnlyIdentity.emailId,
+				claimToken: "04040404-0404-4404-8404-040404040404",
+				identitySource: "message-id",
+				rawSha256: null,
+			}),
+			{ status: "identity_conflict", id: rawOnlyIdentity.emailId },
+		);
+		const reconstructed = {
+			...rawOnlyIdentity,
+			claimToken: "05050505-0505-4505-8505-050505050505",
+		};
+		const reconstructedSeed = await seed(reconstructed, 0);
+		assert.deepEqual(
+			await rpc("/import-create", {
+				...reconstructed,
+				...reconstructedSeed,
+				count: 0,
+			}),
+			{ status: "stored" },
+		);
+
       const owned = {
         emailId: "11111111111111111111111111111111",
         claimToken: "11111111-1111-4111-8111-111111111111",
@@ -141,7 +298,7 @@ test(
       );
       assert.deepEqual(
         await rpc("/import-create", { ...owned, ...ownedSeed, count: 1 }),
-        { status: "duplicate" },
+        { status: "duplicate", folder: "archive" },
       );
       const ownedFinalized = await finalizeUntilTerminal(
         owned,
@@ -160,6 +317,17 @@ test(
       assert.equal(ownedState.objectExists, true);
       assert.notEqual(ownedState.email, undefined);
       assert.equal(ownedState.claim, undefined);
+		assert.deepEqual(
+			await rpc("/import-claim", {
+				emailId: owned.emailId,
+				legacyId: owned.emailId,
+				claimToken: "12121212-1212-4212-8212-121212121212",
+				identitySource: "raw-sha256",
+				rawSha256: "c".repeat(64),
+			}),
+			{ status: "identity_conflict", id: owned.emailId },
+			"an existing ID without raw authority is never a no-Message-ID duplicate",
+		);
 
       const lostCreateResponse = {
         emailId: "abababababababababababababababab",
@@ -201,8 +369,14 @@ test(
           emailId: lostCreateResponse.emailId,
           legacyId: `${lostCreateResponse.emailId.slice(0, 31)}0`,
           claimToken: "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+		  identitySource: "message-id",
+		  rawSha256: null,
         }),
-        { status: "existing", id: lostCreateResponse.emailId },
+        {
+          status: "existing",
+          id: lostCreateResponse.emailId,
+          folder: "archive",
+        },
       );
       assert.equal((await state(lostCreateResponse)).objectExists, true);
 
@@ -246,6 +420,8 @@ test(
           emailId: blockedCommitted.emailId,
           legacyId: `${blockedCommitted.emailId.slice(0, 31)}0`,
           claimToken: "99999999-9999-4999-8999-999999999999",
+		  identitySource: "message-id",
+		  rawSha256: null,
         }),
         { status: "busy" },
       );
@@ -274,6 +450,8 @@ test(
           emailId: lateWrite.emailId,
           legacyId: `${lateWrite.emailId.slice(0, 31)}0`,
           claimToken: successorToken,
+		  identitySource: "message-id",
+		  rawSha256: null,
         }),
         { status: "claimed" },
       );
@@ -447,7 +625,7 @@ test(
       );
       assert.deepEqual(
         await rpc("/import-create", { ...large, ...largeSeed, count: 513 }),
-        { status: "duplicate" },
+        { status: "duplicate", folder: "archive" },
       );
       assert.equal(
         (

@@ -15,11 +15,13 @@ const session: SessionClaims = {
 	email: "user@example.com",
 	role: "AGENT",
 	mailbox: "team@example.com",
+	sessionVersion: 1,
 };
 
 function testApp(
 	operations: AiDraftRouteOperations,
 	activeSession: SessionClaims | null = session,
+	authorize: () => Promise<boolean> = async () => true,
 ) {
 	const app = new Hono<AiDraftRouteContext>();
 	app.use("*", async (c, next) => {
@@ -27,7 +29,7 @@ function testApp(
 		c.set("authorizedMailboxId", "team@example.com");
 		await next();
 	});
-	app.route("/", createAiDraftRoutes(operations));
+	app.route("/", createAiDraftRoutes(operations, authorize));
 	return app;
 }
 
@@ -301,4 +303,32 @@ test("AI draft routes preserve safe budget messages and redact arbitrary failure
 		error: "AI drafting is temporarily unavailable. Please try again.",
 	});
 	assert.doesNotMatch(JSON.stringify(logged), /sk-secret|upstream payload/);
+});
+
+test("later live revocation discards both reply and compose AI output or private failures", async () => {
+	for (const [path, body] of [
+		["/ai-draft", JSON.stringify({ emailId: "mail-1" })],
+		["/ai-compose", JSON.stringify({ prompt: "Write an update" })],
+	] as const) {
+		for (const fail of [false, true]) {
+			let checks = 0;
+			const response = await request(
+				testApp(operations({
+					async draftReply() {
+						if (fail) throw new Error("private draft failure");
+						return { to: "person@example.com", subject: "Private", body: "Private" };
+					},
+					async draftCompose() {
+						if (fail) throw new Error("private draft failure");
+						return { subject: "Private", body: "Private" };
+					},
+				}), session, async () => ++checks === 1),
+				path,
+				body,
+			);
+			assert.equal(response.status, 403);
+			assert.equal(response.headers.get("cache-control"), "private, no-store");
+			assert.doesNotMatch(await response.text(), /Private|private draft failure/);
+		}
+	}
 });

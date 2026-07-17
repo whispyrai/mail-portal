@@ -23,7 +23,8 @@ function app(options: {
 	session?: SessionClaims;
 	features?: string[];
 	binding?: boolean;
-	failure?: "capacity" | "provider";
+	failure?: "capacity" | "provider" | "synchronous";
+	rosters?: Array<{ mailboxIds: string[] } | null | Error>;
 } = {}) {
 	const calls: GlobalSemanticSearchRouteInput[] = [];
 	const root = new Hono<GlobalSemanticSearchRouteContext>();
@@ -32,17 +33,25 @@ function app(options: {
 		await next();
 	});
 	root.route("/", createGlobalSemanticSearchRoutes({
-		run: async (input) => {
+		run: (input) => {
 			calls.push(input);
 			if (options.failure === "capacity") throw new SemanticSearchCapacityError(21);
 			if (options.failure === "provider") throw new Error("private query or provider detail");
-			return {
+			if (options.failure === "synchronous") throw new Error("private synchronous factory detail");
+			return Promise.resolve({
 				state: "complete",
 				accessChanged: false,
 				results: [],
 				mailboxes: [],
-			};
+			});
 		},
+	}, async () => {
+		const nextRoster = options.rosters?.shift();
+		const roster = nextRoster === undefined
+			? { mailboxIds: ["user@example.com"] }
+			: nextRoster;
+		if (roster instanceof Error) throw roster;
+		return roster;
 	}));
 	const env = {
 		BRAND: "wiser",
@@ -137,4 +146,85 @@ test("semantic route exposes bounded capacity truth and redacts provider failure
 	);
 	assert.equal(failedResponse.status, 503);
 	assert.equal(JSON.stringify(await failedResponse.json()).includes("private query"), false);
+});
+
+test("global semantic output requires the same exact live session and Mailbox roster after runtime", async () => {
+	for (const failure of [undefined, "provider" as const]) {
+		const state = app({
+			session,
+			features: ["semantic_search"],
+			binding: true,
+			failure,
+			rosters: [
+				{ mailboxIds: ["a@example.com"] },
+				{ mailboxIds: ["a@example.com", "b@example.com"] },
+			],
+		});
+		const response = await state.root.request(
+			request(JSON.stringify({ query: "private query" })),
+			undefined,
+			state.env,
+		);
+		assert.equal(response.status, 403);
+		assert.deepEqual(await response.json(), { error: "Forbidden" });
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+	}
+
+	const stale = app({
+		session,
+		features: ["semantic_search"],
+		binding: true,
+		rosters: [{ mailboxIds: [] }, null],
+	});
+	assert.equal((await stale.root.request(
+		request(JSON.stringify({ query: "anything" })),
+		undefined,
+		stale.env,
+	)).status, 401);
+
+	const outage = app({
+		session,
+		features: ["semantic_search"],
+		binding: true,
+		rosters: [{ mailboxIds: [] }, new Error("private SQL")],
+	});
+	assert.equal((await outage.root.request(
+		request(JSON.stringify({ query: "anything" })),
+		undefined,
+		outage.env,
+	)).status, 503);
+
+	const activeEmpty = app({
+		session,
+		features: ["semantic_search"],
+		binding: true,
+		rosters: [{ mailboxIds: [] }, { mailboxIds: [] }],
+	});
+	assert.equal((await activeEmpty.root.request(
+		request(JSON.stringify({ query: "anything" })),
+		undefined,
+		activeEmpty.env,
+	)).status, 200);
+});
+
+test("global roster drift overrides a synchronous private runtime-factory failure", async () => {
+	const state = app({
+		session,
+		features: ["semantic_search"],
+		binding: true,
+		failure: "synchronous",
+		rosters: [
+			{ mailboxIds: ["a@example.com"] },
+			{ mailboxIds: ["a@example.com", "b@example.com"] },
+		],
+	});
+	const response = await state.root.request(
+		request(JSON.stringify({ query: "private query" })),
+		undefined,
+		state.env,
+	);
+	assert.equal(response.status, 403);
+	const body = await response.text();
+	assert.deepEqual(JSON.parse(body), { error: "Forbidden" });
+	assert.doesNotMatch(body, /private synchronous factory detail/);
 });

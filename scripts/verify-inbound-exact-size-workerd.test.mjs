@@ -5,10 +5,41 @@ import {
   FIXTURE_LAYOUT,
   buildExactSizeFixture,
   normalizedQueueCompletions,
+  runWithPhaseDeadline,
   safeChildEnvironment,
   validateLocalViteBindingConfig,
   wranglerBundleArguments,
 } from "./verify-inbound-exact-size-workerd.mjs";
+
+test("a hung ingress phase times out with heartbeat and last-progress evidence", async () => {
+  const progress = [];
+  const failures = [];
+  const details = [];
+  const runtimeState = {
+    active: null,
+    disposing: null,
+    phaseProgress: { concurrency: 4, value: "ingress_archived_1_of_4" },
+  };
+  await assert.rejects(
+    runWithPhaseDeadline({
+      concurrency: 4,
+      logger: {
+        progress: (value) => progress.push(value),
+        failure: (value) => failures.push(value),
+        detail: (value) => details.push(value),
+      },
+      runtimeState,
+      timeoutMs: 8,
+      work: () => new Promise(() => {}),
+    }),
+    /phase 4 timed out after 8ms; last progress: ingress_archived_1_of_4/u,
+  );
+  assert.ok(progress.some((line) => line.includes("heartbeat")));
+  assert.deepEqual(failures, [
+    "Phase 4: TIMEOUT after 8ms; last progress: ingress_archived_1_of_4",
+  ]);
+  assert.deepEqual(details, []);
+});
 
 test("exact-size fixture owns every byte of the 24,960,359-byte message", () => {
   const fixture = buildExactSizeFixture();

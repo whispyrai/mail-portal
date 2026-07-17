@@ -13,12 +13,14 @@ const session = {
 	sub: "user-a",
 	email: "user@example.com",
 	role: "AGENT",
+	sessionVersion: 1,
 } as SessionClaims;
 
 function app(input: {
 	session?: SessionClaims;
 	stub?: unknown;
 	run?: InboxTriageSuggestionRouteDependencies["run"];
+	authorize?: () => Promise<boolean>;
 }) {
 	const root = new Hono<InboxTriageSuggestionRouteContext>();
 	root.use("*", async (c, next) => {
@@ -36,7 +38,7 @@ function app(input: {
 					state: "budget_paused",
 					reason: "admin_review_required",
 				})),
-		}),
+		}, input.authorize ?? (async () => true)),
 	);
 	return root;
 }
@@ -152,4 +154,22 @@ test("revocation is forbidden and generic failure leaks no mail content", async 
 	const text = await failed.text();
 	assert.doesNotMatch(text, /secret sender|message body/);
 	assert.match(text, /No mail was changed/i);
+});
+
+test("later live revocation discards triage suggestions and private runtime errors", async () => {
+	for (const run of [
+		async () => ({ state: "stale" as const }),
+		async (): Promise<never> => { throw new Error("private triage failure"); },
+	]) {
+		let checks = 0;
+		const response = await app({
+			session,
+			stub: {},
+			run,
+			authorize: async () => ++checks === 1,
+		}).request(request(validBody));
+		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+		assert.doesNotMatch(await response.text(), /private triage failure/);
+	}
 });

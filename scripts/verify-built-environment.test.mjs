@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,6 +20,8 @@ const identities = {
 		queue: "sales-mail-inbound",
 		dlq: "sales-mail-inbound-dlq",
 		parking: "sales-mail-inbound-parking",
+		emergencyQueue: "sales-mail-emergency-forward",
+		emergencyFrom: "emergency-forward@whispyrcrm.com",
 		kvId: "cd541026bdf949d9ac63b3b5fdff4969",
 		route: "mail.whispyrcrm.com",
 	},
@@ -36,6 +38,8 @@ const identities = {
 		queue: "wiser-mail-inbound",
 		dlq: "wiser-mail-inbound-dlq",
 		parking: "wiser-mail-inbound-parking",
+		emergencyQueue: "wiser-mail-emergency-forward",
+		emergencyFrom: "emergency-forward@wiserchat.ai",
 		kvId: "c934d803c2f8430d9088f4a5d9f29d55",
 		route: "mail.wiserchat.ai",
 	},
@@ -45,23 +49,33 @@ function validArtifact(brand) {
 	const identity = identities[brand];
 	return {
 		name: identity.name,
+		main: "index.js",
+		compatibility_date: "2025-11-28",
+		no_bundle: true,
+		rules: [{ type: "ESModule", globs: ["**/*.js", "**/*.mjs"] }],
+		observability: { enabled: true },
 		vars: {
 			BRAND: brand,
 			DOMAINS: identity.domain,
 			FEATURES: identity.features,
+			AWS_REGION: "eu-west-2",
+			SES_CONFIGURATION_SET: "mail-portal-events",
 			INBOUND_QUEUE_NAME: identity.queue,
 			INBOUND_DLQ_NAME: identity.dlq,
 			INBOUND_PARKING_NAME: identity.parking,
+			EMERGENCY_FORWARD_QUEUE_NAME: identity.emergencyQueue,
+			EMERGENCY_FORWARD_FROM: identity.emergencyFrom,
+			EMERGENCY_FORWARD_DESTINATION: "heshamelmahdi@gmail.com",
 		},
 		secrets: {
 			required: [
 				"AWS_ACCESS_KEY_ID",
 				"AWS_SECRET_ACCESS_KEY",
 				"SES_EVENT_WEBHOOK_SECRET",
+				"CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1",
 				"JWT_SECRET",
 				"ADMIN_BOOTSTRAP_EMAIL",
 				"ACCOUNT_RECOVERY_DIRECTORY",
-				"EMERGENCY_FORWARD_TO",
 				"VAPID_PUBLIC_KEY",
 				"VAPID_PRIVATE_KEY",
 			],
@@ -87,34 +101,52 @@ function validArtifact(brand) {
 				preview_bucket_name: identity.rawPreviewBucket,
 			},
 		],
+		send_email: [
+			{
+				name: "EMERGENCY_EMAIL",
+				destination_address: "heshamelmahdi@gmail.com",
+				allowed_sender_addresses: [identity.emergencyFrom],
+			},
+		],
 		queues: {
-			producers: [{ binding: "INBOUND_QUEUE", queue: identity.queue }],
+			producers: [
+				{ binding: "INBOUND_QUEUE", queue: identity.queue },
+				{ binding: "EMERGENCY_FORWARD_QUEUE", queue: identity.emergencyQueue },
+			],
 			consumers: [
 				{
 					queue: identity.queue,
-					max_batch_size: 1,
-					max_concurrency: 1,
-					max_batch_timeout: 5,
+					max_batch_size: 2,
+					max_concurrency: 8,
+					max_batch_timeout: 1,
 					max_retries: 10,
-					retry_delay: 1,
+					retry_delay: 30,
 					dead_letter_queue: identity.dlq,
 				},
 				{
 					queue: identity.dlq,
-					max_batch_size: 1,
-					max_concurrency: 1,
-					max_batch_timeout: 5,
+					max_batch_size: 4,
+					max_concurrency: 4,
+					max_batch_timeout: 1,
 					max_retries: 10,
-					retry_delay: 60,
+					retry_delay: 30,
 					dead_letter_queue: identity.parking,
 				},
 				{
 					queue: identity.parking,
-					max_batch_size: 1,
-					max_concurrency: 1,
-					max_batch_timeout: 5,
+					max_batch_size: 4,
+					max_concurrency: 4,
+					max_batch_timeout: 1,
 					max_retries: 100,
-					retry_delay: 3600,
+					retry_delay: 300,
+				},
+				{
+					queue: identity.emergencyQueue,
+					max_batch_size: 2,
+					max_concurrency: 4,
+					max_batch_timeout: 1,
+					max_retries: 100,
+					retry_delay: 30,
 				},
 			],
 		},
@@ -171,6 +203,25 @@ test("rejects a wrong Wiser mail domain", async () => {
 	await assert.rejects(fixture.invocation, /DOMAINS/);
 });
 
+test("rejects every mutated deployment-critical runtime field", async () => {
+	for (const [label, mutate] of [
+		["AWS_REGION", (artifact) => { artifact.vars.AWS_REGION = "us-east-1"; }],
+		["SES_CONFIGURATION_SET", (artifact) => {
+			artifact.vars.SES_CONFIGURATION_SET = "other";
+		}],
+		["compatibility_date", (artifact) => {
+			artifact.compatibility_date = "2025-11-27";
+		}],
+		["observability", (artifact) => { artifact.observability.enabled = false; }],
+		["main", (artifact) => { artifact.main = "workers/app.ts"; }],
+		["module rules", (artifact) => { artifact.rules[0].type = "CommonJS"; }],
+		["no_bundle", (artifact) => { artifact.no_bundle = false; }],
+	]) {
+		const fixture = await runFixture("wiser", mutate);
+		await assert.rejects(fixture.invocation, new RegExp(label, "i"));
+	}
+});
+
 test("rejects a missing required secret", async () => {
 	const fixture = await runFixture("wiser", (artifact) => {
 		artifact.secrets.required = artifact.secrets.required.filter(
@@ -196,6 +247,37 @@ test("rejects a missing Queue edge", async () => {
 		delete artifact.queues.consumers[1].dead_letter_queue;
 	});
 	await assert.rejects(fixture.invocation, /Queue graph and consumer settings/);
+});
+
+test("rejects Queue isolation and recovery-latency regressions", async () => {
+	for (const mutate of [
+		(artifact) => {
+			artifact.queues.consumers[0].max_batch_size = 1;
+			artifact.queues.consumers[0].max_concurrency = 1;
+		},
+		(artifact) => {
+			artifact.queues.consumers[0].max_batch_size = 100;
+		},
+		(artifact) => {
+			artifact.queues.consumers[3].retry_delay = 300;
+		},
+	]) {
+		const fixture = await runFixture("wiser", mutate);
+		await assert.rejects(
+			fixture.invocation,
+			/Queue graph and consumer settings/,
+		);
+	}
+});
+
+test("rejects a mutable or cross-brand emergency delivery binding", async () => {
+	const fixture = await runFixture("wiser", (artifact) => {
+		artifact.send_email[0].destination_address = "someone@example.com";
+	});
+	await assert.rejects(
+		fixture.invocation,
+		/fixed emergency Email Service binding/,
+	);
 });
 
 test("rejects a wrong Cron schedule", async () => {
@@ -258,6 +340,7 @@ test("creates a detailed log for successful and failed runs", async () => {
 	const successful = await runFixture("whispyr");
 	await successful.invocation();
 	assert.match(await readFile(successful.logFilePath, "utf8"), /Phase 4\/4/);
+	assert.equal((await stat(successful.logFilePath)).mode & 0o777, 0o600);
 
 	const failed = await runFixture("wiser", (artifact) => {
 		artifact.vars.INBOUND_QUEUE_NAME = "wrong-queue";

@@ -11,6 +11,15 @@ import {
 	AI_DRAFTING_LIMITS,
 	validateAiComposeDraftRequest,
 } from "../../shared/ai-drafting.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+} from "../lib/live-authorized-read.ts";
+import {
+	hasExactLiveMailboxAccess,
+	runLiveMailboxAuthorizedRead,
+	type LiveMailboxAccessAuthorizer,
+} from "../lib/live-mailbox-authorization.ts";
 
 export const AI_DRAFT_REQUEST_LIMITS = {
 	replyBytes: AI_DRAFTING_LIMITS.replyRequestBytes,
@@ -156,6 +165,7 @@ function invalidComposeMessage(value: unknown): string {
 
 export function createAiDraftRoutes(
 	operations: AiDraftRouteOperations = productionOperations,
+	authorize: LiveMailboxAccessAuthorizer = hasExactLiveMailboxAccess,
 ) {
 	const app = new Hono<AiDraftRouteContext>();
 
@@ -164,6 +174,7 @@ export function createAiDraftRoutes(
 		"/api/v1/mailboxes/:mailboxId/ai-compose",
 	]) {
 		app.use(path, async (c, next) => {
+			c.header("Cache-Control", "private, no-store");
 			if (!c.get("session")) return c.json({ error: "Unauthorized" }, 401);
 			await next();
 		});
@@ -192,14 +203,29 @@ export function createAiDraftRoutes(
 			const mailboxId = c.var.authorizedMailboxId;
 		try {
 			return c.json(
-				await operations.draftReply(
+				await runLiveMailboxAuthorizedRead(
 					c.env,
-					mailboxId,
-					input.emailId,
-					session.sub,
+					{
+						mailboxId,
+						userId: session.sub,
+						sessionVersion: session.sessionVersion,
+					},
+					() => operations.draftReply(
+						c.env,
+						mailboxId,
+						input.emailId,
+						session.sub,
+					),
+					authorize,
 				),
 			);
 		} catch (error) {
+			if (error instanceof LiveReadAuthorizationError) {
+				return c.json({ error: "Forbidden" }, 403);
+			}
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return c.json({ error: "Authorization unavailable" }, 503);
+			}
 			return c.json(
 				{
 					error: safeInferenceError(error, {
@@ -248,14 +274,29 @@ export function createAiDraftRoutes(
 			const mailboxId = c.var.authorizedMailboxId;
 		try {
 			return c.json(
-				await operations.draftCompose(
+				await runLiveMailboxAuthorizedRead(
 					c.env,
-					mailboxId,
-					input,
-					session.sub,
+					{
+						mailboxId,
+						userId: session.sub,
+						sessionVersion: session.sessionVersion,
+					},
+					() => operations.draftCompose(
+						c.env,
+						mailboxId,
+						input,
+						session.sub,
+					),
+					authorize,
 				),
 			);
 		} catch (error) {
+			if (error instanceof LiveReadAuthorizationError) {
+				return c.json({ error: "Forbidden" }, 403);
+			}
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return c.json({ error: "Authorization unavailable" }, 503);
+			}
 			return c.json(
 				{
 					error: safeInferenceError(error, {

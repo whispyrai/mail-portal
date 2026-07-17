@@ -12,12 +12,13 @@ export interface Env extends Cloudflare.Env {
   // AWS_REGION is a plain var in wrangler.jsonc and comes through Cloudflare.Env.
   AWS_ACCESS_KEY_ID: string;
   AWS_SECRET_ACCESS_KEY: string;
-  // SES configuration set that publishes Bounce and Complaint events to the
-  // authenticated EventBridge API Destination targeting /webhooks/ses.
+  // SES configuration set that publishes Delivery, Bounce, and Complaint events
+  // to the authenticated EventBridge API Destination targeting /webhooks/ses.
   SES_CONFIGURATION_SET: Cloudflare.Env["SES_CONFIGURATION_SET"];
   // Dedicated bearer secret for authenticated SES EventBridge API Destination
   // callbacks. It must not be reused as a user or session credential.
   SES_EVENT_WEBHOOK_SECRET: string;
+  CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1: string;
   // HMAC secret for signing session JWTs (set via `wrangler secret put`).
   JWT_SECRET: string;
   // Web Push VAPID keys (WISER-240). VAPID_SUBJECT is a plain var (a mailto:

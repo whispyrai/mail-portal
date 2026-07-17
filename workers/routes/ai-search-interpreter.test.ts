@@ -15,12 +15,14 @@ const session = {
 	email: "user@example.com",
 	role: "AGENT",
 	mailbox: "team@example.com",
+	sessionVersion: 1,
 } as SessionClaims;
 
 function app(input: {
 	session?: SessionClaims;
 	stub?: unknown;
 	run?: AiSearchInterpreterRouteDependencies["run"];
+	authorize?: () => Promise<boolean>;
 }) {
 	const root = new Hono<AiSearchInterpreterRouteContext>();
 	root.use("*", async (c, next) => {
@@ -33,7 +35,7 @@ function app(input: {
 		"/",
 		createAiSearchInterpreterRoutes({
 			run: input.run ?? (async () => ({ state: "unsupported" })),
-		}),
+		}, input.authorize ?? (async () => true)),
 	);
 	return root;
 }
@@ -147,4 +149,22 @@ test("interpreter route has no search execution or content logging seam", async 
 	);
 	assert.doesNotMatch(source, /searchEmails|countSearchResults|SearchOperations/);
 	assert.doesNotMatch(source, /console\.(?:log|error)|intent\s*:/);
+});
+
+test("later live revocation overrides interpreted search output and private failure", async () => {
+	for (const run of [
+		async () => ({ state: "unsupported" as const }),
+		async (): Promise<never> => { throw new Error("private interpretation failure"); },
+	]) {
+		let checks = 0;
+		const response = await app({
+			session,
+			stub: {},
+			run,
+			authorize: async () => ++checks === 1,
+		}).request(request(validBody));
+		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+		assert.doesNotMatch(await response.text(), /private interpretation failure/);
+	}
 });

@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deriveImportId } from "./parse.ts";
+import { deriveImportId, sha256RawEmail } from "./parse.ts";
 import { importParsedEmail } from "./import-email.ts";
 
 type CreatedEmail = {
@@ -22,19 +22,47 @@ function objectMetadata(value: ArrayBuffer | string) {
 }
 
 function withImportClaims<
-	T extends { getEmail(id: string): Promise<{ id: string } | null> },
+	T extends { getEmail(id: string): Promise<{ id: string; folder_id?: string } | null> },
 >(mailbox: T) {
 	let active: { emailId: string; token: string } | null = null;
 	let sealedFingerprint: string | null = null;
+	const rawEvidence = new Map<string, string>();
 	const customHasEmailOrThreadIdentity = (mailbox as T & {
 		hasEmailOrThreadIdentity?: (value: string) => Promise<boolean>;
 	}).hasEmailOrThreadIdentity;
 	return Object.assign(mailbox, {
-		async claimImportedEmail(emailId: string, legacyId: string, token: string) {
+		async claimImportedEmail(
+			emailId: string,
+			legacyId: string,
+			token: string,
+			identitySource: "message-id" | "raw-sha256",
+			rawSha256: string | null,
+		) {
+			const evidence = rawEvidence.get(emailId);
+			if (evidence && (identitySource !== "raw-sha256" || evidence !== rawSha256)) {
+				return { status: "identity_conflict" as const, id: emailId };
+			}
 			const existing = await mailbox.getEmail(emailId) ?? await mailbox.getEmail(legacyId);
-			if (existing) return { status: "existing" as const, id: existing.id };
+			if (existing) {
+				if (identitySource === "raw-sha256" && evidence !== rawSha256) {
+					return { status: "identity_conflict" as const, id: existing.id };
+				}
+				return identitySource === "raw-sha256"
+					? {
+							status: "existing" as const,
+							id: existing.id,
+							folder: existing.folder_id ?? "archive",
+							rawSha256: evidence,
+						}
+					: {
+							status: "existing" as const,
+							id: existing.id,
+							folder: existing.folder_id ?? "archive",
+						};
+			}
 			if (active) return { status: "busy" as const };
 			active = { emailId, token };
+			if (identitySource === "raw-sha256" && rawSha256) rawEvidence.set(emailId, rawSha256);
 			return { status: "claimed" as const };
 		},
 		async releaseImportedEmailClaim(emailId: string, token: string) {
@@ -145,12 +173,14 @@ test("importParsedEmail preserves metadata, attachments, threads, and idempotenc
 		status: "imported",
 		id: await deriveImportId({ messageId: "<reply@zoho.example>" }, "team@example.com"),
 		folder: "archive",
+		identitySource: "message-id",
 	});
 	assert.deepEqual(duplicate, {
 		status: "skipped",
 		reason: "duplicate",
 		id: imported.id,
 		folder: "archive",
+		identitySource: "message-id",
 	});
 	assert.equal(createdEmails.length, 1);
 	assert.equal(createdEmails[0]?.folder, "archive");
@@ -163,6 +193,240 @@ test("importParsedEmail preserves metadata, attachments, threads, and idempotenc
 	assert.equal(createdEmails[0]?.attachments[0]?.email_id, imported.id);
 	assert.equal(storedAttachmentKeys.length, 1);
 	assert.match(storedAttachmentKeys[0] ?? "", new RegExp(`^attachments/${imported.id}/`));
+});
+
+test("no-Message-ID imports preserve distinct exact source messages", async () => {
+	const storedEmailIds = new Set<string>();
+	const createdIds: string[] = [];
+	const mailbox = withImportClaims({
+		async getEmail(id: string) {
+			return storedEmailIds.has(id) ? { id } : null;
+		},
+		async resolveCanonicalThreadId() { return null; },
+		async createEmail(
+			_folder: string,
+			email: Record<string, unknown>,
+		) {
+			const id = String(email.id);
+			storedEmailIds.add(id);
+			createdIds.push(id);
+		},
+	});
+	const objects = new Map<string, ArrayBuffer | string>();
+	const bucket = {
+		async put(key: string, value: ArrayBuffer | string) {
+			objects.set(key, value);
+			return objectMetadata(value);
+		},
+		async delete(key: string) { objects.delete(key); },
+	};
+	const parsed = {
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		subject: "Same parsed message",
+		from: { address: "sender@example.com" },
+		to: [{ address: "hello@wiserchat.ai" }],
+		text: "Same parsed body",
+		headers: [],
+		headerLines: [],
+	};
+	const firstRaw = new TextEncoder().encode("same headers and body\nattachment=one").buffer;
+	const secondRaw = new TextEncoder().encode("same headers and body\nattachment=two").buffer;
+	const first = await importParsedEmail(
+		{ bucket, mailbox },
+		{
+			...parsed,
+			attachments: [{
+				filename: "proof.bin",
+				mimeType: "application/octet-stream",
+				content: new Uint8Array([1]).buffer,
+			}],
+		},
+		"archive",
+		"team@example.com",
+		await sha256RawEmail(firstRaw),
+	);
+	const second = await importParsedEmail(
+		{ bucket, mailbox },
+		{
+			...parsed,
+			attachments: [{
+				filename: "proof.bin",
+				mimeType: "application/octet-stream",
+				content: new Uint8Array([2]).buffer,
+			}],
+		},
+		"archive",
+		"team@example.com",
+		await sha256RawEmail(secondRaw),
+	);
+
+	assert.equal(first.status, "imported");
+	assert.equal(second.status, "imported");
+	assert.notEqual(first.id, second.id);
+	assert.deepEqual(createdIds, [first.id, second.id]);
+});
+
+test("byte-identical no-Message-ID imports are idempotent", async () => {
+	const storedEmailIds = new Set<string>();
+	const mailbox = withImportClaims({
+		async getEmail(id: string) {
+			return storedEmailIds.has(id) ? { id } : null;
+		},
+		async resolveCanonicalThreadId() { return null; },
+		async createEmail(_folder: string, email: Record<string, unknown>) {
+			storedEmailIds.add(String(email.id));
+		},
+	});
+	const bucket = {
+		async put(_key: string, value: ArrayBuffer | string) {
+			return objectMetadata(value);
+		},
+		async delete() {},
+	};
+	const parsed = {
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		subject: "No Message-ID",
+		from: { address: "sender@example.com" },
+		to: [{ address: "hello@wiserchat.ai" }],
+		text: "Exact rerun",
+		headers: [],
+		headerLines: [],
+		attachments: [],
+	};
+	const rawSha256 = await sha256RawEmail(
+		new TextEncoder().encode("exact original RFC822 bytes").buffer,
+	);
+	const first = await importParsedEmail(
+		{ bucket, mailbox }, parsed, "archive", "team@example.com", rawSha256,
+	);
+	const rerun = await importParsedEmail(
+		{ bucket, mailbox }, parsed, "archive", "TEAM@EXAMPLE.COM", rawSha256,
+	);
+
+	assert.equal(first.status, "imported");
+	assert.deepEqual(rerun, {
+		status: "skipped",
+		reason: "duplicate",
+		id: first.id,
+		folder: "archive",
+		identitySource: "raw-sha256",
+		rawSha256,
+	});
+});
+
+test("a late canonical duplicate reports its durable folder rather than the requested folder", async () => {
+	const mailbox = withImportClaims({
+		async getEmail() { return null; },
+		async resolveCanonicalThreadId() { return null; },
+		async createEmail() {},
+	});
+	mailbox.createImportedEmail = async () => ({ status: "duplicate", folder: "inbox" });
+	const result = await importParsedEmail({
+		bucket: { async put() {}, async delete() {} },
+		mailbox,
+	}, {
+		messageId: "<late-duplicate@example.com>",
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		from: { address: "sender@example.com" },
+		to: [{ address: "team@example.com" }],
+		text: "duplicate",
+		headers: [],
+		headerLines: [],
+		attachments: [],
+	}, "sent", "team@example.com");
+	assert.deepEqual(result, {
+		status: "skipped",
+		reason: "duplicate",
+		id: await deriveImportId(
+			{ messageId: "<late-duplicate@example.com>" },
+			"team@example.com",
+		),
+		folder: "inbox",
+		identitySource: "message-id",
+	});
+});
+
+test("an early canonical duplicate reports its durable folder rather than the requested folder", async () => {
+	const mailbox = withImportClaims({
+		async getEmail() { return null; },
+		async resolveCanonicalThreadId() { return null; },
+		async createEmail() {},
+	});
+	mailbox.claimImportedEmail = async () => ({
+		status: "existing",
+		id: "legacy-existing",
+		folder: "inbox",
+	});
+	const result = await importParsedEmail({
+		bucket: { async put() {}, async delete() {} },
+		mailbox,
+	}, {
+		messageId: "<early-duplicate@example.com>",
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		from: { address: "sender@example.com" },
+		to: [{ address: "team@example.com" }],
+		text: "duplicate",
+		headers: [],
+		headerLines: [],
+		attachments: [],
+	}, "sent", "team@example.com");
+	assert.deepEqual(result, {
+		status: "skipped",
+		reason: "duplicate",
+		id: "legacy-existing",
+		folder: "inbox",
+		identitySource: "message-id",
+	});
+});
+
+test("a late duplicate without a durable folder fails closed", async () => {
+	const mailbox = withImportClaims({
+		async getEmail() { return null; },
+		async resolveCanonicalThreadId() { return null; },
+		async createEmail() {},
+	});
+	mailbox.createImportedEmail = async () => ({ status: "duplicate" });
+	await assert.rejects(
+		importParsedEmail({
+			bucket: { async put() {}, async delete() {} },
+			mailbox,
+		}, {
+			messageId: "<missing-folder@example.com>",
+			date: "Wed, 15 Apr 2026 15:42:00 +0000",
+			from: { address: "sender@example.com" },
+			to: [{ address: "team@example.com" }],
+			text: "duplicate",
+			headers: [],
+			headerLines: [],
+			attachments: [],
+		}, "sent", "team@example.com"),
+		/omitted its authoritative folder/i,
+	);
+});
+
+test("an unexpected canonical import status fails closed", async () => {
+	const mailbox = withImportClaims({
+		async getEmail() { return null; },
+		async resolveCanonicalThreadId() { return null; },
+		async createEmail() {},
+	});
+	mailbox.createImportedEmail = async () => ({ status: "mystery" });
+	await assert.rejects(
+		importParsedEmail({
+			bucket: { async put() {}, async delete() {} },
+			mailbox,
+		}, {
+			messageId: "<unexpected-status@example.com>",
+			date: "Wed, 15 Apr 2026 15:42:00 +0000",
+			from: { address: "sender@example.com" },
+			to: [{ address: "team@example.com" }],
+			text: "unexpected",
+			headers: [],
+			headerLines: [],
+			attachments: [],
+		}, "archive", "team@example.com"),
+		/unexpected status/i,
+	);
 });
 
 test("importParsedEmail cleans partial objects and retries with isolated attachment ids", async () => {
@@ -376,9 +640,40 @@ test("rerunning an import recognizes an existing legacy unscoped message without
 		reason: "duplicate",
 		id: legacyId,
 		folder: "archive",
+		identitySource: "message-id",
 	});
 	assert.equal(created, false);
 	assert.equal(writes, 0);
+});
+
+test("a legacy lossy no-Message-ID identity cannot suppress a distinct exact source", async () => {
+	const legacyLossyId = "2aeb0093d251d800f487dc2ae69ac52d";
+	let createdId: string | null = null;
+	const result = await importParsedEmail({
+		bucket: { async put() {}, async delete() {} },
+		mailbox: withImportClaims({
+			async getEmail(id: string) {
+				return id === legacyLossyId ? { id } : null;
+			},
+			async resolveCanonicalThreadId() { return null; },
+			async createEmail(_folder: string, email: Record<string, unknown>) {
+				createdId = String(email.id);
+			},
+		}),
+	}, {
+		date: "Wed, 15 Apr 2026 15:42:00 +0000",
+		subject: "Legacy lossy fallback",
+		from: { address: "sender@example.com" },
+		to: [{ address: "hello@wiserchat.ai" }],
+		text: "Same parsed body",
+		headers: [],
+		headerLines: [],
+		attachments: [],
+	}, "archive", "team@example.com", "9".repeat(64));
+
+	assert.equal(result.status, "imported");
+	assert.equal(createdId, result.id);
+	assert.notEqual(result.id, legacyLossyId);
 });
 
 test("a newly scoped reply joins an existing legacy thread even when its root row is absent", async () => {
@@ -529,6 +824,7 @@ test("a concurrent duplicate import cannot overwrite the winning attachment byte
 			content: base.text,
 		}, "team@example.com"),
 		folder: "archive",
+		identitySource: "message-id",
 	});
 	assert.equal(writes, 1, "the losing request writes no canonical R2 object");
 	releaseFirstWrite();
@@ -561,7 +857,13 @@ test("an expired in-flight writer cannot overwrite a successor generation", asyn
 		async hasEmailOrThreadIdentity() { return false; },
 		async claimImportedEmail(emailId: string, legacyId: string, token: string) {
 			const existing = await this.getEmail(emailId) ?? await this.getEmail(legacyId);
-			if (existing) return { status: "existing" as const, id: existing.id };
+			if (existing) {
+				return {
+					status: "existing" as const,
+					id: existing.id,
+					folder: "archive",
+				};
+			}
 			if (currentClaim) return { status: "busy" as const };
 			currentClaim = { emailId, token };
 			return { status: "claimed" as const };

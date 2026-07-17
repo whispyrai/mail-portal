@@ -4,10 +4,25 @@ import {
 } from "./mail-address.ts";
 
 export class RecoveryDirectoryError extends Error {
-  constructor(message = "Account recovery is not configured for this user") {
+  readonly code: "UNMAPPED" | "INVALID_CONFIG";
+  constructor(
+    code: "UNMAPPED" | "INVALID_CONFIG" = "UNMAPPED",
+    message = "Account recovery is not configured for this user",
+  ) {
     super(message);
     this.name = "RecoveryDirectoryError";
+    this.code = code;
   }
+}
+
+const RECOVERY_DIRECTORY_LIMITS = {
+  bytes: 64 * 1024,
+  entries: 1_024,
+  addressBytes: 254,
+} as const;
+
+function boundedAddress(value: string): boolean {
+  return new TextEncoder().encode(value).byteLength <= RECOVERY_DIRECTORY_LIMITS.addressBytes;
 }
 
 /**
@@ -20,32 +35,62 @@ export function recoveryAddressFor(
   configuredDomains: string | undefined,
 ): string {
   const normalizedPortal = normalizeMailAddress(portalEmail);
-  if (!normalizedPortal || !rawDirectory) throw new RecoveryDirectoryError();
+  if (!normalizedPortal || !boundedAddress(normalizedPortal)) {
+    throw new RecoveryDirectoryError();
+  }
+  if (!rawDirectory) {
+    throw new RecoveryDirectoryError(
+      "INVALID_CONFIG",
+      "Account recovery directory is invalid",
+    );
+  }
+  if (new TextEncoder().encode(rawDirectory).byteLength > RECOVERY_DIRECTORY_LIMITS.bytes) {
+    throw new RecoveryDirectoryError(
+      "INVALID_CONFIG",
+      "Account recovery directory is invalid",
+    );
+  }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawDirectory);
   } catch {
-    throw new RecoveryDirectoryError("Account recovery directory is invalid");
+    throw new RecoveryDirectoryError(
+      "INVALID_CONFIG",
+      "Account recovery directory is invalid",
+    );
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new RecoveryDirectoryError("Account recovery directory is invalid");
+    throw new RecoveryDirectoryError(
+      "INVALID_CONFIG",
+      "Account recovery directory is invalid",
+    );
   }
 
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length > RECOVERY_DIRECTORY_LIMITS.entries) {
+    throw new RecoveryDirectoryError(
+      "INVALID_CONFIG",
+      "Account recovery directory is invalid",
+    );
+  }
   const normalized = new Map<string, string>();
-  for (const [portal, external] of Object.entries(
-    parsed as Record<string, unknown>,
-  )) {
+  for (const [portal, external] of entries) {
     const normalizedKey = normalizeMailAddress(portal);
     const normalizedExternal =
       typeof external === "string" ? normalizeMailAddress(external) : null;
     if (
       !normalizedKey ||
       !normalizedExternal ||
+      !boundedAddress(normalizedKey) ||
+      !boundedAddress(normalizedExternal) ||
       isAddressInConfiguredMailDomains(normalizedExternal, configuredDomains) ||
       normalized.has(normalizedKey)
     ) {
-      throw new RecoveryDirectoryError("Account recovery directory is invalid");
+      throw new RecoveryDirectoryError(
+        "INVALID_CONFIG",
+        "Account recovery directory is invalid",
+      );
     }
     normalized.set(normalizedKey, normalizedExternal);
   }

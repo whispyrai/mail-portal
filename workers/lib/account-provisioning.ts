@@ -51,8 +51,7 @@ export async function provisionAccount(
 			} catch (rollbackError) {
 				console.error("[account-provisioning] failed to roll back user after mailbox provisioning failure", {
 					userId: user.id,
-					email: user.email,
-					error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+					errorName: rollbackError instanceof Error ? rollbackError.name : "UnknownError",
 				});
 				throw accountProvisioningError(
 					"User was created but mailbox provisioning and rollback both failed",

@@ -7,6 +7,31 @@ import type { Env } from "../types.ts";
 
 const MAILBOX_ID = "team@example.com";
 
+function inboundAuthority(emailId: string, variant = "exact") {
+  return {
+    schemaVersion: 1 as const,
+    ingressId: emailId,
+    rawKey: `raw/2026/07/17/10/00/${emailId}.eml`,
+    mailboxId: MAILBOX_ID,
+    rawSize: 4,
+    rawSha256: variant === "exact" ? "a".repeat(64) : "d".repeat(64),
+    archivedAt: "2026-07-17T10:00:00.000Z",
+    etag: `archive-etag-${variant}`,
+    version: "archive-version",
+  };
+}
+
+function directInboundAuthority(emailId: string, variant = "exact") {
+  return {
+    schemaVersion: 1 as const,
+    ingressId: emailId,
+    mailboxId: MAILBOX_ID,
+    rawSize: 4,
+    rawSha256: variant === "exact" ? "a".repeat(64) : "c".repeat(64),
+    receivedAt: "2026-07-17T10:00:00.000Z",
+  };
+}
+
 function bodyKey(emailId: string, attemptId: string): string {
   return `email-bodies/${emailId}/${attemptId}/0.body`;
 }
@@ -41,11 +66,15 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
     emailId: string;
     claimToken: string;
     count: number;
+    rawSha256?: string;
   }): Promise<{ proofFingerprint: string }> {
+    const identitySource = input.rawSha256 ? "raw-sha256" : "message-id";
     const claim = await this.claimImportedEmail(
       input.emailId,
-      `${input.emailId.slice(0, 31)}0`,
+	  input.rawSha256 ? input.emailId : `${input.emailId.slice(0, 31)}0`,
       input.claimToken,
+      identitySource,
+      input.rawSha256 ?? null,
     );
     if (claim.status !== "claimed") throw new Error("test import claim failed");
     await this.beginImportedEmailPromotionIntent(
@@ -179,6 +208,7 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
     claimToken: string;
     proofFingerprint: string;
     count: number;
+    rawSha256?: string;
   }): Promise<unknown> {
     return this.createImportedEmail(
       Folders.ARCHIVE,
@@ -205,6 +235,9 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
       MAILBOX_ID,
       input.claimToken,
       input.proofFingerprint,
+      input.rawSha256 ? "raw-sha256" : "message-id",
+      input.rawSha256 ?? null,
+	  input.rawSha256 ? input.emailId : `${input.emailId.slice(0, 31)}0`,
     );
   }
 
@@ -236,6 +269,20 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
       input.claimToken,
       input.proofFingerprint,
     );
+  }
+
+  deleteImportedEmailForTest(input: { emailId: string }): void {
+    this.db.delete(schema.emails).where(eq(schema.emails.id, input.emailId)).run();
+  }
+
+  readImportSourceEvidenceForTest(input: { emailId: string }): unknown {
+    return [
+      ...this.ctx.storage.sql.exec<{ raw_sha256: string; created_at: number }>(
+        `SELECT raw_sha256, created_at FROM import_source_identities
+         WHERE email_id = ? LIMIT 1`,
+        input.emailId,
+      ),
+    ][0] ?? null;
   }
 
   async failNextImportHeadForTest(input: {
@@ -393,6 +440,7 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
   async createInboundForTest(input: {
     emailId: string;
     attemptId: string;
+    authorityVariant?: string;
     ownedKey?: string;
     ownedKeys?: string[];
     cleanupKey?: string;
@@ -449,9 +497,340 @@ export class R2DeletionRaceTestMailboxDO extends MailboxDO {
       })),
       mailboxAddress: MAILBOX_ID,
       allowTerminalRecovery: true,
+      archiveAuthority: inboundAuthority(
+        input.emailId,
+        input.authorityVariant,
+      ),
       projectionAttemptId: input.attemptId,
       derivedContentProof: proof,
     });
+  }
+
+  async createDirectInboundForTest(input: {
+    emailId: string;
+    attemptId: string;
+    authorityVariant?: string;
+    ownedKey?: string;
+    ownedKeys?: string[];
+    cleanupKey?: string;
+    cleanupKeys?: string[];
+  }): Promise<unknown> {
+    const ownedKeys =
+      input.ownedKeys ?? (input.ownedKey ? [input.ownedKey] : []);
+    const cleanupKeys =
+      input.cleanupKeys ?? (input.cleanupKey ? [input.cleanupKey] : []);
+    const proof = [
+      ...ownedKeys.map((r2Key) => ({ r2Key, byteLength: 4 })),
+      ...cleanupKeys.map((r2Key) => ({ r2Key, byteLength: 4 })),
+    ];
+    const authority = directInboundAuthority(
+      input.emailId,
+      input.authorityVariant,
+    );
+    return this.createDirectInboundEmail({
+      folder: Folders.INBOX,
+      email: {
+        id: input.emailId,
+        subject: "Direct race proof",
+        sender: "sender@example.com",
+        sender_name: "Sender",
+        recipient: MAILBOX_ID,
+        cc: null,
+        bcc: null,
+        date: authority.receivedAt,
+        read: false,
+        body: "body",
+        in_reply_to: null,
+        email_references: null,
+        thread_id: input.emailId,
+        message_id: `<${input.emailId}@example.com>`,
+        raw_headers: "[]",
+        recipient_memory_origin: "live_inbound",
+        snooze_wake_thread_id: null,
+        follow_up_reply_mailbox_address: null,
+        automation_trigger: "live_inbound",
+        push_notification: {
+          title: "New email",
+          body: "Direct race proof",
+          icon: "/icon.png",
+          badge: "/badge.png",
+          clickUrl: `/mailbox/${encodeURIComponent(MAILBOX_ID)}/open/${input.emailId}`,
+          data: { emailId: input.emailId, mailboxId: MAILBOX_ID },
+        },
+      },
+      attachments: [],
+      bodyObjects: ownedKeys.map((r2Key, partIndex) => ({
+        id: `${input.emailId}-body-${partIndex}`,
+        email_id: input.emailId,
+        part_index: partIndex,
+        content_type: "text/plain",
+        charset: "utf-8",
+        r2_key: r2Key,
+        byte_length: 4,
+      })),
+      mailboxAddress: MAILBOX_ID,
+      allowTerminalRecovery: true,
+      directAuthority: authority,
+      projectionExpiresAt: Date.now() + 30_000,
+      projectionAttemptId: input.attemptId,
+      derivedContentProof: proof,
+    });
+  }
+
+  async createDirectInboundThenLoseResponseForTest(input: {
+    emailId: string;
+    attemptId: string;
+  }): Promise<never> {
+    const result = await this.createDirectInboundForTest(input);
+    if (
+      !result ||
+      typeof result !== "object" ||
+      !("status" in result) ||
+      result.status !== "stored"
+    ) {
+      throw new Error("controlled direct inbound create did not commit");
+    }
+    throw new Error("controlled lost direct inbound create response");
+  }
+
+  async readDirectInboundAuthorityForTest(input: {
+    emailId: string;
+    authorityVariant?: string;
+  }): Promise<unknown> {
+    const authority = directInboundAuthority(
+      input.emailId,
+      input.authorityVariant,
+    );
+    return {
+      projection: await this.getDirectInboundProjectionAuthority(authority),
+      deletion: await this.getDirectInboundDeletionAuthority(authority),
+      archivedProjection: await this.getInboundProjectionAuthority(
+        inboundAuthority(input.emailId),
+      ),
+      archivedDeletion: await this.getInboundDeletionAuthority(
+        inboundAuthority(input.emailId),
+      ),
+    };
+  }
+
+  deleteDirectInboundForTest(input: { emailId: string }): Promise<unknown> {
+    return this.deleteEmail(input.emailId);
+  }
+
+  async readInboundAuthorityForTest(input: {
+    emailId: string;
+    authorityVariant?: string;
+  }): Promise<unknown> {
+    const authority = inboundAuthority(
+      input.emailId,
+      input.authorityVariant,
+    );
+    return {
+      projection: await this.getInboundProjectionAuthority(authority),
+      deletion: await this.getInboundDeletionAuthority(authority),
+    };
+  }
+
+  recordInboundTerminalFailureForTest(input: {
+    emailId: string;
+    authorityVariant?: string;
+  }): Promise<"deleted" | "ledgered" | "stored"> {
+    return this.recordInboundTerminalFailure({
+      id: input.emailId,
+      archiveAuthority: inboundAuthority(
+        input.emailId,
+        input.authorityVariant,
+      ),
+      queueRef: "a".repeat(16),
+      attempts: 11,
+      errorCode: "QUEUE_RETRY_EXHAUSTED",
+    });
+  }
+
+  readInboundOwnerStateForTest(input: { emailId: string }): {
+    archiveState: string | null;
+    directState: string | null;
+    emailExists: boolean;
+    tombstoneDeletedAt: string | null;
+  } {
+    const archive = this.db
+      .select({ state: schema.inboundDeliveryAuthorities.state })
+      .from(schema.inboundDeliveryAuthorities)
+      .where(eq(schema.inboundDeliveryAuthorities.id, input.emailId))
+      .get();
+    const direct = this.db
+      .select({ state: schema.directInboundDeliveryAuthorities.state })
+      .from(schema.directInboundDeliveryAuthorities)
+      .where(eq(schema.directInboundDeliveryAuthorities.id, input.emailId))
+      .get();
+    const email = this.db
+      .select({ id: schema.emails.id })
+      .from(schema.emails)
+      .where(eq(schema.emails.id, input.emailId))
+      .get();
+    const tombstone = this.db
+      .select({ deletedAt: schema.emailDeletionTombstones.deleted_at })
+      .from(schema.emailDeletionTombstones)
+      .where(eq(schema.emailDeletionTombstones.id, input.emailId))
+      .get();
+    return {
+      archiveState: archive?.state ?? null,
+      directState: direct?.state ?? null,
+      emailExists: email !== undefined,
+      tombstoneDeletedAt: tombstone?.deletedAt ?? null,
+    };
+  }
+
+  seedInboundOwnerCorruptionForTest(input: {
+    emailId: string;
+    mode:
+      | "both_projected"
+      | "direct_deleted_with_live_email"
+      | "direct_projected_with_tombstone";
+  }): Promise<void> | void {
+    if (input.mode === "both_projected") {
+      const authority = inboundAuthority(input.emailId);
+      this.db
+        .insert(schema.inboundDeliveryAuthorities)
+        .values({
+          id: authority.ingressId,
+          schema_version: authority.schemaVersion,
+          raw_key: authority.rawKey,
+          mailbox_id: authority.mailboxId,
+          raw_size: authority.rawSize,
+          raw_sha256: authority.rawSha256,
+          archived_at: authority.archivedAt,
+          archive_etag: authority.etag,
+          archive_version: authority.version,
+          generation: 1,
+          state: "projected",
+          deleted_at: null,
+        })
+        .run();
+      return;
+    }
+    const deletedAt = "2026-07-17T10:20:00.000Z";
+    if (input.mode === "direct_projected_with_tombstone") {
+      this.db
+        .insert(schema.emailDeletionTombstones)
+        .values({ id: input.emailId, deleted_at: deletedAt })
+        .run();
+      return;
+    }
+    this.db
+      .update(schema.directInboundDeliveryAuthorities)
+      .set({
+        state: "deleted",
+        generation: 2,
+        deleted_at: deletedAt,
+      })
+      .where(eq(schema.directInboundDeliveryAuthorities.id, input.emailId))
+      .run();
+    this.db
+      .insert(schema.emailDeletionTombstones)
+      .values({ id: input.emailId, deleted_at: deletedAt })
+      .run();
+  }
+
+  async deleteInboundAndCaptureForTest(input: {
+    emailId: string;
+  }): Promise<{ error: string | null }> {
+    try {
+      await this.deleteEmail(input.emailId);
+      return { error: null };
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : "unknown",
+      };
+    }
+  }
+
+  seedForeignTombstoneForTest(input: { emailId: string }): void {
+    this.db
+      .insert(schema.emailDeletionTombstones)
+      .values({
+        id: input.emailId,
+        deleted_at: "2026-07-17T10:25:00.000Z",
+      })
+      .run();
+  }
+
+  async seedInboundAuthorityStateForTest(input: {
+    emailId: string;
+    mode:
+      | "deleted_exact"
+      | "deleted_with_live_email"
+      | "deleted_without_tombstone"
+      | "projected_with_live_email_and_tombstone"
+      | "projected_with_imported_email"
+      | "projected_without_email";
+  }): Promise<void> {
+    const authority = inboundAuthority(input.emailId);
+    const insertAuthority = (
+      state: "deleted" | "projected",
+      deletedAt: string | null,
+    ) => {
+      this.db
+        .insert(schema.inboundDeliveryAuthorities)
+        .values({
+          id: authority.ingressId,
+          schema_version: authority.schemaVersion,
+          raw_key: authority.rawKey,
+          mailbox_id: authority.mailboxId,
+          raw_size: authority.rawSize,
+          raw_sha256: authority.rawSha256,
+          archived_at: authority.archivedAt,
+          archive_etag: authority.etag,
+          archive_version: authority.version,
+          generation: state === "deleted" ? 2 : 1,
+          state,
+          deleted_at: deletedAt,
+        })
+        .run();
+    };
+
+    if (input.mode === "projected_without_email") {
+      insertAuthority("projected", null);
+      return;
+    }
+    if (input.mode === "projected_with_imported_email") {
+      await this.createGenericForTest({ emailId: input.emailId });
+      insertAuthority("projected", null);
+      return;
+    }
+    if (input.mode === "deleted_without_tombstone") {
+      insertAuthority("deleted", "2026-07-17T10:10:00.000Z");
+      return;
+    }
+
+    await this.createInboundForTest({
+      emailId: input.emailId,
+      attemptId: crypto.randomUUID(),
+    });
+    if (input.mode === "projected_with_live_email_and_tombstone") {
+      this.db
+        .insert(schema.emailDeletionTombstones)
+        .values({
+          id: input.emailId,
+          deleted_at: "2026-07-17T10:10:00.000Z",
+        })
+        .run();
+      return;
+    }
+    if (input.mode === "deleted_exact") {
+      await this.deleteEmail(input.emailId);
+      return;
+    }
+    const deletedAt = "2026-07-17T10:10:00.000Z";
+    this.db
+      .update(schema.inboundDeliveryAuthorities)
+      .set({ state: "deleted", generation: 2, deleted_at: deletedAt })
+      .where(eq(schema.inboundDeliveryAuthorities.id, input.emailId))
+      .run();
+    this.db
+      .insert(schema.emailDeletionTombstones)
+      .values({ id: input.emailId, deleted_at: deletedAt })
+      .run();
   }
 
   createGenericForTest(input: {
@@ -809,6 +1188,12 @@ export default {
       case "/import-finalize":
         value = await stub.finalizeImportForTest(body as never);
         break;
+      case "/import-delete-email":
+        value = await stub.deleteImportedEmailForTest(body as never);
+        break;
+      case "/import-source-evidence":
+        value = await stub.readImportSourceEvidenceForTest(body as never);
+        break;
       case "/import-fail-head":
         value = await stub.failNextImportHeadForTest(body as never);
         break;
@@ -825,16 +1210,63 @@ export default {
         value = await stub.readImportStateForTest(body as never);
         break;
       case "/import-claim": {
-        const input = body as { emailId: string; legacyId: string; claimToken: string };
+        const input = body as {
+          emailId: string;
+          legacyId: string;
+          claimToken: string;
+          identitySource: "message-id" | "raw-sha256";
+          rawSha256: string | null;
+        };
         value = await stub.claimImportedEmail(
           input.emailId,
           input.legacyId,
           input.claimToken,
+          input.identitySource,
+          input.rawSha256,
         );
         break;
       }
       case "/create":
         value = await stub.createInboundForTest(body as never);
+        break;
+      case "/create-direct":
+        value = await stub.createDirectInboundForTest(body as never);
+        break;
+      case "/create-direct-lose-response":
+        try {
+          await stub.createDirectInboundThenLoseResponseForTest(body as never);
+        } catch (error) {
+          value = {
+            error: error instanceof Error ? error.message : "unknown",
+          };
+        }
+        break;
+      case "/direct-inbound-authority-read":
+        value = await stub.readDirectInboundAuthorityForTest(body as never);
+        break;
+      case "/direct-inbound-delete":
+        value = await stub.deleteDirectInboundForTest(body as never);
+        break;
+      case "/inbound-authority-read":
+        value = await stub.readInboundAuthorityForTest(body as never);
+        break;
+      case "/inbound-terminal-failure":
+        value = await stub.recordInboundTerminalFailureForTest(body as never);
+        break;
+      case "/inbound-owner-state":
+        value = await stub.readInboundOwnerStateForTest(body as never);
+        break;
+      case "/inbound-owner-corruption":
+        value = await stub.seedInboundOwnerCorruptionForTest(body as never);
+        break;
+      case "/inbound-delete-capture":
+        value = await stub.deleteInboundAndCaptureForTest(body as never);
+        break;
+      case "/foreign-tombstone":
+        value = await stub.seedForeignTombstoneForTest(body as never);
+        break;
+      case "/inbound-authority-seed":
+        value = await stub.seedInboundAuthorityStateForTest(body as never);
         break;
       case "/create-generic":
         value = await stub.createGenericForTest(body as never);

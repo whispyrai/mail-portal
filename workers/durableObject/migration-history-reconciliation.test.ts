@@ -214,6 +214,7 @@ test("exact deployed-main history upgrades without collisions or data loss", asy
 		"38_reconcile_deployed_inbound_durability",
 		"39_complete_outbound_reliability",
 		"40_add_cleanup_parking",
+		"41_add_exact_import_source_identity",
 	]) {
 		assert.equal(
 			(await execute(database, "SELECT COUNT(*) AS count FROM d1_migrations WHERE name = ?", [name]))[0]?.count,
@@ -230,6 +231,28 @@ test("fresh migration history converges to the same final contracts", async () =
 	assert.equal((await columns(database, "outbound_provider_events")).includes("recipient_hashes_json"), true);
 	assert.equal((await columns(database, "draft_save_cleanup_intents")).includes("state"), true);
 	assert.equal((await columns(database, "outbound_acceptance_recovery")).includes("generation"), true);
+	assert.deepEqual(
+		await columns(database, "import_source_identities"),
+		["email_id", "raw_sha256", "created_at"],
+	);
+	for (const column of ["legacy_id", "identity_source", "raw_sha256"]) {
+		assert.equal(
+			(await columns(database, "import_generation_claims")).includes(column),
+			true,
+		);
+	}
+	await execute(database, `
+		INSERT INTO import_source_identities (email_id, raw_sha256, created_at)
+		VALUES ('retained-source', '${"a".repeat(64)}', 1);
+		INSERT INTO emails (id, folder_id, subject, sender, recipient, date, body)
+		VALUES ('retained-source', 'inbox', 'Subject', 'sender@example.com',
+			'team@example.com', '2026-07-17T00:00:00.000Z', 'Body');
+		DELETE FROM emails WHERE id = 'retained-source';
+	`);
+	assert.equal(
+		(await execute(database, "SELECT raw_sha256 FROM import_source_identities WHERE email_id = 'retained-source'"))[0]?.raw_sha256,
+		"a".repeat(64),
+	);
 	await apply(database);
 });
 
@@ -258,6 +281,7 @@ test("branch-local databases already through committed migration 37 upgrade safe
 	assert.equal(await hasMigration(database, "38_reconcile_deployed_inbound_durability"), true);
 	assert.equal((await columns(database, "outbound_acceptance_recovery")).includes("generation"), true);
 	assert.equal((await columns(database, "r2_deletion_outbox")).includes("recovery_ref"), true);
+	assert.equal(await hasMigration(database, "41_add_exact_import_source_identity"), true);
 });
 
 async function hasMigration(database: string, name: string): Promise<boolean> {

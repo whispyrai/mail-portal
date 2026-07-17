@@ -70,6 +70,25 @@ test("a prepared SES request is single-use even when dispatch is repeated", asyn
 	assert.equal(fetches, 1);
 });
 
+test("prepared SES dispatch forwards the exact abort signal to custom transport", async () => {
+	const controller = new AbortController();
+	let observedSignal: AbortSignal | null | undefined;
+	const preparation = await prepareSesSend(env, params, {
+		createTransport: () =>
+			transport(async (_url, request) => {
+				observedSignal = request.signal;
+				return Response.json({ MessageId: "ses-message-signal" });
+			}),
+	});
+	assert.equal(preparation.ok, true);
+	if (!preparation.ok) return;
+	assert.equal(
+		(await dispatchPreparedSesSend(preparation.prepared, controller.signal)).kind,
+		"accepted",
+	);
+	assert.equal(observedSignal, controller.signal);
+});
+
 test("SES signing failure proves no provider request was dispatched", async () => {
 	let fetches = 0;
 	const preparation = await prepareSesSend(env, params, {
@@ -176,6 +195,34 @@ test("SES request carries mailbox and delivery correlation tags", async () => {
 		{ Name: "MailboxKey", Value: "dGVhbUBleGFtcGxlLmNvbQ" },
 		{ Name: "DeliveryId", Value: "delivery_123" },
 		{ Name: "AttemptId", Value: "attempt_456" },
+	]);
+	assert.equal(payload?.ConfigurationSetName, "mail-portal-events");
+});
+
+test("credential recovery uses its own provider correlation namespace", async () => {
+	let payload: Record<string, unknown> | undefined;
+	const outcome = await sendEmailWithOutcome(
+		env,
+		{
+			...params,
+			credentialRecoveryTracking: {
+				deliveryId: "recovery_delivery_123",
+				attemptId: "recovery_attempt_456",
+			},
+		},
+		{
+			createTransport: () =>
+				transport(async (_url, request) => {
+					payload = JSON.parse(String(request.body));
+					return Response.json({ MessageId: "ses-message-1" });
+				}),
+		},
+	);
+
+	assert.equal(outcome.kind, "accepted");
+	assert.deepEqual(payload?.EmailTags, [
+		{ Name: "CredentialRecoveryId", Value: "recovery_delivery_123" },
+		{ Name: "CredentialRecoveryAttempt", Value: "recovery_attempt_456" },
 	]);
 	assert.equal(payload?.ConfigurationSetName, "mail-portal-events");
 });

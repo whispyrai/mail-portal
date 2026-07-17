@@ -7,17 +7,12 @@
 // Worker-rendered HTML (no React) — locked-decisions D-23, D-62, D-64.
 
 import { Hono, type Context } from "hono";
-import PostalMime, { type Email } from "postal-mime";
 import { USER_ROLES, type UserRole } from "../db/users-schema";
-import { importParsedEmail } from "../lib/import/import-email";
-import { mapZohoFolder } from "../lib/import/parse";
-import { MAX_EMAIL_SIZE } from "../lib/store-email";
 import {
   listUsers,
   getUserById,
   getUserByEmail,
   revokeUserCredentials,
-  updateUserRecoveryEmail,
 } from "../lib/users";
 import {
   hashPassword,
@@ -43,6 +38,7 @@ import { renderAdminAiCostPage } from "./admin-ai-cost-page.ts";
 import { resolveAiCostControlConfig } from "../lib/ai-cost-control.ts";
 import { createAiCostController } from "../lib/ai-cost-control-d1.ts";
 import { credentialRecoveryWorkflow } from "../lib/credential-recovery-runtime.ts";
+import { drainCredentialRecoveryDeliveries } from "../lib/credential-recovery-delivery-outbox.ts";
 import {
   maskedRecoveryAddress,
   recoveryAddressFor,
@@ -53,6 +49,7 @@ import { createAdminReadDisclosureGuard } from "./admin-read-disclosure-guard.ts
 import { requireAgentConnectionReconciliation } from "../lib/agent-connection-revocation-outbox.ts";
 import { adminInboundRecoveryApp } from "./admin-inbound-recovery.ts";
 import { adminOutboundRecoveryApp } from "./admin-outbound-recovery.ts";
+import { createAdminImportRouteHandler } from "./admin-import.ts";
 
 type AdminEnv = { Bindings: Env; Variables: { session?: SessionClaims } };
 
@@ -70,6 +67,9 @@ async function issueSetupLink(
   c: Context<AdminEnv>,
   user: NonNullable<Awaited<ReturnType<typeof getUserById>>>,
 ) {
+  if (user.is_active !== 1) {
+    throw new Error("Inactive accounts cannot receive setup links.");
+  }
   if (user.ownership_confirmed_at !== null) {
     throw new Error(
       "Claimed accounts use owner-initiated recovery from the sign-in page.",
@@ -80,17 +80,28 @@ async function issueSetupLink(
     user.email,
     c.env.DOMAINS,
   );
-  if (user.recovery_email !== recoveryEmail) {
-    await updateUserRecoveryEmail(c.env, user.id, recoveryEmail);
-  }
-  return credentialRecoveryWorkflow(c.env).issue({
+  const issued = await credentialRecoveryWorkflow(c.env).issue({
     purpose: "setup",
     userId: user.id,
     loginEmail: user.email,
     recoveryEmail,
     issuedBy: c.get("session")!.sub,
-    origin: new URL(c.req.url).origin,
+    origin: resolveBrand(c.env.BRAND).mailOrigin,
   });
+  if (issued.issuance !== "issued") {
+    throw new Error(
+      issued.issuance === "rate_limited"
+        ? "Setup issuance is temporarily rate limited."
+        : "The account is no longer eligible for setup.",
+    );
+  }
+  try {
+    const maintenance = drainCredentialRecoveryDeliveries(c.env);
+    c.executionCtx.waitUntil(maintenance);
+  } catch {
+    // The durable outbox is authoritative. Cron will retry delivery.
+  }
+  return issued;
 }
 
 // Gate: ADMIN only (the app-level gate already guarantees a valid session).
@@ -201,6 +212,24 @@ adminApp.get("/mailboxes", async (c) => {
 adminApp.get("/users", async (c) => {
   const brand = resolveBrand(c.env.BRAND);
   const users = await listUsers(c.env);
+  const recoveryDisplays = new Map(
+    users.map((user) => {
+      try {
+        return [
+          user.id,
+          maskedRecoveryAddress(
+            recoveryAddressFor(
+              c.env.ACCOUNT_RECOVERY_DIRECTORY,
+              user.email,
+              c.env.DOMAINS,
+            ),
+          ),
+        ] as const;
+      } catch {
+        return [user.id, "Unavailable"] as const;
+      }
+    }),
+  );
   const flash = c.req.query("ok")
     ? `<div class="flash ok">${escapeHtml(c.req.query("ok")!)}</div>`
     : c.req.query("err")
@@ -221,13 +250,13 @@ adminApp.get("/users", async (c) => {
       const ownership = u.ownership_confirmed_at
         ? `<span class="badge">claimed</span>`
         : `<span class="badge off">pending setup</span>`;
-      const setupAction = u.ownership_confirmed_at
+      const setupAction = u.ownership_confirmed_at || u.is_active !== 1
         ? ""
         : `<form class="inline" method="post" action="/admin/users/${u.id}/setup"><button class="sm" type="submit">Resend secure setup link</button></form>`;
       return `<tr>
         <td>${escapeHtml(u.email)} ${roleBadge}</td>
         <td>${escapeHtml(u.mailbox_address)}</td>
-				<td>${ownership} ${escapeHtml(maskedRecoveryAddress(u.recovery_email))}</td>
+				<td>${ownership} ${escapeHtml(recoveryDisplays.get(u.id) ?? "Unavailable")}</td>
         <td>${status}
 				  ${setupAction}
           <form class="inline" method="post" action="/admin/users/${u.id}/revoke"><button class="sm" type="submit">Revoke sessions and credentials</button></form>
@@ -363,7 +392,6 @@ adminApp.post("/users", async (c) => {
       passwordSalt: salt,
       role,
       mailboxAddress: email,
-      recoveryEmail,
       displayName: name,
       mailboxSettings: {
         agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id),
@@ -371,8 +399,8 @@ adminApp.post("/users", async (c) => {
     });
   } catch (error) {
     console.error("[admin] failed to create user and mailbox", {
-      email,
-      error: error instanceof Error ? error.message : String(error),
+      operation: "admin_account_provisioning",
+      errorName: error instanceof Error ? error.name : "UnknownError",
     });
     return c.redirect(
       `/admin/users?err=${encodeURIComponent("User and mailbox could not be created. Please retry or inspect logs.")}`,
@@ -380,19 +408,7 @@ adminApp.post("/users", async (c) => {
     );
   }
   try {
-    const issued = await issueSetupLink(c, user);
-    if (issued.delivery === "failed") {
-      return c.redirect(
-        `/admin/users?err=${encodeURIComponent("User was created, but SES did not accept the invitation. Verify delivery setup and resend the link.")}`,
-        302,
-      );
-    }
-    if (issued.delivery === "uncertain") {
-      return c.redirect(
-        `/admin/users?ok=${encodeURIComponent(`Created ${email}; SES acceptance of the invitation is uncertain. Confirm delivery before reissuing.`)}`,
-        302,
-      );
-    }
+    await issueSetupLink(c, user);
   } catch (error) {
     return c.redirect(
       `/admin/users?err=${encodeURIComponent(`User was created, but the invitation could not be issued: ${error instanceof Error ? error.message : "unknown error"}`)}`,
@@ -401,7 +417,7 @@ adminApp.post("/users", async (c) => {
   }
 
   return c.redirect(
-    `/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}) and sent a secure invitation.`)}`,
+    `/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}) and queued a secure invitation for delivery.`)}`,
     302,
   );
 });
@@ -430,15 +446,10 @@ adminApp.post("/users/:id/setup", async (c) => {
       302,
     );
   try {
-    const issued = await issueSetupLink(c, user);
-    const message =
-      issued.delivery === "accepted"
-        ? `Secure setup link sent for ${user.email}.`
-        : issued.delivery === "uncertain"
-          ? `SES acceptance was uncertain for ${user.email}. Confirm delivery before resending setup.`
-          : `SES did not accept the setup email for ${user.email}.`;
+    await issueSetupLink(c, user);
+    const message = `Secure setup link queued for ${user.email}. Delivery retries automatically until the link expires.`;
     return c.redirect(
-      `/admin/users?${issued.delivery === "failed" ? "err" : "ok"}=${encodeURIComponent(message)}`,
+      `/admin/users?ok=${encodeURIComponent(message)}`,
       302,
     );
   } catch (error) {
@@ -480,53 +491,6 @@ adminApp.post("/users/:id/revoke", async (c) => {
 // push. Idempotent: the internal id is derived from the message, so re-running
 // skips anything already imported (R2 keys are keyed on that id too). Removable
 // after the migration.
-adminApp.post("/import/:mailboxId", async (c) => {
-  const mailboxId = decodeURIComponent(c.req.param("mailboxId")).toLowerCase();
-  const session = c.get("session");
-  if (
-    !session ||
-    !(await mailboxAccess(c.env).canAccessMailbox(session.sub, mailboxId))
-  ) {
-    return c.json({ error: "Explicit mailbox membership is required" }, 403);
-  }
-  const sourceFolder = c.req.query("folder")?.trim();
-  if (!sourceFolder)
-    return c.json({ error: "folder query param is required" }, 400);
-
-  // Require a pre-provisioned mailbox. The importer never creates one (role
-  // inboxes are admin-provisioned via /admin/users before import).
-  if (!(await c.env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
-    return c.json({ error: "Mailbox not found" }, 404);
-  }
-
-  const folder = mapZohoFolder(sourceFolder);
-  if (!folder) {
-    return c.json(
-      { status: "skipped", reason: "excluded-folder", folder: sourceFolder },
-      200,
-    );
-  }
-
-  const raw = await c.req.arrayBuffer();
-  if (raw.byteLength === 0) return c.json({ error: "empty message body" }, 400);
-  if (raw.byteLength > MAX_EMAIL_SIZE)
-    return c.json({ error: "message exceeds size limit" }, 413);
-
-  let parsed: Email;
-  try {
-    parsed = await new PostalMime().parse(raw);
-  } catch {
-    return c.json({ error: "invalid RFC822 message" }, 400);
-  }
-  const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
-  const result = await importParsedEmail(
-    { bucket: c.env.BUCKET, mailbox: stub },
-    parsed,
-    folder,
-    mailboxId,
-  );
-  if (result.status === "imported") return c.json(result, 201);
-  return c.json(result, result.reason === "in_progress" ? 409 : 200);
-});
+adminApp.post("/import/:mailboxId", createAdminImportRouteHandler());
 
 export { adminApp };

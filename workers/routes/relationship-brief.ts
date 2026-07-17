@@ -1,4 +1,4 @@
-import { Hono, type Context } from "hono";
+import { Hono } from "hono";
 import {
 	RelationshipBriefContractError,
 	parseRelationshipBriefRequest,
@@ -8,9 +8,17 @@ import {
 import { validateMailPersonId } from "../../shared/mail-people.ts";
 import type { MailboxDO } from "../durableObject/index.ts";
 import {
-	hasLiveMailboxContentAccess,
 	type MailboxContext,
 } from "../lib/mailbox.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+} from "../lib/live-authorized-read.ts";
+import {
+	hasExactLiveMailboxAccess,
+	runLiveMailboxAuthorizedRead,
+	type LiveMailboxAccessAuthorizer,
+} from "../lib/live-mailbox-authorization.ts";
 import {
 	RelationshipBriefAccessRevokedError,
 	createRelationshipBriefRuntime,
@@ -18,10 +26,9 @@ import {
 } from "../lib/relationship-brief-runtime.ts";
 
 const MAX_BODY_BYTES = 256;
-type AppContext = Context<MailboxContext>;
 
 export type RelationshipBriefRouteInput = {
-	env: AppContext["env"];
+	env: MailboxContext["Bindings"];
 	actorUserId: string;
 	mailboxId: string;
 	personId: string;
@@ -31,7 +38,6 @@ export type RelationshipBriefRouteInput = {
 
 export type RelationshipBriefRouteDependencies = {
 	run(input: RelationshipBriefRouteInput): Promise<RelationshipBriefResponse>;
-	revalidateAccess(context: AppContext): Promise<boolean>;
 };
 
 class RelationshipBriefRequestError extends Error {
@@ -91,16 +97,17 @@ const productionDependencies: RelationshipBriefRouteDependencies = {
 		createRelationshipBriefRuntime(input.env, input),
 		input,
 	),
-	revalidateAccess: hasLiveMailboxContentAccess,
 };
 
 export function createRelationshipBriefRoutes(
 	dependencies: RelationshipBriefRouteDependencies = productionDependencies,
+	authorize: LiveMailboxAccessAuthorizer = hasExactLiveMailboxAccess,
 ) {
 	const app = new Hono<MailboxContext>();
 	app.post(
 		"/api/v1/mailboxes/:mailboxId/people/:personId/relationship-brief",
 		async (c) => {
+			c.header("Cache-Control", "private, no-store");
 			const session = c.get("session");
 			if (!session) return c.json({ error: "Unauthorized" }, 401);
 			const stub = c.get("mailboxStub");
@@ -120,39 +127,44 @@ export function createRelationshipBriefRoutes(
 				return c.json({ error: "Relationship brief request is invalid" }, 400);
 			}
 
-			const outcome = await dependencies.run({
-				env: c.env,
-				actorUserId: session.sub,
-				mailboxId: mailbox,
-				personId: person,
-				refresh: request.refresh,
-				stub,
-			}).then(
-				(value) => ({ state: "success" as const, value }),
-				(error: unknown) => ({ state: "failure" as const, error }),
-			);
-			if (!(await dependencies.revalidateAccess(c))) {
-				return c.json({ error: "Forbidden" }, 403);
-			}
-			if (outcome.state === "failure") {
-				if (outcome.error instanceof RelationshipBriefAccessRevokedError) {
+			try {
+				return c.json(await runLiveMailboxAuthorizedRead(
+					c.env,
+					{
+						mailboxId: mailbox,
+						userId: session.sub,
+						sessionVersion: session.sessionVersion,
+					},
+					async () => validateRelationshipBriefResponse(await dependencies.run({
+						env: c.env,
+						actorUserId: session.sub,
+						mailboxId: mailbox,
+						personId: person,
+						refresh: request.refresh,
+						stub,
+					})),
+					authorize,
+				));
+			} catch (error) {
+				if (error instanceof LiveReadAuthorizationError) {
 					return c.json({ error: "Forbidden" }, 403);
+				}
+				if (error instanceof LiveReadAuthorizationUnavailableError) {
+					return c.json({ error: "Authorization unavailable" }, 503);
+				}
+				if (error instanceof RelationshipBriefAccessRevokedError) {
+					return c.json({ error: "Forbidden" }, 403);
+				}
+				if (error instanceof RelationshipBriefContractError) {
+					return c.json({ error: "The relationship brief is temporarily unavailable." }, 502);
 				}
 				console.error("[relationship-brief] generation failed", {
 					actorUserId: session.sub,
 					mailboxId: mailbox,
 					personId: person,
-					errorName: outcome.error instanceof Error ? outcome.error.name : "UnknownError",
+					errorName: error instanceof Error ? error.name : "UnknownError",
 				});
 				return c.json({ error: "The relationship brief is temporarily unavailable." }, 502);
-			}
-			try {
-				return c.json(validateRelationshipBriefResponse(outcome.value));
-			} catch (error) {
-				if (error instanceof RelationshipBriefContractError) {
-					return c.json({ error: "The relationship brief is temporarily unavailable." }, 502);
-				}
-				throw error;
 			}
 		},
 	);

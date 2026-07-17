@@ -9,6 +9,16 @@ import {
 import type { TodayBriefDayBoundary } from "../lib/today-brief-timezone.ts";
 import { resolveTodayBriefDay } from "../lib/today-brief-timezone.ts";
 import type { Env } from "../types.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+	LiveReadSessionAuthorizationError,
+} from "../lib/live-authorized-read.ts";
+import {
+	loadExactLiveMailboxRoster,
+	runExactLiveMailboxRosterRead,
+	type ExactLiveMailboxRosterLoader,
+} from "../lib/live-mailbox-authorization.ts";
 
 const REQUEST_BYTES = 1_024;
 const requestSchema = z.object({
@@ -91,6 +101,7 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 
 export function createGlobalTodayBriefRoutes(
 	dependencies: GlobalTodayBriefRouteDependencies = productionDependencies,
+	loadRoster: ExactLiveMailboxRosterLoader = loadExactLiveMailboxRoster,
 ) {
 	const app = new Hono<GlobalTodayBriefRouteContext>();
 	app.post("/api/v1/today/brief", async (c) => {
@@ -109,8 +120,30 @@ export function createGlobalTodayBriefRoutes(
 			return c.json({ error: "Global Today brief request is invalid" }, 400);
 		}
 		try {
-			return c.json(await dependencies.run({ env: c.env, actorUserId: session.sub, day, refresh }));
+			return c.json(await runExactLiveMailboxRosterRead(
+				c.env,
+				{
+					userId: session.sub,
+					sessionVersion: session.sessionVersion,
+				},
+				() => dependencies.run({
+					env: c.env,
+					actorUserId: session.sub,
+					day,
+					refresh,
+				}),
+				loadRoster,
+			));
 		} catch (error) {
+			if (error instanceof LiveReadSessionAuthorizationError) {
+				return c.json({ error: "Unauthorized" }, 401);
+			}
+			if (error instanceof LiveReadAuthorizationError) {
+				return c.json({ error: "Mailbox access changed" }, 403);
+			}
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return c.json({ error: "Authorization unavailable" }, 503);
+			}
 			if (error instanceof GlobalTodayBriefAccessChangedError) {
 				return c.json({ error: "Mailbox access changed" }, 403);
 			}

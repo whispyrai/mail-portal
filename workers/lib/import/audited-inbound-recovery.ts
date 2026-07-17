@@ -1,7 +1,10 @@
 import type { Email } from "postal-mime";
 import type { InboundArchivePointer } from "../../inbound-email.ts";
 import type { EmailStorageDependencies } from "../store-email.ts";
-import { recoverInboundEmail } from "./recover-inbound.ts";
+import {
+  exactRecoveryArchiveAuthority,
+  recoverInboundEmail,
+} from "./recover-inbound.ts";
 import { safeErrorCode } from "../safe-error-code.ts";
 import { mailTelemetryLogRef } from "../mail-telemetry.ts";
 
@@ -174,9 +177,7 @@ export async function recoverInboundEmailWithAudit(
       if (!input.parsed) throw new Error("Recovery source is unavailable");
       result = projectAuditedProjectionResult(
         await recoverInboundEmail(input.dependencies, input.parsed, {
-          ingressId: input.pointer.ingressId,
-          archivedAt: input.pointer.archivedAt,
-          mailboxId: input.pointer.mailboxId,
+          archiveAuthority: exactRecoveryArchiveAuthority(input.pointer),
         }),
       );
     }

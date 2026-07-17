@@ -22,12 +22,14 @@ const session = {
 	sub: "user-a",
 	email: "user@example.com",
 	role: "AGENT",
+	sessionVersion: 1,
 } as SessionClaims;
 
 function app(input: {
 	session?: SessionClaims;
 	stub?: unknown;
 	run?: ReplyRefinementRouteDependencies["run"];
+	authorize?: () => Promise<boolean>;
 }) {
 	const root = new Hono<ReplyRefinementRouteContext>();
 	root.use("*", async (c, next) => {
@@ -45,7 +47,7 @@ function app(input: {
 					state: "budget_paused",
 					reason: "admin_review_required",
 				})),
-		}),
+		}, input.authorize ?? (async () => true)),
 	);
 	return root;
 }
@@ -177,4 +179,22 @@ test("route maps missing, unsupported, revoked, and stale states without leaking
 	const text = await failed.text();
 	assert.doesNotMatch(text, /secret draft|prompt|sender content/);
 	assert.match(text, /draft remains unchanged/i);
+});
+
+test("later live revocation discards reply-refinement success and private failure", async () => {
+	for (const run of [
+		async () => ({ state: "stale" as const }),
+		async (): Promise<never> => { throw new Error("private refinement failure"); },
+	]) {
+		let checks = 0;
+		const response = await app({
+			session,
+			stub: {},
+			run,
+			authorize: async () => ++checks === 1,
+		}).request(request(validBody));
+		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+		assert.doesNotMatch(await response.text(), /private refinement failure/);
+	}
 });

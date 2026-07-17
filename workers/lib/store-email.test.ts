@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { Email } from "postal-mime";
 import {
+	isEmailTerminalDuringProjection,
 	storeParsedEmail as storeParsedEmailProduction,
 	type EmailStorageDependencies,
 } from "./store-email.ts";
@@ -66,6 +67,20 @@ function parsed(overrides: Partial<Email> = {}): Email {
 	} as Email;
 }
 
+function archiveAuthority(messageId: string, archivedAt: string) {
+	return {
+		schemaVersion: 1 as const,
+		ingressId: messageId,
+		rawKey: `raw/2026/07/17/10/00/${messageId}.eml`,
+		mailboxId: "team@example.com",
+		rawSize: 100,
+		rawSha256: "a".repeat(64),
+		archivedAt,
+		etag: "archive-etag",
+		version: "archive-version",
+	};
+}
+
 test("heuristic same-subject threading never gains Snooze wake authority", async () => {
 	const state = dependencies();
 	await storeParsedEmail(state.value, parsed(), {
@@ -116,6 +131,10 @@ test("live RFC reply identity may wake its exact stored thread", async () => {
 			mailboxId: "team@example.com",
 			date: "2026-07-11T09:00:00.000Z",
 			messageId: "internal-original",
+			archiveAuthority: archiveAuthority(
+				"internal-original",
+				"2026-07-11T09:00:00.000Z",
+			),
 		}));
 		const signal = await storeParsedEmailProduction(state.value, parsed({
 			inReplyTo: "<raw-original@example.com>",
@@ -124,6 +143,10 @@ test("live RFC reply identity may wake its exact stored thread", async () => {
 			mailboxId: "team@example.com",
 			date: "2026-07-11T10:00:00.000Z",
 			messageId: "internal-reply",
+			archiveAuthority: archiveAuthority(
+				"internal-reply",
+				"2026-07-11T10:00:00.000Z",
+			),
 		}));
 		assert.equal(state.created[0]!.message_id, "raw-original@example.com");
 		assert.equal(state.created[1]!.thread_id, "internal-original");
@@ -150,7 +173,80 @@ test("live RFC reply identity may wake its exact stored thread", async () => {
 		conversationKey: "internal-original",
 		inboundMessageId: "internal-reply",
 		inboundMessageDate: "2026-07-11T10:00:00.000Z",
+		status: "stored",
 	});
+});
+
+test("live Queue projection passes its absolute expiry to the Mailbox command", async () => {
+	const state = dependencies();
+	let command: InboundProjectionCommand | undefined;
+	state.value.mailbox.createInboundEmail = async (value) => {
+		command = value;
+		return { status: "stored" };
+	};
+
+	await storeParsedEmailProduction(
+		state.value,
+		parsed(),
+		liveInboundProjectionOptions({
+			brand: "wiser",
+			mailboxId: "team@example.com",
+			date: "2026-07-17T10:00:00.000Z",
+			messageId: "deadline-command",
+			projectionExpiresAt: 1_768_644_060_000,
+			archiveAuthority: archiveAuthority(
+				"deadline-command",
+				"2026-07-17T10:00:00.000Z",
+			),
+		}),
+	);
+
+	assert.equal(command?.projectionExpiresAt, 1_768_644_060_000);
+});
+
+test("live projection requires exactly one archive or direct authority", async () => {
+	for (const authorityMode of ["both", "neither"] as const) {
+		const state = dependencies();
+		state.value.mailbox.createInboundEmail = async () => {
+			assert.fail("invalid authority selection must not reach archive storage");
+		};
+		state.value.mailbox.createDirectInboundEmail = async () => {
+			assert.fail("invalid authority selection must not reach direct storage");
+		};
+		const messageId = `authority-${authorityMode}`;
+		const date = "2026-07-17T10:00:00.000Z";
+		const archived = archiveAuthority(messageId, date);
+		await assert.rejects(
+			() =>
+				storeParsedEmailProduction(
+					state.value,
+					parsed(),
+					liveInboundProjectionOptions({
+						brand: "wiser",
+						mailboxId: "team@example.com",
+						date,
+						messageId,
+						...(authorityMode === "both"
+							? {
+									archiveAuthority: archived,
+									directAuthority: {
+										schemaVersion: 1,
+										ingressId: messageId,
+										mailboxId: "team@example.com",
+										rawSize: 100,
+										rawSha256: "a".repeat(64),
+										receivedAt: date,
+									},
+								}
+							: {}),
+					}),
+				),
+			(error: unknown) =>
+				error instanceof Error &&
+				"code" in error &&
+				error.code === "MAILBOX_INBOUND_PROJECTION_UNSUPPORTED",
+		);
+	}
 });
 
 test("live projection surfaces active derived-content deletion as a retryable conflict", async () => {
@@ -168,12 +264,42 @@ test("live projection surfaces active derived-content deletion as a retryable co
 					mailboxId: "team@example.com",
 					date: "2026-07-15T10:00:00.000Z",
 					messageId: "cleanup-conflict",
+					archiveAuthority: archiveAuthority(
+						"cleanup-conflict",
+						"2026-07-15T10:00:00.000Z",
+					),
 				}),
 			),
 		(error: unknown) =>
 			error instanceof Error &&
 			"code" in error &&
 			error.code === "INBOUND_DERIVED_CONTENT_CLEANUP_CONFLICT",
+	);
+});
+
+test("live projection treats an existing identity conflict as indeterminate terminal truth", async () => {
+	const state = dependencies();
+	state.value.mailbox.createInboundEmail = async () => ({
+		status: "identity_conflict",
+	});
+
+	await assert.rejects(
+		() =>
+			storeParsedEmailProduction(
+				state.value,
+				parsed(),
+				liveInboundProjectionOptions({
+					brand: "wiser",
+					mailboxId: "team@example.com",
+					date: "2026-07-17T10:00:00.000Z",
+					messageId: "identity-conflict",
+					archiveAuthority: archiveAuthority(
+						"identity-conflict",
+						"2026-07-17T10:00:00.000Z",
+					),
+				}),
+			),
+		(error: unknown) => isEmailTerminalDuringProjection(error),
 	);
 });
 

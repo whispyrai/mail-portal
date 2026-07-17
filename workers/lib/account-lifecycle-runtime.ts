@@ -44,6 +44,27 @@ export function accountLifecycle(
             "UPDATE credential_recovery_tokens SET consumed_at = ? WHERE user_id = ? AND consumed_at IS NULL",
           ).bind(input.at, input.userId),
           env.DB.prepare(
+            `UPDATE credential_recovery_delivery_outbox
+             SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL,
+                 payload_key_version = NULL, payload_iv = NULL,
+                 payload_ciphertext = NULL, completed_at = ?, updated_at = ?,
+                 last_error_code = 'ACCOUNT_DEACTIVATED',
+                 cancellation_reason = 'ACCOUNT_DEACTIVATED',
+                 cancellation_observed_at = ?
+             WHERE token_id IN (
+               SELECT id FROM credential_recovery_tokens WHERE user_id = ?
+             ) AND state IN ('pending', 'leased')`,
+          ).bind(input.at, input.at, input.at, input.userId),
+          env.DB.prepare(
+            `UPDATE credential_recovery_delivery_outbox
+             SET cancellation_reason = COALESCE(cancellation_reason, 'ACCOUNT_DEACTIVATED'),
+                 cancellation_observed_at = COALESCE(cancellation_observed_at, ?),
+                 updated_at = ?
+             WHERE token_id IN (
+               SELECT id FROM credential_recovery_tokens WHERE user_id = ?
+             ) AND state = 'dispatching'`,
+          ).bind(input.at, input.at, input.userId),
+          env.DB.prepare(
             `INSERT INTO credential_recovery_audit
 						 (id, user_id, event_type, actor_user_id, created_at)
 						 SELECT ?, ?, 'account_deactivated', NULL, ?

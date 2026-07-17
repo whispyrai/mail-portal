@@ -11,6 +11,9 @@ AWS_SECRET_ACCESS_KEY=your-ses-iam-secret-access-key
 
 # Shared secret authenticating AWS SES delivery-event webhooks.
 SES_EVENT_WEBHOOK_SECRET=your-long-random-ses-webhook-secret
+# Stable AES-GCM/HMAC root for version-1 recovery ciphertext and opaque refs.
+# Keep it separate from JWT_SECRET and do not rotate it in place.
+CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1=your-stable-credential-recovery-payload-key
 
 # Session signing secret (64+ random bytes). Generate with:
 #   openssl rand -base64 48
@@ -18,7 +21,6 @@ JWT_SECRET=your-long-random-jwt-secret
 
 # Verified external destination used only if both raw R2 archival and direct
 # Mailbox persistence fail. Configure the approved address per environment.
-EMERGENCY_FORWARD_TO=replace-with-verified-emergency-destination
 
 # Email allowed to self-provision the first ADMIN account on first login.
 ADMIN_BOOTSTRAP_EMAIL=replace-with-the-brand-admin-address

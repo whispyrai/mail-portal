@@ -4,7 +4,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import test from "node:test";
 import { Hono } from "hono";
 import type { SessionClaims } from "../lib/auth.ts";
-import { hasLiveMailboxContentAccess, requireMailbox, type MailboxContext } from "../lib/mailbox.ts";
+import { requireMailbox, type MailboxContext } from "../lib/mailbox.ts";
 import type { Env } from "../types.ts";
 import { createRelationshipBriefRoutes } from "./relationship-brief.ts";
 
@@ -74,7 +74,6 @@ function fixture() {
 			).run("team@example.com", "member");
 			return { state: "unavailable" };
 		},
-		revalidateAccess: hasLiveMailboxContentAccess,
 	}));
 	return {
 		database,

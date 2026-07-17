@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { reconcileInboundArchives } from "./inbound-reconciliation.ts";
 import {
+	emergencyForwardMarkerKey,
+	reconcileEmergencyForwardMarkers,
+} from "./lib/emergency-forward.ts";
+import {
 	createInboundCleanupIntent,
 	inboundCleanupIntentKey,
 } from "./lib/inbound-derived-content-cleanup-intent.ts";
@@ -24,13 +28,18 @@ function attemptId(index: number) {
 
 test("a maximum scheduled reconciliation shape stays within the Worker service-subrequest budget", async () => {
 	let serviceSubrequests = 0;
+	let emergencyServiceSubrequests = 0;
 	let etagRevision = 0;
 	let recentListCount = 0;
-	const stored = new Map<string, { value: string; etag: string }>();
+	const stored = new Map<string, {
+		value: string;
+		etag: string;
+		customMetadata?: Record<string, string>;
+	}>();
 	const repairKeys: string[] = [];
 	const cleanupKeys: string[] = [];
 	const recentKeys = Array.from(
-		{ length: 128 },
+		{ length: 64 },
 		(_, index) => {
 			const minute = new Date(Date.UTC(2026, 6, 14, 10, Math.floor(index / 2)));
 			const year = minute.getUTCFullYear();
@@ -42,6 +51,14 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 		},
 	);
 	const archiveKeys = [...recentKeys.slice(0, 8), "raw/2026/07/15/archive-8.eml"];
+	const emergencyRawKeys = Array.from(
+		{ length: 8 },
+		(_, index) => `raw/2026/07/15/emergency-${index}.eml`,
+	);
+	const emergencyMarkerKeys = emergencyRawKeys.map(emergencyForwardMarkerKey);
+	const emergencyQueue: unknown[] = [];
+	const emergencyRawSha256 = "a".repeat(64);
+	const archiveRawSha256 = "b".repeat(64);
 	const activeMarkerKeys = archiveKeys.slice(0, 8).map(
 		(rawKey) => `system/inbound-active/${encodeURIComponent(rawKey)}.json`,
 	);
@@ -53,6 +70,36 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 		}),
 		etag: "recent-cursor-etag",
 	});
+	stored.set("system/emergency-forward/reconciliation-cursor.json", {
+		value: "not-json",
+		etag: "corrupt-emergency-cursor-etag",
+	});
+	for (const [index, rawKey] of emergencyRawKeys.entries()) {
+		const ingressId = `emergency-${index}`;
+		stored.set(emergencyMarkerKeys[index], {
+			value: "not-json",
+			etag: `corrupt-emergency-marker-${index}`,
+			customMetadata: { ingressId, status: "forward_pending" },
+		});
+		stored.set(`receipts/${ingressId}.json`, {
+			value: JSON.stringify({
+				schemaVersion: 1,
+				ingressId,
+				rawKey,
+				mailboxId,
+				rawSize: 1,
+				rawSha256: emergencyRawSha256,
+				archivedAt: "2026-07-15T09:00:00.000Z",
+				etag: `emergency-raw-etag-${index}`,
+				version: `emergency-raw-version-${index}`,
+				state: "quarantined",
+				updatedAt: "2026-07-15T09:01:00.000Z",
+				errorCode: "MIME_PARSE_FAILED",
+			}),
+			etag: `emergency-receipt-${index}`,
+			customMetadata: { state: "quarantined" },
+		});
+	}
 
 	for (let index = 0; index < 20; index += 1) {
 		const id = attemptId(index);
@@ -110,6 +157,7 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 				rawKey: archiveKeys[index],
 				mailboxId,
 				rawSize: 1,
+				rawSha256: archiveRawSha256,
 				archivedAt: "2026-07-15T09:00:00.000Z",
 				etag: `raw-archive-${index}`,
 				version: "raw-version",
@@ -137,6 +185,14 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 	const rawBucket = {
 		async list(options: { prefix: string; limit: number; cursor?: string }) {
 			serviceSubrequests += 1;
+			if (options.prefix === "system/emergency-forward/active/") {
+				emergencyServiceSubrequests += 1;
+				assert.equal(options.limit, 8);
+				return {
+					objects: emergencyMarkerKeys.map((key) => ({ key })),
+					truncated: false,
+				};
+			}
 			if (options.prefix === "system/derived-content-repair-attempts/pending/") {
 				assert.equal(options.limit, 20);
 				return { objects: repairKeys.map((key) => ({ key })), truncated: false };
@@ -153,7 +209,7 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 				};
 			}
 			if (/^raw\/2026\/07\/14\/\d{2}\/\d{2}\/$/.test(options.prefix)) {
-				assert.equal(options.limit, 128 - 2 * recentListCount);
+				assert.equal(options.limit, 64 - 2 * recentListCount);
 				const objects = recentKeys
 					.filter((key) => key.startsWith(options.prefix))
 					.map((key) => ({ key }));
@@ -193,35 +249,102 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 					ingressId,
 					mailboxId,
 					rawSize: "1",
+					rawSha256: archiveRawSha256,
 					schemaVersion: "1",
+				},
+				checksums: {
+					sha256: Uint8Array.from(
+						Buffer.from(archiveRawSha256, "hex"),
+					).buffer,
 				},
 			};
 		},
 		async get(key: string) {
 			serviceSubrequests += 1;
+			if (
+				key === "system/emergency-forward/reconciliation-cursor.json" ||
+				key === "system/emergency-forward/anomalies/reconciliation-cursor.json" ||
+				key.startsWith("system/emergency-forward/active/") ||
+				key.startsWith("system/emergency-forward/anomalies/raw%2F2026%2F07%2F15%2Femergency-") ||
+				emergencyRawKeys.includes(key) ||
+				/^receipts\/emergency-\d+\.json$/.test(key)
+			) {
+				emergencyServiceSubrequests += 1;
+			}
+			const emergencyRawIndex = emergencyRawKeys.indexOf(key);
+			if (emergencyRawIndex >= 0) {
+				return {
+					key,
+					version: `emergency-raw-version-${emergencyRawIndex}`,
+					size: 1,
+					etag: `emergency-raw-etag-${emergencyRawIndex}`,
+					body: new ReadableStream(),
+					customMetadata: {
+						schemaVersion: "1",
+						ingressId: `emergency-${emergencyRawIndex}`,
+						mailboxId,
+						rawSize: "1",
+						rawSha256: emergencyRawSha256,
+						archivedAt: "2026-07-15T09:00:00.000Z",
+					},
+					checksums: {
+						sha256: Uint8Array.from(
+							Buffer.from(emergencyRawSha256, "hex"),
+						).buffer,
+					},
+					async text() { return "x"; },
+				};
+			}
 			const object = stored.get(key);
 			return object
-				? { etag: object.etag, async text() { return object.value; } }
+				? {
+						key,
+						etag: object.etag,
+						customMetadata: object.customMetadata,
+						async text() { return object.value; },
+					}
 				: null;
 		},
 		async put(
 			key: string,
 			value: string,
-			options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } },
+			options?: {
+				customMetadata?: Record<string, string>;
+				onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+			},
 		) {
 			serviceSubrequests += 1;
+			if (
+				key === "system/emergency-forward/reconciliation-cursor.json" ||
+				key === "system/emergency-forward/anomalies/reconciliation-cursor.json" ||
+				key.startsWith("system/emergency-forward/active/") ||
+				key.startsWith("system/emergency-forward/anomalies/") ||
+				/^receipts\/emergency-\d+\.json$/.test(key)
+			) {
+				emergencyServiceSubrequests += 1;
+			}
 			const current = stored.get(key);
 			if (options?.onlyIf?.etagDoesNotMatch === "*" && current) return null;
 			if (options?.onlyIf?.etagMatches &&
 				current?.etag !== options.onlyIf.etagMatches) return null;
 			etagRevision += 1;
-			stored.set(key, { value, etag: `etag-${etagRevision}` });
+			stored.set(key, {
+				value,
+				etag: `etag-${etagRevision}`,
+				customMetadata: options?.customMetadata,
+			});
 			return key.startsWith("system/derived-content-repair-attempts/resolved/")
 				? null
 				: {};
 		},
 		async delete(key: string) {
 			serviceSubrequests += 1;
+			if (
+				key.startsWith("system/emergency-forward/") ||
+				/^receipts\/emergency-\d+\.json$/.test(key)
+			) {
+				emergencyServiceSubrequests += 1;
+			}
 			stored.delete(key);
 		},
 	};
@@ -262,6 +385,13 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 				throw new Error("stored archives must not enqueue");
 			},
 		},
+		EMERGENCY_FORWARD_QUEUE: {
+			async send(value: unknown) {
+				serviceSubrequests += 1;
+				emergencyServiceSubrequests += 1;
+				emergencyQueue.push(value);
+			},
+		},
 		MAILBOX: {
 			idFromName(value: string) {
 				return value;
@@ -293,6 +423,13 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 							bodyObjects: [],
 						};
 					},
+					async getInboundProjectionAuthority(authority: {
+						rawSha256: string;
+					}) {
+						serviceSubrequests += 1;
+						assert.equal(authority.rawSha256, archiveRawSha256);
+						return { generation: 1 };
+					},
 					async isEmailDeleted() {
 						serviceSubrequests += 1;
 						return false;
@@ -315,7 +452,13 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 	console.log = () => {};
 	console.error = () => {};
 	try {
-		const result = await reconcileInboundArchives(env, { now: () => now });
+		const [result] = await Promise.all([
+			reconcileInboundArchives(env, { now: () => now }),
+			reconcileEmergencyForwardMarkers(env, {
+				now: () => now,
+				bestEffortTimeoutMs: 1,
+			}),
+		]);
 		assert.equal(result.scanned, 9);
 		assert.equal(result.pendingReview, 9);
 	} finally {
@@ -323,9 +466,12 @@ test("a maximum scheduled reconciliation shape stays within the Worker service-s
 		console.error = originalError;
 	}
 
-	assert.equal(
-		serviceSubrequests,
-		INBOUND_RECONCILIATION_WORST_CASE_SERVICE_SUBREQUESTS,
+	assert.equal(INBOUND_RECONCILIATION_WORST_CASE_SERVICE_SUBREQUESTS, 8_865);
+	assert.equal(emergencyQueue.length, 8);
+	assert.equal(emergencyServiceSubrequests, 4 + 8 * 13);
+	assert.equal(serviceSubrequests, 8_753);
+	assert.ok(
+		serviceSubrequests <= INBOUND_RECONCILIATION_WORST_CASE_SERVICE_SUBREQUESTS,
 	);
 	assert.ok(serviceSubrequests <= INBOUND_RECONCILIATION_SERVICE_SUBREQUEST_BUDGET);
 });

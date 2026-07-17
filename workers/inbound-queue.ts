@@ -30,8 +30,27 @@ import {
 } from "./lib/mail-telemetry.ts";
 import { clearInboundActiveMarker } from "./lib/inbound-active-index.ts";
 import { isInboundRawKeyForIngress } from "./lib/inbound-raw-key.ts";
+import {
+  beginEmergencyForward,
+  type EmergencyForwardEnvelope,
+  type EmergencyForwardReason,
+} from "./lib/emergency-forward.ts";
+import { hasExactInboundSmtpRejectionAuthority } from "./lib/inbound-smtp-rejection.ts";
+import { inboundTerminalAuthorityRequirement } from "./lib/inbound-terminal-authority.ts";
+import {
+  createQueueDisposition,
+  runInboundWorkWithDeadline,
+  type InboundDeadlineScheduler,
+  type InboundQueueDisposition,
+} from "./lib/inbound-work-deadline.ts";
 
 export const INBOUND_MAX_RETRIES = 10;
+export const INBOUND_QUEUE_ITEM_TIMEOUT_MS = 60_000;
+export const INBOUND_DLQ_ITEM_TIMEOUT_MS = 15_000;
+export const INBOUND_BINDING_TIMEOUT_MS = 5_000;
+export const INBOUND_EMERGENCY_HANDOFF_TIMEOUT_MS = 10_000;
+export const INBOUND_RECOVERY_RETRY_SECONDS = 30;
+export const INBOUND_ISOLATED_RETRY_SECONDS = 300;
 
 type ArchivedEmailObject = {
   key: string;
@@ -62,20 +81,46 @@ type InboundReceiptBucket = {
   ): Promise<unknown | null>;
 };
 
+async function bestEffortMailTelemetryLogRef(
+  kind: "ingress" | "object" | "queue",
+  value: string,
+): Promise<string> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      mailTelemetryLogRef(kind, value),
+      new Promise<string>((resolve) => {
+        timeout = setTimeout(() => resolve("unavailable"), 25);
+      }),
+    ]);
+  } catch {
+    return "unavailable";
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
 async function clearTerminalActiveMarkerBestEffort(
   bucket: InboundReceiptBucket,
   pointer: InboundArchivePointer,
+  runtime: InboundProjectionRuntime,
 ): Promise<void> {
   if (!bucket.delete) return;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    await clearInboundActiveMarker(
-      { delete: bucket.delete.bind(bucket) },
-      pointer.rawKey,
-    );
+    await Promise.race([
+      clearInboundActiveMarker(
+        { delete: bucket.delete.bind(bucket) },
+        pointer.rawKey,
+      ),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, runtime.infrastructureTimeoutMs ?? 100);
+      }),
+    ]);
   } catch {
     const [ingressRef, objectRef] = await Promise.all([
-      mailTelemetryLogRef("ingress", pointer.ingressId),
-      mailTelemetryLogRef("object", pointer.rawKey),
+      bestEffortMailTelemetryLogRef("ingress", pointer.ingressId),
+      bestEffortMailTelemetryLogRef("object", pointer.rawKey),
     ]);
     console.error("[mail-projection] terminal active marker cleanup degraded", {
       errorCode: "ACTIVE_RECOVERY_INDEX_DELETE_FAILED",
@@ -85,6 +130,8 @@ async function clearTerminalActiveMarkerBestEffort(
       recoveryAction: "scheduled_reconciliation",
       status: "degraded",
     });
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 
@@ -101,6 +148,7 @@ type InboundProjectionEnvironment = {
     head(key: string): Promise<unknown | null>;
   };
   MAILBOX: InboundMailboxNamespace;
+  EMERGENCY_FORWARD_QUEUE: Pick<Queue<EmergencyForwardEnvelope>, "send">;
 };
 
 type QueueMessage = Pick<
@@ -116,6 +164,12 @@ type UntrustedQueueMessage = Pick<
 type InboundProjectionRuntime = {
   parse?(raw: ReadableStream): Promise<Email>;
   now(): Date;
+  infrastructureTimeoutMs?: number;
+  itemTimeoutMs?: number;
+  deadLetterItemTimeoutMs?: number;
+  emergencyHandoffTimeoutMs?: number;
+  deadlineScheduler?: InboundDeadlineScheduler;
+  projectionExpiresAt?: number;
 };
 
 const INBOUND_RETRY_ERROR_CODES = [
@@ -150,6 +204,8 @@ type InboundReceiptDetails = {
   attempt?: number;
   delaySeconds?: number;
   errorCode?: string;
+  providerAccepted?: true;
+  rejectionOrigin?: "smtp_ingress";
   queueRef?: string;
 };
 
@@ -218,9 +274,9 @@ async function projectionTelemetryRefs(
   queueMessageId: string,
 ) {
   const [ingressRef, objectRef, queueRef] = await Promise.all([
-    mailTelemetryLogRef("ingress", pointer.ingressId),
-    mailTelemetryLogRef("object", pointer.rawKey),
-    mailTelemetryLogRef("queue", queueMessageId),
+    bestEffortMailTelemetryLogRef("ingress", pointer.ingressId),
+    bestEffortMailTelemetryLogRef("object", pointer.rawKey),
+    bestEffortMailTelemetryLogRef("queue", queueMessageId),
   ]);
   return { ingressRef, objectRef, queueRef };
 }
@@ -245,10 +301,40 @@ function isTerminalReceiptState(state: string | undefined): boolean {
   return (
     state === "stored" ||
     state === "deleted" ||
-    state === "quarantined" ||
     state === "rejected" ||
-    state === "dead_lettered"
+    state === "forwarded"
   );
+}
+
+async function handOffToEmergencyForward(
+  message: QueueMessage,
+  pointer: InboundArchivePointer,
+  env: Pick<
+    InboundProjectionEnvironment,
+    "RAW_MAIL_BUCKET" | "MAILBOX" | "EMERGENCY_FORWARD_QUEUE"
+  >,
+  runtime: InboundProjectionRuntime,
+  reason: EmergencyForwardReason,
+): Promise<boolean> {
+  const authorityDurable = await establishEmergencyForwardAuthority(
+    env,
+    pointer,
+    reason,
+    runtime,
+  );
+  if (!authorityDurable) {
+    await bestEffortDeadLetterTerminalLedger(message, pointer, env, runtime);
+  }
+  // The normal Queue delivery remains a recovery authority until the
+  // emergency consumer durably records provider acceptance (or another exact
+  // terminal proof wins). Returning without retry would auto-ack on
+  // Cloudflare Queues and could strand a merely pending forward.
+  message.retry({
+    delaySeconds: authorityDurable
+      ? INBOUND_ISOLATED_RETRY_SECONDS
+      : INBOUND_RECOVERY_RETRY_SECONDS,
+  });
+  return authorityDurable;
 }
 
 function projectInboundReceiptDetails(
@@ -328,6 +414,426 @@ export function isInboundArchivePointer(
   );
 }
 
+type ExactInboundReceipt = {
+  state:
+    | "admitted"
+    | "archived"
+    | "dead_letter_pending"
+    | "dead_lettered"
+    | "deleted"
+    | "enqueued"
+    | "forward_pending"
+    | "forwarded"
+    | "quarantined"
+    | "rejected"
+    | "retrying"
+    | "stored";
+  errorCode?: string;
+};
+
+type ExactInboundReceiptRead =
+  | { status: "absent" }
+  | { status: "invalid"; object?: ArchivedEmailObject }
+  | {
+      status: "valid";
+      object: ArchivedEmailObject;
+      receipt: ExactInboundReceipt;
+    };
+
+async function boundedInfrastructureWork<T>(
+  work: () => Promise<T>,
+  runtime: InboundProjectionRuntime,
+): Promise<{ ok: true; value: T } | { ok: false }> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const value = await Promise.race([
+      Promise.resolve().then(work),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Inbound infrastructure read timed out")),
+          runtime.infrastructureTimeoutMs ?? INBOUND_BINDING_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    return { ok: true, value };
+  } catch {
+    return { ok: false };
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+async function requireBoundedInfrastructureWork<T>(
+  work: () => Promise<T>,
+  runtime: InboundProjectionRuntime,
+): Promise<T> {
+  const result = await boundedInfrastructureWork(work, runtime);
+  if (!result.ok) throw new Error("Inbound infrastructure work failed");
+  return result.value;
+}
+
+async function establishEmergencyForwardAuthority(
+  env: Pick<
+    InboundProjectionEnvironment,
+    "RAW_MAIL_BUCKET" | "EMERGENCY_FORWARD_QUEUE"
+  >,
+  pointer: InboundArchivePointer,
+  reason: EmergencyForwardReason,
+  runtime: InboundProjectionRuntime,
+): Promise<boolean> {
+  const result = await runInboundWorkWithDeadline(
+    async () => beginEmergencyForward(env, pointer, reason, runtime),
+    {
+      now: () => runtime.now().getTime(),
+      scheduler: runtime.deadlineScheduler,
+      timeoutMs:
+        runtime.emergencyHandoffTimeoutMs ??
+        INBOUND_EMERGENCY_HANDOFF_TIMEOUT_MS,
+    },
+  );
+  return result.status === "completed";
+}
+
+function exactReceiptPointerMatches(
+  value: Record<string, unknown>,
+  pointer: InboundArchivePointer,
+): boolean {
+  return (
+    value.schemaVersion === pointer.schemaVersion &&
+    value.ingressId === pointer.ingressId &&
+    value.rawKey === pointer.rawKey &&
+    value.mailboxId === pointer.mailboxId &&
+    value.rawSize === pointer.rawSize &&
+    value.rawSha256 === pointer.rawSha256 &&
+    value.archivedAt === pointer.archivedAt &&
+    value.etag === pointer.etag &&
+    value.version === pointer.version
+  );
+}
+
+const EXACT_RECEIPT_POINTER_FIELDS = [
+  "schemaVersion",
+  "ingressId",
+  "rawKey",
+  "mailboxId",
+  "rawSize",
+  "rawSha256",
+  "archivedAt",
+  "etag",
+  "version",
+] as const;
+
+function exactReceiptHasOnly(
+  value: Record<string, unknown>,
+  details: readonly string[] = [],
+): boolean {
+  const allowed = new Set([
+    ...EXACT_RECEIPT_POINTER_FIELDS,
+    "state",
+    "updatedAt",
+    ...details,
+  ]);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function exactReceiptTimestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    Number.isFinite(Date.parse(value)) &&
+    new Date(value).toISOString() === value
+  );
+}
+
+function exactReceiptNonNegativeInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function exactTerminalFailureIsValid(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Object.keys(value).every((key) =>
+      ["queueRef", "attempts", "errorCode", "recordedAt"].includes(key),
+    ) &&
+    typeof value.queueRef === "string" &&
+    /^[a-f0-9]{16}$/.test(value.queueRef) &&
+    exactReceiptNonNegativeInteger(value.attempts) &&
+    value.errorCode === "QUEUE_RETRY_EXHAUSTED" &&
+    exactReceiptTimestamp(value.recordedAt)
+  );
+}
+
+function exactReceiptDetailsAreValid(value: Record<string, unknown>): boolean {
+  switch (value.state) {
+    case "archived":
+      return exactReceiptHasOnly(value);
+    case "admitted":
+    case "enqueued":
+      return (
+        exactReceiptHasOnly(value, ["reconciled"]) &&
+        (value.reconciled === undefined || value.reconciled === true)
+      );
+    case "retrying":
+    case "dead_letter_pending":
+      return (
+        exactReceiptHasOnly(value, ["attempt", "delaySeconds", "errorCode"]) &&
+        exactReceiptNonNegativeInteger(value.attempt) &&
+        exactReceiptNonNegativeInteger(value.delaySeconds) &&
+        typeof value.errorCode === "string" &&
+        INBOUND_RECEIPT_ERROR_CODES.has(value.errorCode)
+      );
+    case "dead_lettered":
+      if (
+        !exactReceiptHasOnly(value, [
+          "attempt",
+          "errorCode",
+          "queueRef",
+          "reconciled",
+          "terminalFailure",
+        ])
+      ) {
+        return false;
+      }
+      if (value.reconciled === true) {
+        return (
+          value.attempt === undefined &&
+          value.queueRef === undefined &&
+          value.errorCode === "DLQ_TERMINAL_LEDGER_RECOVERED" &&
+          exactTerminalFailureIsValid(value.terminalFailure)
+        );
+      }
+      if (
+        value.reconciled !== undefined ||
+        value.terminalFailure !== undefined ||
+        value.errorCode !== "QUEUE_RETRY_EXHAUSTED"
+      ) {
+        return false;
+      }
+      if (value.attempt === undefined && value.queueRef === undefined) {
+        return true;
+      }
+      return (
+        exactReceiptNonNegativeInteger(value.attempt) &&
+        typeof value.queueRef === "string" &&
+        /^[a-f0-9]{16}$/.test(value.queueRef)
+      );
+    case "forward_pending":
+      return (
+        exactReceiptHasOnly(value, ["errorCode"]) &&
+        typeof value.errorCode === "string" &&
+        (value.errorCode === "QUEUE_RETRY_EXHAUSTED" ||
+          INBOUND_RECEIPT_ERROR_CODES.has(value.errorCode)) &&
+        value.errorCode !== "MAILBOX_UNAVAILABLE" &&
+        value.errorCode !== "RAW_ARCHIVE_INTEGRITY_MISMATCH"
+      );
+    case "forwarded":
+      return (
+        exactReceiptHasOnly(value, ["providerAccepted", "providerRef"]) &&
+        value.providerAccepted === true &&
+        (value.providerRef === undefined ||
+          (typeof value.providerRef === "string" &&
+            /^[a-f0-9]{16}$/.test(value.providerRef)))
+      );
+    case "stored":
+      return (
+        exactReceiptHasOnly(value, ["errorCode", "reconciled"]) &&
+        ((value.reconciled === undefined &&
+          (value.errorCode === undefined ||
+            value.errorCode === "MAILBOX_PROJECTION_STORED")) ||
+          (value.reconciled === true &&
+            value.errorCode === "MAILBOX_PROJECTION_RECOVERED"))
+      );
+    case "deleted":
+      return (
+        exactReceiptHasOnly(value, ["errorCode", "reconciled"]) &&
+        value.errorCode === "MAILBOX_PROJECTION_DELETED" &&
+        (value.reconciled === undefined || value.reconciled === true)
+      );
+    case "rejected":
+      return (
+        exactReceiptHasOnly(value, ["errorCode", "rejectionOrigin"]) &&
+        hasExactInboundSmtpRejectionAuthority(value)
+      );
+    case "quarantined":
+      return (
+        exactReceiptHasOnly(value, ["errorCode"]) &&
+        typeof value.errorCode === "string" &&
+        INBOUND_RECEIPT_ERROR_CODES.has(value.errorCode)
+      );
+    default:
+      return false;
+  }
+}
+
+async function readExactInboundReceipt(
+  bucket: Pick<InboundReceiptBucket, "get">,
+  pointer: InboundArchivePointer,
+  runtime: InboundProjectionRuntime,
+): Promise<ExactInboundReceiptRead> {
+  const key = receiptKey(pointer.ingressId);
+  const objectRead = await boundedInfrastructureWork(() => bucket.get(key), runtime);
+  if (!objectRead.ok) return { status: "invalid" };
+  const object = objectRead.value;
+  if (!object) return { status: "absent" };
+  if (typeof object.etag !== "string" || object.etag.trim().length === 0) {
+    return { status: "invalid", object };
+  }
+  let value: unknown;
+  const textRead = await boundedInfrastructureWork(() => object.text(), runtime);
+  if (!textRead.ok) return { status: "invalid", object };
+  try { value = JSON.parse(textRead.value); } catch { return { status: "invalid", object }; }
+  if (
+    !isRecord(value) ||
+    (object.key !== undefined && object.key !== key) ||
+    (object.customMetadata?.state !== undefined &&
+      object.customMetadata.state !== value.state) ||
+    !exactReceiptPointerMatches(value, pointer) ||
+    !exactReceiptTimestamp(value.updatedAt) ||
+    !exactReceiptDetailsAreValid(value)
+  ) {
+    return { status: "invalid", object };
+  }
+  return {
+    status: "valid",
+    object,
+    receipt: {
+      state: value.state as ExactInboundReceipt["state"],
+      ...(typeof value.errorCode === "string"
+        ? { errorCode: value.errorCode }
+        : {}),
+      ...(value.providerAccepted === true
+        ? { providerAccepted: true as const }
+        : {}),
+      ...(value.rejectionOrigin === "smtp_ingress"
+        ? { rejectionOrigin: "smtp_ingress" as const }
+        : {}),
+    },
+  };
+}
+
+function exactReceiptIsSuppression(receipt: ExactInboundReceipt): boolean {
+  const requirement = inboundTerminalAuthorityRequirement(
+    receipt as Record<string, unknown>,
+  );
+  return (
+    requirement === "smtp_rejected" ||
+    requirement === "raw_integrity_mismatch"
+  );
+}
+
+function emergencyReasonForReceipt(
+  receipt: ExactInboundReceipt,
+): EmergencyForwardReason {
+  switch (receipt.errorCode) {
+    case "EMAXLEN":
+    case "MIME_CHARSET_UNSUPPORTED":
+    case "MIME_HEADER_SIZE_EXCEEDED":
+    case "MIME_MULTIPART_BOUNDARY_INVALID":
+    case "MIME_MULTIPART_BOUNDARY_MISSING":
+    case "MIME_PARSE_FAILED":
+    case "MIME_ROOT_HEADER_MISSING":
+      return receipt.errorCode;
+    default:
+      return "QUEUE_RETRY_EXHAUSTED";
+  }
+}
+
+async function exactTerminalReceiptIsAuthoritative(
+  receipt: ExactInboundReceipt,
+  env: Pick<InboundProjectionEnvironment, "MAILBOX" | "RAW_MAIL_BUCKET">,
+  pointer: InboundArchivePointer,
+  runtime: InboundProjectionRuntime,
+): Promise<boolean> {
+  const requirement = inboundTerminalAuthorityRequirement(
+    receipt as Record<string, unknown>,
+  );
+  if (
+    requirement === "provider_accepted" ||
+    requirement === "smtp_rejected"
+  ) {
+    return true;
+  }
+  if (requirement === "raw_integrity_mismatch") {
+    const raw = await boundedInfrastructureWork(
+      () => env.RAW_MAIL_BUCKET.get(pointer.rawKey),
+      runtime,
+    );
+    return Boolean(
+      raw.ok &&
+        raw.value &&
+        !inboundRawArchiveMatchesPointer(raw.value, pointer),
+    );
+  }
+  if (
+    requirement !== "stored_projection" &&
+    requirement !== "deleted_projection"
+  ) {
+    return false;
+  }
+  const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(pointer.mailboxId));
+  const archiveAuthority =
+    pointer.rawSha256 === undefined
+      ? null
+      : {
+          ...projectInboundArchivePointer(pointer),
+          rawSha256: pointer.rawSha256,
+        };
+  const deletedRead =
+    archiveAuthority && mailbox.getInboundDeletionAuthority
+    ? await boundedInfrastructureWork(
+        () => mailbox.getInboundDeletionAuthority!(archiveAuthority),
+        runtime,
+      )
+    : { ok: true as const, value: null };
+  if (!deletedRead.ok) return false;
+  const deleted = Boolean(deletedRead.value);
+  if (requirement === "deleted_projection") return deleted;
+  if (deleted) return false;
+  const projectionRead =
+    archiveAuthority && mailbox.getInboundProjectionAuthority
+      ? await boundedInfrastructureWork(
+          () => mailbox.getInboundProjectionAuthority!(archiveAuthority),
+          runtime,
+        )
+      : { ok: true as const, value: null };
+  if (
+    !projectionRead.ok ||
+    !projectionRead.value ||
+    projectionRead.value.generation !== 1
+  ) {
+    return false;
+  }
+  const stored = await boundedInfrastructureWork(
+    () => emailExists(mailbox, pointer.ingressId),
+    runtime,
+  );
+  return stored.ok && Boolean(stored.value);
+}
+
+async function exactMailboxProjectionTruth(
+  mailbox: EmailStorageDependencies["mailbox"],
+  pointer: InboundArchivePointer,
+  runtime: InboundProjectionRuntime,
+): Promise<"deleted" | "stored" | null> {
+  if (pointer.rawSha256 === undefined) return null;
+  const authority = {
+    ...projectInboundArchivePointer(pointer),
+    rawSha256: pointer.rawSha256,
+  };
+  if (mailbox.getInboundDeletionAuthority) {
+    const deleted = await requireBoundedInfrastructureWork(
+      () => mailbox.getInboundDeletionAuthority!(authority),
+      runtime,
+    );
+    if (deleted) return "deleted";
+  }
+  if (!mailbox.getInboundProjectionAuthority) return null;
+  const projected = await requireBoundedInfrastructureWork(
+    () => mailbox.getInboundProjectionAuthority!(authority),
+    runtime,
+  );
+  return projected?.generation === 1 ? "stored" : null;
+}
+
 async function writeReceipt(
   bucket: InboundReceiptBucket,
   pointer: InboundArchivePointer,
@@ -341,10 +847,11 @@ async function writeReceipt(
     | "rejected",
   runtime: InboundProjectionRuntime,
   details: InboundReceiptDetails = {},
-): Promise<boolean> {
+): Promise<ExactInboundReceiptRead> {
   const key = receiptKey(pointer.ingressId);
-  const current = bucket.head ? await bucket.head(key) : null;
-  const currentState = current?.customMetadata?.state;
+  const current = await readExactInboundReceipt(bucket, pointer, runtime);
+  const currentState =
+    current.status === "valid" ? current.receipt.state : undefined;
   if (
     currentState &&
     currentState !== state &&
@@ -352,32 +859,39 @@ async function writeReceipt(
       !(currentState === "stored" && state === "deleted")) ||
       (currentState === "dead_letter_pending" && state === "retrying"))
   ) {
-    if (isTerminalReceiptState(currentState)) {
-      await clearTerminalActiveMarkerBestEffort(bucket, pointer);
-    }
-    return false;
+    return current;
   }
 
-  const written = await bucket.put(
-    key,
-    JSON.stringify({
-      ...projectInboundArchivePointer(pointer),
-      state,
-      updatedAt: runtime.now().toISOString(),
-      ...projectInboundReceiptDetails(details),
-    }),
-    {
-      customMetadata: { state },
-      httpMetadata: { contentType: "application/json" },
-      onlyIf: current
-        ? { etagMatches: current.etag }
-        : { etagDoesNotMatch: "*" },
-    },
-  );
-  if (written !== null && isTerminalReceiptState(state)) {
-    await clearTerminalActiveMarkerBestEffort(bucket, pointer);
+  const currentObject = current.status === "absent" ? undefined : current.object;
+  if (
+    currentObject &&
+    (typeof currentObject.etag !== "string" ||
+      currentObject.etag.trim().length === 0)
+  ) {
+    return current;
   }
-  return written !== null;
+
+  await requireBoundedInfrastructureWork(
+    () =>
+      bucket.put(
+        key,
+        JSON.stringify({
+          ...projectInboundArchivePointer(pointer),
+          state,
+          updatedAt: runtime.now().toISOString(),
+          ...projectInboundReceiptDetails(details),
+        }),
+        {
+          customMetadata: { state },
+          httpMetadata: { contentType: "application/json" },
+          onlyIf: currentObject
+            ? { etagMatches: currentObject.etag }
+            : { etagDoesNotMatch: "*" },
+        },
+      ),
+    runtime,
+  );
+  return readExactInboundReceipt(bucket, pointer, runtime);
 }
 
 async function writeReceiptBestEffort(
@@ -393,7 +907,9 @@ async function writeReceiptBestEffort(
     message.id,
   );
   try {
-    const written = await writeReceipt(bucket, pointer, state, runtime);
+    const result = await writeReceipt(bucket, pointer, state, runtime);
+    const written =
+      result.status === "valid" && result.receipt.state === state;
     console.log(
       "[mail-projection] receipt state write completed",
       {
@@ -419,6 +935,56 @@ async function writeReceiptBestEffort(
   }
 }
 
+async function finalizeExactTerminalReceipt(
+  message: QueueMessage,
+  pointer: InboundArchivePointer,
+  env: InboundProjectionEnvironment,
+  runtime: InboundProjectionRuntime,
+  state: "deleted" | "quarantined" | "rejected" | "stored",
+  details: InboundReceiptDetails = {},
+): Promise<boolean> {
+  try {
+    const winner = await writeReceipt(
+      env.RAW_MAIL_BUCKET,
+      pointer,
+      state,
+      runtime,
+      details,
+    );
+    if (
+      winner.status === "valid" &&
+      (winner.receipt.state === "stored" ||
+        winner.receipt.state === "deleted" ||
+        winner.receipt.state === "forwarded" ||
+        exactReceiptIsSuppression(winner.receipt)) &&
+      (await exactTerminalReceiptIsAuthoritative(
+          winner.receipt,
+          env,
+          pointer,
+          runtime,
+        ))
+    ) {
+      await clearTerminalActiveMarkerBestEffort(
+        env.RAW_MAIL_BUCKET,
+        pointer,
+        runtime,
+      );
+      message.ack();
+      return true;
+    }
+  } catch {
+    // The Queue delivery remains the authority until an exact terminal receipt wins.
+  }
+  await handOffToEmergencyForward(
+    message,
+    pointer,
+    env,
+    runtime,
+    "QUEUE_RETRY_EXHAUSTED",
+  );
+  return false;
+}
+
 function retryDelaySeconds(attempt: number): number {
   return Math.min(300, 2 ** Math.max(1, attempt));
 }
@@ -437,16 +1003,22 @@ async function scheduleRetry(
     | "raw_archive_read",
   startedAt: number,
 ): Promise<void> {
+  // Recovery authority must precede telemetry and non-authoritative evidence.
+  // A retrying receipt write could hang before the emergency handoff or
+  // overwrite its forward_pending state, so scheduled retries never mutate
+  // receipt authority outside beginEmergencyForward.
+  const authorityDurable = await handOffToEmergencyForward(
+    message,
+    pointer,
+    env,
+    runtime,
+    "QUEUE_RETRY_EXHAUSTED",
+  );
   const { ingressRef, objectRef, queueRef } =
     await projectionTelemetryRefs(pointer, message.id);
-  const delaySeconds = retryDelaySeconds(message.attempts);
-  const isFinalAttempt = message.attempts >= INBOUND_MAX_RETRIES + 1;
-  const state = isFinalAttempt ? "dead_letter_pending" : "retrying";
-  await writeReceipt(env.RAW_MAIL_BUCKET, pointer, state, runtime, {
-    attempt: message.attempts,
-    delaySeconds,
-    errorCode,
-  });
+  const delaySeconds = authorityDurable
+    ? INBOUND_ISOLATED_RETRY_SECONDS
+    : INBOUND_RECOVERY_RETRY_SECONDS;
   console.error(
     "[mail-projection] retry disposition scheduled",
     {
@@ -458,10 +1030,9 @@ async function scheduleRetry(
       objectRef,
       operation,
       queueRef,
-      status: state,
+      status: authorityDurable ? "forward_pending" : "retrying",
     },
   );
-  message.retry({ delaySeconds });
 }
 
 export async function processInboundMessage(
@@ -473,90 +1044,130 @@ export async function processInboundMessage(
   const projectionStartedAt = runtime.now().getTime();
   const { ingressRef, objectRef, queueRef } =
     await projectionTelemetryRefs(pointer, message.id);
-  if (env.RAW_MAIL_BUCKET.head) {
-    try {
-      const currentReceipt = await env.RAW_MAIL_BUCKET.head(
-        receiptKey(pointer.ingressId),
-      );
-      const currentState = currentReceipt?.customMetadata?.state;
-      if (!currentState) {
-        const delaySeconds = retryDelaySeconds(message.attempts);
-        console.error("[mail-projection] receipt unavailable", {
-          attempt: message.attempts,
-          delaySeconds,
-          errorCode: "RECEIPT_STATE_UNAVAILABLE",
-          ingressRef,
-          operation: "queue_terminal_check",
-          queueRef,
-          status: "retrying",
-        });
-        message.retry({ delaySeconds });
-        return;
-      }
-      if (isTerminalReceiptState(currentState)) {
-        await clearTerminalActiveMarkerBestEffort(
-          env.RAW_MAIL_BUCKET,
-          pointer,
-        );
-        console.log("[mail-projection] terminal delivery acknowledged", {
-          attempt: message.attempts,
-          durationMs: durationMs(runtime, projectionStartedAt),
-          ingressRef,
-          operation: "queue_terminal_check",
-          queueRef,
-          status: "terminal",
-        });
-        message.ack();
-        return;
-      }
-      if (currentState === "dead_letter_pending") {
-        console.log("[mail-projection] pending DLQ delivery acknowledged", {
-          attempt: message.attempts,
-          ingressRef,
-          operation: "queue_terminal_check",
-          queueRef,
-          status: "terminalizing",
-        });
-        message.ack();
-        return;
-      }
-      if (
-        currentState !== "admitted" &&
-        currentState !== "enqueued" &&
-        currentState !== "retrying" &&
-        currentState !== "archived"
-      ) {
-        const delaySeconds = retryDelaySeconds(message.attempts);
-        console.error("[mail-projection] unknown receipt state", {
-          attempt: message.attempts,
-          delaySeconds,
-          errorCode: "RECEIPT_STATE_UNKNOWN",
-          ingressRef,
-          operation: "queue_terminal_check",
-          queueRef,
-          status: "retrying",
-        });
-        message.retry({ delaySeconds });
-        return;
-      }
-    } catch {
-      console.error("[mail-projection] terminal receipt check degraded", {
+  try {
+    const current = await readExactInboundReceipt(
+      env.RAW_MAIL_BUCKET,
+      pointer,
+      runtime,
+    );
+    if (current.status !== "valid") {
+      console.error("[mail-projection] receipt authority unavailable", {
         attempt: message.attempts,
-        errorCode: "TERMINAL_RECEIPT_CHECK_FAILED",
+        errorCode:
+          current.status === "absent"
+            ? "RECEIPT_STATE_UNAVAILABLE"
+            : "RECEIPT_STATE_UNKNOWN",
         ingressRef,
         operation: "queue_terminal_check",
         queueRef,
-        status: "degraded",
+        status: "verifying_mailbox_truth",
       });
-      message.retry({ delaySeconds: retryDelaySeconds(message.attempts) });
+      await handOffToEmergencyForward(
+        message,
+        pointer,
+        env,
+        runtime,
+        "QUEUE_RETRY_EXHAUSTED",
+      );
       return;
+    } else {
+      const currentState = current.receipt.state;
+      if (
+        currentState === "stored" ||
+        currentState === "deleted" ||
+        currentState === "forwarded" ||
+        exactReceiptIsSuppression(current.receipt)
+      ) {
+        if (
+          !(await exactTerminalReceiptIsAuthoritative(
+            current.receipt,
+            env,
+            pointer,
+            runtime,
+          ))
+        ) {
+          console.error("[mail-projection] terminal receipt lacks authority", {
+            attempt: message.attempts,
+            errorCode: "TERMINAL_RECEIPT_TRUTH_MISMATCH",
+            ingressRef,
+            operation: "queue_terminal_check",
+            queueRef,
+            status: "retrying",
+          });
+          // A stale sidecar cannot terminate the Queue delivery. Continue to
+          // live Mailbox checks and either repair projection truth or forward.
+        } else {
+          await clearTerminalActiveMarkerBestEffort(
+            env.RAW_MAIL_BUCKET,
+            pointer,
+            runtime,
+          );
+          console.log("[mail-projection] terminal delivery acknowledged", {
+            attempt: message.attempts,
+            durationMs: durationMs(runtime, projectionStartedAt),
+            ingressRef,
+            operation: "queue_terminal_check",
+            queueRef,
+            status: "terminal",
+          });
+          message.ack();
+          return;
+        }
+      } else if (currentState === "forward_pending") {
+        await handOffToEmergencyForward(
+          message,
+          pointer,
+          env,
+          runtime,
+          emergencyReasonForReceipt(current.receipt),
+        );
+        return;
+      } else if (
+        currentState === "dead_lettered" ||
+        (currentState === "quarantined" &&
+          !exactReceiptIsSuppression(current.receipt))
+      ) {
+        await handOffToEmergencyForward(
+          message,
+          pointer,
+          env,
+          runtime,
+          currentState === "dead_lettered"
+            ? "QUEUE_RETRY_EXHAUSTED"
+            : (current.receipt.errorCode as EmergencyForwardReason),
+        );
+        return;
+      } else if (currentState === "dead_letter_pending") {
+        await handOffToEmergencyForward(
+          message,
+          pointer,
+          env,
+          runtime,
+          "QUEUE_RETRY_EXHAUSTED",
+        );
+        return;
+      }
     }
+  } catch (error) {
+    console.error("[mail-projection] terminal receipt check degraded", {
+      attempt: message.attempts,
+      errorCode: "TERMINAL_RECEIPT_CHECK_FAILED",
+      ingressRef,
+      operation: "queue_terminal_check",
+      queueRef,
+      status: "degraded",
+    });
+    throw error;
   }
   const mailboxLookupStartedAt = runtime.now().getTime();
   let mailboxMarker: unknown | null;
   try {
-    mailboxMarker = await env.BUCKET.head(
-      `mailboxes/${pointer.mailboxId}.json`,
+    mailboxMarker = await requireBoundedInfrastructureWork(
+      () =>
+        env.BUCKET.head(
+          `mailboxes/${pointer.mailboxId}.json`,
+        ),
+      runtime,
     );
   } catch {
     await scheduleRetry(
@@ -581,27 +1192,22 @@ export async function processInboundMessage(
     target: "r2",
   });
   if (!mailboxMarker) {
-    const receiptStartedAt = runtime.now().getTime();
-    await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "quarantined", runtime, {
-      errorCode: "MAILBOX_UNAVAILABLE",
-    });
-    console.error("[mail-projection] quarantined", {
-      attempt: message.attempts,
-      durationMs: durationMs(runtime, receiptStartedAt),
-      errorCode: "MAILBOX_UNAVAILABLE",
-      ingressRef,
-      objectRef,
-      operation: "mailbox_resolution",
-      queueRef,
-      status: "quarantined",
-    });
-    message.ack();
+    await handOffToEmergencyForward(
+      message,
+      pointer,
+      env,
+      runtime,
+      "QUEUE_RETRY_EXHAUSTED",
+    );
     return;
   }
 
   let mailboxActive: boolean;
   try {
-    mailboxActive = await isActiveMailbox(env, pointer.mailboxId);
+    mailboxActive = await requireBoundedInfrastructureWork(
+      () => isActiveMailbox(env, pointer.mailboxId),
+      runtime,
+    );
   } catch {
     await scheduleRetry(
       message,
@@ -615,31 +1221,35 @@ export async function processInboundMessage(
     return;
   }
   if (!mailboxActive) {
-    await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "rejected", runtime, {
-      errorCode: "MAILBOX_INACTIVE",
-    });
-    console.log("[mail-projection] inactive mailbox delivery rejected", {
+    await handOffToEmergencyForward(
+      message,
+      pointer,
+      env,
+      runtime,
+      "QUEUE_RETRY_EXHAUSTED",
+    );
+    console.log("[mail-projection] inactive mailbox delivery forwarded", {
       attempt: message.attempts,
       durationMs: durationMs(runtime, mailboxLookupStartedAt),
       errorCode: "MAILBOX_INACTIVE",
       ingressRef,
       operation: "mailbox_resolution",
       queueRef,
-      status: "rejected",
+      status: "forward_pending",
     });
-    message.ack();
     return;
   }
 
   const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(pointer.mailboxId));
   const idempotencyStartedAt = runtime.now().getTime();
   let existingEmail: unknown | null;
-  let wasDeleted = false;
+  let mailboxTruth: "deleted" | "stored" | null;
   try {
-    wasDeleted = mailbox.isEmailDeleted
-      ? await mailbox.isEmailDeleted(pointer.ingressId)
-      : false;
-    existingEmail = await emailExists(mailbox, pointer.ingressId);
+    mailboxTruth = await exactMailboxProjectionTruth(mailbox, pointer, runtime);
+    existingEmail = await requireBoundedInfrastructureWork(
+      () => emailExists(mailbox, pointer.ingressId),
+      runtime,
+    );
   } catch {
     await scheduleRetry(
       message,
@@ -662,36 +1272,16 @@ export async function processInboundMessage(
     status: existingEmail ? "hit" : "miss",
     target: "durable_object",
   });
-  if (wasDeleted) {
+  if (mailboxTruth === "deleted") {
     const receiptStartedAt = runtime.now().getTime();
-    try {
-      const written = await writeReceipt(
-        env.RAW_MAIL_BUCKET,
-        pointer,
-        "deleted",
-        runtime,
-        { errorCode: "MAILBOX_PROJECTION_DELETED" },
-      );
-      console.log("[mail-projection] deletion receipt finalized", {
-        attempt: message.attempts,
-        durationMs: durationMs(runtime, receiptStartedAt),
-        ingressRef,
-        operation: "receipt_write",
-        queueRef,
-        status: written ? "succeeded" : "superseded",
-        target: "r2",
-      });
-    } catch {
-      console.error("[mail-projection] deletion receipt write degraded", {
-        attempt: message.attempts,
-        durationMs: durationMs(runtime, receiptStartedAt),
-        errorCode: "DELETION_RECEIPT_WRITE_FAILED",
-        ingressRef,
-        operation: "receipt_write",
-        queueRef,
-        status: "degraded",
-      });
-    }
+    const finalized = await finalizeExactTerminalReceipt(
+      message,
+      pointer,
+      env,
+      runtime,
+      "deleted",
+      { errorCode: "MAILBOX_PROJECTION_DELETED" },
+    );
     console.log("[mail-projection] deleted projection remains suppressed", {
       attempt: message.attempts,
       durationMs: durationMs(runtime, projectionStartedAt),
@@ -700,16 +1290,36 @@ export async function processInboundMessage(
       queueRef,
       status: "deleted",
     });
-    message.ack();
+    if (!finalized) return;
     return;
   }
   if (existingEmail) {
-    await writeReceiptBestEffort(
-      env.RAW_MAIL_BUCKET,
-      pointer,
-      "stored",
-      runtime,
+    if (mailboxTruth !== "stored") {
+      await handOffToEmergencyForward(
+        message,
+        pointer,
+        env,
+        runtime,
+        "QUEUE_RETRY_EXHAUSTED",
+      );
+      console.error("[mail-projection] unrelated existing identity forwarded", {
+        attempt: message.attempts,
+        durationMs: durationMs(runtime, idempotencyStartedAt),
+        errorCode: "MAILBOX_IDENTITY_CONFLICT",
+        ingressRef,
+        operation: "mailbox_idempotency_check",
+        queueRef,
+        status: "forward_pending",
+      });
+      return;
+    }
+    const finalized = await finalizeExactTerminalReceipt(
       message,
+      pointer,
+      env,
+      runtime,
+      "stored",
+      {},
     );
     console.log("[mail-projection] duplicate acknowledged", {
       attempt: message.attempts,
@@ -719,14 +1329,17 @@ export async function processInboundMessage(
       queueRef,
       status: "duplicate",
     });
-    message.ack();
+    if (!finalized) return;
     return;
   }
 
   let raw: ArchivedEmailObject | null;
   const rawReadStartedAt = runtime.now().getTime();
   try {
-    raw = await env.RAW_MAIL_BUCKET.get(pointer.rawKey);
+    raw = await requireBoundedInfrastructureWork(
+      () => env.RAW_MAIL_BUCKET.get(pointer.rawKey),
+      runtime,
+    );
     if (!raw) throw new Error("Archived email object was not found");
   } catch {
     await scheduleRetry(
@@ -752,9 +1365,14 @@ export async function processInboundMessage(
   });
   if (!inboundRawArchiveMatchesPointer(raw, pointer)) {
     const receiptStartedAt = runtime.now().getTime();
-    await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "quarantined", runtime, {
-      errorCode: "RAW_ARCHIVE_INTEGRITY_MISMATCH",
-    });
+    const finalized = await finalizeExactTerminalReceipt(
+      message,
+      pointer,
+      env,
+      runtime,
+      "quarantined",
+      { errorCode: "RAW_ARCHIVE_INTEGRITY_MISMATCH" },
+    );
     console.error("[mail-projection] quarantined", {
       attempt: message.attempts,
       durationMs: durationMs(runtime, receiptStartedAt),
@@ -765,12 +1383,15 @@ export async function processInboundMessage(
       queueRef,
       status: "quarantined",
     });
-    message.ack();
+    if (!finalized) return;
     return;
   }
 
   try {
-    mailboxActive = await isActiveMailbox(env, pointer.mailboxId);
+    mailboxActive = await requireBoundedInfrastructureWork(
+      () => isActiveMailbox(env, pointer.mailboxId),
+      runtime,
+    );
   } catch {
     await scheduleRetry(
       message,
@@ -784,18 +1405,21 @@ export async function processInboundMessage(
     return;
   }
   if (!mailboxActive) {
-    await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "rejected", runtime, {
-      errorCode: "MAILBOX_INACTIVE",
-    });
-    console.log("[mail-projection] deactivated mailbox projection suppressed", {
+    await handOffToEmergencyForward(
+      message,
+      pointer,
+      env,
+      runtime,
+      "QUEUE_RETRY_EXHAUSTED",
+    );
+    console.log("[mail-projection] deactivated mailbox delivery forwarded", {
       attempt: message.attempts,
       errorCode: "MAILBOX_INACTIVE",
       ingressRef,
       operation: "mailbox_projection_admission",
       queueRef,
-      status: "rejected",
+      status: "forward_pending",
     });
-    message.ack();
     return;
   }
 
@@ -808,16 +1432,14 @@ export async function processInboundMessage(
       try {
         parsed = await runtime.parse(raw.body);
       } catch {
-        await writeReceipt(
-          env.RAW_MAIL_BUCKET,
+        await handOffToEmergencyForward(
+          message,
           pointer,
-          "quarantined",
+          env,
           runtime,
-          {
-            errorCode: "MIME_PARSE_FAILED",
-          },
+          "MIME_PARSE_FAILED",
         );
-        console.error("[mail-projection] quarantined", {
+        console.error("[mail-projection] emergency forward pending", {
           attempt: message.attempts,
           durationMs: durationMs(runtime, parseStartedAt),
           errorCode: "MIME_PARSE_FAILED",
@@ -825,9 +1447,8 @@ export async function processInboundMessage(
           objectRef,
           operation: "mime_parse",
           queueRef,
-          status: "quarantined",
+          status: "forward_pending",
         });
-        message.ack();
         return;
       }
       await storeParsedEmail(
@@ -838,6 +1459,15 @@ export async function processInboundMessage(
           mailboxId: pointer.mailboxId,
           messageId: pointer.ingressId,
           date: pointer.archivedAt,
+          projectionExpiresAt: runtime.projectionExpiresAt,
+          ...(pointer.rawSha256 === undefined
+            ? {}
+            : {
+                archiveAuthority: {
+                  ...projectInboundArchivePointer(pointer),
+                  rawSha256: pointer.rawSha256,
+                },
+              }),
         }),
       );
     } else {
@@ -849,20 +1479,27 @@ export async function processInboundMessage(
           mailboxId: pointer.mailboxId,
           messageId: pointer.ingressId,
           date: pointer.archivedAt,
+          projectionExpiresAt: runtime.projectionExpiresAt,
+          ...(pointer.rawSha256 === undefined
+            ? {}
+            : {
+                archiveAuthority: {
+                  ...projectInboundArchivePointer(pointer),
+                  rawSha256: pointer.rawSha256,
+                },
+              }),
         }),
         env.RAW_MAIL_BUCKET,
       );
     }
   } catch (error) {
     if (isEmailTerminalDuringProjection(error)) {
-      await writeReceipt(
-        env.RAW_MAIL_BUCKET,
+      await handOffToEmergencyForward(
+        message,
         pointer,
-        "dead_lettered",
+        env,
         runtime,
-        {
-          errorCode: "QUEUE_RETRY_EXHAUSTED",
-        },
+        "QUEUE_RETRY_EXHAUSTED",
       );
       console.log("[mail-projection] terminal ledger won projection race", {
         attempt: message.attempts,
@@ -870,15 +1507,41 @@ export async function processInboundMessage(
         ingressRef,
         operation: "mailbox_projection",
         queueRef,
-        status: "dead_lettered",
+        status: "forward_pending",
       });
-      message.ack();
       return;
     }
     if (isEmailDeletedDuringProjection(error)) {
-      await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "deleted", runtime, {
-        errorCode: "MAILBOX_PROJECTION_DELETED",
-      });
+      const deletionAuthority =
+        pointer.rawSha256 !== undefined &&
+        mailbox.getInboundDeletionAuthority
+          ? await boundedInfrastructureWork(
+              () =>
+                mailbox.getInboundDeletionAuthority!({
+                  ...projectInboundArchivePointer(pointer),
+                  rawSha256: pointer.rawSha256!,
+                }),
+              runtime,
+            )
+          : { ok: true as const, value: null };
+      if (!deletionAuthority.ok || !deletionAuthority.value) {
+        await handOffToEmergencyForward(
+          message,
+          pointer,
+          env,
+          runtime,
+          "QUEUE_RETRY_EXHAUSTED",
+        );
+        return;
+      }
+      const finalized = await finalizeExactTerminalReceipt(
+        message,
+        pointer,
+        env,
+        runtime,
+        "deleted",
+        { errorCode: "MAILBOX_PROJECTION_DELETED" },
+      );
       console.log("[mail-projection] concurrent deletion remained terminal", {
         attempt: message.attempts,
         durationMs: durationMs(runtime, mailboxProjectionStartedAt),
@@ -887,16 +1550,20 @@ export async function processInboundMessage(
         queueRef,
         status: "deleted",
       });
-      message.ack();
+      if (!finalized) return;
       return;
     }
     if (isPermanentMimeProjectionError(error)) {
       const permanentErrorCode =
         permanentMimeProjectionErrorCode(error) ?? "MIME_PARSE_FAILED";
-      await writeReceipt(env.RAW_MAIL_BUCKET, pointer, "quarantined", runtime, {
-        errorCode: permanentErrorCode,
-      });
-      console.error("[mail-projection] quarantined", {
+      await handOffToEmergencyForward(
+        message,
+        pointer,
+        env,
+        runtime,
+        permanentErrorCode as EmergencyForwardReason,
+      );
+      console.error("[mail-projection] emergency forward pending", {
         attempt: message.attempts,
         durationMs: durationMs(runtime, parseStartedAt),
         errorCode: permanentErrorCode,
@@ -904,19 +1571,41 @@ export async function processInboundMessage(
         objectRef,
         operation: "mime_parse",
         queueRef,
-        status: "quarantined",
+        status: "forward_pending",
       });
-      message.ack();
       return;
     }
-    let wasCommitted = false;
+    let ambiguousTruth: "deleted" | "stored" | null = null;
     try {
-      wasCommitted = Boolean(await mailbox.getEmail(pointer.ingressId));
+      ambiguousTruth = await exactMailboxProjectionTruth(
+        mailbox,
+        pointer,
+        runtime,
+      );
     } catch {
-      // An unavailable verification read cannot prove a commit. A retry is safe
-      // because ingressId is the stable projection identity.
+      // An unavailable exact authority read cannot prove a commit.
     }
-    if (!wasCommitted) {
+    if (ambiguousTruth === "deleted") {
+      const finalized = await finalizeExactTerminalReceipt(
+        message,
+        pointer,
+        env,
+        runtime,
+        "deleted",
+        { errorCode: "MAILBOX_PROJECTION_DELETED" },
+      );
+      if (!finalized) return;
+      console.log("[mail-projection] ambiguous deletion recovered", {
+        attempt: message.attempts,
+        durationMs: durationMs(runtime, mailboxProjectionStartedAt),
+        ingressRef,
+        operation: "mailbox_projection",
+        queueRef,
+        status: "deleted",
+      });
+      return;
+    }
+    if (ambiguousTruth !== "stored") {
       await scheduleRetry(
         message,
         pointer,
@@ -955,14 +1644,15 @@ export async function processInboundMessage(
     target: "durable_object",
   });
 
-  await writeReceiptBestEffort(
-    env.RAW_MAIL_BUCKET,
-    pointer,
-    "stored",
-    runtime,
+  const finalized = await finalizeExactTerminalReceipt(
     message,
+    pointer,
+    env,
+    runtime,
+    "stored",
+    {},
   );
-  message.ack();
+  if (!finalized) return;
   console.log("[mail-projection] message acknowledged", {
     attempt: message.attempts,
     durationMs: durationMs(runtime, projectionStartedAt),
@@ -973,317 +1663,317 @@ export async function processInboundMessage(
   });
 }
 
+async function processInboundQueueItem(
+  message: UntrustedQueueMessage,
+  env: InboundProjectionEnvironment,
+  runtime: InboundProjectionRuntime,
+): Promise<void> {
+  const queueRef = await bestEffortMailTelemetryLogRef("queue", message.id);
+  console.log("[mail-projection] Queue message received", {
+    attempt: message.attempts,
+    operation: "queue_consume",
+    queueRef,
+    status: "started",
+  });
+  if (!isInboundArchivePointer(message.body)) {
+    const durableQueueRef = await mailTelemetryRef("queue", message.id);
+    await persistInvalidPointer(
+      env.RAW_MAIL_BUCKET,
+      message,
+      durableQueueRef,
+      "INVALID_QUEUE_POINTER",
+      runtime,
+    );
+    console.error("[mail-projection] invalid Queue pointer", {
+      attempt: message.attempts,
+      errorCode: "INVALID_QUEUE_POINTER",
+      operation: "queue_pointer_validate",
+      queueRef,
+      status: "quarantined",
+    });
+    message.ack();
+    return;
+  }
+
+  await processInboundMessage(
+    {
+      id: message.id,
+      timestamp: message.timestamp,
+      body: message.body,
+      attempts: message.attempts,
+      ack: () => message.ack(),
+      retry: (options) => message.retry(options),
+    },
+    env,
+    runtime,
+  );
+}
+
+async function recoverNormalQueueDelivery(
+  message: UntrustedQueueMessage,
+  pointer: InboundArchivePointer,
+  env: InboundProjectionEnvironment,
+  runtime: InboundProjectionRuntime,
+  disposition: InboundQueueDisposition,
+): Promise<void> {
+  const authorityDurable = await establishEmergencyForwardAuthority(
+    env,
+    pointer,
+    "QUEUE_RETRY_EXHAUSTED",
+    runtime,
+  );
+  if (!authorityDurable) {
+    await bestEffortDeadLetterTerminalLedger(message, pointer, env, runtime);
+  }
+  disposition.retry({
+    delaySeconds: authorityDurable
+      ? INBOUND_ISOLATED_RETRY_SECONDS
+      : INBOUND_RECOVERY_RETRY_SECONDS,
+  });
+}
+
 export async function processInboundBatch(
   batch: { messages: readonly UntrustedQueueMessage[] },
   env: InboundProjectionEnvironment,
   runtime: InboundProjectionRuntime = defaultRuntime,
 ): Promise<void> {
-  for (const message of batch.messages) {
-    const queueRef = await mailTelemetryLogRef("queue", message.id);
-    console.log("[mail-projection] Queue message received", {
-      attempt: message.attempts,
-      operation: "queue_consume",
-      queueRef,
-      status: "started",
-    });
-    if (!isInboundArchivePointer(message.body)) {
-      try {
-        const durableQueueRef = await mailTelemetryRef("queue", message.id);
-        await persistInvalidPointer(
-          env.RAW_MAIL_BUCKET,
-          message,
-          durableQueueRef,
-          "INVALID_QUEUE_POINTER",
-          runtime,
-        );
-      } catch {
-        const delaySeconds = retryDelaySeconds(message.attempts);
+  await Promise.allSettled(
+    batch.messages.map(async (message) => {
+      const disposition = createQueueDisposition(message);
+      const attempt = disposition.createScope();
+      const scopedMessage: UntrustedQueueMessage = {
+        ...message,
+        ack: () => {
+          attempt.ack();
+        },
+        retry: (options) => {
+          attempt.retry(options);
+        },
+      };
+      const result = await runInboundWorkWithDeadline(
+        async ({ expiresAt }) =>
+          processInboundQueueItem(scopedMessage, env, {
+            ...runtime,
+            projectionExpiresAt: expiresAt,
+          }),
+        {
+          now: () => runtime.now().getTime(),
+          onExpire: () => attempt.close(),
+          scheduler: runtime.deadlineScheduler,
+          timeoutMs: runtime.itemTimeoutMs ?? INBOUND_QUEUE_ITEM_TIMEOUT_MS,
+        },
+      );
+      attempt.close();
+      if (disposition.isSettled()) return;
+
+      if (!isInboundArchivePointer(message.body)) {
         console.error("[mail-projection] invalid pointer ledger failed", {
           attempt: message.attempts,
-          delaySeconds,
+          delaySeconds: INBOUND_RECOVERY_RETRY_SECONDS,
           errorCode: "INVALID_POINTER_LEDGER_FAILED",
           operation: "queue_pointer_validate",
-          queueRef,
           status: "retrying",
         });
-        message.retry({ delaySeconds });
-        continue;
+        disposition.retry({
+          delaySeconds: INBOUND_RECOVERY_RETRY_SECONDS,
+        });
+        return;
       }
-      console.error("[mail-projection] invalid Queue pointer", {
-        attempt: message.attempts,
-        errorCode: "INVALID_QUEUE_POINTER",
-        operation: "queue_pointer_validate",
-        queueRef,
-        status: "quarantined",
-      });
-      message.ack();
-      continue;
-    }
 
-    const { ingressRef, objectRef } = await projectionTelemetryRefs(
-      message.body,
-      message.id,
-    );
-    try {
-      await processInboundMessage(
-        {
-          id: message.id,
-          timestamp: message.timestamp,
-          body: message.body,
-          attempts: message.attempts,
-          ack: () => message.ack(),
-          retry: (options) => message.retry(options),
-        },
-        env,
-        runtime,
-      );
-    } catch {
-      const delaySeconds = retryDelaySeconds(message.attempts);
-      console.error("[mail-projection] unexpected failure", {
+      const { ingressRef, objectRef, queueRef } =
+        await projectionTelemetryRefs(message.body, message.id);
+      console.error("[mail-projection] bounded projection recovery started", {
         attempt: message.attempts,
-        delaySeconds,
-        errorCode: "UNEXPECTED_PROJECTION_FAILURE",
+        errorCode:
+          result.status === "timed_out"
+            ? "PROJECTION_DEADLINE_EXCEEDED"
+            : "UNEXPECTED_PROJECTION_FAILURE",
         ingressRef,
         objectRef,
         operation: "mailbox_projection",
         queueRef,
-        status: "retrying",
+        status: "recovering",
       });
-      message.retry({ delaySeconds });
+      await recoverNormalQueueDelivery(
+        message,
+        message.body,
+        env,
+        runtime,
+        disposition,
+      );
+    }),
+  );
+}
+
+async function bestEffortDeadLetterTerminalLedger(
+  message: UntrustedQueueMessage,
+  pointer: InboundArchivePointer,
+  env: Pick<InboundProjectionEnvironment, "MAILBOX">,
+  runtime: InboundProjectionRuntime,
+): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const bounded = async <T>(work: () => Promise<T>): Promise<T | null> => {
+    try {
+      return await Promise.race([
+        Promise.resolve().then(work),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("DLQ terminal ledger timed out")),
+            runtime.infrastructureTimeoutMs ?? 100,
+          );
+        }),
+      ]);
+    } catch {
+      return null;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      timeout = undefined;
     }
+  };
+  const durableQueueRef = await bounded(() =>
+    mailTelemetryRef("queue", message.id),
+  );
+  if (!durableQueueRef || pointer.rawSha256 === undefined) return;
+  const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(pointer.mailboxId));
+  const recordTerminalFailure = mailbox.recordInboundTerminalFailure?.bind(mailbox);
+  if (!recordTerminalFailure) return;
+  await bounded(() =>
+    recordTerminalFailure({
+      id: pointer.ingressId,
+      archiveAuthority: {
+        ...projectInboundArchivePointer(pointer),
+        rawSha256: pointer.rawSha256!,
+      },
+      queueRef: durableQueueRef,
+      attempts: message.attempts,
+      errorCode: "QUEUE_RETRY_EXHAUSTED",
+    }),
+  );
+}
+
+async function processInboundDeadLetterItem(
+  message: UntrustedQueueMessage,
+  env: Pick<
+    InboundProjectionEnvironment,
+    "RAW_MAIL_BUCKET" | "MAILBOX" | "EMERGENCY_FORWARD_QUEUE"
+  >,
+  runtime: InboundProjectionRuntime,
+): Promise<void> {
+  const queueRef = await bestEffortMailTelemetryLogRef("queue", message.id);
+  if (!isInboundArchivePointer(message.body)) {
+    const durableQueueRef = await mailTelemetryRef("queue", message.id);
+    await persistInvalidPointer(
+      env.RAW_MAIL_BUCKET,
+      message,
+      durableQueueRef,
+      "INVALID_DLQ_POINTER",
+      runtime,
+    );
+    console.error("[mail-projection] invalid dead-letter pointer", {
+      attempt: message.attempts,
+      errorCode: "INVALID_DLQ_POINTER",
+      operation: "dead_letter_consume",
+      queueRef,
+      status: "quarantined",
+    });
+    message.ack();
+    return;
   }
+
+  const pointer = message.body;
+  const { ingressRef, objectRef } = await projectionTelemetryRefs(
+    pointer,
+    message.id,
+  );
+  await beginEmergencyForward(
+    env,
+    pointer,
+    "QUEUE_RETRY_EXHAUSTED",
+    runtime,
+  );
+  message.ack();
+  await bestEffortDeadLetterTerminalLedger(
+    message,
+    pointer,
+    env,
+    runtime,
+  );
+  console.error("[mail-projection] emergency forward handoff completed", {
+    attempt: message.attempts,
+    ingressRef,
+    objectRef,
+    operation: "dead_letter_consume",
+    queueRef,
+    status: "forward_pending",
+  });
 }
 
 export async function processInboundDeadLetterBatch(
   batch: { messages: readonly UntrustedQueueMessage[] },
-  env: Pick<InboundProjectionEnvironment, "RAW_MAIL_BUCKET" | "MAILBOX">,
+  env: Pick<
+    InboundProjectionEnvironment,
+    "RAW_MAIL_BUCKET" | "MAILBOX" | "EMERGENCY_FORWARD_QUEUE"
+  >,
   runtime: InboundProjectionRuntime = defaultRuntime,
 ): Promise<void> {
-  for (const message of batch.messages) {
-    const queueRef = await mailTelemetryLogRef("queue", message.id);
-    if (!isInboundArchivePointer(message.body)) {
-      try {
-        const durableQueueRef = await mailTelemetryRef("queue", message.id);
-        await persistInvalidPointer(
-          env.RAW_MAIL_BUCKET,
-          message,
-          durableQueueRef,
-          "INVALID_DLQ_POINTER",
-          runtime,
-        );
-      } catch (error) {
+  await Promise.allSettled(
+    batch.messages.map(async (message) => {
+      const disposition = createQueueDisposition(message);
+      const attempt = disposition.createScope();
+      const scopedMessage: UntrustedQueueMessage = {
+        ...message,
+        ack: () => {
+          attempt.ack();
+        },
+        retry: (options) => {
+          attempt.retry(options);
+        },
+      };
+      await runInboundWorkWithDeadline(
+        async () => processInboundDeadLetterItem(scopedMessage, env, runtime),
+        {
+          now: () => runtime.now().getTime(),
+          onExpire: () => attempt.close(),
+          scheduler: runtime.deadlineScheduler,
+          timeoutMs:
+            runtime.deadLetterItemTimeoutMs ?? INBOUND_DLQ_ITEM_TIMEOUT_MS,
+        },
+      );
+      attempt.close();
+      if (disposition.isSettled()) return;
+
+      if (!isInboundArchivePointer(message.body)) {
         console.error("[mail-projection] invalid DLQ pointer ledger failed", {
           attempt: message.attempts,
           errorCode: "INVALID_DLQ_POINTER_LEDGER_FAILED",
           operation: "dead_letter_consume",
-          queueRef,
-          status: "failed",
+          status: "retrying",
         });
-        throw error;
-      }
-      console.error("[mail-projection] invalid dead-letter pointer", {
-        attempt: message.attempts,
-        errorCode: "INVALID_DLQ_POINTER",
-        operation: "dead_letter_consume",
-        queueRef,
-        status: "quarantined",
-      });
-      message.ack();
-      continue;
-    }
-
-    const { ingressRef, objectRef } = await projectionTelemetryRefs(
-      message.body,
-      message.id,
-    );
-
-    if (env.RAW_MAIL_BUCKET.head) {
-      try {
-        const currentReceipt = await env.RAW_MAIL_BUCKET.head(
-          receiptKey(message.body.ingressId),
-        );
-        const currentState = currentReceipt?.customMetadata?.state;
-        if (isTerminalReceiptState(currentState)) {
-          await clearTerminalActiveMarkerBestEffort(
-            env.RAW_MAIL_BUCKET,
-            message.body,
-          );
-          console.log("[mail-projection] terminal DLQ delivery acknowledged", {
-            attempt: message.attempts,
-            ingressRef,
-            operation: "dead_letter_terminal_check",
-            queueRef,
-            status: "terminal",
-          });
-          message.ack();
-          continue;
-        }
-      } catch {
-        console.error("[mail-projection] terminal DLQ check degraded", {
-          attempt: message.attempts,
-          errorCode: "TERMINAL_DLQ_RECEIPT_CHECK_FAILED",
-          ingressRef,
-          operation: "dead_letter_terminal_check",
-          queueRef,
-          status: "degraded",
+        disposition.retry({
+          delaySeconds: INBOUND_RECOVERY_RETRY_SECONDS,
         });
+        return;
       }
-    }
 
-    const mailbox = env.MAILBOX.get(
-      env.MAILBOX.idFromName(message.body.mailboxId),
-    );
-    if (mailbox.getEmail) {
-      const deleted = mailbox.isEmailDeleted
-        ? await mailbox.isEmailDeleted(message.body.ingressId)
-        : false;
-      const stored = deleted
-        ? null
-        : await mailbox.getEmail(message.body.ingressId);
-      if (deleted || stored) {
-        const state = deleted ? "deleted" : "stored";
-        try {
-          await writeReceipt(
-            env.RAW_MAIL_BUCKET,
-            message.body,
-            state,
-            runtime,
-            {
-              errorCode: deleted
-                ? "MAILBOX_PROJECTION_DELETED"
-                : "MAILBOX_PROJECTION_STORED",
-            },
-          );
-        } catch {
-          console.error("[mail-projection] terminal DLQ receipt degraded", {
-            attempt: message.attempts,
-            errorCode: "TERMINAL_DLQ_RECEIPT_WRITE_FAILED",
-            ingressRef,
-            operation: "dead_letter_terminal_check",
-            queueRef,
-            status: "degraded",
-          });
-        }
-        console.log("[mail-projection] late DLQ delivery suppressed", {
-          attempt: message.attempts,
-          ingressRef,
-          operation: "dead_letter_terminal_check",
-          queueRef,
-          status: "terminal",
-        });
-        message.ack();
-        continue;
-      }
-    }
-    let terminalLedgered = false;
-    const durableQueueRef = await mailTelemetryRef("queue", message.id);
-    try {
-      if (!mailbox.recordInboundTerminalFailure) {
-        throw new Error("Mailbox terminal-failure ledger is unavailable");
-      }
-      const disposition = await mailbox.recordInboundTerminalFailure({
-        id: message.body.ingressId,
-        queueRef: durableQueueRef,
-        attempts: message.attempts,
-        errorCode: "QUEUE_RETRY_EXHAUSTED",
-      });
-      if (disposition === "stored" || disposition === "deleted") {
-        try {
-          await writeReceipt(
-            env.RAW_MAIL_BUCKET,
-            message.body,
-            disposition,
-            runtime,
-            {
-              errorCode:
-                disposition === "stored"
-                  ? "MAILBOX_PROJECTION_STORED"
-                  : "MAILBOX_PROJECTION_DELETED",
-            },
-          );
-        } catch {
-          console.error(
-            "[mail-projection] atomic DLQ disposition receipt degraded",
-            {
-              errorCode: "ATOMIC_DLQ_DISPOSITION_RECEIPT_FAILED",
-              ingressRef,
-              operation: "dead_letter_terminal_ledger",
-              queueRef,
-              status: "degraded",
-            },
-          );
-        }
-        message.ack();
-        continue;
-      }
-      // Cloudflare Queues batching/retries: ack() prevents redelivery even if
-      // the batch later fails. Only an explicit ledger commit may authorize it.
-      terminalLedgered = disposition === "ledgered";
-    } catch {
-      console.error("[mail-projection] terminal fallback ledger failed", {
-        attempt: message.attempts,
-        errorCode: "TERMINAL_FALLBACK_LEDGER_FAILED",
-        ingressRef,
-        operation: "dead_letter_terminal_ledger",
-        queueRef,
-        status: "failed",
-      });
-    }
-
-    let written = false;
-    try {
-      written = await writeReceipt(
-        env.RAW_MAIL_BUCKET,
+      const authorityDurable = await establishEmergencyForwardAuthority(
+        env,
         message.body,
-        "dead_lettered",
+        "QUEUE_RETRY_EXHAUSTED",
         runtime,
-        {
-          attempt: message.attempts,
-          errorCode: "QUEUE_RETRY_EXHAUSTED",
-          queueRef: durableQueueRef,
-        },
       );
-    } catch (error) {
-      console.error("[mail-projection] terminal receipt write failed", {
-        attempt: message.attempts,
-        errorCode: "TERMINAL_RECEIPT_WRITE_FAILED",
-        ingressRef,
-        operation: "dead_letter_consume",
-        queueRef,
-        status: terminalLedgered ? "fallback_ledgered" : "failed",
-      });
-      if (!terminalLedgered) throw error;
-    }
-    if (!written) {
-      let supersededByTerminalReceipt = false;
-      try {
-        const current = env.RAW_MAIL_BUCKET.head
-          ? await env.RAW_MAIL_BUCKET.head(receiptKey(message.body.ingressId))
-          : null;
-        supersededByTerminalReceipt = isTerminalReceiptState(
-          current?.customMetadata?.state,
-        );
-      } catch (error) {
-        if (!terminalLedgered) throw error;
+      await bestEffortDeadLetterTerminalLedger(
+        message,
+        message.body,
+        env,
+        runtime,
+      );
+      if (authorityDurable) {
+        disposition.ack();
+      } else {
+        disposition.retry({
+          delaySeconds: INBOUND_RECOVERY_RETRY_SECONDS,
+        });
       }
-      if (!terminalLedgered && !supersededByTerminalReceipt) {
-        throw new Error(
-          "Dead-letter failure was not persisted in either durable terminal ledger",
-        );
-      }
-    }
-    console.error("[mail-projection] dead-letter handoff completed", {
-      attempt: message.attempts,
-      ingressRef,
-      objectRef,
-      operation: "dead_letter_consume",
-      queueRef,
-      status: written
-        ? "dead_lettered"
-        : terminalLedgered
-          ? "fallback_ledgered"
-          : "superseded",
-    });
-    message.ack();
-  }
+    }),
+  );
 }

@@ -11,7 +11,11 @@ import {
 
 const session = { sub: "user-a", email: "user@example.com", mailbox: "user@example.com", role: "AGENT", sessionVersion: 1 } satisfies SessionClaims;
 
-function app(options: { session?: SessionClaims; fail?: boolean | "access" } = {}) {
+function app(options: {
+	session?: SessionClaims;
+	fail?: boolean | "access";
+	rosters?: Array<{ mailboxIds: string[] } | null | Error>;
+} = {}) {
 	const calls: GlobalTodayBriefRouteInput[] = [];
 	const root = new Hono<GlobalTodayBriefRouteContext>();
 	root.use("*", async (c, next) => {
@@ -25,6 +29,13 @@ function app(options: { session?: SessionClaims; fail?: boolean | "access" } = {
 			if (options.fail) throw new Error("private infrastructure detail");
 			return { state: "no_attention", counts: { privateRemindersDue: 0, unreadConversations: 0 }, omittedCount: 0 };
 		},
+	}, async () => {
+		const nextRoster = options.rosters?.shift();
+		const roster = nextRoster === undefined
+			? { mailboxIds: ["user@example.com"] }
+			: nextRoster;
+		if (roster instanceof Error) throw roster;
+		return roster;
 	}));
 	return { root, calls };
 }
@@ -80,4 +91,20 @@ test("revocation after runtime work returns forbidden so the client purges all m
 	const response = await app({ session, fail: "access" }).root.request(request(JSON.stringify({ timeZone: "UTC" })));
 	assert.equal(response.status, 403);
 	assert.deepEqual(await response.json(), { error: "Mailbox access changed" });
+});
+
+test("global Today brief discards success or private failure after exact roster drift", async () => {
+	for (const fail of [false, true]) {
+		const response = await app({
+			session,
+			fail,
+			rosters: [
+				{ mailboxIds: ["a@example.com", "b@example.com"] },
+				{ mailboxIds: ["b@example.com"] },
+			],
+		}).root.request(request(JSON.stringify({ timeZone: "UTC" })));
+		assert.equal(response.status, 403);
+		assert.deepEqual(await response.json(), { error: "Mailbox access changed" });
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+	}
 });

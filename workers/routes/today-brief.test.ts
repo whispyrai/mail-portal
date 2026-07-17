@@ -7,9 +7,10 @@ import {
 } from "./today-brief.ts";
 
 function app(input: {
-	session?: { sub: string };
+	session?: { sub: string; sessionVersion: number };
 	stub?: unknown;
 	run?: TodayBriefRouteDependencies["run"];
+	authorize?: () => Promise<boolean>;
 }) {
 	const root = new Hono();
 	root.use("*", async (c, next) => {
@@ -22,7 +23,7 @@ function app(input: {
 		"/",
 		createTodayBriefRoutes({
 			run: input.run ?? (async () => ({ state: "no_attention" })),
-		}) as never,
+		}, input.authorize ?? (async () => true)) as never,
 	);
 	return root;
 }
@@ -45,13 +46,13 @@ test("auth and an authorized mailbox stub win before request processing", async 
 	);
 	assert.equal(withoutSession.status, 401);
 
-	const withoutStub = await app({ session: { sub: "user-a" } }).request(
+	const withoutStub = await app({ session: { sub: "user-a", sessionVersion: 1 } }).request(
 		request(JSON.stringify({ timeZone: "UTC" })),
 	);
 	assert.equal(withoutStub.status, 403);
 
 	const authorized = await app({
-		session: { sub: "user-a" },
+		session: { sub: "user-a", sessionVersion: 1 },
 		stub: {},
 		run: async (input) => {
 			called = true;
@@ -66,7 +67,7 @@ test("auth and an authorized mailbox stub win before request processing", async 
 });
 
 test("strictly validates timezone-only input and UTF-8 body bounds", async () => {
-	const server = app({ session: { sub: "user-a" }, stub: {} });
+	const server = app({ session: { sub: "user-a", sessionVersion: 1 }, stub: {} });
 	for (const body of [
 		{},
 		{ timeZone: "Mars/Olympus_Mons" },
@@ -87,7 +88,7 @@ test("strictly validates timezone-only input and UTF-8 body bounds", async () =>
 
 test("provider failures expose no prompt or mail content", async () => {
 	const response = await app({
-		session: { sub: "user-a" },
+		session: { sub: "user-a", sessionVersion: 1 },
 		stub: {},
 		run: async () => {
 			throw new Error("secret prompt and sender content");
@@ -97,4 +98,22 @@ test("provider failures expose no prompt or mail content", async () => {
 	const text = await response.text();
 	assert.doesNotMatch(text, /secret prompt|sender content/);
 	assert.match(text, /Today remains fully usable/);
+});
+
+test("later live revocation overrides Today brief success and private runtime failure", async () => {
+	for (const run of [
+		async () => ({ state: "no_attention" }),
+		async (): Promise<never> => { throw new Error("private Today failure"); },
+	]) {
+		let checks = 0;
+		const response = await app({
+			session: { sub: "user-a", sessionVersion: 1 },
+			stub: {},
+			run,
+			authorize: async () => ++checks === 1,
+		}).request(request(JSON.stringify({ timeZone: "UTC" })));
+		assert.equal(response.status, 403);
+		assert.equal(response.headers.get("cache-control"), "private, no-store");
+		assert.doesNotMatch(await response.text(), /private Today failure/);
+	}
 });

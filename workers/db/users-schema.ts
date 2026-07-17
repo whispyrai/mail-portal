@@ -89,6 +89,163 @@ export const credentialRecoveryRequestLimits = sqliteTable(
   },
 );
 
+export const CREDENTIAL_RECOVERY_JOB_STATES = [
+  "pending",
+  "leased",
+  "completed",
+  "suppressed",
+  "expired",
+  "parked",
+] as const;
+
+export const credentialRecoveryRequestJobs = sqliteTable(
+  "credential_recovery_request_jobs",
+  {
+    id: text("id").primaryKey(),
+    account_ref: text("account_ref").notNull(),
+    payload_key_version: integer("payload_key_version"),
+    payload_iv: text("payload_iv"),
+    payload_ciphertext: text("payload_ciphertext"),
+    state: text("state", { enum: CREDENTIAL_RECOVERY_JOB_STATES }).notNull(),
+    attempt_count: integer("attempt_count").notNull().default(0),
+    next_attempt_at: integer("next_attempt_at").notNull(),
+    lease_token: text("lease_token"),
+    lease_expires_at: integer("lease_expires_at"),
+    last_error_code: text("last_error_code"),
+    completed_at: integer("completed_at"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_credential_recovery_request_jobs_due").on(
+      table.next_attempt_at,
+      table.created_at,
+      table.id,
+    ),
+  ],
+);
+
+export const CREDENTIAL_RECOVERY_DELIVERY_STATES = [
+  "pending",
+  "leased",
+  "dispatching",
+  "accepted",
+  "cancelled",
+  "expired",
+  "parked",
+] as const;
+
+export const credentialRecoveryDeliveryOutbox = sqliteTable(
+  "credential_recovery_delivery_outbox",
+  {
+    id: text("id").primaryKey(),
+    token_id: text("token_id")
+      .notNull()
+      .unique()
+      .references(() => credentialRecoveryTokens.id, { onDelete: "restrict" }),
+    payload_key_version: integer("payload_key_version"),
+    payload_iv: text("payload_iv"),
+    payload_ciphertext: text("payload_ciphertext"),
+    state: text("state", {
+      enum: CREDENTIAL_RECOVERY_DELIVERY_STATES,
+    }).notNull(),
+    attempt_count: integer("attempt_count").notNull().default(0),
+    next_attempt_at: integer("next_attempt_at").notNull(),
+    lease_token: text("lease_token"),
+    lease_expires_at: integer("lease_expires_at"),
+    dispatch_started_at: integer("dispatch_started_at"),
+    provider_message_id: text("provider_message_id"),
+    accepted_attempt_id: text("accepted_attempt_id"),
+    provider_event_status: text("provider_event_status", {
+      enum: ["delivery", "bounce", "complaint"],
+    }),
+    provider_event_at: integer("provider_event_at"),
+    last_error_code: text("last_error_code"),
+    ambiguous_dispatch_count: integer("ambiguous_dispatch_count")
+      .notNull()
+      .default(0),
+    last_ambiguity_at: integer("last_ambiguity_at"),
+    cancellation_reason: text("cancellation_reason"),
+    cancellation_observed_at: integer("cancellation_observed_at"),
+    accepted_at: integer("accepted_at"),
+    completed_at: integer("completed_at"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_credential_recovery_delivery_outbox_due").on(
+      table.next_attempt_at,
+      table.created_at,
+      table.id,
+    ),
+  ],
+);
+
+export const credentialRecoveryDeliveryAttempts = sqliteTable(
+  "credential_recovery_delivery_attempts",
+  {
+    attempt_id: text("attempt_id").primaryKey(),
+    outbox_id: text("outbox_id")
+      .notNull()
+      .references(() => credentialRecoveryDeliveryOutbox.id, {
+        onDelete: "restrict",
+      }),
+    state: text("state", {
+      enum: ["dispatching", "ambiguous", "http_rejected", "accepted"],
+    }).notNull(),
+    provider_message_id: text("provider_message_id"),
+    dispatch_started_at: integer("dispatch_started_at").notNull(),
+    resolved_at: integer("resolved_at"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_credential_recovery_delivery_attempts_outbox").on(
+      table.outbox_id,
+      table.created_at,
+      table.attempt_id,
+    ),
+    index("idx_credential_recovery_delivery_attempts_retention").on(
+      table.updated_at,
+      table.attempt_id,
+    ),
+  ],
+);
+
+export const credentialRecoveryDeliveryEvents = sqliteTable(
+  "credential_recovery_delivery_events",
+  {
+    event_id: text("event_id").primaryKey(),
+    outbox_id: text("outbox_id")
+      .notNull()
+      .references(() => credentialRecoveryDeliveryOutbox.id, {
+        onDelete: "restrict",
+      }),
+    attempt_id: text("attempt_id")
+      .notNull()
+      .references(() => credentialRecoveryDeliveryAttempts.attempt_id, {
+        onDelete: "restrict",
+      }),
+    provider_message_id: text("provider_message_id").notNull(),
+    event_type: text("event_type", {
+      enum: ["delivery", "bounce", "complaint"],
+    }).notNull(),
+    occurred_at: integer("occurred_at").notNull(),
+    recorded_at: integer("recorded_at").notNull(),
+  },
+  (table) => [
+    index("idx_credential_recovery_delivery_events_outbox").on(
+      table.outbox_id,
+      table.occurred_at,
+      table.event_id,
+    ),
+    index("idx_credential_recovery_delivery_events_retention").on(
+      table.recorded_at,
+      table.event_id,
+    ),
+  ],
+);
+
 export type UserRow = typeof users.$inferSelect;
 
 export const MAILBOX_TYPES = ["PERSONAL", "SHARED"] as const;

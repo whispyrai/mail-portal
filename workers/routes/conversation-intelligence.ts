@@ -4,6 +4,15 @@ import type { SessionClaims } from "../lib/auth.ts";
 import type { MailboxDO } from "../durableObject/index.ts";
 import type { Env } from "../types.ts";
 import {
+  LiveReadAuthorizationError,
+  LiveReadAuthorizationUnavailableError,
+} from "../lib/live-authorized-read.ts";
+import {
+  hasExactLiveMailboxAccess,
+  runLiveMailboxAuthorizedRead,
+  type LiveMailboxAccessAuthorizer,
+} from "../lib/live-mailbox-authorization.ts";
+import {
   ConversationIntelligenceNotFoundError,
   ConversationIntelligenceUnsupportedStateError,
   createConversationIntelligenceRuntime,
@@ -36,11 +45,13 @@ const requestSchema = z.object({ refresh: z.boolean().optional() }).strict();
 
 export function createConversationIntelligenceApp(
   dependencies?: ConversationIntelligenceRouteDependencies,
+  authorize: LiveMailboxAccessAuthorizer = hasExactLiveMailboxAccess,
 ) {
   const app = new Hono<ConversationIntelligenceRouteContext>();
   app.post(
     "/api/v1/mailboxes/:mailboxId/emails/:emailId/intelligence",
     async (c) => {
+      c.header("Cache-Control", "private, no-store");
       const session = c.get("session");
       if (!session) return c.json({ error: "Unauthorized" }, 401);
       const stub = c.get("mailboxStub");
@@ -59,15 +70,30 @@ export function createConversationIntelligenceApp(
           ));
       try {
         return c.json(
-          await run({
-            mailboxId,
-            actorUserId: session.sub,
-            emailId: c.req.param("emailId")!,
-            force: parsed.data.refresh === true,
-            stub,
-          }),
+          await runLiveMailboxAuthorizedRead(
+            c.env,
+            {
+              mailboxId,
+              userId: session.sub,
+              sessionVersion: session.sessionVersion,
+            },
+            () => run({
+              mailboxId,
+              actorUserId: session.sub,
+              emailId: c.req.param("emailId")!,
+              force: parsed.data.refresh === true,
+              stub,
+            }),
+            authorize,
+          ),
         );
       } catch (error) {
+        if (error instanceof LiveReadAuthorizationError) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+        if (error instanceof LiveReadAuthorizationUnavailableError) {
+          return c.json({ error: "Authorization unavailable" }, 503);
+        }
         if (error instanceof ConversationIntelligenceUnsupportedStateError) {
           return c.json(
             {

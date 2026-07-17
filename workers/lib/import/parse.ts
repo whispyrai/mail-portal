@@ -18,6 +18,28 @@ import type { FolderId } from "../../../shared/folders";
 /** Zoho source folders we deliberately do NOT import. */
 const DROP_FOLDERS = new Set(["trash", "deleted", "bin", "spam", "junk"]);
 
+/** Normalize the complete relative folder path supplied by the import driver. */
+export function normalizeZohoFolderPath(sourceFolder: string): string {
+	if (
+		typeof sourceFolder !== "string" ||
+		sourceFolder.length > 1_000 ||
+		/[\u0000-\u001f\u007f]/.test(sourceFolder)
+	) {
+		throw new Error("Zoho source folder path is invalid");
+	}
+	const segments = sourceFolder
+		.replaceAll("\\", "/")
+		.split("/")
+		.map((segment) => segment.trim());
+	if (
+		segments.length === 0 ||
+		segments.some((segment) => !segment || segment === "." || segment === "..")
+	) {
+		throw new Error("Zoho source folder path is invalid");
+	}
+	return segments.join("/");
+}
+
 /**
  * Map a Zoho export folder name to a portal folder. Inbox→inbox, Sent→sent,
  * Trash/Spam (and common aliases) are dropped (null), and every other
@@ -25,10 +47,12 @@ const DROP_FOLDERS = new Set(["trash", "deleted", "bin", "spam", "junk"]);
  * ticket excludes only Trash and Spam, so nothing else is discarded.
  */
 export function mapZohoFolder(sourceFolder: string): FolderId | null {
-	const name = sourceFolder.trim().toLowerCase();
-	if (DROP_FOLDERS.has(name)) return null;
-	if (name === "inbox") return "inbox";
-	if (name === "sent") return "sent";
+	const segments = normalizeZohoFolderPath(sourceFolder)
+		.split("/")
+		.map((segment) => segment.toLowerCase());
+	if (segments.some((segment) => DROP_FOLDERS.has(segment))) return null;
+	if (segments.length === 1 && segments[0] === "inbox") return "inbox";
+	if (segments.length === 1 && segments[0] === "sent") return "sent";
 	return "archive";
 }
 
@@ -46,11 +70,7 @@ export function normalizeEmailDate(raw: string | null | undefined): string {
 /** Fields used to derive a stable id when a Message-ID is present or not. */
 type ImportIdParts = {
 	messageId?: string | null;
-	from?: string | null;
-	to?: string | null;
-	date?: string | null;
-	subject?: string | null;
-	content?: string | null;
+	rawSha256?: string | null;
 };
 
 type ImportThreadParts = ImportIdParts & {
@@ -73,17 +93,22 @@ async function deriveImportHash(key: string): Promise<string> {
 	return hex.slice(0, 32);
 }
 
+/** Hash the exact uploaded RFC822 bytes before any parser normalization. */
+export async function sha256RawEmail(raw: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", raw);
+	return Array.from(new Uint8Array(digest))
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
 function importMessageKey(parts: ImportIdParts): string {
 	const mid = normalizeMessageId(parts.messageId);
-	return mid
-		? `msgid:${mid}`
-		: `fallback:${JSON.stringify([
-			parts.from ?? "",
-			parts.to ?? "",
-			parts.date ?? "",
-			parts.subject ?? "",
-			parts.content ?? "",
-		])}`;
+	if (mid) return `msgid:${mid}`;
+	const rawSha256 = parts.rawSha256?.trim().toLowerCase();
+	if (!rawSha256 || !/^[0-9a-f]{64}$/.test(rawSha256)) {
+		throw new Error("A valid raw SHA-256 is required when Message-ID is absent");
+	}
+	return `raw-sha256:${rawSha256}`;
 }
 
 /** The pre-mailbox-scope identity, retained only as a read-compatibility bridge. */
@@ -96,9 +121,10 @@ export function deriveLegacyImportId(parts: ImportIdParts): Promise<string> {
  * import is idempotent: the endpoint skips any message whose id already exists.
  * Attachments add a claim-generation fence beneath this mailbox-scoped message
  * identity so a failed or expired writer cannot collide with its successor.
- * The message identity is keyed on the RFC `Message-ID` when present, else on
- * the sender, recipients, date, subject, and content. SHA-256 → first 32 hex
- * chars: stable and filesystem/URL-safe for R2 paths and deep links.
+ * The message identity is keyed on the RFC `Message-ID` when present, preserving
+ * its existing 32-hex contract. Without one, it is keyed on the exact raw
+ * RFC822 SHA-256 while preserving the same 32-hex storage contract. Both are
+ * stable and safe for R2 paths, promotion intents, and deep links.
  */
 export async function deriveImportId(
 	parts: ImportIdParts,
@@ -106,7 +132,9 @@ export async function deriveImportId(
 ): Promise<string> {
 	const mailbox = mailboxId.trim().toLowerCase();
 	if (!mailbox) throw new Error("Target mailbox identity is required for import");
-	return deriveImportHash(`mailbox:${mailbox}\n${importMessageKey(parts)}`);
+	return deriveImportHash(
+		`mailbox:${mailbox}\n${importMessageKey(parts)}`,
+	);
 }
 
 /**

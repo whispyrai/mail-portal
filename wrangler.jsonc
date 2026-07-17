@@ -42,6 +42,9 @@
 				"INBOUND_QUEUE_NAME": "sales-mail-inbound",
 				"INBOUND_DLQ_NAME": "sales-mail-inbound-dlq",
 				"INBOUND_PARKING_NAME": "sales-mail-inbound-parking",
+				"EMERGENCY_FORWARD_QUEUE_NAME": "sales-mail-emergency-forward",
+				"EMERGENCY_FORWARD_FROM": "emergency-forward@whispyrcrm.com",
+				"EMERGENCY_FORWARD_DESTINATION": "heshamelmahdi@gmail.com",
 				"AWS_REGION": "eu-west-2",
 				"SES_CONFIGURATION_SET": "mail-portal-events",
 				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -59,10 +62,10 @@
 					"AWS_ACCESS_KEY_ID",
 					"AWS_SECRET_ACCESS_KEY",
 					"SES_EVENT_WEBHOOK_SECRET",
+					"CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1",
 					"JWT_SECRET",
 					"ADMIN_BOOTSTRAP_EMAIL",
 					"ACCOUNT_RECOVERY_DIRECTORY",
-					"EMERGENCY_FORWARD_TO",
 					"VAPID_PUBLIC_KEY",
 					"VAPID_PRIVATE_KEY"
 				]
@@ -95,39 +98,55 @@
 					"preview_bucket_name": "sales-mail-raw-archive-preview"
 				}
 			],
+			"send_email": [
+				{
+					"name": "EMERGENCY_EMAIL",
+					"destination_address": "heshamelmahdi@gmail.com",
+					"allowed_sender_addresses": ["emergency-forward@whispyrcrm.com"]
+				}
+			],
 			// Queue retention is a control-plane setting, not a Wrangler binding
-			// field. All three queues are locked at 14 days and must be verified
+			// field. All four queues are locked at 14 days and must be verified
 			// separately before deploy.
 			"queues": {
 				"producers": [
-					{ "binding": "INBOUND_QUEUE", "queue": "sales-mail-inbound" }
+					{ "binding": "INBOUND_QUEUE", "queue": "sales-mail-inbound" },
+					{ "binding": "EMERGENCY_FORWARD_QUEUE", "queue": "sales-mail-emergency-forward" }
 				],
 				"consumers": [
 					{
 						"queue": "sales-mail-inbound",
-						"max_batch_size": 1,
-						"max_concurrency": 1,
-						"max_batch_timeout": 5,
+						"max_batch_size": 2,
+						"max_concurrency": 8,
+						"max_batch_timeout": 1,
 						"max_retries": 10,
-						"retry_delay": 1,
+						"retry_delay": 30,
 						"dead_letter_queue": "sales-mail-inbound-dlq"
 					},
 					{
 						"queue": "sales-mail-inbound-dlq",
-						"max_batch_size": 1,
-						"max_concurrency": 1,
-						"max_batch_timeout": 5,
+						"max_batch_size": 4,
+						"max_concurrency": 4,
+						"max_batch_timeout": 1,
 						"max_retries": 10,
-						"retry_delay": 60,
+						"retry_delay": 30,
 						"dead_letter_queue": "sales-mail-inbound-parking"
 					},
 					{
 						"queue": "sales-mail-inbound-parking",
-						"max_batch_size": 1,
-						"max_concurrency": 1,
-						"max_batch_timeout": 5,
+						"max_batch_size": 4,
+						"max_concurrency": 4,
+						"max_batch_timeout": 1,
 						"max_retries": 100,
-						"retry_delay": 3600
+						"retry_delay": 300
+					},
+					{
+						"queue": "sales-mail-emergency-forward",
+						"max_batch_size": 2,
+						"max_concurrency": 4,
+						"max_batch_timeout": 1,
+						"max_retries": 100,
+						"retry_delay": 30
 					}
 				]
 			},
@@ -196,6 +215,9 @@
 				"INBOUND_QUEUE_NAME": "wiser-mail-inbound",
 				"INBOUND_DLQ_NAME": "wiser-mail-inbound-dlq",
 				"INBOUND_PARKING_NAME": "wiser-mail-inbound-parking",
+				"EMERGENCY_FORWARD_QUEUE_NAME": "wiser-mail-emergency-forward",
+				"EMERGENCY_FORWARD_FROM": "emergency-forward@wiserchat.ai",
+				"EMERGENCY_FORWARD_DESTINATION": "heshamelmahdi@gmail.com",
 				"AWS_REGION": "eu-west-2",
 				"SES_CONFIGURATION_SET": "mail-portal-events",
 				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -210,10 +232,10 @@
 					"AWS_ACCESS_KEY_ID",
 					"AWS_SECRET_ACCESS_KEY",
 					"SES_EVENT_WEBHOOK_SECRET",
+					"CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1",
 					"JWT_SECRET",
 					"ADMIN_BOOTSTRAP_EMAIL",
 					"ACCOUNT_RECOVERY_DIRECTORY",
-					"EMERGENCY_FORWARD_TO",
 					"VAPID_PUBLIC_KEY",
 					"VAPID_PRIVATE_KEY"
 				]
@@ -244,39 +266,55 @@
 					"preview_bucket_name": "wiser-mail-raw-archive-preview"
 				}
 			],
+			"send_email": [
+				{
+					"name": "EMERGENCY_EMAIL",
+					"destination_address": "heshamelmahdi@gmail.com",
+					"allowed_sender_addresses": ["emergency-forward@wiserchat.ai"]
+				}
+			],
 			// Queue retention is a control-plane setting, not a Wrangler binding
-			// field. All three queues are locked at 14 days and must be verified
+			// field. All four queues are locked at 14 days and must be verified
 			// separately before deploy.
 			"queues": {
 				"producers": [
-					{ "binding": "INBOUND_QUEUE", "queue": "wiser-mail-inbound" }
+					{ "binding": "INBOUND_QUEUE", "queue": "wiser-mail-inbound" },
+					{ "binding": "EMERGENCY_FORWARD_QUEUE", "queue": "wiser-mail-emergency-forward" }
 				],
 				"consumers": [
 					{
 						"queue": "wiser-mail-inbound",
-						"max_batch_size": 1,
-						"max_concurrency": 1,
-						"max_batch_timeout": 5,
+						"max_batch_size": 2,
+						"max_concurrency": 8,
+						"max_batch_timeout": 1,
 						"max_retries": 10,
-						"retry_delay": 1,
+						"retry_delay": 30,
 						"dead_letter_queue": "wiser-mail-inbound-dlq"
 					},
 					{
 						"queue": "wiser-mail-inbound-dlq",
-						"max_batch_size": 1,
-						"max_concurrency": 1,
-						"max_batch_timeout": 5,
+						"max_batch_size": 4,
+						"max_concurrency": 4,
+						"max_batch_timeout": 1,
 						"max_retries": 10,
-						"retry_delay": 60,
+						"retry_delay": 30,
 						"dead_letter_queue": "wiser-mail-inbound-parking"
 					},
 					{
 						"queue": "wiser-mail-inbound-parking",
-						"max_batch_size": 1,
-						"max_concurrency": 1,
-						"max_batch_timeout": 5,
+						"max_batch_size": 4,
+						"max_concurrency": 4,
+						"max_batch_timeout": 1,
 						"max_retries": 100,
-						"retry_delay": 3600
+						"retry_delay": 300
+					},
+					{
+						"queue": "wiser-mail-emergency-forward",
+						"max_batch_size": 2,
+						"max_concurrency": 4,
+						"max_batch_timeout": 1,
+						"max_retries": 100,
+						"retry_delay": 30
 					}
 				]
 			},

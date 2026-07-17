@@ -2,14 +2,61 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import PostalMime from "postal-mime";
-import type { InboundArchivePointer } from "./inbound-email.ts";
+import {
+  receiveEmail,
+  type InboundArchivePointer,
+} from "./inbound-email.ts";
 import type { InboundProjectionCommand } from "./lib/inbound-projection-contract.ts";
+import type { InboundDeadlineScheduler } from "./lib/inbound-work-deadline.ts";
 import {
   isInboundArchivePointer,
   processInboundBatch,
   processInboundDeadLetterBatch,
   processInboundMessage as processInboundMessageProduction,
 } from "./inbound-queue.ts";
+
+function manualDeadlineScheduler(): InboundDeadlineScheduler & {
+  fireDelay(delayMs: number): void;
+} {
+  let nextHandle = 0;
+  const pending = new Map<number, { callback: () => void; delayMs: number }>();
+  return {
+    setTimeout(callback, delayMs) {
+      nextHandle += 1;
+      pending.set(nextHandle, { callback, delayMs });
+      return nextHandle;
+    },
+    clearTimeout(handle) {
+      pending.delete(handle);
+    },
+    fireDelay(delayMs) {
+      const matches = [...pending.entries()].filter(
+        ([, value]) => value.delayMs === delayMs,
+      );
+      assert.ok(matches.length > 0, `no ${delayMs}ms deadline was pending`);
+      for (const [handle, value] of matches) {
+        pending.delete(handle);
+        value.callback();
+      }
+    },
+  };
+}
+
+async function waitForCondition(
+  condition: () => boolean,
+  failure: string,
+): Promise<void> {
+  await Promise.race([
+    (async () => {
+      while (!condition()) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    })(),
+    new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(failure)), 50);
+    }),
+  ]);
+}
 
 test("Queue pointer admission accepts legacy and minute raw keys but rejects lookalikes", () => {
   const base = {
@@ -90,7 +137,18 @@ async function processInboundMessage(
   const get = env.MAILBOX.get.bind(env.MAILBOX);
   const rawBucket = env.RAW_MAIL_BUCKET;
   const cleanupIntents = new Map<string, { value: string; etag: string }>();
+  const emergencySidecars = new Map<
+    string,
+    { value: string; etag: string; customMetadata?: Record<string, string> }
+  >();
+  const receiptSidecars = new Map<
+    string,
+    { value: string; etag: string; customMetadata?: Record<string, string> }
+  >();
   let cleanupRevision = 0;
+  let receiptRevision = 0;
+  const projectedAuthorities = new Map<string, string>();
+  const projectedEmails = new Set<string>();
   const cleanupAwareRawBucket = {
     ...rawBucket,
     async get(key: string) {
@@ -105,12 +163,84 @@ async function processInboundMessage(
             }
           : null;
       }
+      if (key.startsWith("system/emergency-forward/")) {
+        const stored = emergencySidecars.get(key);
+        return stored
+          ? {
+              key,
+              version: "emergency-sidecar-version",
+              size: stored.value.length,
+              etag: stored.etag,
+              body: new ReadableStream(),
+              customMetadata: stored.customMetadata,
+              async text() {
+                return stored.value;
+              },
+            }
+          : null;
+      }
+      if (key.startsWith("receipts/")) {
+        const stored = receiptSidecars.get(key);
+        if (stored) {
+          return {
+            key,
+            version: "receipt-version",
+            size: stored.value.length,
+            etag: stored.etag,
+            body: new ReadableStream(),
+            customMetadata: stored.customMetadata,
+            async text() { return stored.value; },
+          };
+        }
+        let underlying: Awaited<ReturnType<typeof rawBucket.get>> = null;
+        try {
+          underlying = await rawBucket.get(key);
+        } catch {
+          // Focused raw-archive stubs commonly reject any non-raw key.
+        }
+        if (underlying) {
+          try {
+            const value = JSON.parse(await underlying.text());
+            if (value?.ingressId === message.body.ingressId) return underlying;
+          } catch {
+            // Most focused tests use one raw-object stub for every key.
+          }
+        }
+        const pointer = message.body;
+        const value = JSON.stringify({
+          schemaVersion: pointer.schemaVersion,
+          ingressId: pointer.ingressId,
+          rawKey: pointer.rawKey,
+          mailboxId: pointer.mailboxId,
+          rawSize: pointer.rawSize,
+          ...(pointer.rawSha256 ? { rawSha256: pointer.rawSha256 } : {}),
+          archivedAt: pointer.archivedAt,
+          etag: pointer.etag,
+          version: pointer.version,
+          state: "enqueued",
+          updatedAt: message.timestamp.toISOString(),
+        });
+        receiptSidecars.set(key, {
+          value,
+          etag: "initial-receipt-etag",
+          customMetadata: { state: "enqueued" },
+        });
+        return {
+          key,
+          version: "initial-receipt-version",
+          size: value.length,
+          etag: "initial-receipt-etag",
+          customMetadata: { state: "enqueued" },
+          async text() { return value; },
+        };
+      }
       return rawBucket.get(key);
     },
     async put(
       key: string,
       value: string,
       options?: {
+        customMetadata?: Record<string, string>;
         onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
       },
     ) {
@@ -128,16 +258,75 @@ async function processInboundMessage(
         cleanupIntents.set(key, { value, etag });
         return { etag };
       }
-      return rawBucket.put(key, value, options as never);
+      if (key.startsWith("system/emergency-forward/")) {
+        const current = emergencySidecars.get(key);
+        if (options?.onlyIf?.etagDoesNotMatch === "*" && current) return null;
+        if (
+          options?.onlyIf?.etagMatches &&
+          options.onlyIf.etagMatches !== current?.etag
+        ) {
+          return null;
+        }
+        const etag = `emergency-etag-${emergencySidecars.size + 1}`;
+        emergencySidecars.set(key, {
+          value,
+          etag,
+          customMetadata: options?.customMetadata,
+        });
+        return { etag };
+      }
+      if (key.startsWith("receipts/") && receiptSidecars.has(key)) {
+        const current = receiptSidecars.get(key);
+        if (options?.onlyIf?.etagDoesNotMatch === "*" && current) return null;
+        if (
+          options?.onlyIf?.etagMatches &&
+          options.onlyIf.etagMatches !== current?.etag
+        ) {
+          return null;
+        }
+        const written = await rawBucket.put(key, value, {
+          ...(options?.customMetadata
+            ? { customMetadata: options.customMetadata }
+            : {}),
+        } as never);
+        if (written === null) return null;
+        receiptRevision += 1;
+        const etag = `receipt-etag-${receiptRevision}`;
+        receiptSidecars.set(key, {
+          value,
+          etag,
+          customMetadata: options?.customMetadata,
+        });
+        return { etag };
+      }
+      const written = await rawBucket.put(key, value, options as never);
+      return written;
     },
     async delete(key: string) {
       if (key.startsWith("system/derived-content-cleanup-intents/pending/")) {
         cleanupIntents.delete(key);
         return;
       }
+      if (key.startsWith("system/emergency-forward/")) {
+        emergencySidecars.delete(key);
+        return;
+      }
       if ("delete" in rawBucket && typeof rawBucket.delete === "function") {
         return rawBucket.delete(key);
       }
+    },
+    async head(key: string) {
+      const stored = emergencySidecars.get(key);
+      if (stored) {
+        return {
+          etag: stored.etag,
+          customMetadata: stored.customMetadata,
+        };
+      }
+      if ("head" in rawBucket && typeof rawBucket.head === "function") {
+        return rawBucket.head(key);
+      }
+      return null;
     },
   };
   return processInboundMessageProduction(
@@ -146,10 +335,59 @@ async function processInboundMessage(
       ...env,
       DB: env.DB ?? mailboxDb(),
       RAW_MAIL_BUCKET: cleanupAwareRawBucket as never,
+      EMERGENCY_FORWARD_QUEUE:
+        env.EMERGENCY_FORWARD_QUEUE ??
+        ({ async send() {} } as never),
       MAILBOX: {
         ...env.MAILBOX,
         get(id: unknown) {
-          return get(id);
+          const mailbox = get(id);
+          const createInboundEmail = mailbox.createInboundEmail?.bind(mailbox);
+          const getEmail = mailbox.getEmail?.bind(mailbox);
+          const getInboundProjectionAuthority =
+            mailbox.getInboundProjectionAuthority?.bind(mailbox);
+          return {
+            ...mailbox,
+            ...(createInboundEmail
+              ? {
+                  async createInboundEmail(command: InboundProjectionCommand) {
+                    const result = await createInboundEmail(command);
+                    if (
+                      command.archiveAuthority &&
+                      result &&
+                      ["stored", "duplicate"].includes(result.status)
+                    ) {
+                      projectedAuthorities.set(
+                        command.email.id,
+                        JSON.stringify(command.archiveAuthority),
+                      );
+                      projectedEmails.add(command.email.id);
+                    }
+                    return result;
+                  },
+                }
+              : {}),
+            ...(getEmail
+              ? {
+                  async getEmail(emailId: string) {
+                    const existing = await getEmail(emailId);
+                    return (
+                      existing ??
+                      (projectedEmails.has(emailId) ? { id: emailId } : null)
+                    );
+                  },
+                }
+              : {}),
+            async getInboundProjectionAuthority(authority) {
+              if (getInboundProjectionAuthority) {
+                return getInboundProjectionAuthority(authority);
+              }
+              return projectedAuthorities.get(authority.ingressId) ===
+                JSON.stringify(authority)
+                ? { generation: 1 }
+                : null;
+            },
+          };
         },
       },
     },
@@ -188,6 +426,66 @@ function archivedEmail(
     }),
     async text() {
       return source;
+    },
+  };
+}
+
+function emergencySidecarStore() {
+  const objects = new Map<
+    string,
+    { value: string; etag: string; customMetadata?: Record<string, string> }
+  >();
+  let revision = 0;
+  return {
+    objects,
+    bucket: {
+      async get(key: string) {
+        const object = objects.get(key);
+        return object
+          ? {
+              key,
+              etag: object.etag,
+              customMetadata: object.customMetadata,
+              async text() {
+                return object.value;
+              },
+            }
+          : null;
+      },
+      async head(key: string) {
+        const object = objects.get(key);
+        return object
+          ? { etag: object.etag, customMetadata: object.customMetadata }
+          : null;
+      },
+      async put(
+        key: string,
+        value: string,
+        options?: {
+          customMetadata?: Record<string, string>;
+          onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+        },
+      ) {
+        const current = objects.get(key);
+        if (options?.onlyIf?.etagDoesNotMatch === "*" && current) return null;
+        if (
+          options?.onlyIf?.etagMatches &&
+          options.onlyIf.etagMatches !== current?.etag
+        ) {
+          return null;
+        }
+        revision += 1;
+        const etag = `sidecar-etag-${revision}`;
+        objects.set(key, {
+          value,
+          etag,
+          customMetadata: options?.customMetadata,
+        });
+        return { etag };
+      },
+      async delete(key: string) {
+        objects.delete(key);
+      },
     },
   };
 }
@@ -325,6 +623,7 @@ test("Queue consumption streams decoded attachments to R2 before acknowledging",
     rawKey: "raw/2026/07/13/streaming-attachment.eml",
     mailboxId: mailboxAddress,
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -425,6 +724,7 @@ test("Queue consumption externalizes a large decoded body without losing its ful
     rawKey: "raw/2026/07/13/large-body.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -510,6 +810,7 @@ test("Queue redelivery acknowledges an already projected ingress without creatin
     rawKey: "raw/2026/07/13/already-stored.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "c".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -531,6 +832,20 @@ test("Queue redelivery acknowledges an already projected ingress without creatin
       },
       async getEmail() {
         return { id: pointer.ingressId };
+      },
+      async getInboundProjectionAuthority(authority: unknown) {
+        assert.deepEqual(authority, {
+          schemaVersion: pointer.schemaVersion,
+          ingressId: pointer.ingressId,
+          rawKey: pointer.rawKey,
+          mailboxId: pointer.mailboxId,
+          rawSize: pointer.rawSize,
+          rawSha256: pointer.rawSha256,
+          archivedAt: pointer.archivedAt,
+          etag: pointer.etag,
+          version: pointer.version,
+        });
+        return { generation: 1 };
       },
     };
     const env = {
@@ -591,6 +906,518 @@ test("Queue redelivery acknowledges an already projected ingress without creatin
   }
 });
 
+test("a late R2 archive pointer converges on the exact same-invocation direct owner without a second projection", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "late-r2-direct-owner",
+    rawKey: "raw/2026/07/17/10/00/late-r2-direct-owner.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    rawSha256: "a".repeat(64),
+    archivedAt: "2026-07-17T10:00:00.000Z",
+    etag: "late-archive-etag",
+    version: "late-archive-version",
+  };
+  const directAuthority = {
+    schemaVersion: 1,
+    ingressId: pointer.ingressId,
+    mailboxId: pointer.mailboxId,
+    rawSize: pointer.rawSize,
+    rawSha256: pointer.rawSha256,
+    receivedAt: pointer.archivedAt,
+  };
+  let acknowledged = false;
+  let createCalls = 0;
+  await processInboundMessage(
+    {
+      id: "queue-late-r2-direct-owner",
+      timestamp: new Date("2026-07-17T10:00:01.000Z"),
+      body: pointer,
+      attempts: 1,
+      ack() {
+        acknowledged = true;
+      },
+      retry() {
+        assert.fail("an exact direct owner must suppress Queue redelivery");
+      },
+    },
+    {
+      RAW_MAIL_BUCKET: {
+        async get() {
+          assert.fail("exact direct stored truth must avoid rereading late raw");
+        },
+        async put() {
+          return {};
+        },
+      },
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getInboundDeletionAuthority() {
+              return null;
+            },
+            async getInboundProjectionAuthority(authority: {
+              ingressId: string;
+              mailboxId: string;
+              rawSize: number;
+              rawSha256: string;
+              archivedAt: string;
+            }) {
+              assert.deepEqual(
+                {
+                  schemaVersion: authority.schemaVersion,
+                  ingressId: authority.ingressId,
+                  mailboxId: authority.mailboxId,
+                  rawSize: authority.rawSize,
+                  rawSha256: authority.rawSha256,
+                  receivedAt: authority.archivedAt,
+                },
+                directAuthority,
+              );
+              return { generation: 1 };
+            },
+            async getEmail() {
+              return { id: pointer.ingressId };
+            },
+            async createInboundEmail() {
+              createCalls += 1;
+              assert.fail("late raw must not create a second authority owner");
+            },
+          };
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          assert.fail("exact direct stored truth must not emergency-forward");
+        },
+      },
+    },
+  );
+
+  assert.equal(acknowledged, true);
+  assert.equal(createCalls, 0);
+});
+
+test("a non-cancellable late raw put converges through Queue on the one direct owner", async () => {
+  const mailboxId = "hello@wiserchat.ai";
+  const rawSource = `From: sender@example.com\r\nTo: ${mailboxId}\r\n\r\nLate R2`;
+  const rawBytes = new TextEncoder().encode(rawSource);
+  const pendingRawPuts: Array<() => void> = [];
+  let lateRaw:
+    | {
+        key: string;
+        size: number;
+        etag: string;
+        version: string;
+        customMetadata?: Record<string, string>;
+      }
+    | undefined;
+  let directAuthority:
+    | {
+        schemaVersion: 1;
+        ingressId: string;
+        mailboxId: string;
+        rawSize: number;
+        rawSha256: string;
+        receivedAt: string;
+      }
+    | undefined;
+  let directCreates = 0;
+  let archiveCreates = 0;
+  let providerForwards = 0;
+  let emergencyForwards = 0;
+  let emailStored = false;
+  const mailbox = {
+    async getEmail() {
+      return emailStored ? { id: directAuthority?.ingressId } : null;
+    },
+    async findThreadBySubject() {
+      return null;
+    },
+    async getDirectInboundDeletionAuthority() {
+      return null;
+    },
+    async getDirectInboundProjectionAuthority(authority: unknown) {
+      return directAuthority &&
+        JSON.stringify(authority) === JSON.stringify(directAuthority)
+        ? { generation: 1 }
+        : null;
+    },
+    async getInboundDeletionAuthority() {
+      return null;
+    },
+    async getInboundProjectionAuthority(authority: {
+      schemaVersion: 1;
+      ingressId: string;
+      mailboxId: string;
+      rawSize: number;
+      rawSha256: string;
+      archivedAt: string;
+    }) {
+      return directAuthority &&
+        authority.schemaVersion === directAuthority.schemaVersion &&
+        authority.ingressId === directAuthority.ingressId &&
+        authority.mailboxId === directAuthority.mailboxId &&
+        authority.rawSize === directAuthority.rawSize &&
+        authority.rawSha256 === directAuthority.rawSha256 &&
+        authority.archivedAt === directAuthority.receivedAt
+        ? { generation: 1 }
+        : null;
+    },
+    async createDirectInboundEmail(command: {
+      directAuthority: NonNullable<typeof directAuthority>;
+    }) {
+      directCreates += 1;
+      directAuthority = command.directAuthority;
+      emailStored = true;
+      return { status: "stored" as const, cleanupKeys: [] };
+    },
+    async createInboundEmail() {
+      archiveCreates += 1;
+      assert.fail("late raw must not create an archive authority owner");
+    },
+  };
+  const rawBucket = {
+    async get() {
+      return null;
+    },
+    async head() {
+      return lateRaw ?? null;
+    },
+    async put(
+      key: string,
+      value: ArrayBuffer | string,
+      options?: {
+        customMetadata?: Record<string, string>;
+        sha256?: ArrayBuffer;
+      },
+    ) {
+      if (typeof value === "string") {
+        return { key, size: value.length, etag: `${key}-etag`, version: "v1" };
+      }
+      return new Promise<typeof lateRaw>((resolve) => {
+        pendingRawPuts.push(() => {
+          lateRaw = {
+            key,
+            size: value.byteLength,
+            etag: "late-direct-etag",
+            version: "late-direct-version",
+            customMetadata: options?.customMetadata,
+            ...(options?.sha256
+              ? { checksums: { sha256: options.sha256 } }
+              : {}),
+          } as typeof lateRaw;
+          resolve(lateRaw);
+        });
+      });
+    },
+    async delete() {},
+  };
+  const mailboxNamespace = {
+    idFromName(value: string) {
+      return value;
+    },
+    get() {
+      return mailbox;
+    },
+  };
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxId,
+      rawSize: rawBytes.byteLength,
+      raw: new ReadableStream({
+        start(controller) {
+          controller.enqueue(rawBytes);
+          controller.close();
+        },
+      }),
+      async forward() {
+        providerForwards += 1;
+        return { messageId: "must-not-forward" };
+      },
+      setReject(reason: string) {
+        assert.fail(`late R2 direct fallback must not reject: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {},
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: rawBucket,
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("raw archival had not completed during ingress");
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          emergencyForwards += 1;
+        },
+      },
+      MAILBOX: mailboxNamespace,
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-17T10:00:00.000Z"),
+      randomUUID: () => "late-r2-direct-integrated",
+      infrastructureTimeoutMs: 1,
+      sleep: () => Promise.resolve(),
+      async digestSha256(value: ArrayBuffer) {
+        return Uint8Array.from(
+          createHash("sha256").update(new Uint8Array(value)).digest(),
+        ).buffer;
+      },
+    },
+  );
+
+  assert.equal(pendingRawPuts.length, 10);
+  assert.equal(directCreates, 1);
+  assert.equal(archiveCreates, 0);
+  assert.equal(providerForwards, 0);
+  pendingRawPuts[0]?.();
+  await Promise.resolve();
+  assert.ok(lateRaw);
+  assert.ok(directAuthority);
+  const lateMetadata = lateRaw.customMetadata;
+  assert.ok(lateMetadata);
+  const pointer: InboundArchivePointer = {
+    schemaVersion: Number(lateMetadata.schemaVersion) as 1,
+    ingressId: String(lateMetadata.ingressId),
+    rawKey: lateRaw.key,
+    mailboxId: String(lateMetadata.mailboxId),
+    rawSize: Number(lateMetadata.rawSize),
+    rawSha256: String(lateMetadata.rawSha256),
+    archivedAt: String(lateMetadata.archivedAt),
+    etag: lateRaw.etag,
+    version: lateRaw.version,
+  };
+  assert.equal(pointer.rawSize, lateRaw.size);
+  assert.deepEqual(
+    {
+      schemaVersion: pointer.schemaVersion,
+      ingressId: pointer.ingressId,
+      mailboxId: pointer.mailboxId,
+      rawSize: pointer.rawSize,
+      rawSha256: pointer.rawSha256,
+      receivedAt: pointer.archivedAt,
+    },
+    directAuthority,
+  );
+  let acknowledged = false;
+  await processInboundMessage(
+    {
+      id: "late-r2-reconciliation-queue",
+      timestamp: new Date("2026-07-17T10:00:01.000Z"),
+      body: pointer,
+      attempts: 1,
+      ack() {
+        acknowledged = true;
+      },
+      retry() {
+        assert.fail("late raw must converge on direct authority");
+      },
+    },
+    {
+      DB: mailboxDb(),
+      RAW_MAIL_BUCKET: rawBucket,
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: mailboxNamespace,
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          emergencyForwards += 1;
+        },
+      },
+    },
+  );
+
+  assert.equal(acknowledged, true);
+  assert.equal(directCreates, 1);
+  assert.equal(archiveCreates, 0);
+  assert.equal(providerForwards, 0);
+  assert.equal(emergencyForwards, 0);
+});
+
+test("a late R2 archive pointer remains deleted when the exact direct deletion owner exists", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "late-r2-direct-deleted",
+    rawKey: "raw/2026/07/17/10/00/late-r2-direct-deleted.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    rawSha256: "a".repeat(64),
+    archivedAt: "2026-07-17T10:00:00.000Z",
+    etag: "late-archive-etag",
+    version: "late-archive-version",
+  };
+  let acknowledged = false;
+  await processInboundMessage(
+    {
+      id: "queue-late-r2-direct-deleted",
+      timestamp: new Date("2026-07-17T10:00:01.000Z"),
+      body: pointer,
+      attempts: 1,
+      ack() {
+        acknowledged = true;
+      },
+      retry() {
+        assert.fail("an exact direct deletion must suppress Queue redelivery");
+      },
+    },
+    {
+      RAW_MAIL_BUCKET: {
+        async get() {
+          assert.fail("exact direct deletion must avoid rereading late raw");
+        },
+        async put() {
+          return {};
+        },
+      },
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getInboundDeletionAuthority() {
+              return {
+                generation: 2,
+                deletedAt: "2026-07-17T10:00:00.500Z",
+              };
+            },
+            async getInboundProjectionAuthority() {
+              assert.fail("exact deletion must be checked first");
+            },
+            async getEmail() {
+              return null;
+            },
+          };
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          assert.fail("exact direct deletion must not emergency-forward");
+        },
+      },
+    },
+  );
+
+  assert.equal(acknowledged, true);
+});
+
+test("an unrelated same-ID email cannot mint a stored Queue receipt without exact projection authority", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "queue-unrelated-collision",
+    rawKey: "raw/2026/07/17/10/00/queue-unrelated-collision.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    rawSha256: "a".repeat(64),
+    archivedAt: "2026-07-17T10:00:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  let acknowledged = false;
+  let retried = false;
+  let emergencyForwards = 0;
+  let storedReceiptWrites = 0;
+  await processInboundMessage(
+    {
+      id: "queue-unrelated-collision-delivery",
+      timestamp: new Date("2026-07-17T10:00:01.000Z"),
+      body: pointer,
+      attempts: 1,
+      ack() {
+        acknowledged = true;
+      },
+      retry() {
+        retried = true;
+      },
+    },
+    {
+      RAW_MAIL_BUCKET: {
+        async get() {
+          return null;
+        },
+        async put(_key: string, value: string) {
+          if (JSON.parse(value).state === "stored") storedReceiptWrites += 1;
+          return {};
+        },
+      },
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getInboundDeletionAuthority() {
+              return null;
+            },
+            async getInboundProjectionAuthority() {
+              return null;
+            },
+            async getEmail() {
+              return { id: pointer.ingressId };
+            },
+            async createInboundEmail() {
+              assert.fail("an unrelated collision must not project");
+            },
+          };
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          emergencyForwards += 1;
+        },
+      },
+    },
+  );
+
+  assert.equal(acknowledged, false);
+  assert.equal(retried, true);
+  assert.equal(emergencyForwards, 1);
+  assert.equal(storedReceiptWrites, 0);
+});
+
 test("Queue redelivery honors a durable user-deletion tombstone", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
@@ -598,6 +1425,7 @@ test("Queue redelivery honors a durable user-deletion tombstone", async () => {
     rawKey: "raw/2026/07/13/deleted-inbound.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "d".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -649,6 +1477,12 @@ test("Queue redelivery honors a durable user-deletion tombstone", async () => {
             async isEmailDeleted() {
               return true;
             },
+            async getInboundDeletionAuthority() {
+              return {
+                generation: 2,
+                deletedAt: "2026-07-13T09:30:30.000Z",
+              };
+            },
             async getEmail() {
               return null;
             },
@@ -683,15 +1517,26 @@ test("Queue projection cannot resurrect an email deleted after the initial idemp
     rawKey: "raw/2026/07/13/tombstone-race.eml",
     mailboxId: mailboxAddress,
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
   };
   let acknowledged = false;
   let receiptState: string | undefined;
+  let deletionAuthorityReads = 0;
   const mailbox = {
     async isEmailDeleted() {
       return false;
+    },
+    async getInboundDeletionAuthority() {
+      deletionAuthorityReads += 1;
+      return deletionAuthorityReads >= 2
+        ? {
+            generation: 2,
+            deletedAt: "2026-07-13T09:30:30.000Z",
+          }
+        : null;
     },
     async getEmail() {
       return null;
@@ -764,6 +1609,7 @@ test("Queue consumption resolves an ambiguous Mailbox error by stable ingress id
     rawKey: "raw/2026/07/13/ambiguous-commit.eml",
     mailboxId: mailboxAddress,
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -786,6 +1632,23 @@ test("Queue consumption resolves an ambiguous Mailbox error by stable ingress id
       },
       async getEmail() {
         return storedEmail;
+      },
+      async getInboundProjectionAuthority(authority: unknown) {
+        return storedEmail &&
+          JSON.stringify(authority) ===
+            JSON.stringify({
+              schemaVersion: pointer.schemaVersion,
+              ingressId: pointer.ingressId,
+              rawKey: pointer.rawKey,
+              mailboxId: pointer.mailboxId,
+              rawSize: pointer.rawSize,
+              rawSha256: pointer.rawSha256,
+              archivedAt: pointer.archivedAt,
+              etag: pointer.etag,
+              version: pointer.version,
+            })
+          ? { generation: 1 }
+          : null;
       },
     };
     const env = {
@@ -847,20 +1710,125 @@ test("Queue consumption resolves an ambiguous Mailbox error by stable ingress id
   }
 });
 
-test("Queue consumption quarantines an unparseable archive without deleting raw MIME", async () => {
+test("Queue resolves a generic lost projection response as deleted only after exact deletion authority appears", async () => {
+  const rawSource =
+    "From: sender@example.com\r\nTo: hello@wiserchat.ai\r\nSubject: Deleted race\r\n\r\nBody";
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "queue-generic-delete-race",
+    rawKey: "raw/2026/07/13/queue-generic-delete-race.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
+    archivedAt: "2026-07-13T09:30:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  let deleted = false;
+  let acknowledged = false;
+  let retried = false;
+  let emergencyForwards = 0;
+  let terminalReceipt: string | undefined;
+
+  await processInboundMessage(
+    {
+      id: "queue-generic-delete-race-delivery",
+      timestamp: new Date("2026-07-13T09:31:00.000Z"),
+      body: pointer,
+      attempts: 1,
+      ack() {
+        acknowledged = true;
+      },
+      retry() {
+        retried = true;
+      },
+    },
+    {
+      RAW_MAIL_BUCKET: {
+        async get() {
+          return archivedEmail(pointer.rawKey, rawSource, pointer);
+        },
+        async put(_key: string, value: string) {
+          terminalReceipt = JSON.parse(value).state;
+          return {};
+        },
+      },
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getInboundDeletionAuthority() {
+              return deleted
+                ? {
+                    generation: 2,
+                    deletedAt: "2026-07-13T09:30:30.000Z",
+                  }
+                : null;
+            },
+            async getInboundProjectionAuthority() {
+              return null;
+            },
+            async getEmail() {
+              return null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail() {
+              deleted = true;
+              throw new Error(
+                "simulated generic response loss after commit and delete",
+              );
+            },
+          };
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          emergencyForwards += 1;
+        },
+      },
+    },
+  );
+
+  assert.equal(deleted, true);
+  assert.equal(terminalReceipt, "deleted");
+  assert.equal(acknowledged, true);
+  assert.equal(retried, false);
+  assert.equal(emergencyForwards, 0);
+});
+
+test("Queue consumption automatically forwards an unparseable archive without deleting raw MIME", async () => {
   const rawSource = "not parseable in this test";
+  const rawSha256 = createHash("sha256").update(rawSource).digest("hex");
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "parse-failure",
     rawKey: "raw/2026/07/13/parse-failure.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256,
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
   };
   let acknowledged = false;
   let receipt: Record<string, unknown> | undefined;
+  const forwarded: unknown[] = [];
+  const sidecars = new Map<
+    string,
+    { value: string; etag: string; customMetadata?: Record<string, string> }
+  >();
+  let sidecarRevision = 0;
   const errors: Array<{ message: string; fields?: Record<string, unknown> }> =
     [];
   const originalConsoleError = console.error;
@@ -881,13 +1849,55 @@ test("Queue consumption quarantines an unparseable archive without deleting raw 
     };
     const env = {
       RAW_MAIL_BUCKET: {
-        async get() {
-          return archivedEmail(pointer.rawKey, rawSource, pointer);
+        async get(key: string) {
+          if (key === pointer.rawKey) {
+            return archivedEmail(pointer.rawKey, rawSource, pointer);
+          }
+          const stored = sidecars.get(key);
+          return stored
+            ? {
+                key,
+                etag: stored.etag,
+                customMetadata: stored.customMetadata,
+                async text() {
+                  return stored.value;
+                },
+              }
+            : null;
         },
-        async put(key: string, value: string) {
-          assert.equal(key, `receipts/${pointer.ingressId}.json`);
-          receipt = JSON.parse(value);
-          return {};
+        async head(key: string) {
+          const stored = sidecars.get(key);
+          return stored
+            ? { etag: stored.etag, customMetadata: stored.customMetadata }
+            : null;
+        },
+        async put(
+          key: string,
+          value: string,
+          options?: {
+            customMetadata?: Record<string, string>;
+            onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+          },
+        ) {
+          const current = sidecars.get(key);
+          if (options?.onlyIf?.etagDoesNotMatch === "*" && current) return null;
+          if (
+            options?.onlyIf?.etagMatches &&
+            options.onlyIf.etagMatches !== current?.etag
+          ) {
+            return null;
+          }
+          if (key === `receipts/${pointer.ingressId}.json`) {
+            receipt = JSON.parse(value);
+          }
+          sidecarRevision += 1;
+          const etag = `sidecar-${sidecarRevision}`;
+          sidecars.set(key, {
+            value,
+            etag,
+            customMetadata: options?.customMetadata,
+          });
+          return { etag };
         },
         async delete(key: string) {
           assert.equal(
@@ -912,7 +1922,13 @@ test("Queue consumption quarantines an unparseable archive without deleting raw 
           return mailbox;
         },
       },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send(value: unknown) {
+          forwarded.push(value);
+        },
+      },
     };
+    let retried = false;
     const message = {
       id: "queue-message-parse-failure",
       timestamp: new Date("2026-07-13T09:31:00.000Z"),
@@ -922,9 +1938,7 @@ test("Queue consumption quarantines an unparseable archive without deleting raw 
         acknowledged = true;
       },
       retry() {
-        assert.fail(
-          "deterministic parse failure must quarantine instead of retrying",
-        );
+        retried = true;
       },
     };
 
@@ -935,31 +1949,27 @@ test("Queue consumption quarantines an unparseable archive without deleting raw 
       now: () => new Date("2026-07-13T09:31:00.000Z"),
     });
 
-    assert.equal(acknowledged, true);
+    assert.equal(acknowledged, false);
+    assert.equal(retried, true);
     assert.deepEqual(receipt, {
       ...pointer,
-      state: "quarantined",
+      state: "forward_pending",
       updatedAt: "2026-07-13T09:31:00.000Z",
       errorCode: "MIME_PARSE_FAILED",
     });
-    assert.deepEqual(errors, [
-      {
-        message: "[mail-projection] quarantined",
-        fields: {
-          attempt: 1,
-          durationMs: 0,
-          errorCode: "MIME_PARSE_FAILED",
-          ingressRef: errors[0]?.fields?.ingressRef,
-          objectRef: errors[0]?.fields?.objectRef,
-          operation: "mime_parse",
-          queueRef: errors[0]?.fields?.queueRef,
-          status: "quarantined",
-        },
-      },
+    assert.deepEqual(forwarded, [
+      { schemaVersion: 1, pointer, generation: 1 },
     ]);
-    assertTelemetryRef(errors[0]?.fields?.ingressRef);
-    assertTelemetryRef(errors[0]?.fields?.objectRef);
-    assertTelemetryRef(errors[0]?.fields?.queueRef);
+    const forwardError = errors.find(
+      ({ message }) => message === "[mail-projection] emergency forward pending",
+    );
+    assert.ok(forwardError);
+    assert.equal(forwardError.fields?.errorCode, "MIME_PARSE_FAILED");
+    assert.equal(forwardError.fields?.operation, "mime_parse");
+    assert.equal(forwardError.fields?.status, "forward_pending");
+    assertTelemetryRef(forwardError.fields?.ingressRef);
+    assertTelemetryRef(forwardError.fields?.objectRef);
+    assertTelemetryRef(forwardError.fields?.queueRef);
     assert.doesNotMatch(
       JSON.stringify(errors),
       /simulated malformed MIME|queue-message-parse-failure|parse-failure\.eml|hello@wiserchat\.ai/,
@@ -984,6 +1994,7 @@ test("Queue consumption projects a newline-free MIME body above 64 KiB", async (
     rawKey: "raw/2026/07/13/mime-line-limit.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1054,31 +2065,23 @@ test("Queue consumption projects a newline-free MIME body above 64 KiB", async (
   assert.equal(acknowledged, true);
 });
 
-test("Queue consumption quarantines an archive when its Mailbox no longer exists", async () => {
+test("Queue consumption establishes emergency authority when its Mailbox marker disappears", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "missing-mailbox",
     rawKey: "raw/2026/07/13/missing-mailbox.eml",
     mailboxId: "removed@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "a".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
   };
   let acknowledged = false;
-  let receipt: Record<string, unknown> | undefined;
+  const sidecars = emergencySidecarStore();
+  const emergencyQueue: unknown[] = [];
   const env = {
-    RAW_MAIL_BUCKET: {
-      async get() {
-        assert.fail(
-          "a removed Mailbox should quarantine from durable metadata alone",
-        );
-      },
-      async put(_key: string, value: string) {
-        receipt = JSON.parse(value);
-        return {};
-      },
-    },
+    RAW_MAIL_BUCKET: sidecars.bucket,
     BUCKET: {
       async head(key: string) {
         assert.equal(key, `mailboxes/${pointer.mailboxId}.json`);
@@ -1095,7 +2098,11 @@ test("Queue consumption quarantines an archive when its Mailbox no longer exists
         assert.fail("a removed Mailbox must not resolve a Durable Object");
       },
     },
+    EMERGENCY_FORWARD_QUEUE: {
+      async send(value: unknown) { emergencyQueue.push(value); },
+    },
   };
+  let retried = false;
   const message = {
     id: "queue-message-missing-mailbox",
     timestamp: new Date("2026-07-13T09:31:00.000Z"),
@@ -1105,22 +2112,26 @@ test("Queue consumption quarantines an archive when its Mailbox no longer exists
       acknowledged = true;
     },
     retry() {
-      assert.fail(
-        "a removed Mailbox is a quarantine outcome, not a retry storm",
-      );
+      retried = true;
     },
   };
 
   await processInboundMessage(message, env, {
     parse() {
-      assert.fail("a removed Mailbox must quarantine before parsing");
+      assert.fail("a missing Mailbox marker must hand off before parsing");
     },
     now: () => new Date("2026-07-13T09:31:00.000Z"),
   });
 
-  assert.equal(acknowledged, true);
-  assert.equal(receipt?.state, "quarantined");
-  assert.equal(receipt?.errorCode, "MAILBOX_UNAVAILABLE");
+  assert.equal(acknowledged, false);
+  assert.equal(retried, true);
+  assert.equal(emergencyQueue.length, 1);
+  assert.equal(
+    JSON.parse(
+      sidecars.objects.get(`receipts/${pointer.ingressId}.json`)?.value ?? "null",
+    ).state,
+    "forward_pending",
+  );
 });
 
 test("Queue consumption records and schedules a bounded retry when the raw archive cannot be read", async () => {
@@ -1130,6 +2141,7 @@ test("Queue consumption records and schedules a bounded retry when the raw archi
     rawKey: "raw/2026/07/13/raw-read-retry.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "a".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1193,20 +2205,168 @@ test("Queue consumption records and schedules a bounded retry when the raw archi
     now: () => new Date("2026-07-13T09:31:00.000Z"),
   });
 
-  assert.equal(receipt?.state, "retrying");
-  assert.equal(receipt?.errorCode, "RAW_ARCHIVE_READ_FAILED");
-  assert.equal(receipt?.attempt, 2);
-  assert.equal(retryDelay, 4);
+  assert.equal(receipt?.state, "forward_pending");
+  assert.equal(receipt?.errorCode, "QUEUE_RETRY_EXHAUSTED");
+  assert.equal(retryDelay, 300);
   assert.equal(acknowledged, false);
 });
 
-test("Queue delivery acknowledges a terminal receipt before touching projection dependencies", async () => {
+test("scheduled retry establishes emergency authority before any diagnostic receipt write can throw or hang", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "authority-before-retry-evidence",
+    rawKey:
+      "raw/2026/07/13/09/31/authority-before-retry-evidence.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    rawSha256: "e".repeat(64),
+    archivedAt: "2026-07-13T09:31:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+
+  for (const poison of ["throw", "hang"] as const) {
+    const sidecars = emergencySidecarStore();
+    const receiptKey = `receipts/${pointer.ingressId}.json`;
+    await sidecars.bucket.put(
+      receiptKey,
+      JSON.stringify({
+        ...pointer,
+        state: "enqueued",
+        updatedAt: "2026-07-13T09:31:00.000Z",
+      }),
+      { customMetadata: { state: "enqueued" } },
+    );
+    const authorityEvents: string[] = [];
+    let diagnosticReceiptWrites = 0;
+    const rawBucket = {
+      ...sidecars.bucket,
+      async get(key: string) {
+        if (key === pointer.rawKey) return null;
+        return sidecars.bucket.get(key);
+      },
+      async put(
+        key: string,
+        value: string,
+        options?: Parameters<typeof sidecars.bucket.put>[2],
+      ) {
+        const body = JSON.parse(value) as { state?: string };
+        if (
+          key === receiptKey &&
+          (body.state === "retrying" ||
+            body.state === "dead_letter_pending")
+        ) {
+          diagnosticReceiptWrites += 1;
+          if (poison === "throw") {
+            throw new Error("diagnostic receipt write failed");
+          }
+          return new Promise<never>(() => undefined);
+        }
+        if (key.startsWith("system/emergency-forward/active/")) {
+          authorityEvents.push("marker");
+        }
+        if (key === receiptKey && body.state === "forward_pending") {
+          authorityEvents.push("forward_pending");
+        }
+        return sidecars.bucket.put(key, value, options);
+      },
+    };
+    const actions: string[] = [];
+    const work = processInboundMessageProduction(
+      {
+        id: `queue-authority-before-evidence-${poison}`,
+        timestamp: new Date("2026-07-13T09:31:00.000Z"),
+        body: pointer,
+        attempts: 2,
+        ack() {
+          actions.push("ack");
+        },
+        retry(options) {
+          actions.push(`retry:${options?.delaySeconds ?? 0}`);
+        },
+      },
+      {
+        DB: mailboxDb(),
+        RAW_MAIL_BUCKET: rawBucket,
+        BUCKET: {
+          async head() {
+            return {};
+          },
+          async put() {},
+          async delete() {},
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            return {
+              async getInboundDeletionAuthority() {
+                return null;
+              },
+              async getInboundProjectionAuthority() {
+                return null;
+              },
+              async isEmailDeleted() {
+                return false;
+              },
+              async getEmail() {
+                return null;
+              },
+            };
+          },
+        },
+        EMERGENCY_FORWARD_QUEUE: {
+          async send() {
+            authorityEvents.push("emergency_queue");
+          },
+        },
+      },
+      {
+        now: () => new Date("2026-07-13T09:31:00.000Z"),
+      },
+    );
+
+    await assert.doesNotReject(
+      Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `${poison} diagnostic receipt path blocked emergency authority`,
+                ),
+              ),
+            100,
+          );
+        }),
+      ]),
+    );
+    assert.equal(diagnosticReceiptWrites, 0, poison);
+    assert.deepEqual(actions, ["retry:300"], poison);
+    assert.equal(authorityEvents[0], "marker", poison);
+    assert.ok(
+      authorityEvents.indexOf("forward_pending") >
+        authorityEvents.indexOf("marker"),
+      poison,
+    );
+    assert.ok(
+      authorityEvents.indexOf("emergency_queue") >
+        authorityEvents.indexOf("forward_pending"),
+      poison,
+    );
+  }
+});
+
+test("Queue delivery acknowledges an exact stored receipt only after Mailbox truth confirms it", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "terminal-receipt-race",
     rawKey: "raw/2026/07/13/terminal-receipt-race.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "a".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1216,8 +2376,20 @@ test("Queue delivery acknowledges a terminal receipt before touching projection 
   let markerCleanupAttempted = false;
   const env = {
     RAW_MAIL_BUCKET: {
-      async get() {
-        assert.fail("mailbox marker failure must occur before the raw read");
+      async get(key: string) {
+        assert.equal(key, `receipts/${pointer.ingressId}.json`);
+        return {
+          key,
+          etag: "stored-etag",
+          customMetadata: { state: "stored" },
+          async text() {
+            return JSON.stringify({
+              ...pointer,
+              state: "stored",
+              updatedAt: "2026-07-13T09:31:00.000Z",
+            });
+          },
+        };
       },
       async head(key: string) {
         assert.equal(key, `receipts/${pointer.ingressId}.json`);
@@ -1243,11 +2415,21 @@ test("Queue delivery acknowledges a terminal receipt before touching projection 
       async delete() {},
     },
     MAILBOX: {
-      idFromName() {
-        assert.fail("marker failure must precede Mailbox resolution");
+      idFromName(mailboxId: string) {
+        return mailboxId;
       },
       get() {
-        assert.fail("marker failure must precede Mailbox resolution");
+        return {
+          async isEmailDeleted() {
+            return false;
+          },
+          async getEmail() {
+            return { id: pointer.ingressId };
+          },
+          async getInboundProjectionAuthority() {
+            return { generation: 1 };
+          },
+        };
       },
     },
   };
@@ -1279,6 +2461,88 @@ test("Queue delivery acknowledges a terminal receipt before touching projection 
   assert.equal(markerCleanupAttempted, true);
 });
 
+test("an exact stored receipt without Mailbox truth retries without clearing recovery authority", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "stored-receipt-missing-mailbox-truth",
+    rawKey:
+      "raw/2026/07/13/10/00/stored-receipt-missing-mailbox-truth.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    archivedAt: "2026-07-13T10:00:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  let acknowledged = false;
+  let retried = false;
+  let markerDeleted = false;
+
+  await processInboundMessage(
+    {
+      id: "stored-receipt-missing-mailbox-truth-message",
+      timestamp: new Date("2026-07-13T10:01:00.000Z"),
+      body: pointer,
+      attempts: 2,
+      ack() {
+        acknowledged = true;
+      },
+      retry() {
+        retried = true;
+      },
+    },
+    {
+      RAW_MAIL_BUCKET: {
+        async get(key: string) {
+          return {
+            key,
+            etag: "stored-etag",
+            customMetadata: { state: "stored" },
+            async text() {
+              return JSON.stringify({
+                ...pointer,
+                state: "stored",
+                updatedAt: "2026-07-13T10:00:30.000Z",
+              });
+            },
+          };
+        },
+        async put() {
+          assert.fail("unproven terminal truth must not mutate the receipt");
+        },
+        async delete() {
+          markerDeleted = true;
+        },
+      },
+      BUCKET: {
+        async head() {
+          assert.fail("unproven terminal truth must retry before projection");
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async isEmailDeleted() {
+              return false;
+            },
+            async getEmail() {
+              return null;
+            },
+          };
+        },
+      },
+    },
+  );
+
+  assert.equal(acknowledged, false);
+  assert.equal(retried, true);
+  assert.equal(markerDeleted, false);
+});
+
 test("Queue consumption retries when the Mailbox marker cannot be read", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
@@ -1286,6 +2550,7 @@ test("Queue consumption retries when the Mailbox marker cannot be read", async (
     rawKey: "raw/2026/07/13/marker-read-retry.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "c".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1345,8 +2610,8 @@ test("Queue consumption retries when the Mailbox marker cannot be read", async (
 
   assert.equal(retried, true);
   assert.equal(acknowledged, false);
-  assert.equal(receipt?.state, "retrying");
-  assert.equal(receipt?.errorCode, "MAILBOX_MARKER_READ_FAILED");
+  assert.equal(receipt?.state, "forward_pending");
+  assert.equal(receipt?.errorCode, "QUEUE_RETRY_EXHAUSTED");
 });
 
 test("Queue consumption quarantines a same-size archive whose checksum does not match its pointer", async () => {
@@ -1438,6 +2703,7 @@ test("Queue consumption retries a Mailbox projection failure that cannot be prov
     rawKey: "raw/2026/07/13/mailbox-retry.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1500,20 +2766,21 @@ test("Queue consumption retries a Mailbox projection failure that cannot be prov
     now: () => new Date("2026-07-13T09:31:00.000Z"),
   });
 
-  assert.equal(receipt?.state, "retrying");
-  assert.equal(receipt?.errorCode, "MAILBOX_PROJECTION_FAILED");
-  assert.equal(receipt?.attempt, 3);
-  assert.equal(retryDelay, 8);
+  assert.equal(receipt?.state, "forward_pending");
+  assert.equal(receipt?.errorCode, "QUEUE_RETRY_EXHAUSTED");
+  assert.equal("attempt" in (receipt ?? {}), false);
+  assert.equal(retryDelay, 300);
   assert.equal(acknowledged, false);
 });
 
-test("Queue consumption records dead-letter intent on the final configured attempt", async () => {
+test("Queue consumption establishes emergency authority on the final configured attempt", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "dead-letter-intent",
     rawKey: "raw/2026/07/13/dead-letter-intent.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "f".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1577,12 +2844,12 @@ test("Queue consumption records dead-letter intent on the final configured attem
 
   assert.equal(retried, true);
   assert.equal(acknowledged, false);
-  assert.equal(receipt?.state, "dead_letter_pending");
-  assert.equal(receipt?.errorCode, "RAW_ARCHIVE_READ_FAILED");
-  assert.equal(receipt?.attempt, 11);
+  assert.equal(receipt?.state, "forward_pending");
+  assert.equal(receipt?.errorCode, "QUEUE_RETRY_EXHAUSTED");
+  assert.equal("attempt" in (receipt ?? {}), false);
 });
 
-test("Queue consumption acknowledges a stored Message even when its receipt sidecar write fails", async () => {
+test("Queue consumption retains a stored Message when its exact receipt cannot commit", async () => {
   const rawSource =
     "From: sender@example.com\r\nTo: hello@wiserchat.ai\r\nSubject: Stored\r\n\r\nBody";
   const pointer: InboundArchivePointer = {
@@ -1591,6 +2858,7 @@ test("Queue consumption acknowledges a stored Message even when its receipt side
     rawKey: "raw/2026/07/13/receipt-write-failure.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1661,11 +2929,8 @@ test("Queue consumption acknowledges a stored Message even when its receipt side
     });
 
     assert.equal(stored?.id, pointer.ingressId);
-    assert.equal(acknowledged, true);
-    assert.equal(retried, false);
-    assert.equal(errors.length, 1);
-    assert.equal(errors[0].fields?.errorCode, "RECEIPT_WRITE_FAILED");
-    assert.equal(errors[0].fields?.status, "degraded");
+    assert.equal(acknowledged, false);
+    assert.equal(retried, true);
   } finally {
     console.error = originalConsoleError;
   }
@@ -1685,6 +2950,7 @@ test("Queue consumption includes branded push work in the atomic Mailbox project
     rawKey: "raw/2026/07/13/branded-push.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1770,6 +3036,7 @@ test("Queue duplicate resolution stays inside the atomic Mailbox projection", as
     rawKey: "raw/2026/07/13/push-claim-loser.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: new TextEncoder().encode(rawSource).byteLength,
+    rawSha256: createHash("sha256").update(rawSource).digest("hex"),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -1844,15 +3111,15 @@ test("Queue duplicate resolution stays inside the atomic Mailbox projection", as
 
 for (const testCase of [
   {
-    name: "rejects an inactive mailbox before reading raw MIME",
+    name: "forwards an inactive mailbox after SMTP acceptance",
     dbState: "inactive" as const,
-    expectedReceipt: "rejected",
-    expectedAction: "ack" as const,
+    expectedReceipt: "forward_pending",
+    expectedAction: "retry" as const,
   },
   {
     name: "retries when the active mailbox lookup is transiently unavailable",
     dbState: "unavailable" as const,
-    expectedReceipt: "retrying",
+    expectedReceipt: "forward_pending",
     expectedAction: "retry" as const,
   },
 ]) {
@@ -1863,6 +3130,7 @@ for (const testCase of [
       rawKey: `raw/2026/07/15/d1-${testCase.dbState}.eml`,
       mailboxId: "hello@wiserchat.ai",
       rawSize: 100,
+      rawSha256: "a".repeat(64),
       archivedAt: "2026-07-15T10:00:00.000Z",
       etag: "archive-etag",
       version: "archive-version",
@@ -1920,15 +3188,15 @@ for (const testCase of [
 
 for (const testCase of [
   {
-    name: "rejects when the mailbox becomes inactive at the pre-projection recheck",
+    name: "forwards when the mailbox becomes inactive at the pre-projection recheck",
     secondCheck: "inactive" as const,
-    expectedReceipt: "rejected",
-    expectedAction: "ack" as const,
+    expectedReceipt: "forward_pending",
+    expectedAction: "retry" as const,
   },
   {
     name: "retries when the pre-projection active lookup becomes unavailable",
     secondCheck: "unavailable" as const,
-    expectedReceipt: "retrying",
+    expectedReceipt: "forward_pending",
     expectedAction: "retry" as const,
   },
 ]) {
@@ -1941,6 +3209,7 @@ for (const testCase of [
       rawKey: `raw/2026/07/15/d1-recheck-${testCase.secondCheck}.eml`,
       mailboxId: "hello@wiserchat.ai",
       rawSize: new TextEncoder().encode(rawSource).byteLength,
+      rawSha256: createHash("sha256").update(rawSource).digest("hex"),
       archivedAt: "2026-07-15T10:00:00.000Z",
       etag: "archive-etag",
       version: "archive-version",
@@ -2027,7 +3296,7 @@ for (const testCase of [
     );
 
     assert.equal(activeChecks, 2);
-    assert.equal(rawReads, 1);
+    assert.equal(rawReads, 2);
     assert.equal(receiptState, testCase.expectedReceipt);
     assert.equal(action, testCase.expectedAction);
   });
@@ -2158,13 +3427,242 @@ test("DLQ batch quarantine persists only a bounded pointer classification", asyn
   });
 });
 
-test("DLQ consumption records a terminal dead-letter receipt before acknowledging", async () => {
+test("Queue batch isolates a hung first delivery while a healthy second delivery completes", async () => {
+  const pointer: InboundArchivePointer = {
+    schemaVersion: 1,
+    ingressId: "queue-hung-first",
+    rawKey: "raw/2026/07/13/09/31/queue-hung-first.eml",
+    mailboxId: "hello@wiserchat.ai",
+    rawSize: 100,
+    rawSha256: "d".repeat(64),
+    archivedAt: "2026-07-13T09:31:00.000Z",
+    etag: "archive-etag",
+    version: "archive-version",
+  };
+  const sidecars = emergencySidecarStore();
+  const receiptKey = `receipts/${pointer.ingressId}.json`;
+  await sidecars.bucket.put(
+    receiptKey,
+    JSON.stringify({
+      ...pointer,
+      state: "enqueued",
+      updatedAt: "2026-07-13T09:31:00.000Z",
+    }),
+    { customMetadata: { state: "enqueued" } },
+  );
+  const initialReceipt = await sidecars.bucket.get(receiptKey);
+  assert.ok(initialReceipt);
+
+  let releaseReceiptRead: (() => void) | undefined;
+  let receiptReads = 0;
+  const rawBucket = {
+    ...sidecars.bucket,
+    async get(key: string) {
+      if (key === receiptKey) {
+        receiptReads += 1;
+        if (receiptReads === 1) {
+          await new Promise<void>((resolve) => {
+            releaseReceiptRead = resolve;
+          });
+          return initialReceipt;
+        }
+      }
+      return sidecars.bucket.get(key);
+    },
+  };
+  const scheduler = manualDeadlineScheduler();
+  const firstActions: string[] = [];
+  const secondActions: string[] = [];
+  const emergencyQueue: unknown[] = [];
+  const work = processInboundBatch(
+    {
+      messages: [
+        {
+          id: "queue-hung-first-message",
+          timestamp: new Date("2026-07-13T09:31:00.000Z"),
+          body: pointer,
+          attempts: 1,
+          ack() {
+            firstActions.push("ack");
+          },
+          retry(options) {
+            firstActions.push(`retry:${options?.delaySeconds ?? 0}`);
+          },
+        },
+        {
+          id: "queue-healthy-second-message",
+          timestamp: new Date("2026-07-13T09:31:00.000Z"),
+          body: ["bounded-classification"],
+          attempts: 1,
+          ack() {
+            secondActions.push("ack");
+          },
+          retry(options) {
+            secondActions.push(`retry:${options?.delaySeconds ?? 0}`);
+          },
+        },
+      ],
+    },
+    {
+      DB: mailboxDb(),
+      RAW_MAIL_BUCKET: rawBucket,
+      BUCKET: {
+        async head() {
+          return null;
+        },
+        async put() {},
+        async delete() {},
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          assert.fail("the hung receipt read must expire before projection");
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send(value: unknown) {
+          emergencyQueue.push(value);
+        },
+      },
+    },
+    {
+      deadlineScheduler: scheduler,
+      infrastructureTimeoutMs: 100_000,
+      now: () => new Date("2026-07-13T09:31:00.000Z"),
+    },
+  );
+
+  await waitForCondition(
+    () => secondActions.length === 1,
+    "the healthy second Queue delivery did not complete independently",
+  );
+  assert.deepEqual(secondActions, ["ack"]);
+  assert.deepEqual(firstActions, []);
+
+  scheduler.fireDelay(60_000);
+  await work;
+
+  assert.deepEqual(firstActions, ["retry:300"]);
+  assert.deepEqual(secondActions, ["ack"]);
+  assert.deepEqual(emergencyQueue, [
+    { schemaVersion: 1, pointer, generation: 1 },
+  ]);
+
+  releaseReceiptRead?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    firstActions,
+    ["retry:300"],
+    "late work must not acknowledge or replace the timeout disposition",
+  );
+});
+
+test("DLQ batch isolates a hung invalid-pointer ledger and fences its late acknowledgement", async () => {
+  const sidecars = emergencySidecarStore();
+  const scheduler = manualDeadlineScheduler();
+  let releasePoisonPut: (() => void) | undefined;
+  const rawBucket = {
+    ...sidecars.bucket,
+    async put(
+      key: string,
+      value: string,
+      options?: Parameters<typeof sidecars.bucket.put>[2],
+    ) {
+      const classification = JSON.parse(value) as { bodyKind?: string };
+      if (classification.bodyKind === "string") {
+        await new Promise<void>((resolve) => {
+          releasePoisonPut = resolve;
+        });
+      }
+      return sidecars.bucket.put(key, value, options);
+    },
+  };
+  const firstActions: string[] = [];
+  const secondActions: string[] = [];
+  const work = processInboundDeadLetterBatch(
+    {
+      messages: [
+        {
+          id: "dlq-hung-first-message",
+          timestamp: new Date("2026-07-13T09:31:00.000Z"),
+          body: "hung-invalid-pointer",
+          attempts: 10,
+          ack() {
+            firstActions.push("ack");
+          },
+          retry(options) {
+            firstActions.push(`retry:${options?.delaySeconds ?? 0}`);
+          },
+        },
+        {
+          id: "dlq-healthy-second-message",
+          timestamp: new Date("2026-07-13T09:31:00.000Z"),
+          body: ["bounded-classification"],
+          attempts: 10,
+          ack() {
+            secondActions.push("ack");
+          },
+          retry(options) {
+            secondActions.push(`retry:${options?.delaySeconds ?? 0}`);
+          },
+        },
+      ],
+    },
+    {
+      RAW_MAIL_BUCKET: rawBucket,
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          assert.fail("invalid DLQ pointers must not resolve a Mailbox");
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          assert.fail("invalid DLQ pointers must not enter emergency delivery");
+        },
+      },
+    },
+    {
+      deadlineScheduler: scheduler,
+      now: () => new Date("2026-07-13T09:31:00.000Z"),
+    },
+  );
+
+  await waitForCondition(
+    () => secondActions.length === 1,
+    "the healthy second DLQ delivery did not complete independently",
+  );
+  assert.deepEqual(secondActions, ["ack"]);
+  assert.deepEqual(firstActions, []);
+
+  scheduler.fireDelay(15_000);
+  await work;
+  assert.deepEqual(firstActions, ["retry:30"]);
+  assert.deepEqual(secondActions, ["ack"]);
+
+  releasePoisonPut?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    firstActions,
+    ["retry:30"],
+    "late DLQ work must not acknowledge or replace the timeout disposition",
+  );
+});
+
+test("DLQ consumption records forward-pending truth and enqueues emergency delivery before acknowledging", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "dead-letter-terminal",
     rawKey: "raw/2026/07/13/dead-letter-terminal.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "a".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -2179,6 +3677,8 @@ test("DLQ consumption records a terminal dead-letter receipt before acknowledgin
       }
     | undefined;
   let acknowledged = false;
+  const emergencyQueue: unknown[] = [];
+  const sidecars = emergencySidecarStore();
   await processInboundDeadLetterBatch(
     {
       messages: [
@@ -2198,18 +3698,17 @@ test("DLQ consumption records a terminal dead-letter receipt before acknowledgin
     },
     {
       RAW_MAIL_BUCKET: {
-        async get() {
-          return null;
-        },
-        async head() {
-          return {
-            etag: "pending-etag",
-            customMetadata: { state: "dead_letter_pending" },
-          };
-        },
-        async put(_key: string, value: string) {
-          receipt = JSON.parse(value);
-          return {};
+        ...sidecars.bucket,
+        async put(
+          key: string,
+          value: string,
+          options?: Parameters<typeof sidecars.bucket.put>[2],
+        ) {
+          const written = await sidecars.bucket.put(key, value, options);
+          if (written && key === `receipts/${pointer.ingressId}.json`) {
+            receipt = JSON.parse(value);
+          }
+          return written;
         },
       },
       MAILBOX: {
@@ -2230,6 +3729,11 @@ test("DLQ consumption records a terminal dead-letter receipt before acknowledgin
           };
         },
       },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send(value: unknown) {
+          emergencyQueue.push(value);
+        },
+      },
     },
     {
       parse: (stream) => PostalMime.parse(stream),
@@ -2237,158 +3741,89 @@ test("DLQ consumption records a terminal dead-letter receipt before acknowledgin
     },
   );
 
-  assert.equal(receipt?.state, "dead_lettered");
-  assert.equal(receipt?.queueRef, "9831ba66d0fbd950");
+  assert.equal(receipt?.state, "forward_pending");
+  assert.equal(receipt?.errorCode, "QUEUE_RETRY_EXHAUSTED");
   assert.equal("queueMessageId" in (receipt ?? {}), false);
   assert.deepEqual(terminalFailure, {
     id: pointer.ingressId,
+    archiveAuthority: pointer,
     queueRef: "9831ba66d0fbd950",
     attempts: 1,
     errorCode: "QUEUE_RETRY_EXHAUSTED",
   });
+  assert.deepEqual(emergencyQueue, [
+    { schemaVersion: 1, pointer, generation: 1 },
+  ]);
   assert.equal(acknowledged, true);
 });
 
-test("DLQ consumption clears a stale active marker when terminal receipt truth already exists", async () => {
+test("DLQ forwarding authority is committed before terminal-ledger throws or hangs", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
-    ingressId: "terminal-dlq-marker",
-    rawKey: "raw/2026/07/13/10/00/terminal-dlq-marker.eml",
+    ingressId: "dead-letter-indeterminate-ledger",
+    rawKey: "raw/2026/07/13/10/00/dead-letter-indeterminate-ledger.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "c".repeat(64),
     archivedAt: "2026-07-13T10:00:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
   };
-  let acknowledged = false;
-  let deletedKey: string | undefined;
-
-  await processInboundDeadLetterBatch(
-    {
-      messages: [{
-        id: "terminal-dlq-marker-message",
-        timestamp: new Date("2026-07-13T10:01:00.000Z"),
-        body: pointer,
-        attempts: 1,
-        ack() {
-          acknowledged = true;
-        },
-        retry() {
-          assert.fail("terminal receipt truth must acknowledge the DLQ message");
-        },
-      }],
-    },
-    {
-      RAW_MAIL_BUCKET: {
-        async get() {
-          assert.fail("terminal receipt truth must not read raw MIME");
-        },
-        async head(key: string) {
-          assert.equal(key, `receipts/${pointer.ingressId}.json`);
-          return {
-            etag: "stored-etag",
-            customMetadata: { state: "stored" },
-          };
-        },
-        async put() {
-          assert.fail("terminal receipt truth must not write another receipt");
-        },
-        async delete(key: string) {
-          deletedKey = key;
-        },
-      },
-      MAILBOX: {
-        idFromName() {
-          assert.fail("terminal receipt truth must not resolve a Mailbox");
-        },
-        get() {
-          assert.fail("terminal receipt truth must not resolve a Mailbox");
-        },
-      },
-    },
-  );
-
-  assert.equal(
-    deletedKey,
-    `system/inbound-active/${encodeURIComponent(pointer.rawKey)}.json`,
-  );
-  assert.equal(acknowledged, true);
-});
-
-test("a late DLQ delivery cannot override an email that is already stored", async () => {
-  const pointer: InboundArchivePointer = {
-    schemaVersion: 1,
-    ingressId: "late-dlq-stored",
-    rawKey: "raw/2026/07/13/late-dlq-stored.eml",
-    mailboxId: "hello@wiserchat.ai",
-    rawSize: 100,
-    archivedAt: "2026-07-13T09:30:00.000Z",
-    etag: "archive-etag",
-    version: "archive-version",
-  };
-  let acknowledged = false;
-  let receiptState: string | undefined;
-
-  await processInboundDeadLetterBatch(
-    {
-      messages: [
-        {
-          id: "late-dlq-message",
-          timestamp: new Date("2026-07-13T10:00:00.000Z"),
+  for (const failure of ["throw", "hang"] as const) {
+    const sidecars = emergencySidecarStore();
+    const emergencyQueue: unknown[] = [];
+    let acknowledged = false;
+    const work = processInboundDeadLetterBatch(
+      {
+        messages: [{
+          id: `dlq-indeterminate-ledger-${failure}`,
+          timestamp: new Date("2026-07-13T10:01:00.000Z"),
           body: pointer,
           attempts: 10,
-          ack() {
-            acknowledged = true;
+          ack() { acknowledged = true; },
+          retry() { assert.fail("durable forwarding authority must acknowledge"); },
+        }],
+      },
+      {
+        RAW_MAIL_BUCKET: sidecars.bucket,
+        MAILBOX: {
+          idFromName(mailboxId: string) { return mailboxId; },
+          get() {
+            return {
+              recordInboundTerminalFailure() {
+                if (failure === "throw") throw new Error("ledger unavailable");
+                return new Promise<never>(() => {});
+              },
+            };
           },
-          retry() {
-            assert.fail(
-              "a stored projection must terminally suppress late DLQ work",
-            );
-          },
         },
-      ],
-    },
-    {
-      RAW_MAIL_BUCKET: {
-        async get() {
-          return null;
-        },
-        async head() {
-          return {
-            etag: "pending-etag",
-            customMetadata: { state: "dead_letter_pending" },
-          };
-        },
-        async put(_key: string, value: string) {
-          receiptState = JSON.parse(value).state;
-          return {};
+        EMERGENCY_FORWARD_QUEUE: {
+          async send(value: unknown) { emergencyQueue.push(value); },
         },
       },
-      MAILBOX: {
-        idFromName(mailboxId: string) {
-          return mailboxId;
-        },
-        get() {
-          return {
-            async isEmailDeleted() {
-              return false;
-            },
-            async getEmail() {
-              return { id: pointer.ingressId };
-            },
-            async recordInboundTerminalFailure() {
-              assert.fail(
-                "a successful projection must not gain a failure ledger",
-              );
-            },
-          };
-        },
+      {
+        now: () => new Date("2026-07-13T10:01:00.000Z"),
+        infrastructureTimeoutMs: 1,
       },
-    },
-  );
-
-  assert.equal(receiptState, "stored");
-  assert.equal(acknowledged, true);
+    );
+    await assert.doesNotReject(
+      Promise.race([
+        work,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${failure} ledger blocked forwarding`)), 40),
+        ),
+      ]),
+    );
+    assert.equal(acknowledged, true, failure);
+    assert.equal(emergencyQueue.length, 1, failure);
+    assert.equal(
+      JSON.parse(
+        sidecars.objects.get(`receipts/${pointer.ingressId}.json`)?.value ?? "null",
+      ).state,
+      "forward_pending",
+      failure,
+    );
+  }
 });
 
 test("a delayed DLQ delivery does not acknowledge a stale pending receipt when terminal evidence cannot commit", async () => {
@@ -2398,6 +3833,7 @@ test("a delayed DLQ delivery does not acknowledge a stale pending receipt when t
     rawKey: "raw/2026/07/13/dead-letter-write-race.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "b".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
@@ -2408,9 +3844,9 @@ test("a delayed DLQ delivery does not acknowledge a stale pending receipt when t
   };
   let headCalls = 0;
   let acknowledged = false;
+  let retryDelay: number | undefined;
   let attemptedReceipt: Record<string, unknown> | undefined;
-  await assert.rejects(
-    processInboundDeadLetterBatch(
+  await processInboundDeadLetterBatch(
       {
         messages: [
           {
@@ -2421,7 +3857,9 @@ test("a delayed DLQ delivery does not acknowledge a stale pending receipt when t
             ack() {
               acknowledged = true;
             },
-            retry() {},
+            retry(options) {
+              retryDelay = options?.delaySeconds;
+            },
           },
         ],
       },
@@ -2456,161 +3894,47 @@ test("a delayed DLQ delivery does not acknowledge a stale pending receipt when t
         },
       },
       { now: () => new Date("2026-07-13T10:00:00.000Z") },
-    ),
-    /either durable terminal ledger/,
   );
 
   assert.deepEqual(receipt, {
     state: "dead_letter_pending",
     updatedAt: "2026-07-13T09:00:00.000Z",
   });
-  assert.equal(attemptedReceipt?.state, "dead_lettered");
+  assert.equal(attemptedReceipt?.reason, "QUEUE_RETRY_EXHAUSTED");
   assert.equal(acknowledged, false);
-  assert.equal(headCalls, 3);
+  assert.equal(retryDelay, 30);
+  assert.equal(headCalls, 0);
 });
 
-test("DLQ consumption acknowledges an R2 outage after the Mailbox terminal ledger commits", async () => {
-  const pointer: InboundArchivePointer = {
-    schemaVersion: 1,
-    ingressId: "dead-letter-fallback-ledger",
-    rawKey: "raw/2026/07/13/dead-letter-fallback-ledger.eml",
-    mailboxId: "hello@wiserchat.ai",
-    rawSize: 100,
-    archivedAt: "2026-07-13T09:30:00.000Z",
-    etag: "archive-etag",
-    version: "archive-version",
-  };
-  let acknowledged = false;
-  let terminalLedgerInput: Record<string, unknown> | undefined;
-
-  await processInboundDeadLetterBatch(
-    {
-      messages: [
-        {
-          id: "dlq-fallback-ledger",
-          timestamp: new Date("2026-07-13T10:00:00.000Z"),
-          body: pointer,
-          attempts: 10,
-          ack() {
-            acknowledged = true;
-          },
-          retry() {
-            assert.fail(
-              "the independent terminal ledger permits acknowledgement",
-            );
-          },
-        },
-      ],
-    },
-    {
-      RAW_MAIL_BUCKET: {
-        async get() {
-          return null;
-        },
-        async head() {
-          throw new Error("simulated receipt outage");
-        },
-        async put() {
-          throw new Error("simulated receipt outage");
-        },
-      },
-      MAILBOX: {
-        idFromName(mailboxId: string) {
-          return mailboxId;
-        },
-        get() {
-          return {
-            async recordInboundTerminalFailure(
-              input: Record<string, unknown>,
-            ): Promise<"ledgered"> {
-              terminalLedgerInput = input;
-              return "ledgered";
-            },
-          };
-        },
-      },
-    },
-  );
-
-  assert.equal(acknowledged, true);
-  assert.equal(terminalLedgerInput?.id, pointer.ingressId);
-  assert.equal(terminalLedgerInput?.errorCode, "QUEUE_RETRY_EXHAUSTED");
-});
-
-test("DLQ consumption rejects an undefined terminal-ledger disposition during an R2 outage", async () => {
-  const pointer: InboundArchivePointer = {
-    schemaVersion: 1,
-    ingressId: "dead-letter-undefined-disposition",
-    rawKey: "raw/2026/07/13/dead-letter-undefined-disposition.eml",
-    mailboxId: "hello@wiserchat.ai",
-    rawSize: 100,
-    archivedAt: "2026-07-13T09:30:00.000Z",
-    etag: "archive-etag",
-    version: "archive-version",
-  };
-  let acknowledged = false;
-
-  await assert.rejects(
-    processInboundDeadLetterBatch(
-      {
-        messages: [
-          {
-            id: "dlq-undefined-disposition",
-            timestamp: new Date("2026-07-13T10:00:00.000Z"),
-            body: pointer,
-            attempts: 10,
-            ack() {
-              acknowledged = true;
-            },
-            retry() {},
-          },
-        ],
-      },
-      {
-        RAW_MAIL_BUCKET: {
-          async get() {
-            throw new Error("simulated receipt outage");
-          },
-          async head() {
-            throw new Error("simulated receipt outage");
-          },
-          async put() {
-            throw new Error("simulated receipt outage");
-          },
-        },
-        MAILBOX: {
-          idFromName(mailboxId: string) {
-            return mailboxId;
-          },
-          get() {
-            return {
-              async recordInboundTerminalFailure() {
-                return undefined;
-              },
-            };
-          },
-        },
-      },
-    ),
-    /simulated receipt outage/,
-  );
-
-  assert.equal(acknowledged, false);
-});
-
-test("a later retry cannot regress dead-letter-pending receipt state", async () => {
+test("a primary duplicate repairs dead-letter-pending into emergency authority", async () => {
   const pointer: InboundArchivePointer = {
     schemaVersion: 1,
     ingressId: "dead-letter-monotonic",
     rawKey: "raw/2026/07/13/dead-letter-monotonic.eml",
     mailboxId: "hello@wiserchat.ai",
     rawSize: 100,
+    rawSha256: "b".repeat(64),
     archivedAt: "2026-07-13T09:30:00.000Z",
     etag: "archive-etag",
     version: "archive-version",
   };
   let retried = false;
   let acknowledged = false;
+  const sidecars = emergencySidecarStore();
+  const receiptKey = `receipts/${pointer.ingressId}.json`;
+  await sidecars.bucket.put(
+    receiptKey,
+    JSON.stringify({
+      ...pointer,
+      state: "dead_letter_pending",
+      updatedAt: "2026-07-13T09:00:00.000Z",
+      attempt: 2,
+      delaySeconds: 4,
+      errorCode: "MAILBOX_PROJECTION_FAILED",
+    }),
+    { customMetadata: { state: "dead_letter_pending" } },
+  );
+  const emergencyQueue: unknown[] = [];
   await processInboundMessage(
     {
       id: "late-primary-message",
@@ -2625,20 +3949,7 @@ test("a later retry cannot regress dead-letter-pending receipt state", async () 
       },
     },
     {
-      RAW_MAIL_BUCKET: {
-        async get() {
-          return null;
-        },
-        async head() {
-          return {
-            etag: "pending-etag",
-            customMetadata: { state: "dead_letter_pending" },
-          };
-        },
-        async put() {
-          assert.fail("retrying must not overwrite dead_letter_pending");
-        },
-      },
+      RAW_MAIL_BUCKET: sidecars.bucket,
       BUCKET: {
         async head() {
           assert.fail("terminal receipt must short-circuit the mailbox marker");
@@ -2654,9 +3965,17 @@ test("a later retry cannot regress dead-letter-pending receipt state", async () 
           throw new Error("unused");
         },
       },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send(value: unknown) { emergencyQueue.push(value); },
+      },
     },
   );
 
-  assert.equal(retried, false);
-  assert.equal(acknowledged, true);
+  assert.equal(retried, true);
+  assert.equal(acknowledged, false);
+  assert.equal(emergencyQueue.length, 1);
+  assert.equal(
+    JSON.parse(sidecars.objects.get(receiptKey)?.value ?? "null").state,
+    "forward_pending",
+  );
 });

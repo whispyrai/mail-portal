@@ -17,6 +17,7 @@ const session = {
   sub: "usr-1",
   email: "user@example.com",
   role: "AGENT",
+  sessionVersion: 1,
 } as SessionClaims;
 
 function app(input: {
@@ -29,6 +30,7 @@ function app(input: {
     force: boolean;
     stub: unknown;
   }) => Promise<ConversationIntelligenceRuntimeResponse>;
+  authorize?: () => Promise<boolean>;
 }) {
   const root = new Hono<ConversationIntelligenceRouteContext>();
   root.use("*", async (c, next) => {
@@ -46,7 +48,7 @@ function app(input: {
           state: "budget_paused",
           reason: "admin_review_required",
         })),
-    }),
+    }, input.authorize ?? (async () => true)),
   );
   return root;
 }
@@ -148,4 +150,50 @@ test("route communicates that Draft and Outbox intelligence is unsupported", asy
       code: "unsupported_message_state",
     });
   }
+});
+
+test("live authorization suppresses in-flight output and authorization outages stay distinct", async () => {
+  let checks = 0;
+  const revoked = await app({
+    session,
+    stub: {},
+    authorize: async () => ++checks === 1,
+    run: async () => ({ state: "budget_paused", reason: "admin_review_required" }),
+  }).request(
+    "/api/v1/mailboxes/team%40example.com/emails/m1/intelligence",
+    { method: "POST" },
+  );
+  assert.equal(revoked.status, 403);
+  assert.equal(revoked.headers.get("cache-control"), "private, no-store");
+
+  checks = 0;
+  const unavailable = await app({
+    session,
+    stub: {},
+    authorize: async () => {
+      checks += 1;
+      if (checks === 2) throw new Error("private SQL detail");
+      return true;
+    },
+  }).request(
+    "/api/v1/mailboxes/team%40example.com/emails/m1/intelligence",
+    { method: "POST" },
+  );
+  assert.equal(unavailable.status, 503);
+  assert.deepEqual(await unavailable.json(), { error: "Authorization unavailable" });
+});
+
+test("later revocation overrides a synchronous known conversation failure", async () => {
+  let checks = 0;
+  const response = await app({
+    session,
+    stub: {},
+    authorize: async () => ++checks === 1,
+    run: () => { throw new ConversationIntelligenceNotFoundError(); },
+  }).request(
+    "/api/v1/mailboxes/team%40example.com/emails/missing/intelligence",
+    { method: "POST" },
+  );
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: "Forbidden" });
 });

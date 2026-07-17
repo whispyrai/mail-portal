@@ -11,7 +11,16 @@ export type CredentialRecoveryIssue = {
 };
 
 export type CredentialRecoveryStore = {
-  issue(record: CredentialRecoveryIssue): Promise<void>;
+  issue(
+    record: CredentialRecoveryIssue,
+    delivery: {
+      to: string;
+      loginEmail: string;
+      recoveryUrl: string;
+      expiresAt: number;
+    },
+    requestLease?: { jobId: string; leaseToken: string },
+  ): Promise<"issued" | "suppressed" | "rate_limited" | "expired" | "lost">;
   consume(input: {
     tokenHash: string;
     now: number;
@@ -30,12 +39,6 @@ export function createCredentialRecoveryWorkflow(deps: {
   generateToken: () => string;
   hashToken: (token: string) => Promise<string>;
   store: CredentialRecoveryStore;
-  deliver: (input: {
-    to: string;
-    loginEmail: string;
-    recoveryUrl: string;
-    expiresAt: number;
-  }) => Promise<"accepted" | "uncertain" | "failed">;
 }) {
   const now = deps.now ?? Date.now;
   return {
@@ -46,27 +49,31 @@ export function createCredentialRecoveryWorkflow(deps: {
       issuedBy?: string;
       origin: string;
       purpose: "setup" | "recovery";
+      requestLease?: { jobId: string; leaseToken: string };
     }) {
       const token = deps.generateToken();
       const createdAt = now();
       const expiresAt = createdAt + CREDENTIAL_RECOVERY_TTL_MS;
-      await deps.store.issue({
-        id: `recovery_${crypto.randomUUID()}`,
-        userId: input.userId,
-        tokenHash: await deps.hashToken(token),
-        expiresAt,
-        issuedBy: input.issuedBy,
-        purpose: input.purpose,
-        createdAt,
-      });
       const recoveryUrl = `${input.origin}/account/recover?token=${encodeURIComponent(token)}`;
-      const delivery = await deps.deliver({
-        to: input.recoveryEmail,
-        loginEmail: input.loginEmail,
-        recoveryUrl,
-        expiresAt,
-      });
-      return { delivery, expiresAt };
+      const issuance = await deps.store.issue(
+        {
+          id: `recovery_${crypto.randomUUID()}`,
+          userId: input.userId,
+          tokenHash: await deps.hashToken(token),
+          expiresAt,
+          issuedBy: input.issuedBy,
+          purpose: input.purpose,
+          createdAt,
+        },
+        {
+          to: input.recoveryEmail,
+          loginEmail: input.loginEmail,
+          recoveryUrl,
+          expiresAt,
+        },
+        input.requestLease,
+      );
+      return { issuance, delivery: issuance === "issued" ? "queued" as const : null, expiresAt };
     },
     async consume(input: {
       token: string;

@@ -17,6 +17,9 @@ import { normalizeObservedSenderName } from "./people/index.ts";
 import type { PushPayload } from "./push/types.ts";
 import {
 	MAX_INBOUND_EMAIL_BYTES,
+	type DirectInboundAuthority,
+	type DirectInboundProjectionCommand,
+	type InboundArchiveAuthority,
 	type InboundDerivedContentManifest,
 	type InboundDerivedContentRepairAttemptIdentity,
 	type InboundDerivedContentRepairAttemptTerminal,
@@ -186,12 +189,28 @@ export type MailboxEmailStore = {
 	createInboundEmail?(
 		command: InboundProjectionCommand,
 	): Promise<InboundProjectionResult>;
+	createDirectInboundEmail?(
+		command: DirectInboundProjectionCommand,
+	): Promise<InboundProjectionResult>;
 	resolveCanonicalThreadId(messageIds: string[]): Promise<string | null>;
 	getEmail(id: string): Promise<unknown | null>;
 	hasEmail?(id: string): Promise<boolean>;
 	isEmailDeleted?(id: string): Promise<boolean>;
+	getInboundDeletionAuthority?(
+		authority: InboundArchiveAuthority,
+	): Promise<{ generation: number; deletedAt: string } | null>;
+	getInboundProjectionAuthority?(
+		authority: InboundArchiveAuthority,
+	): Promise<{ generation: number } | null>;
+	getDirectInboundDeletionAuthority?(
+		authority: DirectInboundAuthority,
+	): Promise<{ generation: number; deletedAt: string } | null>;
+	getDirectInboundProjectionAuthority?(
+		authority: DirectInboundAuthority,
+	): Promise<{ generation: number } | null>;
 	recordInboundTerminalFailure?(input: {
 		id: string;
+		archiveAuthority: InboundArchiveAuthority;
 		queueRef: string;
 		attempts: number;
 		errorCode: "QUEUE_RETRY_EXHAUSTED";
@@ -332,7 +351,8 @@ export function isEmailTerminalDuringProjection(error: unknown): boolean {
     error &&
     typeof error === "object" &&
     "code" in error &&
-    error.code === "EMAIL_TERMINAL_DURING_PROJECTION",
+    (error.code === "EMAIL_TERMINAL_DURING_PROJECTION" ||
+      error.code === "INBOUND_PROJECTION_IDENTITY_CONFLICT"),
   );
 }
 
@@ -340,6 +360,7 @@ export interface StoredEmailSignal {
 	conversationKey: string;
 	inboundMessageId: string;
 	inboundMessageDate: string;
+	status: "duplicate" | "stored";
 }
 
 export type StoreEmailProjectionOptions = {
@@ -359,6 +380,9 @@ export type StoreEmailProjectionOptions = {
 	/** Optional write-generation fence for import-only attachment identities. */
 	attachmentIdNamespace?: string;
 	allowTerminalRecovery?: boolean;
+	inboundArchiveAuthority?: InboundProjectionCommand["archiveAuthority"];
+	directInboundAuthority?: DirectInboundAuthority;
+	inboundProjectionExpiresAt?: number;
 };
 
 type StoreParsedEmailOptions = StoreEmailProjectionOptions;
@@ -384,6 +408,10 @@ export class InboundProjectionOutcomeError extends Error {
 				code: "EMAIL_DELETED_DURING_PROJECTION",
 				message: "Email was deleted while its projection was in flight",
 			},
+			identity_conflict: {
+				code: "INBOUND_PROJECTION_IDENTITY_CONFLICT",
+				message: "Inbound identity conflicts with existing mailbox state",
+			},
 			terminal: {
 				code: "EMAIL_TERMINAL_DURING_PROJECTION",
 				message: "Inbound delivery is already terminal",
@@ -405,11 +433,19 @@ function validatedInboundProjectionResult(
 	}
 	const result = value as Record<string, unknown>;
 	if (
-		!(["cleanup_conflict", "deleted", "duplicate", "stored", "terminal"] as const)
+		!([
+			"cleanup_conflict",
+			"deleted",
+			"duplicate",
+			"identity_conflict",
+			"stored",
+			"terminal",
+		] as const)
 			.includes(result.status as never) ||
 		!(result.cleanupKeys === undefined ||
 			(Array.isArray(result.cleanupKeys) &&
-				result.cleanupKeys.every((key) => typeof key === "string")))
+				result.cleanupKeys.every((key) => typeof key === "string"))) ||
+		!(result.folder === undefined || typeof result.folder === "string")
 	) {
 		throw new Error("Mailbox inbound projection response is invalid");
 	}
@@ -418,6 +454,7 @@ function validatedInboundProjectionResult(
 		...(result.cleanupKeys === undefined
 			? {}
 			: { cleanupKeys: [...(result.cleanupKeys as string[])] }),
+		...(result.folder === undefined ? {} : { folder: result.folder as string }),
 	};
 }
 
@@ -514,33 +551,68 @@ export async function storeEmailProjection(
 	};
 	let result: unknown;
 	if (options.recipientMemoryOrigin === "live_inbound") {
+		const hasArchiveAuthority =
+			options.inboundArchiveAuthority !== undefined;
+		const hasDirectAuthority = options.directInboundAuthority !== undefined;
 		if (
-			!dependencies.mailbox.createInboundEmail ||
 			!options.mailboxAddress ||
 			email.automation_trigger !== "live_inbound" ||
-			!email.push_notification
+			!email.push_notification ||
+			hasArchiveAuthority === hasDirectAuthority
 		) {
 			throw Object.assign(
-				new Error("Live inbound projection contract is incomplete"),
+				new Error(
+					"Live inbound projection requires exactly one authority",
+				),
 				{ code: "MAILBOX_INBOUND_PROJECTION_UNSUPPORTED" },
 			);
 		}
-		result = validatedInboundProjectionResult(
-			await dependencies.mailbox.createInboundEmail({
-				folder,
-				email: {
-					...email,
-					recipient_memory_origin: options.recipientMemoryOrigin,
-					automation_trigger: email.automation_trigger,
-					push_notification: email.push_notification,
-				},
-				attachments: attachmentData,
-				bodyObjects,
-				mailboxAddress: options.mailboxAddress,
-				allowTerminalRecovery: options.allowTerminalRecovery ?? false,
-				...projectionAttempt,
-			}),
-		);
+		const command = {
+			folder,
+			email: {
+				...email,
+				recipient_memory_origin: options.recipientMemoryOrigin,
+				automation_trigger: email.automation_trigger,
+				push_notification: email.push_notification,
+			},
+			attachments: attachmentData,
+			bodyObjects,
+			mailboxAddress: options.mailboxAddress,
+			allowTerminalRecovery: options.allowTerminalRecovery ?? false,
+			...(options.inboundProjectionExpiresAt === undefined
+				? {}
+				: { projectionExpiresAt: options.inboundProjectionExpiresAt }),
+			...projectionAttempt,
+		};
+		if (options.directInboundAuthority !== undefined) {
+			if (!dependencies.mailbox.createDirectInboundEmail) {
+				throw Object.assign(
+					new Error("Direct inbound projection contract is incomplete"),
+					{ code: "MAILBOX_INBOUND_PROJECTION_UNSUPPORTED" },
+				);
+			}
+			result = validatedInboundProjectionResult(
+				await dependencies.mailbox.createDirectInboundEmail({
+					...command,
+					directAuthority: options.directInboundAuthority,
+				}),
+			);
+		} else {
+			if (!dependencies.mailbox.createInboundEmail) {
+				throw Object.assign(
+					new Error("Archived inbound projection contract is incomplete"),
+					{ code: "MAILBOX_INBOUND_PROJECTION_UNSUPPORTED" },
+				);
+			}
+			result = validatedInboundProjectionResult(
+				await dependencies.mailbox.createInboundEmail({
+					...command,
+					...(options.inboundArchiveAuthority === undefined
+						? {}
+						: { archiveAuthority: options.inboundArchiveAuthority }),
+				}),
+			);
+		}
 	} else {
 		result = await dependencies.mailbox.createEmail(
 			folder,
@@ -554,7 +626,12 @@ export async function storeEmailProjection(
 		result &&
 		typeof result === "object" &&
 		"status" in result &&
-		(["cleanup_conflict", "deleted", "terminal"] as const).includes(
+		([
+			"cleanup_conflict",
+			"deleted",
+			"identity_conflict",
+			"terminal",
+		] as const).includes(
 			result.status as never,
 		)
 	) {
@@ -692,6 +769,7 @@ export async function storeParsedEmail(
 			conversationKey: stored.conversationKey,
 			inboundMessageId: stored.inboundMessageId,
 			inboundMessageDate: stored.inboundMessageDate,
+			status: stored.status,
 		};
 	} catch (error) {
 		return removeUncommittedEmailObjects(

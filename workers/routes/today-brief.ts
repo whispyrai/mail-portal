@@ -9,6 +9,15 @@ import {
 	runTodayBrief,
 } from "../lib/today-brief-runtime.ts";
 import type { Env } from "../types.ts";
+import {
+	LiveReadAuthorizationError,
+	LiveReadAuthorizationUnavailableError,
+} from "../lib/live-authorized-read.ts";
+import {
+	hasExactLiveMailboxAccess,
+	runLiveMailboxAuthorizedRead,
+	type LiveMailboxAccessAuthorizer,
+} from "../lib/live-mailbox-authorization.ts";
 
 const TODAY_BRIEF_REQUEST_BYTES = 1_024;
 
@@ -100,9 +109,11 @@ async function boundedJsonBody(request: Request): Promise<unknown> {
 
 export function createTodayBriefRoutes(
 	dependencies: TodayBriefRouteDependencies = productionDependencies,
+	authorize: LiveMailboxAccessAuthorizer = hasExactLiveMailboxAccess,
 ) {
 	const app = new Hono<TodayBriefRouteContext>();
 	app.use("/api/v1/mailboxes/:mailboxId/today-brief", async (c, next) => {
+		c.header("Cache-Control", "private, no-store");
 		if (!c.get("session")) return c.json({ error: "Unauthorized" }, 401);
 		if (!c.get("mailboxStub")) {
 			return c.json({ error: "Mailbox access is required" }, 403);
@@ -128,15 +139,30 @@ export function createTodayBriefRoutes(
 		const session = c.get("session")!;
 		try {
 			return c.json(
-				await dependencies.run({
-					env: c.env,
-					actorUserId: session.sub,
-					mailboxId,
-					day,
-					stub: c.get("mailboxStub")!,
-				}),
+				await runLiveMailboxAuthorizedRead(
+					c.env,
+					{
+						mailboxId,
+						userId: session.sub,
+						sessionVersion: session.sessionVersion,
+					},
+					() => dependencies.run({
+						env: c.env,
+						actorUserId: session.sub,
+						mailboxId,
+						day,
+						stub: c.get("mailboxStub")!,
+					}),
+					authorize,
+				),
 			);
 		} catch (error) {
+			if (error instanceof LiveReadAuthorizationError) {
+				return c.json({ error: "Forbidden" }, 403);
+			}
+			if (error instanceof LiveReadAuthorizationUnavailableError) {
+				return c.json({ error: "Authorization unavailable" }, 503);
+			}
 			console.error("[today-brief] generation failed", {
 				actorUserId: session.sub,
 				mailboxId,

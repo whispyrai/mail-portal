@@ -7,6 +7,10 @@ import { RecipientMemoryOrigins } from "../../shared/recipient-suggestions.ts";
 import { resolveBrand } from "../routes/brand.ts";
 import { buildPushPayload } from "./push/payload.ts";
 import type { StoreEmailProjectionOptions } from "./store-email.ts";
+import type {
+	DirectInboundAuthority,
+	InboundArchiveAuthority,
+} from "./inbound-projection-contract.ts";
 
 export function liveInboundProjectionOptions(input: {
 	brand?: string;
@@ -14,6 +18,9 @@ export function liveInboundProjectionOptions(input: {
 	messageId: string;
 	date: string;
 	allowTerminalRecovery?: boolean;
+	archiveAuthority?: InboundArchiveAuthority;
+	directAuthority?: DirectInboundAuthority;
+	projectionExpiresAt?: number;
 }): StoreEmailProjectionOptions {
 	const brand = resolveBrand(input.brand);
 	return {
@@ -27,6 +34,9 @@ export function liveInboundProjectionOptions(input: {
 		recipientMemoryOrigin: RecipientMemoryOrigins.LIVE_INBOUND,
 		automationTrigger: "live_inbound",
 		allowTerminalRecovery: input.allowTerminalRecovery,
+		inboundArchiveAuthority: input.archiveAuthority,
+		directInboundAuthority: input.directAuthority,
+		inboundProjectionExpiresAt: input.projectionExpiresAt,
 		pushNotificationFor: (parsed) =>
 			buildPushPayload({
 				emailId: input.messageId,

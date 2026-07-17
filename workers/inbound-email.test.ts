@@ -46,6 +46,7 @@ function r2Object(
     size,
     etag,
     version,
+    customMetadata: options?.customMetadata,
     ...(options?.sha256 instanceof ArrayBuffer
       ? { checksums: { sha256: options.sha256 } }
       : {}),
@@ -69,6 +70,143 @@ function activeMarkerObject(
     "active-marker-etag",
     "active-marker-version",
   );
+}
+
+function r2TextObject(key: string, value: string, etag = "receipt-etag") {
+  return {
+    ...r2Object(key, value.length, undefined, etag, "receipt-version"),
+    body: new ReadableStream(),
+    async text() {
+      return value;
+    },
+  };
+}
+
+function rejectionRecoveryBucket(
+  mode: "concurrent_winner" | "false" | "throw",
+) {
+  const sidecars = new Map<
+    string,
+    { value: string; etag: string; customMetadata?: Record<string, string> }
+  >();
+  let raw:
+    | {
+        key: string;
+        bytes: Uint8Array;
+        customMetadata?: Record<string, string>;
+        sha256?: ArrayBuffer | string;
+      }
+    | undefined;
+  let revision = 0;
+  const objectForSidecar = (
+    key: string,
+    stored: {
+      value: string;
+      etag: string;
+      customMetadata?: Record<string, string>;
+    },
+  ) => ({
+    ...r2TextObject(key, stored.value, stored.etag),
+    customMetadata: stored.customMetadata,
+  });
+  return {
+    sidecars,
+    bucket: {
+      async head(key: string) {
+        if (raw?.key === key) {
+          return {
+            ...r2Object(
+              key,
+              raw.bytes.byteLength,
+              { sha256: raw.sha256 },
+            ),
+            customMetadata: raw.customMetadata,
+          };
+        }
+        const stored = sidecars.get(key);
+        return stored ? objectForSidecar(key, stored) : null;
+      },
+      async get(key: string) {
+        if (raw?.key === key) {
+          return {
+            ...r2Object(
+              key,
+              raw.bytes.byteLength,
+              { sha256: raw.sha256 },
+            ),
+            body: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(raw?.bytes);
+                controller.close();
+              },
+            }),
+            customMetadata: raw.customMetadata,
+            async text() {
+              return new TextDecoder().decode(raw?.bytes);
+            },
+          };
+        }
+        const stored = sidecars.get(key);
+        return stored ? objectForSidecar(key, stored) : null;
+      },
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
+        if (value instanceof ArrayBuffer) {
+          raw = {
+            key,
+            bytes: new Uint8Array(value),
+            customMetadata: options?.customMetadata,
+            sha256: options?.sha256,
+          };
+          return r2Object(key, value.byteLength, options);
+        }
+        const parsed = JSON.parse(value) as Record<string, unknown>;
+        if (
+          key.startsWith("receipts/") &&
+          parsed.state === "rejected"
+        ) {
+          if (mode === "throw")
+            throw new Error("simulated rejected receipt write outage");
+          if (mode === "concurrent_winner") {
+            revision += 1;
+            sidecars.set(key, {
+              value: JSON.stringify({
+                ...parsed,
+                state: "forward_pending",
+                errorCode: "INGRESS_RECOVERY_REQUIRED",
+              }),
+              etag: `sidecar-${revision}`,
+              customMetadata: { state: "forward_pending" },
+            });
+          }
+          return null;
+        }
+        const current = sidecars.get(key);
+        if (
+          options?.onlyIf?.etagDoesNotMatch === "*" &&
+          current
+        ) return null;
+        if (
+          options?.onlyIf?.etagMatches &&
+          current?.etag !== options.onlyIf.etagMatches
+        ) return null;
+        revision += 1;
+        const stored = {
+          value,
+          etag: `sidecar-${revision}`,
+          customMetadata: options?.customMetadata,
+        };
+        sidecars.set(key, stored);
+        return objectForSidecar(key, stored);
+      },
+      async delete(key: string) {
+        sidecars.delete(key);
+      },
+    },
+  };
 }
 
 function rawEmail(headers: string, body = "Hello from the Internet.") {
@@ -120,7 +258,7 @@ test("inbound delivery forwards to the emergency destination only after verifyin
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(),
         BUCKET: {
           async head() {
@@ -179,7 +317,7 @@ test("inbound delivery forwards to the emergency destination only after verifyin
 });
 
 for (const dbState of ["inactive", "unavailable"] as const) {
-  test(`unreadable messages never emergency-forward when the mailbox is ${dbState}`, async () => {
+  test(`unreadable messages use verified policy or emergency delivery when the mailbox is ${dbState}`, async () => {
     let forwarded = false;
     let rejection: string | undefined;
     await receiveEmail(
@@ -203,7 +341,7 @@ for (const dbState of ["inactive", "unavailable"] as const) {
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(dbState),
         BUCKET: {
           async head() {
@@ -228,8 +366,12 @@ for (const dbState of ["inactive", "unavailable"] as const) {
       },
     );
 
-    assert.equal(forwarded, false);
-    assert.match(rejection ?? "", /mailbox unavailable/i);
+    assert.equal(forwarded, dbState === "unavailable");
+    if (dbState === "inactive") {
+      assert.match(rejection ?? "", /mailbox unavailable/i);
+    } else {
+      assert.equal(rejection, undefined);
+    }
   });
 }
 
@@ -257,7 +399,7 @@ test("inbound delivery rejects an unreadable message for an unverified recipient
     {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       BUCKET: {
         async head() {
           return null;
@@ -287,7 +429,7 @@ test("inbound delivery rejects an unreadable message for an unverified recipient
   assert.match(rejection ?? "", /mailbox unavailable/i);
 });
 
-test("unreadable-message admission failures reject without forwarding or leaking provider detail", async () => {
+test("unreadable-message R2 admission outages forward without leaking provider detail", async () => {
   const errors: Array<Record<string, unknown>> = [];
   let forwarded = false;
   let rejection: string | undefined;
@@ -317,7 +459,7 @@ test("unreadable-message admission failures reject without forwarding or leaking
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         BUCKET: {
           async head() {
             throw new Error("simulated mailbox marker outage");
@@ -346,8 +488,8 @@ test("unreadable-message admission failures reject without forwarding or leaking
     console.error = originalConsoleError;
   }
 
-  assert.equal(forwarded, false);
-  assert.match(rejection ?? "", /mailbox unavailable/i);
+  assert.equal(forwarded, true);
+  assert.equal(rejection, undefined);
   const admissionFailure = errors.find(
     (fields) => fields.operation === "emergency_forward_admission",
   );
@@ -358,7 +500,7 @@ test("unreadable-message admission failures reject without forwarding or leaking
   const rejectionLog = errors.find(
     (fields) => fields.operation === "smtp_rejection",
   );
-  assert.equal(rejectionLog?.errorCode, "MAILBOX_VERIFICATION_FAILED");
+  assert.equal(rejectionLog, undefined);
   assert.doesNotMatch(
     JSON.stringify(errors),
     /simulated stream failure|simulated mailbox marker outage/,
@@ -519,6 +661,668 @@ test("inbound delivery archives exact raw MIME and durably enqueues its pointer 
   ]);
 });
 
+test("a late timed-out initial raw put cannot supersede the exact create-only winner", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  let currentRaw: ReturnType<typeof r2Object> | undefined;
+  let completeTimedOutPut: (() => void) | undefined;
+  let rawPutAttempts = 0;
+  let queuedPointer: InboundArchivePointer | undefined;
+  const rawConditions: Array<R2PutTestOptions["onlyIf"]> = [];
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`),
+      async forward() {
+        assert.fail("an exact raw winner must not emergency-forward");
+      },
+      setReject(reason: string) {
+        assert.fail(`an exact raw winner must not reject: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: { async head() { return {}; } },
+      RAW_MAIL_BUCKET: {
+        async get() { return null; },
+        async head(key: string) {
+          return currentRaw?.key === key ? currentRaw : null;
+        },
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (typeof value === "string")
+            return r2Object(key, value.length, options, `${key}-etag`);
+          rawPutAttempts += 1;
+          rawConditions.push(options?.onlyIf);
+          if (rawPutAttempts === 1) {
+            return new Promise<ReturnType<typeof r2Object> | null>((resolve) => {
+              completeTimedOutPut = () => {
+                if (currentRaw) {
+                  resolve(null);
+                  return;
+                }
+                currentRaw = r2Object(
+                  key,
+                  value.byteLength,
+                  options,
+                  "late-etag",
+                  "late-version",
+                );
+                resolve(currentRaw);
+              };
+            });
+          }
+          assert.equal(currentRaw, undefined);
+          currentRaw = r2Object(
+            key,
+            value.byteLength,
+            options,
+            "winner-etag",
+            "winner-version",
+          );
+          return currentRaw;
+        },
+      },
+      INBOUND_QUEUE: {
+        async send(pointer: InboundArchivePointer) {
+          queuedPointer = pointer;
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          assert.fail("normal Queue success must not use emergency recovery");
+        },
+      },
+      MAILBOX: {
+        idFromName() {
+          assert.fail("normal Queue success must not resolve Mailbox");
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-17T10:00:00.000Z"),
+      randomUUID: () => "late-initial-raw-put",
+      infrastructureTimeoutMs: 1,
+      sleep: () => Promise.resolve(),
+      async digestSha256(value: ArrayBuffer) {
+        return new Uint8Array(
+          createHash("sha256").update(new Uint8Array(value)).digest(),
+        ).buffer;
+      },
+    },
+  );
+
+  assert.equal(rawPutAttempts, 2);
+  assert.deepEqual(rawConditions, [
+    { etagDoesNotMatch: "*" },
+    { etagDoesNotMatch: "*" },
+  ]);
+  assert.equal(queuedPointer?.version, "winner-version");
+  assert.ok(completeTimedOutPut);
+  completeTimedOutPut();
+  await Promise.resolve();
+  assert.equal(currentRaw?.version, "winner-version");
+  assert.equal(currentRaw?.etag, queuedPointer?.etag);
+});
+
+test("a raw put that completes after direct fallback preserves the direct owner for later Queue convergence", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  const lateCompletions: Array<() => void> = [];
+  let rawPutAttempts = 0;
+  let lateRaw: ReturnType<typeof r2Object> | undefined;
+  let storedEmail: { id: string } | undefined;
+  let storedAuthority: Record<string, unknown> | undefined;
+  let forwardCalls = 0;
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward() {
+        forwardCalls += 1;
+        return { messageId: "must-not-forward-late-r2-direct" };
+      },
+      setReject(reason: string) {
+        assert.fail(`direct fallback must not reject: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain direct fallback must not upload derived content");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async get() {
+          return null;
+        },
+        async head() {
+          return lateRaw ?? null;
+        },
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          assert.ok(value instanceof ArrayBuffer);
+          rawPutAttempts += 1;
+          return new Promise<ReturnType<typeof r2Object>>((resolve) => {
+            lateCompletions.push(() => {
+              lateRaw = r2Object(
+                key,
+                value.byteLength,
+                options,
+                "late-direct-etag",
+                "late-direct-version",
+              );
+              resolve(lateRaw);
+            });
+          });
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("timed-out raw archival must not enqueue yet");
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return storedEmail ?? null;
+            },
+            async getDirectInboundDeletionAuthority() {
+              return null;
+            },
+            async getDirectInboundProjectionAuthority(
+              authority: Record<string, unknown>,
+            ) {
+              return storedAuthority &&
+                JSON.stringify(authority) === JSON.stringify(storedAuthority)
+                ? { generation: 1 }
+                : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createDirectInboundEmail(command: {
+              email: { id: string };
+              directAuthority: Record<string, unknown>;
+            }) {
+              storedEmail = command.email;
+              storedAuthority = command.directAuthority;
+              return { status: "stored" as const, cleanupKeys: [] };
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-17T10:00:00.000Z"),
+      randomUUID: () => "late-r2-direct-owner",
+      infrastructureTimeoutMs: 1,
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(rawPutAttempts, 10);
+  assert.equal(storedEmail?.id, "late-r2-direct-owner");
+  assert.equal(forwardCalls, 0);
+  assert.equal(lateRaw, undefined);
+  lateCompletions[0]?.();
+  await Promise.resolve();
+  assert.equal(lateRaw?.key, "raw/2026/07/17/10/00/late-r2-direct-owner.eml");
+  assert.equal(storedAuthority?.ingressId, "late-r2-direct-owner");
+});
+
+test("a late timed-out MD5-to-SHA rewrite cannot supersede the exact CAS winner", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  let currentRaw:
+    | (ReturnType<typeof r2Object> & {
+        checksums: { md5?: ArrayBuffer; sha256?: ArrayBuffer };
+      })
+    | undefined;
+  let completeTimedOutUpgrade: (() => void) | undefined;
+  let digestCalls = 0;
+  let rawPutAttempts = 0;
+  let queuedPointer: InboundArchivePointer | undefined;
+  const rawConditions: Array<R2PutTestOptions["onlyIf"]> = [];
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`),
+      async forward() {
+        assert.fail("an exact SHA upgrade winner must not emergency-forward");
+      },
+      setReject(reason: string) {
+        assert.fail(`an exact SHA upgrade winner must not reject: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: { async head() { return {}; } },
+      RAW_MAIL_BUCKET: {
+        async get() { return null; },
+        async head(key: string) {
+          return currentRaw?.key === key ? currentRaw : null;
+        },
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (typeof value === "string")
+            return r2Object(key, value.length, options, `${key}-etag`);
+          rawPutAttempts += 1;
+          rawConditions.push(options?.onlyIf);
+          if (rawPutAttempts === 1) {
+            currentRaw = {
+              ...r2Object(
+                key,
+                value.byteLength,
+                options,
+                "weak-etag",
+                "weak-version",
+              ),
+              checksums: { md5: new Uint8Array(16).buffer },
+            };
+            return currentRaw;
+          }
+          const completeUpgrade = (
+            resolve: (value: typeof currentRaw | null) => void,
+            etag: string,
+            version: string,
+          ) => {
+            if (
+              currentRaw?.etag !== options?.onlyIf?.etagMatches ||
+              !(options?.sha256 instanceof ArrayBuffer)
+            ) {
+              resolve(null);
+              return;
+            }
+            currentRaw = {
+              ...r2Object(
+                key,
+                value.byteLength,
+                options,
+                etag,
+                version,
+              ),
+              checksums: { sha256: options.sha256 },
+            };
+            resolve(currentRaw);
+          };
+          if (rawPutAttempts === 2) {
+            return new Promise<typeof currentRaw | null>((resolve) => {
+              completeTimedOutUpgrade = () =>
+                completeUpgrade(resolve, "late-sha-etag", "late-sha-version");
+            });
+          }
+          return new Promise<typeof currentRaw | null>((resolve) => {
+            completeUpgrade(resolve, "sha-winner-etag", "sha-winner-version");
+          });
+        },
+      },
+      INBOUND_QUEUE: {
+        async send(pointer: InboundArchivePointer) {
+          queuedPointer = pointer;
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          assert.fail("normal Queue success must not use emergency recovery");
+        },
+      },
+      MAILBOX: {
+        idFromName() {
+          assert.fail("normal Queue success must not resolve Mailbox");
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-17T10:00:00.000Z"),
+      randomUUID: () => "late-sha-upgrade-put",
+      infrastructureTimeoutMs: 1,
+      sleep: () => Promise.resolve(),
+      async digestSha256(value: ArrayBuffer) {
+        digestCalls += 1;
+        if (digestCalls === 1)
+          throw new Error("simulated first SHA preparation failure");
+        return new Uint8Array(
+          createHash("sha256").update(new Uint8Array(value)).digest(),
+        ).buffer;
+      },
+    },
+  );
+
+  assert.equal(rawPutAttempts, 3);
+  assert.deepEqual(rawConditions, [
+    { etagDoesNotMatch: "*" },
+    { etagMatches: "weak-etag" },
+    { etagMatches: "weak-etag" },
+  ]);
+  assert.equal(queuedPointer?.version, "sha-winner-version");
+  assert.ok(completeTimedOutUpgrade);
+  completeTimedOutUpgrade();
+  await Promise.resolve();
+  assert.equal(currentRaw?.version, "sha-winner-version");
+  assert.equal(currentRaw?.etag, queuedPointer?.etag);
+});
+
+for (const stalledBoundary of [
+  "raw_stream",
+  "raw_put",
+  "active_marker",
+  "receipt",
+  "bucket_head",
+  "d1_lookup",
+  "do_lookup",
+  "do_write",
+  "primary_queue",
+  "emergency_authority",
+  "provider_forward",
+] as const) {
+  test(`a never-resolving ${stalledBoundary} boundary still ends in a canonical ingress outcome`, async () => {
+    const mailboxAddress = "hello@wiserchat.ai";
+    const recovery = rejectionRecoveryBucket("false");
+    let forwardCalls = 0;
+    let rejection: string | undefined;
+    let projectedId: string | undefined;
+    let emergencyQueueCalls = 0;
+    const raw =
+      stalledBoundary === "raw_stream"
+        ? {
+            raw: new ReadableStream<Uint8Array>({ start() {} }),
+            rawSize: 100,
+          }
+        : rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+    const never = () => new Promise<never>(() => {});
+    const rawBucket = {
+      ...recovery.bucket,
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
+        if (
+          stalledBoundary === "raw_put" &&
+          value instanceof ArrayBuffer
+        ) {
+          return never();
+        }
+        if (
+          stalledBoundary === "active_marker" &&
+          isActiveMarkerKey(key)
+        ) {
+          return never();
+        }
+        if (
+          stalledBoundary === "receipt" &&
+          key.startsWith("receipts/")
+        ) {
+          return never();
+        }
+        if (
+          stalledBoundary === "emergency_authority" &&
+          key.startsWith("receipts/")
+        ) {
+          throw new Error("simulated receipt outage");
+        }
+        if (
+          stalledBoundary === "emergency_authority" &&
+          key.startsWith("system/emergency-forward/active/")
+        ) {
+          return never();
+        }
+        return recovery.bucket.put(key, value, options);
+      },
+    };
+
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...raw,
+        async forward(recipient: string) {
+          forwardCalls += 1;
+          assert.equal(recipient, "verified-backup@example.com");
+          if (stalledBoundary === "provider_forward") return never();
+          return { messageId: `deadline-${stalledBoundary}` };
+        },
+        setReject(reason: string) {
+          rejection = reason;
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+        DB: {
+          prepare(query: string) {
+            assert.match(query, /FROM mailboxes/);
+            return {
+              bind() {
+                return {
+                  async first() {
+                    if (stalledBoundary === "d1_lookup") return never();
+                    return { id: mailboxAddress };
+                  },
+                };
+              },
+            };
+          },
+        },
+        BUCKET: {
+          async head() {
+            if (
+              stalledBoundary === "raw_put" ||
+              stalledBoundary === "active_marker" ||
+              stalledBoundary === "receipt"
+            ) {
+              throw new Error("force provider fallback");
+            }
+            if (stalledBoundary === "bucket_head") return never();
+            if (stalledBoundary === "emergency_authority") return null;
+            return {};
+          },
+          async put() {
+            assert.fail("deadline recovery fixture must not write derived blobs");
+          },
+          async delete() {},
+        },
+        RAW_MAIL_BUCKET: rawBucket,
+        INBOUND_QUEUE: {
+          async send() {
+            if (stalledBoundary === "primary_queue") return never();
+            if (
+              stalledBoundary === "do_lookup" ||
+              stalledBoundary === "do_write" ||
+              stalledBoundary === "provider_forward"
+            ) {
+              throw new Error("force direct projection fallback");
+            }
+            assert.fail(
+              `${stalledBoundary} must recover before primary Queue handoff`,
+            );
+          },
+        },
+        EMERGENCY_FORWARD_QUEUE: {
+          async send() {
+            emergencyQueueCalls += 1;
+          },
+        },
+        MAILBOX: {
+          idFromName(mailboxId: string) {
+            return mailboxId;
+          },
+          get() {
+            return {
+              async getEmail() {
+                if (stalledBoundary === "do_lookup") return never();
+                if (stalledBoundary === "provider_forward")
+                  throw new Error("force provider fallback");
+                return projectedId ? { id: projectedId } : null;
+              },
+              async getInboundProjectionAuthority() {
+                return projectedId ? { generation: 1 } : null;
+              },
+              async findThreadBySubject() {
+                return null;
+              },
+              async createInboundEmail(command: { email: { id: string } }) {
+                if (stalledBoundary === "do_write") return never();
+                projectedId = command.email.id;
+                return { status: "stored", cleanupKeys: [] };
+              },
+            };
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-17T10:00:00.000Z"),
+        randomUUID: () => `stalled-${stalledBoundary.replaceAll("_", "-")}`,
+        infrastructureTimeoutMs: 10,
+        providerTimeoutMs: 1,
+        sleep: () => Promise.resolve(),
+        async parse() {
+          return {
+            headers: [],
+            headerLines: [],
+            from: { name: "Sender", address: "sender@example.com" },
+            to: [{ name: "Mailbox", address: mailboxAddress }],
+            text: "Deadline recovery",
+            attachments: [],
+          };
+        },
+      },
+    );
+
+    if (stalledBoundary === "primary_queue") {
+      assert.equal(projectedId, "stalled-primary-queue");
+      assert.equal(forwardCalls, 0);
+    } else {
+      assert.equal(forwardCalls, 1);
+    }
+    if (stalledBoundary === "provider_forward") {
+      assert.equal(emergencyQueueCalls, 1);
+    }
+    assert.equal(rejection, undefined);
+  });
+}
+
+for (const telemetryFailure of ["throw", "hang"] as const) {
+  test(`initial telemetry ${telemetryFailure} cannot gate raw archival or Queue handoff`, async () => {
+    const mailboxAddress = "hello@wiserchat.ai";
+    const raw = rawEmail(
+      `From: sender@example.com\r\nTo: ${mailboxAddress}`,
+    );
+    let rawArchived = false;
+    let queued = false;
+    await Promise.race([
+      receiveEmail(
+        {
+          from: "sender@example.com",
+          to: mailboxAddress,
+          ...raw,
+          setReject(reason: string) {
+            assert.fail(`telemetry failure rejected durable mail: ${reason}`);
+          },
+        },
+        {
+          DOMAINS: "wiserchat.ai",
+          EMAIL_ADDRESSES: [],
+          DB: mailboxDb(),
+          BUCKET: {
+            async head() {
+              return {};
+            },
+          },
+          RAW_MAIL_BUCKET: {
+            async put(
+              key: string,
+              value: ArrayBuffer | string,
+              options?: R2PutTestOptions,
+            ) {
+              if (isActiveMarkerKey(key))
+                return activeMarkerObject(key, value, options);
+              if (key.startsWith("receipts/")) {
+                const state = JSON.parse(String(value)).state as string;
+                return r2Object(
+                  key,
+                  String(value).length,
+                  options,
+                  `receipt-${state}`,
+                );
+              }
+              rawArchived = true;
+              assert.ok(value instanceof ArrayBuffer);
+              return r2Object(key, value.byteLength, options);
+            },
+          },
+          INBOUND_QUEUE: {
+            async send() {
+              queued = true;
+            },
+          },
+          MAILBOX: {
+            idFromName() {
+              assert.fail("Queue admission must not resolve the Mailbox");
+            },
+          },
+        },
+        { waitUntil() {} },
+        {
+          now: () => new Date("2026-07-17T09:00:00.000Z"),
+          randomUUID: () => `telemetry-${telemetryFailure}`,
+          bestEffortTimeoutMs: 1,
+          telemetryLogRef() {
+            if (telemetryFailure === "throw")
+              throw new Error("simulated telemetry failure");
+            return new Promise(() => {});
+          },
+        },
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("telemetry blocked ingress durability")),
+          100,
+        ),
+      ),
+    ]);
+    assert.equal(rawArchived, true);
+    assert.equal(queued, true);
+  });
+}
+
 test("inbound delivery uses direct durable projection when every active-marker write fails after raw archival", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
@@ -546,7 +1350,7 @@ test("inbound delivery uses direct durable projection when every active-marker w
       BRAND: "wiser",
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -587,6 +1391,9 @@ test("inbound delivery uses direct durable projection when every active-marker w
           return {
             async getEmail() {
               return projectedId ? { id: projectedId } : null;
+            },
+            async getInboundProjectionAuthority() {
+              return projectedId ? { generation: 1 } : null;
             },
             async findThreadBySubject() {
               return null;
@@ -630,6 +1437,187 @@ test("inbound delivery uses direct durable projection when every active-marker w
   assert.equal(rejected, false);
 });
 
+for (const authorityFailure of [
+  "marker_put",
+  "forward_pending_receipt_put",
+  "queue_send",
+] as const) {
+  test(`post-archive emergency authority ${authorityFailure} failure falls through to direct provider forwarding`, async () => {
+    const mailboxAddress = "hello@wiserchat.ai";
+    const ingressId = `emergency-authority-${authorityFailure.replaceAll("_", "-")}`;
+    const recovery = rejectionRecoveryBucket("false");
+    let activeMarkerAttempts = 0;
+    let emergencyMarkerAttempts = 0;
+    let forwardPendingAttempts = 0;
+    let emergencyQueueAttempts = 0;
+    let forwardCalls = 0;
+    let rejection: string | undefined;
+    const bucket = {
+      ...recovery.bucket,
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
+        if (isActiveMarkerKey(key)) {
+          activeMarkerAttempts += 1;
+          throw new Error("simulated active marker outage");
+        }
+        if (key.startsWith("system/emergency-forward/active/")) {
+          emergencyMarkerAttempts += 1;
+          if (authorityFailure === "marker_put")
+            throw new Error("simulated emergency marker outage");
+        }
+        if (
+          typeof value === "string" &&
+          key.startsWith("receipts/") &&
+          JSON.parse(value).state === "forward_pending"
+        ) {
+          forwardPendingAttempts += 1;
+          if (authorityFailure === "forward_pending_receipt_put")
+            throw new Error("simulated forward-pending receipt outage");
+        }
+        return recovery.bucket.put(key, value, options);
+      },
+    };
+
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`),
+        async forward(recipient: string) {
+          forwardCalls += 1;
+          assert.equal(recipient, "verified-backup@example.com");
+          return { messageId: `provider-${authorityFailure}` };
+        },
+        setReject(reason: string) {
+          rejection = reason;
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: [],
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+        DB: mailboxDb(),
+        BUCKET: {
+          async head() {
+            return null;
+          },
+        },
+        RAW_MAIL_BUCKET: bucket,
+        INBOUND_QUEUE: {
+          async send() {
+            assert.fail("active-marker failure must not reach the primary Queue");
+          },
+        },
+        EMERGENCY_FORWARD_QUEUE: {
+          async send() {
+            emergencyQueueAttempts += 1;
+            if (authorityFailure === "queue_send")
+              throw new Error("simulated emergency Queue outage");
+          },
+        },
+        MAILBOX: {
+          idFromName() {
+            assert.fail("unprovisioned direct fallback must not resolve Mailbox");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-17T10:00:00.000Z"),
+        randomUUID: () => ingressId,
+        sleep: () => Promise.resolve(),
+      },
+    );
+
+    assert.equal(activeMarkerAttempts, 10);
+    assert.equal(forwardCalls, 1);
+    assert.equal(rejection, undefined);
+    assert.ok(emergencyMarkerAttempts >= 1);
+    assert.equal(
+      forwardPendingAttempts > 0,
+      authorityFailure !== "marker_put",
+    );
+    assert.equal(emergencyQueueAttempts, authorityFailure === "queue_send" ? 1 : 0);
+  });
+}
+
+test("post-archive recovery ends in SMTP rejection when emergency authority and provider forwarding both fail", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const recovery = rejectionRecoveryBucket("false");
+  let forwardCalls = 0;
+  let rejection: string | undefined;
+  const bucket = {
+    ...recovery.bucket,
+    async put(
+      key: string,
+      value: ArrayBuffer | string,
+      options?: R2PutTestOptions,
+    ) {
+      if (
+        isActiveMarkerKey(key) ||
+        key.startsWith("system/emergency-forward/active/")
+      ) {
+        throw new Error("simulated recovery marker outage");
+      }
+      return recovery.bucket.put(key, value, options);
+    },
+  };
+
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`),
+      async forward() {
+        forwardCalls += 1;
+        throw new Error("simulated provider outage");
+      },
+      setReject(reason: string) {
+        rejection = reason;
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return null;
+        },
+      },
+      RAW_MAIL_BUCKET: bucket,
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("active-marker failure must not reach the primary Queue");
+        },
+      },
+      EMERGENCY_FORWARD_QUEUE: {
+        async send() {
+          assert.fail("marker failure must stop before emergency Queue send");
+        },
+      },
+      MAILBOX: {
+        idFromName() {
+          assert.fail("unprovisioned direct fallback must not resolve Mailbox");
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-17T10:00:00.000Z"),
+      randomUUID: () => "emergency-authority-provider-failure",
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(forwardCalls, 1);
+  assert.match(rejection ?? "", /please resend later/i);
+});
+
 test("inbound delivery directly projects exact archived bytes when the archived receipt cannot commit", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
@@ -667,7 +1655,7 @@ test("inbound delivery directly projects exact archived bytes when the archived 
       BRAND: "wiser",
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -708,6 +1696,9 @@ test("inbound delivery directly projects exact archived bytes when the archived 
           return {
             async getEmail() {
               return projection?.email ?? null;
+            },
+            async getInboundProjectionAuthority() {
+              return projection ? { generation: 1 } : null;
             },
             async findThreadBySubject() {
               return null;
@@ -757,7 +1748,7 @@ test("inbound delivery directly projects exact archived bytes when the archived 
 
 for (const scenario of [
   { name: "emergency-forwards once when direct projection fails", forwardSucceeds: true },
-  { name: "rejects SMTP when direct projection and emergency forwarding fail", forwardSucceeds: false },
+  { name: "preserves automatic recovery when direct projection and emergency forwarding fail", forwardSucceeds: false },
 ]) {
   test(`inbound delivery ${scenario.name} after the archived receipt cannot commit`, async () => {
     const mailboxAddress = "hello@wiserchat.ai";
@@ -785,7 +1776,7 @@ for (const scenario of [
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(),
         BUCKET: {
           async head() {
@@ -830,8 +1821,11 @@ for (const scenario of [
     );
 
     assert.equal(forwardCalls, 1);
-    if (scenario.forwardSucceeds) assert.equal(rejection, undefined);
-    else assert.match(rejection ?? "", /could not be stored.*resend later/i);
+    if (scenario.forwardSucceeds) {
+      assert.equal(rejection, undefined);
+    } else {
+      assert.match(rejection ?? "", /please resend later/i);
+    }
   });
 }
 
@@ -849,7 +1843,7 @@ for (const deactivationCase of [
     expectedProjectionCalls: 1,
   },
 ]) {
-  test(`inbound delivery rejects when a mailbox becomes inactive ${deactivationCase.name}`, async () => {
+  test(`inbound delivery preserves archived recovery when a mailbox becomes inactive ${deactivationCase.name}`, async () => {
     const mailboxAddress = "hello@wiserchat.ai";
     const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
     let activeChecks = 0;
@@ -874,7 +1868,7 @@ for (const deactivationCase of [
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: {
           prepare(query: string) {
             assert.match(query, /FROM mailboxes/);
@@ -964,8 +1958,8 @@ for (const deactivationCase of [
     assert.equal(activeChecks, deactivationCase.expectedActiveChecks);
     assert.equal(projectionCalls, deactivationCase.expectedProjectionCalls);
     assert.equal(queueCalls, 0);
-    assert.equal(forwardCalls, 0);
-    assert.match(rejection ?? "", /mailbox unavailable/i);
+    assert.equal(forwardCalls, 1);
+    assert.equal(rejection, undefined);
   });
 }
 
@@ -996,7 +1990,7 @@ test("inbound delivery emergency-forwards once when the per-attempt active reche
     {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: {
         prepare(query: string) {
           assert.match(query, /FROM mailboxes/);
@@ -1081,7 +2075,7 @@ test("inbound delivery emergency-forwards once when the per-attempt active reche
   assert.equal(rejection, undefined);
 });
 
-async function assertEmergencyForwardResultRejected(
+async function assertEmergencyForwardResultPreserved(
   forwardResult: unknown,
 ): Promise<void> {
   const mailboxAddress = "hello@wiserchat.ai";
@@ -1121,7 +2115,7 @@ async function assertEmergencyForwardResultRejected(
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(),
         BUCKET: {
           async head() {
@@ -1170,7 +2164,7 @@ async function assertEmergencyForwardResultRejected(
   }
 
   assert.equal(forwardCalls, 1);
-  assert.match(rejection ?? "", /could not be stored.*resend later/i);
+  assert.match(rejection ?? "", /please resend later/i);
   assert.equal(
     logs.some(
       (entry) =>
@@ -1197,18 +2191,18 @@ async function assertEmergencyForwardResultRejected(
   assert.doesNotMatch(JSON.stringify(logs), /provider-message-id-poison/);
 }
 
-test("inbound delivery rejects SMTP when emergency forwarding resolves without a message ID", async () => {
-  await assertEmergencyForwardResultRejected({});
+test("inbound delivery preserves archived recovery when emergency forwarding resolves without a message ID", async () => {
+  await assertEmergencyForwardResultPreserved({});
 });
 
-test("inbound delivery rejects SMTP when emergency forwarding resolves with a non-string message ID", async () => {
-  await assertEmergencyForwardResultRejected({
+test("inbound delivery preserves archived recovery when emergency forwarding resolves with a non-string message ID", async () => {
+  await assertEmergencyForwardResultPreserved({
     messageId: { privatePayload: "provider-message-id-poison" },
   });
 });
 
-test("inbound delivery rejects SMTP when emergency forwarding resolves with a whitespace-only message ID", async () => {
-  await assertEmergencyForwardResultRejected({ messageId: " \t\n" });
+test("inbound delivery preserves archived recovery when emergency forwarding resolves with a whitespace-only message ID", async () => {
+  await assertEmergencyForwardResultPreserved({ messageId: " \t\n" });
 });
 
 test("inbound delivery keeps a successful Queue handoff when enqueued receipt advancement loses CAS", async () => {
@@ -1336,7 +2330,7 @@ test("inbound delivery directly projects when the admitted receipt cannot commit
     {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -1387,6 +2381,9 @@ test("inbound delivery directly projects when the admitted receipt cannot commit
             async getEmail() {
               return projectedId ? {} : null;
             },
+            async getInboundProjectionAuthority() {
+              return projectedId ? { generation: 1 } : null;
+            },
             async findThreadBySubject() {
               return null;
             },
@@ -1426,10 +2423,11 @@ test("inbound delivery directly projects when the admitted receipt cannot commit
   assert.equal(projectedId, "admitted-receipt-failure");
 });
 
-test("inbound delivery preserves a concurrent terminal winner when admitted receipt CAS loses", async () => {
+test("a bare legacy tombstone after admitted-receipt CAS loss cannot suppress emergency forwarding", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
   let receiptState = "missing";
+  let forwardCalls = 0;
 
   await receiveEmail(
     {
@@ -1437,7 +2435,8 @@ test("inbound delivery preserves a concurrent terminal winner when admitted rece
       to: mailboxAddress,
       ...raw,
       async forward() {
-        assert.fail("a terminal Mailbox winner must not emergency-forward");
+        forwardCalls += 1;
+        return { messageId: "legacy-tombstone-recovery-forward" };
       },
       setReject(reason: string) {
         assert.fail(`a terminal Mailbox winner must not reject: ${reason}`);
@@ -1446,7 +2445,7 @@ test("inbound delivery preserves a concurrent terminal winner when admitted rece
     {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -1511,6 +2510,7 @@ test("inbound delivery preserves a concurrent terminal winner when admitted rece
   );
 
   assert.equal(receiptState, "deleted");
+  assert.equal(forwardCalls, 1);
 });
 
 test("attachment fallback never uploads without a cleanup ledger and forwards once", async () => {
@@ -1551,7 +2551,7 @@ test("attachment fallback never uploads without a cleanup ledger and forwards on
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -1676,7 +2676,7 @@ test("inbound delivery forwards to Gmail when raw archival and direct mailbox st
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(),
         BUCKET: {
           async head() {
@@ -1756,7 +2756,7 @@ test("inbound delivery forwards when a raw outage coincides with a transient mai
     {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       BUCKET: {
         async head() {
           throw new Error("simulated mailbox marker outage");
@@ -1814,7 +2814,7 @@ test("inbound delivery logs raw and fallback boundaries before starting them", a
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(),
         BUCKET: {
           async head() {
@@ -1904,7 +2904,7 @@ test("inbound delivery permanently rejects only when all three durable paths fai
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         BUCKET: {
           async head() {
             return {};
@@ -1949,11 +2949,332 @@ test("inbound delivery permanently rejects only when all three durable paths fai
   }
 });
 
-test("inbound delivery stores in the intended mailbox when checksum preparation fails", async () => {
+test("checksum failure preserves raw in R2 then directly forwards without SHA-less recovery authority", async () => {
   const mailboxAddress = "hello@wiserchat.ai";
   const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
-  let rawPutAttempted = false;
+  let digestAttempts = 0;
+  let rawPuts = 0;
+  let forwardedTo: string | undefined;
+  let rejection: string | undefined;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        rejection = reason;
+      },
+      async forward(recipient: string) {
+        forwardedTo = recipient;
+        return { messageId: "provider-accepted-preserved-raw" };
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: {
+        prepare() {
+          assert.fail("SHA-less preservation must not run D1 admission");
+        },
+      },
+      BUCKET: {
+        async head() {
+          assert.fail("SHA-less preservation must not run mailbox admission");
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          rawPuts += 1;
+          assert.match(key, /^raw\//);
+          assert.ok(value instanceof ArrayBuffer);
+          assert.equal(options?.sha256, undefined);
+          assert.equal(options?.customMetadata?.rawSha256, undefined);
+          return {
+            ...r2Object(key, value.byteLength, options),
+            checksums: { md5: new ArrayBuffer(16) },
+          };
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("SHA-less pointer must not reach the normal Queue");
+        },
+      },
+      MAILBOX: {
+        idFromName() {
+          assert.fail("SHA-less preservation must not resolve a Mailbox");
+        },
+        get() {
+          assert.fail("SHA-less preservation must not resolve a Mailbox");
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "digest-failure-preserved",
+      async digestSha256() {
+        digestAttempts += 1;
+        throw new Error("simulated WebCrypto failure");
+      },
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(rawPuts, 1);
+  assert.equal(digestAttempts, 3);
+  assert.equal(forwardedTo, "verified-backup@example.com");
+  assert.equal(rejection, undefined);
+});
+
+test("checksum preparation retry rewrites the preservation archive with exact SHA authority", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  const digest = Uint8Array.from(
+    createHash("sha256")
+      .update(
+        new TextEncoder().encode(
+          `From: sender@example.com\r\nTo: ${mailboxAddress}\r\n\r\nHello from the Internet.`,
+        ),
+      )
+      .digest(),
+  ).buffer;
+  let digestAttempts = 0;
+  const rawWrites: Array<{ hasSha: boolean; metadataSha?: string }> = [];
+  let queued: InboundArchivePointer | undefined;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        assert.fail(`exact rewrite must not reject: ${reason}`);
+      },
+      async forward() {
+        assert.fail("exact rewrite must continue through normal Queue handoff");
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (key.startsWith("raw/")) {
+            assert.ok(value instanceof ArrayBuffer);
+            rawWrites.push({
+              hasSha: options?.sha256 instanceof ArrayBuffer,
+              metadataSha: options?.customMetadata?.rawSha256,
+            });
+            return options?.sha256 instanceof ArrayBuffer
+              ? r2Object(key, value.byteLength, options)
+              : {
+                  ...r2Object(key, value.byteLength, options),
+                  checksums: { md5: new ArrayBuffer(16) },
+                };
+          }
+          if (isActiveMarkerKey(key))
+            return activeMarkerObject(key, value, options);
+          return r2Object(key, String(value).length, options);
+        },
+      },
+      INBOUND_QUEUE: {
+        async send(value: InboundArchivePointer) {
+          queued = value;
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          throw new Error("normal Queue handoff must precede projection");
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "digest-retry-rewrite",
+      async digestSha256() {
+        digestAttempts += 1;
+        if (digestAttempts === 1)
+          throw new Error("simulated transient WebCrypto failure");
+        return digest;
+      },
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.deepEqual(rawWrites, [
+    { hasSha: false, metadataSha: undefined },
+    {
+      hasSha: true,
+      metadataSha: Buffer.from(digest).toString("hex"),
+    },
+  ]);
+  assert.equal(digestAttempts, 2);
+  assert.equal(queued?.rawSha256, Buffer.from(digest).toString("hex"));
+});
+
+test("failed exact-SHA rewrite falls back to exact direct authority before forwarding", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  const digest = Uint8Array.from(
+    createHash("sha256")
+      .update(
+        new TextEncoder().encode(
+          `From: sender@example.com\r\nTo: ${mailboxAddress}\r\n\r\nHello from the Internet.`,
+        ),
+      )
+      .digest(),
+  ).buffer;
+  let digestAttempts = 0;
+  let preservationWrites = 0;
+  let exactRewriteAttempts = 0;
+  let forwardCalls = 0;
+  let directCalls = 0;
   let storedEmail: Record<string, unknown> | undefined;
+  let storedAuthority: Record<string, unknown> | undefined;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        assert.fail(`preserved raw direct-forward must not reject: ${reason}`);
+      },
+      async forward(recipient: string) {
+        forwardCalls += 1;
+        assert.equal(recipient, "verified-backup@example.com");
+        return { messageId: "provider-accepted-after-rewrite-outage" };
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain direct fallback must not upload derived content");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          assert.match(key, /^raw\//);
+          assert.ok(value instanceof ArrayBuffer);
+          if (options?.sha256 instanceof ArrayBuffer) {
+            exactRewriteAttempts += 1;
+            throw new Error("simulated exact SHA rewrite outage");
+          }
+          preservationWrites += 1;
+          return {
+            ...r2Object(key, value.byteLength, options),
+            checksums: { md5: new ArrayBuffer(16) },
+          };
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          assert.fail("failed exact rewrite must not enqueue a pointer");
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return storedEmail ?? null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async getDirectInboundProjectionAuthority(
+              authority: Record<string, unknown>,
+            ) {
+              return storedAuthority &&
+                JSON.stringify(authority) === JSON.stringify(storedAuthority)
+                ? { generation: 1 }
+                : null;
+            },
+            async getDirectInboundDeletionAuthority() {
+              return null;
+            },
+            async createDirectInboundEmail(command: {
+              email: Record<string, unknown>;
+              directAuthority: Record<string, unknown>;
+            }) {
+              directCalls += 1;
+              assert.equal(
+                command.directAuthority.rawSha256,
+                Buffer.from(digest).toString("hex"),
+              );
+              storedEmail = command.email;
+              storedAuthority = command.directAuthority;
+              return { status: "stored" as const, cleanupKeys: [] };
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "digest-rewrite-outage",
+      async digestSha256() {
+        digestAttempts += 1;
+        if (digestAttempts === 1)
+          throw new Error("simulated initial WebCrypto failure");
+        return digest;
+      },
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(digestAttempts, 2);
+  assert.equal(preservationWrites, 1);
+  assert.equal(exactRewriteAttempts, 10);
+  assert.equal(directCalls, 1);
+  assert.equal(forwardCalls, 0);
+});
+
+test("exact SHA authority stores directly when raw preservation fails", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  const expectedRawSha256 = createHash("sha256")
+    .update(
+      `From: sender@example.com\r\nTo: ${mailboxAddress}\r\n\r\nHello from the Internet.`,
+    )
+    .digest("hex");
+  let rawPutAttempts = 0;
+  let storedEmail: Record<string, unknown> | undefined;
+  let storedAuthority: Record<string, unknown> | undefined;
   let forwarded = false;
   const errors: Array<{ fields?: Record<string, unknown> }> = [];
   const originalConsoleError = console.error;
@@ -1977,7 +3298,7 @@ test("inbound delivery stores in the intended mailbox when checksum preparation 
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(),
         BUCKET: {
           async head() {
@@ -1992,8 +3313,8 @@ test("inbound delivery stores in the intended mailbox when checksum preparation 
         },
         RAW_MAIL_BUCKET: {
           async put() {
-            rawPutAttempted = true;
-            assert.fail("R2 must not receive a raw write without a checksum");
+            rawPutAttempts += 1;
+            throw new Error("simulated R2 preservation outage");
           },
         },
         INBOUND_QUEUE: { async send() {} },
@@ -2009,15 +3330,44 @@ test("inbound delivery stores in the intended mailbox when checksum preparation 
               async findThreadBySubject() {
                 return null;
               },
-              async createInboundEmail(command: {
+              async getDirectInboundProjectionAuthority(
+                authority: Record<string, unknown>,
+              ) {
+                return storedAuthority &&
+                  JSON.stringify(authority) === JSON.stringify(storedAuthority)
+                  ? { generation: 1 }
+                  : null;
+              },
+              async getDirectInboundDeletionAuthority() {
+                return null;
+              },
+              async createDirectInboundEmail(command: {
                 folder: string;
                 email: Record<string, unknown>;
                 allowTerminalRecovery: boolean;
+                projectionExpiresAt?: number;
+                directAuthority: Record<string, unknown>;
               }) {
                 assert.equal(command.folder, "inbox");
                 assert.equal(command.allowTerminalRecovery, false);
+                assert.ok(
+                  Number.isSafeInteger(command.projectionExpiresAt) &&
+                    command.projectionExpiresAt! > Date.now(),
+                );
+                assert.deepEqual(command.directAuthority, {
+                  schemaVersion: 1,
+                  ingressId: "digest-failure",
+                  mailboxId: mailboxAddress,
+                  rawSize: raw.rawSize,
+                  rawSha256: expectedRawSha256,
+                  receivedAt: "2026-07-13T09:30:00.000Z",
+                });
                 storedEmail = command.email;
+                storedAuthority = command.directAuthority;
                 return { status: "stored" as const, cleanupKeys: [] };
+              },
+              async createInboundEmail() {
+                assert.fail("direct fallback must not use archive authority");
               },
             };
           },
@@ -2027,25 +3377,289 @@ test("inbound delivery stores in the intended mailbox when checksum preparation 
       {
         now: () => new Date("2026-07-13T09:30:00.000Z"),
         randomUUID: () => "digest-failure",
-        async digestSha256() {
-          throw new Error("simulated WebCrypto failure");
-        },
+        sleep: () => Promise.resolve(),
       },
     );
 
-    assert.equal(rawPutAttempted, false);
+    assert.equal(rawPutAttempts, 10);
     assert.equal(forwarded, false);
     assert.equal(storedEmail?.id, "digest-failure");
+    assert.equal(storedAuthority?.rawSha256, expectedRawSha256);
     assert.equal(
-      errors.find(
+      errors.some(
         (entry) =>
-          entry.fields?.errorCode === "RAW_ARCHIVE_CHECKSUM_PREPARATION_FAILED",
-      )?.fields?.status,
-      "failed",
+          entry.fields?.errorCode ===
+          "RAW_ARCHIVE_CHECKSUM_PREPARATION_FAILED",
+      ),
+      false,
     );
   } finally {
     console.error = originalConsoleError;
   }
+});
+
+test("ambiguous direct commit is accepted only after the exact authority getter proves it", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let storedEmail: { id: string } | undefined;
+  let storedAuthority: Record<string, unknown> | undefined;
+  let createCalls = 0;
+  let forwardCalls = 0;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        assert.fail(`proven ambiguous commit must not reject: ${reason}`);
+      },
+      async forward() {
+        forwardCalls += 1;
+        return { messageId: "must-not-forward" };
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain direct projection must not upload derived content");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async put() {
+          throw new Error("simulated raw archive outage");
+        },
+      },
+      INBOUND_QUEUE: { async send() {} },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return storedEmail ?? null;
+            },
+            async getDirectInboundProjectionAuthority(
+              authority: Record<string, unknown>,
+            ) {
+              return storedAuthority &&
+                JSON.stringify(authority) === JSON.stringify(storedAuthority)
+                ? { generation: 1 }
+                : null;
+            },
+            async getDirectInboundDeletionAuthority() {
+              return null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createDirectInboundEmail(command: {
+              email: { id: string };
+              directAuthority: Record<string, unknown>;
+            }) {
+              createCalls += 1;
+              storedEmail = command.email;
+              storedAuthority = command.directAuthority;
+              throw new Error("simulated response loss after commit");
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "direct-ambiguous",
+      sleep: () => Promise.resolve(),
+      async parse() {
+        return {
+          headers: [],
+          headerLines: [],
+          from: { name: "Sender", address: "sender@example.com" },
+          to: [{ name: "Mailbox", address: mailboxAddress }],
+          text: "Committed before response loss.",
+          attachments: [],
+        };
+      },
+    },
+  );
+
+  assert.equal(createCalls, 1);
+  assert.equal(storedEmail?.id, "direct-ambiguous");
+  assert.equal(forwardCalls, 0);
+});
+
+test("a direct commit-delete-lost-response race never provider-forwards after exact deletion authority appears", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let deletedAuthority: Record<string, unknown> | undefined;
+  let forwardCalls = 0;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        assert.fail(`exact deletion must remain terminal: ${reason}`);
+      },
+      async forward() {
+        forwardCalls += 1;
+        return { messageId: "must-not-forward-deleted-direct" };
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain direct projection must not upload derived content");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async put() {
+          throw new Error("simulated raw archive outage");
+        },
+      },
+      INBOUND_QUEUE: { async send() {} },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return null;
+            },
+            async getDirectInboundProjectionAuthority() {
+              return null;
+            },
+            async getDirectInboundDeletionAuthority(
+              authority: Record<string, unknown>,
+            ) {
+              return deletedAuthority &&
+                JSON.stringify(authority) === JSON.stringify(deletedAuthority)
+                ? {
+                    generation: 2,
+                    deletedAt: "2026-07-13T09:30:01.000Z",
+                  }
+                : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createDirectInboundEmail(command: {
+              directAuthority: Record<string, unknown>;
+            }) {
+              deletedAuthority = command.directAuthority;
+              throw new Error(
+                "simulated response loss after direct commit and delete",
+              );
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "direct-delete-lost-response",
+      sleep: () => Promise.resolve(),
+      async parse() {
+        return {
+          headers: [],
+          headerLines: [],
+          from: { name: "Sender", address: "sender@example.com" },
+          to: [{ name: "Mailbox", address: mailboxAddress }],
+          text: "Deleted before response loss.",
+          attachments: [],
+        };
+      },
+    },
+  );
+
+  assert.ok(deletedAuthority);
+  assert.equal(forwardCalls, 0);
+});
+
+test("unrelated direct identity collision falls through to provider forwarding", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let forwardCalls = 0;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      setReject(reason: string) {
+        assert.fail(`provider recovery must not reject: ${reason}`);
+      },
+      async forward(recipient: string) {
+        forwardCalls += 1;
+        assert.equal(recipient, "verified-backup@example.com");
+        return { messageId: "provider-after-direct-identity-conflict" };
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+      },
+      RAW_MAIL_BUCKET: {
+        async put() {
+          throw new Error("simulated raw archive outage");
+        },
+      },
+      INBOUND_QUEUE: { async send() {} },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return { id: "direct-foreign-collision" };
+            },
+            async getDirectInboundProjectionAuthority() {
+              return null;
+            },
+            async getDirectInboundDeletionAuthority() {
+              return null;
+            },
+            async createDirectInboundEmail() {
+              assert.fail("an unrelated existing email must not be overwritten");
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "direct-foreign-collision",
+      sleep: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(forwardCalls, 1);
 });
 
 test("inbound delivery retries when R2 omits the requested raw checksum", async () => {
@@ -2077,7 +3691,7 @@ test("inbound delivery retries when R2 omits the requested raw checksum", async 
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         BUCKET: {
           async head() {
             return {};
@@ -2156,7 +3770,7 @@ test("inbound delivery retries when R2 returns a same-size raw object with the w
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         BUCKET: {
           async head() {
             return {};
@@ -2224,7 +3838,7 @@ test("inbound delivery refuses handoff when the persisted raw size does not matc
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
       DB: mailboxDb(),
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       BUCKET: {
         async head() {
           return {};
@@ -2311,7 +3925,7 @@ test("inbound delivery directly projects when Queue enqueue fails", async () => 
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -2362,6 +3976,9 @@ test("inbound delivery directly projects when Queue enqueue fails", async () => 
           return {
             async getEmail() {
               return projectedId ? {} : null;
+            },
+            async getInboundProjectionAuthority() {
+              return projectedId ? { generation: 1 } : null;
             },
             async findThreadBySubject() {
               return null;
@@ -2428,6 +4045,118 @@ test("inbound delivery directly projects when Queue enqueue fails", async () => 
   } finally {
     console.error = originalConsoleError;
   }
+});
+
+test("an archive-backed commit-delete-lost-response race never provider-forwards after exact deletion authority appears", async () => {
+  const mailboxAddress = "hello@wiserchat.ai";
+  const raw = rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`);
+  let deletedAuthority: Record<string, unknown> | undefined;
+  let forwardCalls = 0;
+  await receiveEmail(
+    {
+      from: "sender@example.com",
+      to: mailboxAddress,
+      ...raw,
+      async forward() {
+        forwardCalls += 1;
+        return { messageId: "must-not-forward-deleted-archive" };
+      },
+      setReject(reason: string) {
+        assert.fail(`exact archive deletion must remain terminal: ${reason}`);
+      },
+    },
+    {
+      DOMAINS: "wiserchat.ai",
+      EMAIL_ADDRESSES: [],
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+      DB: mailboxDb(),
+      BUCKET: {
+        async head() {
+          return {};
+        },
+        async put() {
+          assert.fail("plain archive projection must not upload derived content");
+        },
+        async delete() {},
+      },
+      RAW_MAIL_BUCKET: {
+        async get() {
+          return null;
+        },
+        async put(
+          key: string,
+          value: ArrayBuffer | string,
+          options?: R2PutTestOptions,
+        ) {
+          if (typeof value === "string") {
+            return r2Object(key, value.length, options, `${key}-etag`);
+          }
+          return r2Object(key, value.byteLength, options);
+        },
+      },
+      INBOUND_QUEUE: {
+        async send() {
+          throw new Error("simulated Queue outage");
+        },
+      },
+      MAILBOX: {
+        idFromName(mailboxId: string) {
+          return mailboxId;
+        },
+        get() {
+          return {
+            async getEmail() {
+              return null;
+            },
+            async getInboundProjectionAuthority() {
+              return null;
+            },
+            async getInboundDeletionAuthority(
+              authority: Record<string, unknown>,
+            ) {
+              return deletedAuthority &&
+                JSON.stringify(authority) === JSON.stringify(deletedAuthority)
+                ? {
+                    generation: 2,
+                    deletedAt: "2026-07-13T09:30:01.000Z",
+                  }
+                : null;
+            },
+            async findThreadBySubject() {
+              return null;
+            },
+            async createInboundEmail(command: {
+              archiveAuthority: Record<string, unknown>;
+            }) {
+              deletedAuthority = command.archiveAuthority;
+              throw new Error(
+                "simulated response loss after archive commit and delete",
+              );
+            },
+          };
+        },
+      },
+    },
+    { waitUntil() {} },
+    {
+      now: () => new Date("2026-07-13T09:30:00.000Z"),
+      randomUUID: () => "archive-delete-lost-response",
+      sleep: () => Promise.resolve(),
+      async parse() {
+        return {
+          headers: [],
+          headerLines: [],
+          from: { name: "Sender", address: "sender@example.com" },
+          to: [{ name: "Mailbox", address: mailboxAddress }],
+          text: "Deleted before archive response loss.",
+          attachments: [],
+        };
+      },
+    },
+  );
+
+  assert.ok(deletedAuthority);
+  assert.equal(forwardCalls, 0);
 });
 
 test("inbound delivery uses the SMTP envelope recipient when the visible To header differs", async () => {
@@ -2506,7 +4235,7 @@ test("inbound delivery directly projects archived mail when the mailbox marker l
     const env = {
       DOMAINS: "wiserchat.ai",
       EMAIL_ADDRESSES: [],
-      EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+      EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
       DB: mailboxDb(),
       BUCKET: {
         async head() {
@@ -2558,6 +4287,9 @@ test("inbound delivery directly projects archived mail when the mailbox marker l
           return {
             async getEmail() {
               return projectedId ? {} : null;
+            },
+            async getInboundProjectionAuthority() {
+              return projectedId ? { generation: 1 } : null;
             },
             async findThreadBySubject() {
               return null;
@@ -2646,6 +4378,7 @@ for (const testCase of d1AdmissionCases) {
   test(`inbound delivery ${testCase.name}`, async () => {
     const mailboxAddress = "hello@wiserchat.ai";
     const receiptStates: string[] = [];
+    const receiptBodies = new Map<string, string>();
     let forwarded = false;
     let projected = false;
     let rejection: string | undefined;
@@ -2668,7 +4401,7 @@ for (const testCase of d1AdmissionCases) {
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: [],
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(testCase.dbState),
         BUCKET: {
           async head() {
@@ -2676,6 +4409,10 @@ for (const testCase of d1AdmissionCases) {
           },
         },
         RAW_MAIL_BUCKET: {
+          async get(key: string) {
+            const value = receiptBodies.get(key);
+            return value ? r2TextObject(key, value, `receipt-${JSON.parse(value).state}`) : null;
+          },
           async put(
             key: string,
             value: ArrayBuffer | string,
@@ -2687,6 +4424,7 @@ for (const testCase of d1AdmissionCases) {
             if (key.startsWith("receipts/")) {
               const state = JSON.parse(String(value)).state as string;
               receiptStates.push(state);
+              receiptBodies.set(key, String(value));
               return r2Object(
                 key,
                 String(value).length,
@@ -2708,8 +4446,22 @@ for (const testCase of d1AdmissionCases) {
             return mailboxId;
           },
           get() {
-            projected = true;
-            throw new Error("unverified recipients must not reach projection");
+            return {
+              async getInboundDeletionAuthority() {
+                return null;
+              },
+              async getDirectInboundDeletionAuthority() {
+                return null;
+              },
+              async createInboundEmail() {
+                projected = true;
+                assert.fail("unverified recipients must not reach projection");
+              },
+              async createDirectInboundEmail() {
+                projected = true;
+                assert.fail("unverified recipients must not reach projection");
+              },
+            };
           },
         },
       },
@@ -2731,6 +4483,7 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
   let rawWasRead = false;
   let rawWasArchived = false;
   let rejection: string | undefined;
+  const receiptBodies = new Map<string, string>();
   const rawBytes = new Uint8Array(100);
   const message = {
     from: "sender@example.com",
@@ -2763,6 +4516,10 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
       },
     },
     RAW_MAIL_BUCKET: {
+      async get(key: string) {
+        const value = receiptBodies.get(key);
+        return value ? r2TextObject(key, value) : null;
+      },
       async put(
         key: string,
         value: ArrayBuffer | string,
@@ -2771,6 +4528,7 @@ test("inbound delivery archives before permanently rejecting an unprovisioned en
         if (isActiveMarkerKey(key)) {
           return activeMarkerObject(key, value, options);
         }
+        if (key.startsWith("receipts/")) receiptBodies.set(key, String(value));
         if (!key.startsWith("receipts/")) rawWasArchived = true;
         return r2Object(
           key,
@@ -2812,7 +4570,7 @@ for (const recipientCase of [
     mailboxState: "inactive",
   },
 ]) {
-  test(`inbound delivery rejects a proven ${recipientCase.name} recipient when rejection receipt persistence fails`, async () => {
+  test(`inbound delivery preserves automatic recovery for a proven ${recipientCase.name} recipient when rejection receipt persistence fails`, async () => {
     const receiptStates: string[] = [];
     let forwarded = false;
     let projected = false;
@@ -2837,7 +4595,7 @@ for (const recipientCase of [
       {
         DOMAINS: "wiserchat.ai",
         EMAIL_ADDRESSES: recipientCase.allowedAddresses,
-        EMERGENCY_FORWARD_TO: "verified-backup@example.com",
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
         DB: mailboxDb(
           recipientCase.mailboxState === "inactive" ? "inactive" : "active",
         ),
@@ -2906,12 +4664,107 @@ for (const recipientCase of [
   });
 }
 
+for (const receiptFailure of [
+  "throw",
+  "false",
+  "concurrent_winner",
+] as const) {
+  test(`post-rejection receipt failure ${receiptFailure} retains recovery authority without a false terminal receipt`, async () => {
+    const mailboxAddress = "blocked@wiserchat.ai";
+    const recovery = rejectionRecoveryBucket(receiptFailure);
+    const emergencyQueue: unknown[] = [];
+    const ingressId = `rejection-${receiptFailure.replaceAll("_", "-")}`;
+    let rejection: string | undefined;
+    let rejectedReceiptAttempts = 0;
+    const orderedBucket = {
+      ...recovery.bucket,
+      async put(
+        key: string,
+        value: ArrayBuffer | string,
+        options?: R2PutTestOptions,
+      ) {
+        if (
+          typeof value === "string" &&
+          key.startsWith("receipts/") &&
+          JSON.parse(value).state === "rejected"
+        ) {
+          rejectedReceiptAttempts += 1;
+          assert.match(
+            rejection ?? "",
+            /mailbox unavailable/i,
+            "setReject must be requested before terminal receipt persistence",
+          );
+        }
+        return recovery.bucket.put(key, value, options);
+      },
+    };
+    await receiveEmail(
+      {
+        from: "sender@example.com",
+        to: mailboxAddress,
+        ...rawEmail(`From: sender@example.com\r\nTo: ${mailboxAddress}`),
+        setReject(reason: string) {
+          rejection = reason;
+        },
+      },
+      {
+        DOMAINS: "wiserchat.ai",
+        EMAIL_ADDRESSES: ["hello@wiserchat.ai"],
+        EMERGENCY_FORWARD_DESTINATION: "verified-backup@example.com",
+        DB: mailboxDb(),
+        BUCKET: {
+          async head() {
+            assert.fail("static rejection must not read a mailbox marker");
+          },
+        },
+        RAW_MAIL_BUCKET: orderedBucket,
+        INBOUND_QUEUE: {
+          async send() {
+            assert.fail("unproven rejection must not reach the primary Queue");
+          },
+        },
+        EMERGENCY_FORWARD_QUEUE: {
+          async send(value: unknown) {
+            emergencyQueue.push(value);
+          },
+        },
+        MAILBOX: {
+          idFromName() {
+            assert.fail("static rejection must not resolve the Mailbox");
+          },
+        },
+      },
+      { waitUntil() {} },
+      {
+        now: () => new Date("2026-07-17T10:00:00.000Z"),
+        randomUUID: () => ingressId,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    const receipt = recovery.sidecars.get(
+      `receipts/${ingressId}.json`,
+    );
+    assert.match(rejection ?? "", /mailbox unavailable/i);
+    assert.ok(rejectedReceiptAttempts >= 1);
+    assert.notEqual(JSON.parse(receipt?.value ?? "null").state, "rejected");
+    assert.equal(
+      [...recovery.sidecars.keys()].some((key) =>
+        key.startsWith("system/inbound-active/"),
+      ),
+      true,
+    );
+    assert.ok(emergencyQueue.length <= 1);
+  });
+}
+
 test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", async () => {
   let rejection: string | undefined;
   let mailboxWasChecked = false;
   let rawWasArchived = false;
   let activeMarkerKey: string | undefined;
   let deletedMarkerKey: string | undefined;
+  let rejectedReceiptWrittenAfterSetReject = false;
+  const receiptBodies = new Map<string, string>();
   const message = {
     from: "sender@example.com",
     to: "contact@wiserchat.ai",
@@ -2930,6 +4783,10 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
       },
     },
     RAW_MAIL_BUCKET: {
+      async get(key: string) {
+        const value = receiptBodies.get(key);
+        return value ? r2TextObject(key, value) : null;
+      },
       async put(
         key: string,
         value: ArrayBuffer | string,
@@ -2938,6 +4795,18 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
         if (isActiveMarkerKey(key)) {
           activeMarkerKey = key;
           return activeMarkerObject(key, value, options);
+        }
+        if (key.startsWith("receipts/")) {
+          const receipt = JSON.parse(String(value)) as Record<string, unknown>;
+          if (receipt.state === "rejected") {
+            assert.match(
+              rejection ?? "",
+              /mailbox unavailable/i,
+              "terminal receipt must be written only after setReject",
+            );
+            rejectedReceiptWrittenAfterSetReject = true;
+          }
+          receiptBodies.set(key, String(value));
         }
         if (!key.startsWith("receipts/")) rawWasArchived = true;
         return r2Object(
@@ -2958,6 +4827,7 @@ test("inbound delivery rejects an envelope recipient outside EMAIL_ADDRESSES", a
   assert.match(rejection ?? "", /mailbox unavailable/i);
   assert.equal(mailboxWasChecked, false);
   assert.equal(rawWasArchived, true);
+  assert.equal(rejectedReceiptWrittenAfterSetReject, true);
   assert.equal(deletedMarkerKey, activeMarkerKey);
 });
 
@@ -2965,6 +4835,7 @@ test("inbound delivery archives recipients outside configured mail domains befor
   let mailboxWasChecked = false;
   let rawWasArchived = false;
   let rejection: string | undefined;
+  const receiptBodies = new Map<string, string>();
   const message = {
     from: "sender@example.com",
     to: "hesham@wiserchat.ai.attacker.example",
@@ -2985,6 +4856,10 @@ test("inbound delivery archives recipients outside configured mail domains befor
       },
     },
     RAW_MAIL_BUCKET: {
+      async get(key: string) {
+        const value = receiptBodies.get(key);
+        return value ? r2TextObject(key, value) : null;
+      },
       async put(
         key: string,
         value: ArrayBuffer | string,
@@ -2993,6 +4868,7 @@ test("inbound delivery archives recipients outside configured mail domains befor
         if (isActiveMarkerKey(key)) {
           return activeMarkerObject(key, value, options);
         }
+        if (key.startsWith("receipts/")) receiptBodies.set(key, String(value));
         if (!key.startsWith("receipts/")) rawWasArchived = true;
         return r2Object(
           key,

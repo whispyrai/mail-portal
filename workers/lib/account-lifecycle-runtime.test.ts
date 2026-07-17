@@ -68,6 +68,7 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
     "0005_auth_security.sql",
     "0006_credential_recovery.sql",
     "0010_create_agent_connection_revocations.sql",
+    "0012_create_credential_recovery_jobs.sql",
   ]) {
     db.exec(
       readFileSync(
@@ -90,7 +91,7 @@ test("D1 deactivation stays revoked after reactivation and purges every mailbox 
     4,
     "member@wiserchat.ai",
     "old-mcp",
-    "owner@personal.example",
+    null,
     100,
     100,
     100,
