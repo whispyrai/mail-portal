@@ -53,6 +53,7 @@ export default function SingleMessageView({
 					mailboxId={mailboxId}
 					bodyState={bodyState}
 					senderLabel={email.sender}
+					autoSize
 				/>
 			</div>
 

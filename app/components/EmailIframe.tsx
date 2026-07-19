@@ -156,7 +156,10 @@ function iframeBridgeScript(
 	}
 	if (!manifestValid) manifestByCid.clear();
 	function reportHeight() {
-		var height = document.body.scrollHeight;
+		var height = Math.max(
+			document.body.scrollHeight,
+			document.documentElement.scrollHeight
+		);
 		if (height > 0) parent.postMessage({ __emailIframeHeight: true, nonce: nonce, height: height }, "*");
 	}
 	function revokeObjectUrls() {

@@ -31,12 +31,20 @@ const hostileId = "hostile-inline-metadata";
 const hostileThreadId = "hostile-inline-metadata-thread";
 const hostileSubject = "Hostile metadata switch";
 const hostileBody = "SAFE HOSTILE METADATA MESSAGE";
+const viewerLayoutId = "viewer-layout-single";
+const viewerLayoutThreadId = "viewer-layout-thread";
+const viewerLayoutSubject = "Viewer layout regression";
+const viewerLayoutBody = Array.from(
+	{ length: 24 },
+	(_, index) => `<p>Viewer layout line ${index + 1}: the complete message remains readable in conversation scroll order.</p>`,
+).join("");
 const cidPng = Buffer.from(
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 	"base64",
 );
 const emailListOnly = process.argv.includes("--email-list-only");
 const cidOnly = process.argv.includes("--cid-only");
+const viewerLayoutOnly = process.argv.includes("--viewer-layout-only");
 
 mkdirSync(artifactDirectory, { recursive: true });
 
@@ -268,6 +276,63 @@ async function installMailFixture(page, handleBody) {
 			return;
 		}
 		detail(`fixture continue GET ${path}`);
+		await route.continue();
+	});
+}
+
+async function installViewerLayoutFixture(page) {
+	const mailboxPrefix = `/api/v1/mailboxes/${mailboxId}`;
+	const email = {
+		id: viewerLayoutId,
+		conversation_id: viewerLayoutThreadId,
+		thread_id: viewerLayoutThreadId,
+		folder_id: "inbox",
+		subject: viewerLayoutSubject,
+		sender: "contact@wiserchat.ai",
+		recipient: mailboxId,
+		date: "2026-07-19T10:44:00.000Z",
+		read: true,
+		starred: false,
+		body: viewerLayoutBody,
+		body_external: false,
+		attachments: [],
+		labels: [],
+		thread_count: 1,
+		thread_unread_count: 0,
+		participants: "contact@wiserchat.ai",
+		snippet: "Viewer layout line 1",
+	};
+	await page.route("**/api/v1/mailboxes/**", async (route) => {
+		const request = route.request();
+		const path = decodeURIComponent(new URL(request.url()).pathname);
+		if (request.method() !== "GET") {
+			await route.continue();
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify({ emails: [email], totalCount: 1 }),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/emails/${viewerLayoutId}`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify(email),
+			});
+			return;
+		}
+		if (path === `${mailboxPrefix}/threads/${viewerLayoutThreadId}`) {
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify([email]),
+			});
+			return;
+		}
 		await route.continue();
 	});
 }
@@ -573,6 +638,81 @@ async function assertAuthoritativeIframe(page, messageId, expectedBody, forbidde
 	);
 	assert.match(srcdoc, new RegExp(expectedBody));
 	assert.doesNotMatch(srcdoc, new RegExp(forbiddenPreview));
+}
+
+async function verifyViewerLayout({ context, baseUrl, name }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(15_000);
+	observeBrowser(page, `${name} viewer-layout`);
+	try {
+		await installViewerLayoutFixture(page);
+		const inboxUrl = `${baseUrl}/mailbox/${encodeURIComponent(mailboxId)}/emails/inbox`;
+		await page.goto(inboxUrl, { waitUntil: "domcontentloaded" });
+		await page
+			.getByRole("button", { name: `Open conversation ${viewerLayoutSubject}` })
+			.click();
+		await page.getByRole("heading", { name: viewerLayoutSubject }).waitFor();
+		const iframe = page
+			.locator(`[data-intelligence-message-id="${viewerLayoutId}"]`)
+			.getByTitle("Email content");
+		await iframe.waitFor();
+		const iframeHandle = await iframe.elementHandle();
+		assert.ok(iframeHandle);
+		const contentFrame = await iframeHandle.contentFrame();
+		assert.ok(contentFrame);
+		await contentFrame.getByText("Viewer layout line 24", { exact: false }).waitFor();
+		const geometry = await pollValue(
+			() => Promise.all([
+				iframe.evaluate((element) => ({
+					height: element.getBoundingClientRect().height,
+					top: element.getBoundingClientRect().top,
+					bottom: element.getBoundingClientRect().bottom,
+				})),
+				contentFrame.evaluate(() => ({
+					clientHeight: document.documentElement.clientHeight,
+					scrollHeight: document.documentElement.scrollHeight,
+				})),
+			]).then(([frame, content]) => ({ frame, content })),
+			(value) => value.content.scrollHeight > 0,
+			"viewer layout iframe geometry",
+		);
+		assert.ok(
+			geometry.content.scrollHeight <= geometry.content.clientHeight + 1,
+			`email iframe owns an internal vertical scrollbar: ${JSON.stringify(geometry)}`,
+		);
+		assert.ok(
+			geometry.frame.height >= geometry.content.scrollHeight - 1,
+			`email iframe clips the message body: ${JSON.stringify(geometry)}`,
+		);
+		const intelligence = page.getByRole("button", { name: "Intelligence" });
+		const activity = page.getByRole("button", { name: "Activity" });
+		await intelligence.waitFor();
+		await activity.waitFor();
+		const order = await Promise.all([
+			iframe.evaluate((element) => element.getBoundingClientRect().top),
+			intelligence.evaluate((element) => element.getBoundingClientRect().top),
+			activity.evaluate((element) => element.getBoundingClientRect().top),
+		]);
+		assert.ok(order[0] < order[1] && order[1] < order[2], JSON.stringify(order));
+		await assertNoHorizontalOverflow(page);
+		await page.screenshot({
+			path: join(artifactDirectory, `email-body-${runStamp}-${name}-viewer-layout-mail.png`),
+		});
+		await intelligence.evaluate((element) =>
+			element.scrollIntoView({ block: "start" })
+		);
+		await delay(100);
+		await page.screenshot({
+			path: join(artifactDirectory, `email-body-${runStamp}-${name}-viewer-layout-tools.png`),
+		});
+		detail(`${name} viewer keeps long mail fully readable before Intelligence and Activity`);
+	} catch (error) {
+		await captureDiagnostic(page, name, "viewer-layout", error);
+		throw error;
+	} finally {
+		await page.unrouteAll({ behavior: "ignoreErrors" });
+		await page.close();
+	}
 }
 
 async function verifyInlineCidRendering({ context, baseUrl, name }) {
@@ -983,12 +1123,17 @@ async function verifyViewport({ browser, baseUrl, storageState, name, viewport }
 	progress(`Verifying ${name} at ${viewport.width}x${viewport.height}`);
 	const context = await browser.newContext({ storageState, viewport });
 	try {
+		if (viewerLayoutOnly) {
+			await verifyViewerLayout({ context, baseUrl, name });
+			return;
+		}
 		if (cidOnly) {
 			await verifyInlineCidRendering({ context, baseUrl, name });
 			return;
 		}
 		await verifyEmailListRetry({ context, baseUrl, name });
 		if (emailListOnly) return;
+		await verifyViewerLayout({ context, baseUrl, name });
 		await verifyInlineCidRendering({ context, baseUrl, name });
 		await verifyDelayedSelected({ context, baseUrl, name });
 		await verifyCollapseCancellation({ context, baseUrl, name });
@@ -1052,13 +1197,19 @@ async function main() {
 			name: "desktop",
 			viewport: { width: 1440, height: 900 },
 		});
-		progress(
-			cidOnly
-				? "PASS: CID inline images render through the nonce-bound opaque bridge at both widths"
-				: emailListOnly
-				? "PASS: email-list failures are truthful and recoverable at both widths"
-				: "PASS: email-list failures are truthful and recoverable, and authoritative email bodies are exact, cancellable, retryable, and Forward-safe at both widths",
-		);
+		let passMessage =
+			"PASS: email-list failures are truthful and recoverable, long mail is unclipped, and authoritative email bodies are exact, cancellable, retryable, and Forward-safe at both widths";
+		if (viewerLayoutOnly) {
+			passMessage =
+				"PASS: long single-message mail owns no internal vertical scrollbar and precedes Intelligence and Activity at both widths";
+		} else if (cidOnly) {
+			passMessage =
+				"PASS: CID inline images render through the nonce-bound opaque bridge at both widths";
+		} else if (emailListOnly) {
+			passMessage =
+				"PASS: email-list failures are truthful and recoverable at both widths";
+		}
+		progress(passMessage);
 	} finally {
 		await browser?.close();
 		await stopServer(serverProcess);
