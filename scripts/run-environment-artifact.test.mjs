@@ -89,6 +89,7 @@ test("deploy uses a private immutable copy of the exact verified build", async (
 	const secretsEnvelopePath = await writeSecretsEnvelope(directory);
 	const calls = [];
 	let stagedPath;
+	let buildEnvironment;
 	await quietRun({
 		brand: "wiser",
 		mode: "deploy",
@@ -101,13 +102,17 @@ test("deploy uses a private immutable copy of the exact verified build", async (
 		],
 		async runCommand(command, args, options) {
 			if (command.endsWith("react-router")) {
+				buildEnvironment = options.env;
 				await writeGeneratedBuild(directory);
 			} else {
 				const wranglerSecretsPath = args[args.indexOf("--secrets-file") + 1];
 				calls.push({
 					command,
 					args,
-					env: options.env.CLOUDFLARE_ENV,
+					hasBrandSelector: Object.hasOwn(
+						options.env,
+						"CLOUDFLARE_ENV",
+					),
 					artifact: await readFile(args[2], "utf8"),
 					wranglerSecretsPath,
 					wranglerSecrets: JSON.parse(
@@ -155,8 +160,35 @@ test("deploy uses a private immutable copy of the exact verified build", async (
 		0o600,
 	);
 	assert.equal(calls[1].artifact, '{"marker":"expected-artifact"}');
-	assert.equal(calls[1].env, "wiser");
+	assert.equal(buildEnvironment.CLOUDFLARE_ENV, "wiser");
+	assert.equal(calls[1].hasBrandSelector, false);
 	assert.equal(await pathIsMissing(dirname(dirname(stagedPath))), true);
+});
+
+test("deploy creates and removes a private writable Wrangler outdir by default", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "mail-portal-outdir-"));
+	let outdirPath;
+	await quietRun({
+		brand: "wiser",
+		mode: "deploy",
+		cwd: directory,
+		deployArgs: ["--dry-run"],
+		async runCommand(command, args, options) {
+			if (command.endsWith("react-router")) {
+				assert.equal(options.env.CLOUDFLARE_ENV, "wiser");
+				await writeGeneratedBuild(directory);
+				return;
+			}
+			assert.equal(Object.hasOwn(options.env, "CLOUDFLARE_ENV"), false);
+			outdirPath = args[args.indexOf("--outdir") + 1];
+			const entry = await lstat(outdirPath);
+			assert.equal(entry.isDirectory(), true);
+			assert.equal(entry.mode & 0o777, 0o700);
+			await writeFile(join(outdirPath, "worker.js"), "Wrangler scratch output");
+		},
+		async verifyArtifact() {},
+	});
+	assert.equal(await pathIsMissing(outdirPath), true);
 });
 
 test("secrets envelopes fail closed before lock, log, build, or verifier", async () => {
@@ -260,6 +292,7 @@ test("derived Wrangler secrets are removed when deployment fails", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "mail-portal-secrets-failure-"));
 	const source = await writeSecretsEnvelope(directory);
 	let derivedPath;
+	let outdirPath;
 	await assert.rejects(
 		() =>
 			quietRun({
@@ -273,6 +306,7 @@ test("derived Wrangler secrets are removed when deployment fails", async () => {
 						return;
 					}
 					derivedPath = args[args.indexOf("--secrets-file") + 1];
+					outdirPath = args[args.indexOf("--outdir") + 1];
 					throw new Error("simulated Wrangler failure");
 				},
 				async verifyArtifact() {},
@@ -281,6 +315,7 @@ test("derived Wrangler secrets are removed when deployment fails", async () => {
 	);
 	assert.equal(await pathIsMissing(derivedPath), true);
 	assert.equal(await pathIsMissing(dirname(derivedPath)), true);
+	assert.equal(await pathIsMissing(outdirPath), true);
 	assert.equal((await stat(source)).mode & 0o777, 0o600);
 });
 

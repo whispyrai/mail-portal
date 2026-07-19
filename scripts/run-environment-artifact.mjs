@@ -299,6 +299,23 @@ async function removePrivateWranglerSecretsFile(file) {
 	await rmdir(file.root);
 }
 
+async function createPrivateWranglerOutdir() {
+	const root = await mkdtemp(join(tmpdir(), "mail-portal-wrangler-out-"));
+	await chmod(root, 0o700);
+	const identity = await lstat(root);
+	assertRealDirectory(identity, "Private Wrangler outdir", 0o700);
+	return { root, identity };
+}
+
+async function removePrivateWranglerOutdir(directory) {
+	const current = await lstat(directory.root);
+	assertRealDirectory(current, "Private Wrangler outdir", 0o700);
+	if (!sameInode(current, directory.identity)) {
+		throw new Error("Private Wrangler outdir path changed during deployment");
+	}
+	await rm(directory.root, { recursive: true, force: false });
+}
+
 async function validateArtifactAncestors(cwd, artifactPath) {
 	const cwdEntry = await lstat(cwd);
 	assertRealDirectory(cwdEntry, "Working directory");
@@ -823,19 +840,25 @@ export async function runEnvironmentArtifact({
 		"server",
 		"wrangler.json",
 	);
-	const commandEnvironment = {
+	const buildEnvironment = {
 		...process.env,
 		...env,
 		CLOUDFLARE_ENV: brand,
 	};
+	// React Router resolves the named brand into a flat generated configuration.
+	// Passing the selector to Wrangler again would suffix the already-resolved
+	// Worker name and deploy to a different Worker.
+	const deployEnvironment = { ...buildEnvironment };
+	delete deployEnvironment.CLOUDFLARE_ENV;
 	const secrets = [
-		...secretValues(commandEnvironment),
+		...secretValues(buildEnvironment),
 		...Object.values(secretsEnvelope?.secrets ?? {}),
 	].sort((left, right) => right.length - left.length);
 	const lock = await acquireLock(resolvedLockPath, brand, mode);
 	let logger;
 	let stage;
 	let wranglerSecretsFile;
+	let wranglerOutdir;
 	let operationError = null;
 	try {
 		await lock.assertHeld();
@@ -849,7 +872,12 @@ export async function runEnvironmentArtifact({
 		});
 		await logger.progress(`Locked shared deployment artifact for ${brand}`);
 		await logger.progress(`Detailed log: ${resolvedLogFilePath}`);
-		const execute = async (label, command, args) => {
+		const execute = async (
+			label,
+			command,
+			args,
+			commandEnvironment = buildEnvironment,
+		) => {
 			signal?.throwIfAborted();
 			await lock.assertHeld();
 			await logger.progress(label);
@@ -918,12 +946,20 @@ export async function runEnvironmentArtifact({
 				await lock.assertHeld();
 				await verifyStagedArtifact(stage);
 				let exactDeployArgs = safeDeployArgs;
+				if (!exactDeployArgs.includes("--outdir")) {
+					wranglerOutdir = await createPrivateWranglerOutdir();
+					exactDeployArgs = [
+						...exactDeployArgs,
+						"--outdir",
+						wranglerOutdir.root,
+					];
+				}
 				if (secretsEnvelope) {
 					wranglerSecretsFile = await createPrivateWranglerSecretsFile(
 						secretsEnvelope.secrets,
 					);
 					exactDeployArgs = replaceSecretsFileArgument(
-						safeDeployArgs,
+						exactDeployArgs,
 						wranglerSecretsFile.path,
 					);
 				}
@@ -932,12 +968,18 @@ export async function runEnvironmentArtifact({
 						"Phase 3/3: deploying the exact verified immutable configuration",
 						join(resolvedCwd, "node_modules", ".bin", "wrangler"),
 						["deploy", "--config", stage.artifactPath, ...exactDeployArgs],
+						deployEnvironment,
 					);
 				} finally {
 					if (wranglerSecretsFile) {
 						const file = wranglerSecretsFile;
 						wranglerSecretsFile = null;
 						await removePrivateWranglerSecretsFile(file);
+					}
+					if (wranglerOutdir) {
+						const directory = wranglerOutdir;
+						wranglerOutdir = null;
+						await removePrivateWranglerOutdir(directory);
 					}
 				}
 			await verifyStagedArtifact(stage);
@@ -959,6 +1001,17 @@ export async function runEnvironmentArtifact({
 				} catch (cleanupError) {
 					await logger?.detail(
 						`Private Wrangler secrets cleanup failed closed: ${cleanupError.message}`,
+					);
+				}
+			}
+			if (wranglerOutdir) {
+				const directory = wranglerOutdir;
+				wranglerOutdir = null;
+				try {
+					await removePrivateWranglerOutdir(directory);
+				} catch (cleanupError) {
+					await logger?.detail(
+						`Private Wrangler outdir cleanup failed closed: ${cleanupError.message}`,
 					);
 				}
 			}
