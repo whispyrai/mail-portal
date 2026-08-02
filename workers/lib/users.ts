@@ -126,15 +126,31 @@ export async function createUser(
   return row;
 }
 
-export async function revokeUserCredentials(
+/**
+ * Replace a user's password. Outstanding sessions, MCP credentials, recovery
+ * tokens, and queued recovery mail all die with the old password.
+ *
+ * An administrator setting a deliberate password also confirms ownership, so a
+ * pending account becomes usable without a setup link. A revocation replaces the
+ * password with material nobody knows and must leave ownership untouched.
+ */
+async function replaceUserCredentials(
   env: Env,
   id: string,
   passwordHash: string,
   passwordSalt: string,
+  confirmOwnership: boolean,
 ): Promise<void> {
   const now = Date.now();
   await env.DB.batch([
-    env.DB.prepare(
+    confirmOwnership
+      ? env.DB.prepare(
+          `UPDATE users SET password_hash = ?, password_salt = ?, mcp_token_hash = NULL,
+			 session_version = session_version + 1,
+			 ownership_confirmed_at = COALESCE(ownership_confirmed_at, ?),
+			 updated_at = ? WHERE id = ?`,
+        ).bind(passwordHash, passwordSalt, now, now, id)
+      : env.DB.prepare(
       `UPDATE users SET password_hash = ?, password_salt = ?, mcp_token_hash = NULL,
 			 session_version = session_version + 1, updated_at = ? WHERE id = ?`,
     ).bind(passwordHash, passwordSalt, now, id),
@@ -161,6 +177,24 @@ export async function revokeUserCredentials(
        ) AND state = 'dispatching'`,
     ).bind(now, now, id),
   ]);
+}
+
+export function revokeUserCredentials(
+  env: Env,
+  id: string,
+  passwordHash: string,
+  passwordSalt: string,
+): Promise<void> {
+  return replaceUserCredentials(env, id, passwordHash, passwordSalt, false);
+}
+
+export function setUserPassword(
+  env: Env,
+  id: string,
+  passwordHash: string,
+  passwordSalt: string,
+): Promise<void> {
+  return replaceUserCredentials(env, id, passwordHash, passwordSalt, true);
 }
 
 export async function deleteUser(env: Env, id: string): Promise<void> {

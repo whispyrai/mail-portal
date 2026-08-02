@@ -4,18 +4,24 @@ import test from "node:test";
 
 const source = readFileSync(new URL("./admin.ts", import.meta.url), "utf8");
 
-test("admin account management never accepts or reveals replacement credentials", () => {
-  assert.doesNotMatch(source, /action="\/admin\/users\/\$\{u\.id\}\/password"/);
-  assert.doesNotMatch(
-    source,
-    /action="\/admin\/users\/\$\{u\.id\}\/mcp-token"/,
-  );
-  assert.doesNotMatch(source, /name="password"/);
+test("admin sets passwords deliberately and still never reveals other credentials", () => {
+  assert.match(source, /name="password"/);
+  assert.match(source, /action="\/admin\/users\/\$\{u\.id\}\/password"/);
+  assert.match(source, /setUserPassword/);
+  assert.match(source, /hashPassword\(password, c\.env\.JWT_SECRET\)/);
+  assert.match(source, /ownershipConfirmedAt: Date\.now\(\)/);
+
+  assert.doesNotMatch(source, /action="\/admin\/users\/\$\{u\.id\}\/mcp-token"/);
   assert.doesNotMatch(source, /MCP token issued/);
   assert.doesNotMatch(source, /name="recoveryEmail"/);
-  assert.match(source, /recoveryAddressFor/);
-  assert.match(source, /Resend secure setup link/);
-  assert.match(source, /ownership_confirmed_at/);
-  assert.doesNotMatch(source, /Secure recovery link sent/);
+  assert.match(source, /maskedRecoveryAddress/);
   assert.match(source, /Revoke sessions and credentials/);
+});
+
+test("the admin console no longer issues setup invitations", () => {
+  assert.doesNotMatch(source, /issueSetupLink/);
+  assert.doesNotMatch(source, /Resend secure setup link/);
+  assert.doesNotMatch(source, /credentialRecoveryWorkflow/);
+  assert.doesNotMatch(source, /purpose: "setup"/);
+  assert.doesNotMatch(source, /\/admin\/users\/\$\{u\.id\}\/setup/);
 });
