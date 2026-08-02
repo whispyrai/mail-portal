@@ -6,13 +6,14 @@
 // revoke credentials without ever learning user-selected replacement secrets.
 // Worker-rendered HTML (no React) — locked-decisions D-23, D-62, D-64.
 
-import { Hono, type Context } from "hono";
+import { Hono } from "hono";
 import { USER_ROLES, type UserRole } from "../db/users-schema";
 import {
   listUsers,
   getUserById,
   getUserByEmail,
   revokeUserCredentials,
+  setUserPassword,
 } from "../lib/users";
 import {
   hashPassword,
@@ -37,12 +38,9 @@ import { renderAdminMailboxesPage } from "./admin-mailboxes-page";
 import { renderAdminAiCostPage } from "./admin-ai-cost-page.ts";
 import { resolveAiCostControlConfig } from "../lib/ai-cost-control.ts";
 import { createAiCostController } from "../lib/ai-cost-control-d1.ts";
-import { credentialRecoveryWorkflow } from "../lib/credential-recovery-runtime.ts";
-import { drainCredentialRecoveryDeliveries } from "../lib/credential-recovery-delivery-outbox.ts";
 import {
   maskedRecoveryAddress,
   recoveryAddressFor,
-  RecoveryDirectoryError,
 } from "../lib/recovery-directory.ts";
 import { accountLifecycle } from "../lib/account-lifecycle-runtime.ts";
 import { isSemanticSearchEnabled } from "../lib/features.ts";
@@ -63,47 +61,6 @@ function shell(brand: BrandConfig, body: string): string {
 }
 
 const adminApp = new Hono<AdminEnv>();
-
-async function issueSetupLink(
-  c: Context<AdminEnv>,
-  user: NonNullable<Awaited<ReturnType<typeof getUserById>>>,
-) {
-  if (user.is_active !== 1) {
-    throw new Error("Inactive accounts cannot receive setup links.");
-  }
-  if (user.ownership_confirmed_at !== null) {
-    throw new Error(
-      "Claimed accounts use owner-initiated recovery from the sign-in page.",
-    );
-  }
-  const recoveryEmail = recoveryAddressFor(
-    c.env.ACCOUNT_RECOVERY_DIRECTORY,
-    user.email,
-    c.env.DOMAINS,
-  );
-  const issued = await credentialRecoveryWorkflow(c.env).issue({
-    purpose: "setup",
-    userId: user.id,
-    loginEmail: user.email,
-    recoveryEmail,
-    issuedBy: c.get("session")!.sub,
-    origin: resolveBrand(c.env.BRAND).mailOrigin,
-  });
-  if (issued.issuance !== "issued") {
-    throw new Error(
-      issued.issuance === "rate_limited"
-        ? "Setup issuance is temporarily rate limited."
-        : "The account is no longer eligible for setup.",
-    );
-  }
-  try {
-    const maintenance = drainCredentialRecoveryDeliveries(c.env);
-    c.executionCtx.waitUntil(maintenance);
-  } catch {
-    // The durable outbox is authoritative. Cron will retry delivery.
-  }
-  return issued;
-}
 
 // Gate: ADMIN only (the app-level gate already guarantees a valid session).
 adminApp.use("*", async (c, next) => {
@@ -251,15 +208,13 @@ adminApp.get("/users", async (c) => {
       const ownership = u.ownership_confirmed_at
         ? `<span class="badge">claimed</span>`
         : `<span class="badge off">pending setup</span>`;
-      const setupAction = u.ownership_confirmed_at || u.is_active !== 1
-        ? ""
-        : `<form class="inline" method="post" action="/admin/users/${u.id}/setup"><button class="sm" type="submit">Resend secure setup link</button></form>`;
+      const setPassword = `<form class="inline" method="post" action="/admin/users/${u.id}/password"><input name="password" type="text" autocomplete="off" placeholder="New password" required><button class="sm" type="submit">Set password</button></form>`;
       return `<tr>
         <td>${escapeHtml(u.email)} ${roleBadge}</td>
         <td>${escapeHtml(u.mailbox_address)}</td>
 				<td>${ownership} ${escapeHtml(recoveryDisplays.get(u.id) ?? "Unavailable")}</td>
         <td>${status}
-				  ${setupAction}
+				  ${setPassword}
           <form class="inline" method="post" action="/admin/users/${u.id}/revoke"><button class="sm" type="submit">Revoke sessions and credentials</button></form>
         </td>
       </tr>`;
@@ -287,7 +242,8 @@ adminApp.get("/users", async (c) => {
         <div><label>Display name</label><input name="name" type="text" placeholder="Kareem Hatem"></div>
       </div>
       <div class="row">
-		<div><label>Role</label><select name="role">${USER_ROLES.map((r) => `<option value="${r}">${r}</option>`).join("")}</select><small>The platform recovery directory must cover this portal email.</small></div>
+		<div><label>Role</label><select name="role">${USER_ROLES.map((r) => `<option value="${r}">${r}</option>`).join("")}</select></div>
+		<div><label>Password</label><input name="password" type="text" autocomplete="off" required><small>You choose it and hand it to them. They can change it later from the sign-in page.</small></div>
       </div>
       <button type="submit">Create user, mailbox &amp; send invitation</button>
     </form>
@@ -367,33 +323,26 @@ adminApp.post("/users", async (c) => {
     );
   }
   const name = String(form.name || "").trim() || email.split("@")[0];
-  try {
-    // Fail before provisioning an account the invitation could never reach.
-    recoveryAddressFor(c.env.ACCOUNT_RECOVERY_DIRECTORY, email, c.env.DOMAINS);
-  } catch (error) {
-    // A broken directory blocks every account; an unmapped one blocks only this
-    // address. The administrator escalates the first and retries the second.
-    const message =
-      error instanceof RecoveryDirectoryError &&
-      error.code === "INVALID_CONFIG"
-        ? "The platform recovery directory is misconfigured. The platform operator must repair it."
-        : "The platform recovery directory does not cover this portal email.";
-    return c.redirect(`/admin/users?err=${encodeURIComponent(message)}`, 302);
+  const password = String(form.password || "");
+  if (!password) {
+    return c.redirect(
+      `/admin/users?err=${encodeURIComponent("Enter a password for the new user.")}`,
+      302,
+    );
   }
 
-  const { hash, salt } = await hashPassword(
-    generateMcpToken(),
-    c.env.JWT_SECRET,
-  );
-  let user: NonNullable<Awaited<ReturnType<typeof getUserById>>>;
+  const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
   try {
-    user = await provisionAccount(c.env, {
+    // The administrator chose this password, so the account is owned on creation
+    // and signs in immediately.
+    await provisionAccount(c.env, {
       email,
       passwordHash: hash,
       passwordSalt: salt,
       role,
       mailboxAddress: email,
       displayName: name,
+      ownershipConfirmedAt: Date.now(),
       mailboxSettings: {
         agentSystemPrompt: systemPromptFor(resolveBrand(c.env.BRAND).id),
       },
@@ -408,17 +357,8 @@ adminApp.post("/users", async (c) => {
       302,
     );
   }
-  try {
-    await issueSetupLink(c, user);
-  } catch (error) {
-    return c.redirect(
-      `/admin/users?err=${encodeURIComponent(`User was created, but the invitation could not be issued: ${error instanceof Error ? error.message : "unknown error"}`)}`,
-      302,
-    );
-  }
-
   return c.redirect(
-    `/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}) and queued a secure invitation for delivery.`)}`,
+    `/admin/users?ok=${encodeURIComponent(`Created ${email} (${role}). They can sign in with the password you set.`)}`,
     302,
   );
 });
@@ -439,26 +379,27 @@ adminApp.post("/users/:id/activate", async (c) => {
   );
 });
 
-adminApp.post("/users/:id/setup", async (c) => {
+adminApp.post("/users/:id/password", async (c) => {
   const user = await getUserById(c.env, c.req.param("id"));
   if (!user)
     return c.redirect(
       `/admin/users?err=${encodeURIComponent("User not found.")}`,
       302,
     );
-  try {
-    await issueSetupLink(c, user);
-    const message = `Secure setup link queued for ${user.email}. Delivery retries automatically until the link expires.`;
+  const form = await c.req.parseBody();
+  const password = String(form.password || "");
+  if (!password) {
     return c.redirect(
-      `/admin/users?ok=${encodeURIComponent(message)}`,
-      302,
-    );
-  } catch (error) {
-    return c.redirect(
-      `/admin/users?err=${encodeURIComponent(error instanceof Error ? error.message : "Setup link could not be issued.")}`,
+      `/admin/users?err=${encodeURIComponent(`Enter a password for ${user.email}.`)}`,
       302,
     );
   }
+  const { hash, salt } = await hashPassword(password, c.env.JWT_SECRET);
+  await setUserPassword(c.env, user.id, hash, salt);
+  return c.redirect(
+    `/admin/users?ok=${encodeURIComponent(`Password set for ${user.email}. Their existing sessions and MCP token were revoked.`)}`,
+    302,
+  );
 });
 
 adminApp.post("/users/:id/revoke", async (c) => {

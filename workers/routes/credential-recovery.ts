@@ -125,9 +125,9 @@ function recoveryPage(
 		<form method="post" action="/account/recover">
 		<input type="hidden" name="token" value="${escapeHtml(input.token)}">
 		<label for="password">New password</label>
-		<input id="password" name="password" type="password" minlength="12" required autocomplete="new-password">
+		<input id="password" name="password" type="password" required autocomplete="new-password">
 		<label for="confirm">Confirm password</label>
-		<input id="confirm" name="confirm" type="password" minlength="12" required autocomplete="new-password">
+		<input id="confirm" name="confirm" type="password" required autocomplete="new-password">
 		<label class="checkbox-label"><input name="createMcp" type="checkbox" value="yes"> <span>Create a new MCP token for me</span></label>
 		<button type="submit" class="block">Set credentials</button>
 		</form></div></div>`,
@@ -310,7 +310,7 @@ export function createCredentialRecoveryHandler(
     const confirm = String(form.confirm ?? "");
     if (
       !token ||
-      password.length < 12 ||
+      !password ||
       password !== confirm ||
       (form.createMcp !== undefined && form.createMcp !== "yes")
     ) {
@@ -320,7 +320,7 @@ export function createCredentialRecoveryHandler(
           error:
             password !== confirm
               ? "Passwords do not match."
-              : "Use a password of at least 12 characters.",
+              : "Enter a password.",
         }),
         400,
       );
