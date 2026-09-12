@@ -46,6 +46,13 @@ type InlineImagePayload = {
 };
 
 const INLINE_IMAGE_DOWNLOAD_CONCURRENCY = 4;
+// A fresh `srcdoc` assignment can be dropped while the previous document is
+// still settling, which would leave the empty placeholder on screen with the
+// real body loaded nowhere. When the frame has not reported in by this long,
+// re-apply the document (the empty-string reset forces the navigation) until
+// it does, so a swallowed navigation heals itself instead of blanking mail.
+const FRAME_LOAD_RETRY_MS = 700;
+const FRAME_LOAD_MAX_RETRIES = 4;
 const EMPTY_EMAIL_IFRAME_DOCUMENT = `<!DOCTYPE html>
 <html>
 <head>
@@ -344,6 +351,15 @@ export default function EmailIframe({
 		let iframeReady = false;
 		let payloads: InlineImagePayload[] | null = null;
 		let payloadPosted = false;
+		let frameReported = false;
+		let frameRetryTimer: ReturnType<typeof setTimeout> | null = null;
+		let frameRetries = 0;
+		const clearFrameRetry = () => {
+			if (frameRetryTimer !== null) {
+				clearTimeout(frameRetryTimer);
+				frameRetryTimer = null;
+			}
+		};
 
 		let cleanBody = DOMPurify.sanitize(body, {
 			USE_PROFILES: { html: true },
@@ -462,6 +478,10 @@ export default function EmailIframe({
 				typeof event.data !== "object" ||
 				event.data.nonce !== nonce
 			) return;
+			// Any nonce-bound message proves the real document is live, so a
+			// pending reload retry has done its job and must stop.
+			frameReported = true;
+			clearFrameRetry();
 			if (event.data.__emailIframeReady === true) {
 				iframeReady = true;
 				postInlineImages();
@@ -482,7 +502,7 @@ export default function EmailIframe({
 
 		// Use srcdoc so the iframe is truly sandboxed (no same-origin access).
 		// We can't use doc.write() because that requires allow-same-origin.
-		iframe.srcdoc = `<!DOCTYPE html>
+		const srcdoc = `<!DOCTYPE html>
 <html>
 <head>
 <base target="_blank">
@@ -543,6 +563,19 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 </head>
 <body>${cleanBody}${iframeBridgeScript(nonce, plannedImages)}</body>
 </html>`;
+		iframe.srcdoc = srcdoc;
+
+		const retryFrameLoad = () => {
+			if (controller.signal.aborted || frameReported) return;
+			if (frameRetries >= FRAME_LOAD_MAX_RETRIES) return;
+			frameRetries += 1;
+			// The empty-string reset is what reliably forces a new navigation;
+			// assigning the document alone is the assignment that was dropped.
+			iframe.srcdoc = "";
+			iframe.srcdoc = srcdoc;
+			frameRetryTimer = setTimeout(retryFrameLoad, FRAME_LOAD_RETRY_MS);
+		};
+		frameRetryTimer = setTimeout(retryFrameLoad, FRAME_LOAD_RETRY_MS);
 
 		if (mailboxId && plannedImages.length > 0) {
 			void Promise.resolve().then(() => controller.signal.aborted
@@ -563,6 +596,7 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 
 		return () => {
 			controller.abort();
+			clearFrameRetry();
 			window.removeEventListener("message", handleMessage);
 		};
 	}, [body, autoSize, inlineAttachments, loadRemoteImages, mailboxId, messageId]);

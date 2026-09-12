@@ -164,6 +164,24 @@ test("a new render clears private content before parsing hostile metadata", () =
 	assert.ok(clearIndex < planIndex);
 });
 
+test("a dropped srcdoc navigation is retried until the frame reports in", () => {
+	assert.match(source, /let frameReported = false/);
+	// Any nonce-bound message proves the real document is live, so a message
+	// stops the retry ladder rather than reloading a healthy frame.
+	assert.match(source, /frameReported = true;\s*clearFrameRetry\(\);/);
+	assert.match(source, /frameRetries >= FRAME_LOAD_MAX_RETRIES/);
+	// The retry has to reset to the empty string first; re-assigning the
+	// document alone is exactly the navigation the browser dropped, which left
+	// the empty placeholder on screen and blanked every message.
+	assert.match(source, /iframe\.srcdoc = "";\s*iframe\.srcdoc = srcdoc;/);
+	assert.match(
+		source,
+		/frameRetryTimer = setTimeout\(retryFrameLoad, FRAME_LOAD_RETRY_MS\)/,
+	);
+	// A rerun or unmount must not leave a retry queued against a stale document.
+	assert.match(source, /controller\.abort\(\);\s*clearFrameRetry\(\);/);
+});
+
 test("CID rendering neutralizes responsive candidates before remote opt-in", () => {
 	assert.match(source, /image\.removeAttribute\("srcset"\)/);
 	assert.match(source, /source\.removeAttribute\("srcset"\)/);

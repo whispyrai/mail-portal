@@ -23,6 +23,7 @@ const selectedPreview = "SELECTED PREVIEW MUST NEVER REPLACE THE COMPLETE MESSAG
 const replyPreview = "OLDER PREVIEW MUST NEVER REPLACE THE COMPLETE MESSAGE";
 const selectedFullBody = "AUTHORITATIVE SELECTED BODY FOR FORWARDING";
 const replyFullBody = "AUTHORITATIVE OLDER MESSAGE BODY";
+const droppedSrcdocBody = `<p>${"DROPPED SRCDOC RECOVERY BODY ".repeat(240)}</p>`;
 const cidContentId = "inline-proof@example.com";
 const cidAttachmentId = "inline-proof";
 const cidSrcsetOnlyContentId = "srcset-only@example.com";
@@ -1103,6 +1104,80 @@ async function verifyDelayedSelected({ context, baseUrl, name }) {
 	}
 }
 
+async function verifyDroppedSrcdocRecovery({ context, baseUrl, name }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(15_000);
+	observeBrowser(page, `${name} dropped-srcdoc`);
+	try {
+		// The browser can swallow a fresh `srcdoc` navigation while the previous
+		// document is still settling; the frame then keeps the empty placeholder
+		// and the real message never appears. Simulate that dropped assignment and
+		// require the viewer to recover the body on its own.
+		await page.addInitScript(() => {
+			const descriptor = Object.getOwnPropertyDescriptor(
+				HTMLIFrameElement.prototype,
+				"srcdoc",
+			);
+			let dropped = false;
+			Object.defineProperty(HTMLIFrameElement.prototype, "srcdoc", {
+				configurable: true,
+				get() {
+					return descriptor.get.call(this);
+				},
+				set(value) {
+					if (!dropped && typeof value === "string" && value.length > 5_000) {
+						dropped = true;
+						return;
+					}
+					descriptor.set.call(this, value);
+				},
+			});
+		});
+		await installMailFixture(page, async ({ route, messageId }) => {
+			if (messageId !== selectedId) {
+				await route.fulfill({
+					status: 200,
+					contentType: "text/plain",
+					body: replyFullBody,
+				});
+				return;
+			}
+			await route.fulfill({
+				status: 200,
+				contentType: "text/plain",
+				body: droppedSrcdocBody,
+			});
+		});
+		await openConversation(page, baseUrl);
+		await assertAuthoritativeIframe(page, selectedId, droppedSrcdocBody, selectedPreview);
+		const iframe = page
+			.locator(`[data-intelligence-message-id="${selectedId}"]`)
+			.getByTitle("Email content");
+		const iframeHandle = await iframe.elementHandle();
+		assert.ok(iframeHandle);
+		const contentFrame = await iframeHandle.contentFrame();
+		assert.ok(contentFrame);
+		await pollValue(
+			() => contentFrame.evaluate(() => document.body.innerText),
+			(value) =>
+				typeof value === "string" &&
+				value.includes("DROPPED SRCDOC RECOVERY BODY"),
+			"dropped srcdoc frame rendered the recovered body",
+		);
+		await assertNoHorizontalOverflow(page);
+		await page.screenshot({
+			path: join(artifactDirectory, `email-body-${runStamp}-${name}-dropped-srcdoc.png`),
+		});
+		detail(`${name} recovered the message after a dropped initial srcdoc navigation`);
+	} catch (error) {
+		await captureDiagnostic(page, name, "dropped-srcdoc", error);
+		throw error;
+	} finally {
+		await page.unrouteAll({ behavior: "ignoreErrors" });
+		await page.close();
+	}
+}
+
 async function verifyCollapseCancellation({ context, baseUrl, name }) {
 	const page = await context.newPage();
 	page.setDefaultTimeout(15_000);
@@ -1242,6 +1317,7 @@ async function verifyViewport({ browser, baseUrl, storageState, name, viewport }
 		await verifyViewerLayout({ context, baseUrl, name });
 		await verifyInlineCidRendering({ context, baseUrl, name });
 		await verifyDelayedSelected({ context, baseUrl, name });
+		await verifyDroppedSrcdocRecovery({ context, baseUrl, name });
 		await verifyCollapseCancellation({ context, baseUrl, name });
 		await verifyRetryRecovery({ context, baseUrl, name });
 	} finally {
