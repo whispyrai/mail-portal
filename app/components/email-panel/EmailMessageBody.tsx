@@ -79,6 +79,8 @@ export default function EmailMessageBody({
 			messageId={email.id}
 			body={authoritativeBody ?? ""}
 			mailboxId={mailboxId}
+			folderId={email.folder_id}
+			bodyExternal={email.body_external ?? false}
 			inlineAttachments={email.attachments}
 			autoSize={autoSize}
 		/>

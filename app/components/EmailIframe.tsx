@@ -12,6 +12,7 @@ import {
 } from "~/lib/email-inline-images";
 import api from "~/services/api";
 import type { Attachment } from "~/types";
+import type { MessageViewerReport } from "../../shared/message-viewer-diagnostics.ts";
 
 // Force every link in rendered email HTML to open in a new tab. Email anchors
 // usually carry no `target`, so inside the sandboxed iframe a click would
@@ -35,6 +36,9 @@ interface EmailIframeProps {
 	messageId: string;
 	body: string;
 	mailboxId?: string;
+	/** Reported with the render diagnostics only. */
+	folderId?: string | null;
+	bodyExternal?: boolean;
 	inlineAttachments?: Attachment[];
 	/** When true, iframe auto-sizes to content height instead of filling parent */
 	autoSize?: boolean;
@@ -53,6 +57,10 @@ const INLINE_IMAGE_DOWNLOAD_CONCURRENCY = 4;
 // it does, so a swallowed navigation heals itself instead of blanking mail.
 const FRAME_LOAD_RETRY_MS = 700;
 const FRAME_LOAD_MAX_RETRIES = 4;
+// Past the whole retry ladder, so a "settled" report states the final outcome.
+// A reader who leaves sooner still gets a "left" report once the first retry
+// could have run, which keeps instant rerenders out of the logs.
+const MESSAGE_VIEWER_REPORT_MS = 5_000;
 const EMPTY_EMAIL_IFRAME_DOCUMENT = `<!DOCTYPE html>
 <html>
 <head>
@@ -295,7 +303,11 @@ function iframeBridgeScript(
 		document.images[loadIndex].addEventListener("error", reportHeight);
 	}
 	window.addEventListener("load", reportHeight);
-	parent.postMessage({ __emailIframeReady: true, nonce: nonce }, "*");
+	parent.postMessage({
+		__emailIframeReady: true,
+		nonce: nonce,
+		textLength: ((document.body && document.body.innerText) || "").length
+	}, "*");
 	reportHeight();
 	setTimeout(reportHeight, 400);
 })();
@@ -328,6 +340,8 @@ export default function EmailIframe({
 	messageId,
 	body,
 	mailboxId,
+	folderId,
+	bodyExternal,
 	inlineAttachments,
 	autoSize,
 }: EmailIframeProps) {
@@ -354,6 +368,12 @@ export default function EmailIframe({
 		let frameReported = false;
 		let frameRetryTimer: ReturnType<typeof setTimeout> | null = null;
 		let frameRetries = 0;
+		const renderStartedAt = performance.now();
+		let firstReportMs: number | null = null;
+		let reportedHeight: number | null = null;
+		let frameTextLength: number | null = null;
+		let reportSent = false;
+		let reportTimer: ReturnType<typeof setTimeout> | null = null;
 		const clearFrameRetry = () => {
 			if (frameRetryTimer !== null) {
 				clearTimeout(frameRetryTimer);
@@ -450,6 +470,7 @@ export default function EmailIframe({
 			}
 		}
 		setHasRemoteImages(togglesRemoteImages);
+		const sanitizedTextLength = template.content.textContent?.trim().length ?? 0;
 		cleanBody = template.innerHTML;
 		const plannedImages = planReferencedInlineImages(
 			referencedCids,
@@ -482,10 +503,20 @@ export default function EmailIframe({
 			// pending reload retry has done its job and must stop.
 			frameReported = true;
 			clearFrameRetry();
+			firstReportMs ??= Math.round(performance.now() - renderStartedAt);
 			if (event.data.__emailIframeReady === true) {
 				iframeReady = true;
+				if (typeof event.data.textLength === "number") {
+					frameTextLength = event.data.textLength;
+				}
 				postInlineImages();
 				return;
+			}
+			if (
+				event.data.__emailIframeHeight === true &&
+				typeof event.data.height === "number"
+			) {
+				reportedHeight = event.data.height;
 			}
 			if (
 				autoSize &&
@@ -577,6 +608,43 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 		};
 		frameRetryTimer = setTimeout(retryFrameLoad, FRAME_LOAD_RETRY_MS);
 
+		// One content-free report per render, so a body that stays blank on one
+		// laptop shows up in the Worker logs with its build, browser and sizes.
+		const sendReport = (trigger: MessageViewerReport["trigger"]) => {
+			if (reportSent || !mailboxId) return;
+			reportSent = true;
+			api.reportMessageViewer(mailboxId, {
+				messageId,
+				folderId: folderId ?? null,
+				bodyExternal: bodyExternal ?? false,
+				outcome: !frameReported
+					? "never_reported"
+					: sanitizedTextLength > 0 && frameTextLength === 0
+						? "blank"
+						: "rendered",
+				trigger,
+				elapsedMs: Math.round(performance.now() - renderStartedAt),
+				retries: frameRetries,
+				firstReportMs,
+				reportedHeight,
+				frameTextLength,
+				bodyLength: body.length,
+				sanitizedLength: cleanBody.length,
+				sanitizedTextLength,
+				frameClientWidth: iframe.clientWidth,
+				frameClientHeight: iframe.clientHeight,
+				frameDisplayed: iframe.getClientRects().length > 0,
+				remoteImagesBlocked: togglesRemoteImages && !loadRemoteImages,
+				inlineImageCount: plannedImages.length,
+				documentVisibility: document.visibilityState,
+				viewportWidth: window.innerWidth,
+				viewportHeight: window.innerHeight,
+				devicePixelRatio: window.devicePixelRatio,
+				build: import.meta.url.slice(-200),
+			});
+		};
+		reportTimer = setTimeout(() => sendReport("settled"), MESSAGE_VIEWER_REPORT_MS);
+
 		if (mailboxId && plannedImages.length > 0) {
 			void Promise.resolve().then(() => controller.signal.aborted
 				? []
@@ -595,11 +663,15 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 		}
 
 		return () => {
+			if (reportTimer !== null) clearTimeout(reportTimer);
+			if (performance.now() - renderStartedAt >= FRAME_LOAD_RETRY_MS) {
+				sendReport("left");
+			}
 			controller.abort();
 			clearFrameRetry();
 			window.removeEventListener("message", handleMessage);
 		};
-	}, [body, autoSize, inlineAttachments, loadRemoteImages, mailboxId, messageId]);
+	}, [body, autoSize, bodyExternal, folderId, inlineAttachments, loadRemoteImages, mailboxId, messageId]);
 
 	const frame = (
 		<iframe

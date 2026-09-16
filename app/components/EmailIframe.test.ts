@@ -187,3 +187,19 @@ test("CID rendering neutralizes responsive candidates before remote opt-in", () 
 	assert.match(source, /source\.removeAttribute\("srcset"\)/);
 	assert.match(source, /cidPictures/);
 });
+
+test("every render reports its outcome once, without message content", () => {
+	// The frame tells the parent how much text it actually drew.
+	assert.match(source, /textLength: \(\(document\.body && document\.body\.innerText\) \|\| ""\)\.length/);
+	assert.match(source, /frameTextLength = event\.data\.textLength;/);
+	// Outcome is derived from whether the real document ever ran and drew text.
+	assert.match(source, /!frameReported\s*\?\s*"never_reported"/);
+	assert.match(source, /sanitizedTextLength > 0 && frameTextLength === 0\s*\?\s*"blank"/);
+	// One report after the retry ladder, or when the reader leaves first.
+	assert.match(source, /if \(reportSent \|\| !mailboxId\) return;\s*reportSent = true;/);
+	assert.match(source, /setTimeout\(\(\) => sendReport\("settled"\), MESSAGE_VIEWER_REPORT_MS\)/);
+	assert.match(source, /sendReport\("left"\);\s*\}\s*controller\.abort\(\);/);
+	// Lengths only: the body itself never leaves the viewer.
+	assert.match(source, /bodyLength: body\.length,/);
+	assert.doesNotMatch(source, /reportMessageViewer\([^)]*\bbody\b\s*[,}]/);
+});

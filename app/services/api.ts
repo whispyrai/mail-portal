@@ -24,6 +24,7 @@ import type {
 	SnoozeScope,
 } from "../../shared/snooze";
 import type { AiComposeDraftRequest } from "../../shared/ai-drafting";
+import type { MessageViewerReport } from "../../shared/message-viewer-diagnostics.ts";
 import { decodeMailboxAttachmentCursor } from "../../shared/mailbox-attachments.ts";
 import {
 	MailboxAttachmentResponseError,
@@ -321,6 +322,19 @@ const api = {
 		get<string>(`/api/v1/mailboxes/${mailboxId}/emails/${id}/body`, {
 			signal: opts?.signal,
 		}),
+	// Fire-and-forget: keepalive lets a report sent while the reader leaves the
+	// message still reach the server, and a failed report never affects the viewer.
+	reportMessageViewer: (mailboxId: string, report: MessageViewerReport) => {
+		void fetch(
+			`/api/v1/mailboxes/${encodedPathPart(mailboxId)}/message-viewer-reports`,
+			{
+				method: "POST",
+				keepalive: true,
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(report),
+			},
+		).catch(() => {});
+	},
 	updateEmail: (mailboxId: string, id: string, data: unknown) =>
 		put<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, data),
 	deleteEmail: (mailboxId: string, id: string) =>

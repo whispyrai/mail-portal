@@ -42,6 +42,7 @@ import { mailboxChangeFeedRoutes } from "./routes/mailbox-change-feed";
 import { mailPeopleRoutes } from "./routes/mail-people";
 import { relationshipBriefRoutes } from "./routes/relationship-brief";
 import { pushHealthRoutes } from "./routes/push-health";
+import { messageViewerDiagnosticsRoutes } from "./routes/message-viewer-diagnostics";
 import { pushSubscriptionRoutes } from "./routes/push-subscriptions";
 import { mailboxMessageLocationRoutes } from "./routes/mailbox-message-location";
 import { automationRuleRoutes } from "./routes/automation-rules";
@@ -161,6 +162,7 @@ app.route("/", mailboxMessageLocationRoutes);
 app.route("/", automationRuleRoutes);
 app.route("/", attachmentUploadRoutes);
 app.route("/", mailboxEmailBodyRoutes);
+app.route("/", messageViewerDiagnosticsRoutes);
 
 // -- Config ---------------------------------------------------------
 
