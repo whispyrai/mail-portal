@@ -170,8 +170,8 @@ const BRANDS: Record<Brand, BrandConfig> = {
 		preloadFont: null,
 		rootVars: `
   --bg:#fafafa; --surface:#ffffff; --charcoal:#0a0a0a; --slate:#27272a; --muted:#71717a;
-  --tint:#f4f4f5; --fill:#e9e9eb;
-  --line:rgba(10,10,10,.10); --line-strong:rgba(10,10,10,.18); --ring:rgba(10,10,10,.30);
+  --tint:#f4f4f5; --fill:#ececee;
+  --line:rgba(10,10,10,.10); --line-strong:rgba(10,10,10,.18); --ring:rgba(10,10,10,.32);
   --success:#1e6b43; --danger:#b42318;
   --accent:#0a0a0a; --accent-hover:#000000; --accent-fg:#ffffff; --focus-shadow:rgba(10,10,10,.12);`,
 		mailDomain: "marquista.co",

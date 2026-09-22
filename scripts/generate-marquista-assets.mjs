@@ -13,7 +13,11 @@ const output = (filename) => path.join(root, "public", filename);
 const background = "#0a0a0a";
 
 async function markBuffer(size, fill) {
-	const svg = (await readFile(source, "utf8")).replace(/fill="#0a0a0a"/, `fill="${fill}"`);
+	const original = await readFile(source, "utf8");
+	if (!original.includes(`fill="${background}"`)) {
+		throw new Error(`${source} no longer uses fill="${background}"; cannot recolor the mark`);
+	}
+	const svg = original.replaceAll(`fill="${background}"`, `fill="${fill}"`);
 	return sharp(Buffer.from(svg), { density: 384 })
 		.resize(size, size, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
 		.png({ compressionLevel: 9 })
