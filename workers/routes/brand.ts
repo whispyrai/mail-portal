@@ -12,7 +12,7 @@
 // Two brand seams are kept in sync by hand: this module (server HTML pages) and
 // app/index.css (the React SPA, via `:root[data-brand="..."]`).
 
-export type Brand = "whispyr" | "wiser";
+export type Brand = "whispyr" | "wiser" | "marquista";
 
 export type BrandConfig = {
 	/** Stable brand id — also the `data-brand` value on the SPA `<html>`. */
@@ -48,8 +48,8 @@ export type BrandConfig = {
 	fontFamily: string;
 	/** `@font-face` declarations for the brand font. */
 	fontFaceCss: string;
-	/** The woff2 to `<link rel="preload">`. */
-	preloadFont: string;
+	/** The woff2 to `<link rel="preload">`; null for a system-font brand. */
+	preloadFont: string | null;
 	/** The brand's `:root` custom-property palette (no font / color-scheme). */
 	rootVars: string;
 	/** Email-address domain, used in address placeholders. */
@@ -144,6 +144,41 @@ const BRANDS: Record<Brand, BrandConfig> = {
 		loginNote: "Wiser team only.",
 		landingBlurb: `This is the internal team mail portal for <strong>Wiser</strong>.`,
 	},
+	// Marquista — the production house's team portal. Mirrors marquista.co:
+	// black and white, Helvetica, the serif "M" of the wordmark as the mark.
+	// Helvetica is a system font here, so there is nothing to self-host.
+	marquista: {
+		id: "marquista",
+		name: "Marquista",
+		appName: "Marquista Mail",
+		mark: "/marquista-mark.svg",
+		favicon: "/marquista-mark.svg",
+		pwaIcon192: "/marquista-icon-192.png",
+		pwaIcon512: "/marquista-icon-512.png",
+		appleTouchIcon: "/marquista-apple-touch-icon.png",
+		notificationBadge: "/marquista-badge-96.png",
+		legacyFavicon: "/marquista-favicon-32.png",
+		legacyFaviconType: "image/png",
+		legacyFaviconSizes: "32x32",
+		markWidth: 37,
+		markHeight: 30,
+		websiteUrl: "https://marquista.co",
+		mailOrigin: "https://mail.marquista.co",
+		themeColor: "#ffffff",
+		fontFamily: `"Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, sans-serif`,
+		fontFaceCss: "",
+		preloadFont: null,
+		rootVars: `
+  --bg:#fafafa; --surface:#ffffff; --charcoal:#0a0a0a; --slate:#27272a; --muted:#71717a;
+  --tint:#f4f4f5; --fill:#e9e9eb;
+  --line:rgba(10,10,10,.10); --line-strong:rgba(10,10,10,.18); --ring:rgba(10,10,10,.30);
+  --success:#1e6b43; --danger:#b42318;
+  --accent:#0a0a0a; --accent-hover:#000000; --accent-fg:#ffffff; --focus-shadow:rgba(10,10,10,.12);`,
+		mailDomain: "marquista.co",
+		loginTagline: "Marquista team mail",
+		loginNote: "Marquista team only.",
+		landingBlurb: `This is the team mail portal for <strong>Marquista</strong>, a production house creating content for social media, TV commercials, and music videos.`,
+	},
 };
 
 /**
@@ -154,6 +189,7 @@ const BRANDS: Record<Brand, BrandConfig> = {
 export function resolveBrand(value: string | undefined | null): BrandConfig {
 	const key = (value ?? "").trim().toLowerCase();
 	if (key === "wiser") return BRANDS.wiser;
+	if (key === "marquista") return BRANDS.marquista;
 	return BRANDS.whispyr;
 }
 
@@ -307,6 +343,5 @@ export function pageShell(b: BrandConfig, title: string, body: string): string {
 <link rel="icon" href="${b.favicon}" type="image/svg+xml">
 <link rel="icon" href="${b.legacyFavicon}" type="${b.legacyFaviconType}" sizes="${b.legacyFaviconSizes}">
 <link rel="apple-touch-icon" href="${b.appleTouchIcon}">
-<link rel="preload" href="${b.preloadFont}" as="font" type="font/woff2" crossorigin>
-<title>${title}</title><style>${brandCss(b)}</style></head><body>${body}</body></html>`;
+${b.preloadFont ? `<link rel="preload" href="${b.preloadFont}" as="font" type="font/woff2" crossorigin>\n` : ""}<title>${title}</title><style>${brandCss(b)}</style></head><body>${body}</body></html>`;
 }

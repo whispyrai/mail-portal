@@ -31,7 +31,7 @@ import {
 	verifyBuiltEnvironment,
 } from "./verify-built-environment.mjs";
 
-const BRANDS = new Set(["whispyr", "wiser"]);
+const BRANDS = new Set(["whispyr", "wiser", "marquista"]);
 const MODES = new Set(["build", "verify", "deploy"]);
 const SECRET_NAME_PATTERN =
 	/(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|RECOVERY_DIRECTORY)/i;
@@ -818,7 +818,7 @@ export async function runEnvironmentArtifact({
 	onChild,
 	onBeforeDeploy,
 }) {
-	if (!BRANDS.has(brand)) throw new Error("brand must be whispyr or wiser");
+	if (!BRANDS.has(brand)) throw new Error("brand must be whispyr, wiser, or marquista");
 	if (!MODES.has(mode)) throw new Error("mode must be build, verify, or deploy");
 	const resolvedCwd = resolve(cwd);
 	const safeDeployArgs =

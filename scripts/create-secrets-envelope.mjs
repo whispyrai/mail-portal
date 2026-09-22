@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 
 import { REQUIRED_SECRETS } from "./verify-built-environment.mjs";
 
-const BRANDS = new Set(["whispyr", "wiser"]);
+const BRANDS = new Set(["whispyr", "wiser", "marquista"]);
 const CREATOR_SIGNALS = ["SIGHUP", "SIGINT", "SIGTERM"];
 
 function throwIfCreatorAborted(signal) {
@@ -65,7 +65,7 @@ export async function createSecretsEnvelope({
 	openEnvelopeFile = ({ path, flags, mode }) => open(path, flags, mode),
 }) {
 	throwIfCreatorAborted(signal);
-	if (!BRANDS.has(brand)) throw new Error("brand must be whispyr or wiser");
+	if (!BRANDS.has(brand)) throw new Error("brand must be whispyr, wiser, or marquista");
 	const envelope = {
 		schemaVersion: 1,
 		brand,
