@@ -5,6 +5,19 @@
 import type { Brand } from "../../workers/routes/brand.ts";
 
 export function assistantCopyFor(brand: Brand, name: string) {
+	if (brand === "marquista") {
+		return {
+			emptyState:
+				"I can read your inbox, summarize conversations, find clients waiting on you, and draft replies in your voice.",
+			suggestedPrompts: [
+				"Summarize my unread emails",
+				"Which clients are waiting on a reply?",
+				"Draft a reply to the latest email",
+			],
+			composePlaceholder: `e.g. Send ${name}'s treatment for the new campaign to Ahmed and propose two shoot dates next week`,
+		};
+	}
+
 	if (brand === "wiser") {
 		return {
 			emptyState:

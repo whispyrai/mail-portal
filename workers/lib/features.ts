@@ -20,6 +20,7 @@ type Feature = "quiz" | "semantic_search";
 const DEFAULT_FEATURES: Record<Brand, readonly Feature[]> = {
 	whispyr: ["quiz"],
 	wiser: [],
+	marquista: [],
 };
 
 /**

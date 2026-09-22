@@ -99,6 +99,7 @@ assert.equal(resolveBrand("WISER").id, "wiser", "case-insensitive → wiser");
 	for (const [name, shell] of [
 		["wiser", wiser],
 		["whispyr", whispyr],
+		["marquista", pageShell(resolveBrand("marquista"), "Marquista", "<main>Marquista</main>")],
 	] as const) {
 		assert.match(
 			shell,
@@ -158,6 +159,18 @@ assert.equal(resolveBrand("WISER").id, "wiser", "case-insensitive → wiser");
 		whispyr.icons.map((icon) => icon.src),
 		["/icon-192.png", "/icon-192.png", "/icon-512.png", "/icon-512.png"],
 	);
+	const marquista = pwaManifestFor(resolveBrand("marquista"));
+	assert.equal(marquista.name, "Marquista Mail");
+	assert.equal(marquista.display, "standalone", "marquista manifest display mode");
+	assert.deepEqual(
+		marquista.icons.map((icon) => icon.src),
+		[
+			"/marquista-icon-192.png",
+			"/marquista-icon-192.png",
+			"/marquista-icon-512.png",
+			"/marquista-icon-512.png",
+		],
+	);
 }
 
 // ── brandCss: each brand emits ONLY its own palette + font, never the other's ──
@@ -170,6 +183,28 @@ assert.equal(resolveBrand("WISER").id, "wiser", "case-insensitive → wiser");
 	assert.match(whispyr, /#1a1a1a/, "whispyr css uses charcoal");
 	assert.ok(!whispyr.includes("70 28% 38%"), "whispyr css contains no olive");
 	assert.ok(!wiser.includes("Kamerik"), "wiser css contains no Kamerik");
+}
+
+
+// ── marquista: system Helvetica, so the shell must not preload a font file ──
+{
+	const marquista = resolveBrand("marquista");
+	assert.equal(marquista.id, "marquista", "marquista id");
+	assert.equal(marquista.appName, "Marquista Mail", "marquista appName");
+	assert.equal(marquista.mailDomain, "marquista.co", "marquista mail domain");
+	assert.match(marquista.fontFamily, /Helvetica/, "marquista font is Helvetica");
+	assert.equal(resolveBrand("MARQUISTA").id, "marquista", "case-insensitive → marquista");
+	const shell = pageShell(marquista, "Marquista", "<main>Marquista</main>");
+	assert.match(shell, /href="\/marquista-mark\.svg" type="image\/svg\+xml"/, "marquista favicon");
+	assert.doesNotMatch(shell, /rel="preload"/, "no font preload for a system-font brand");
+	assert.match(
+		shell,
+		/<meta name="apple-mobile-web-app-title" content="Marquista Mail">/,
+		"marquista home-screen title",
+	);
+	assert.match(brandLogo(marquista), />\s*Marquista/, "marquista wordmark says Marquista");
+	const wiserShell = pageShell(resolveBrand("wiser"), "Wiser", "<main>Wiser</main>");
+	assert.match(wiserShell, /rel="preload" href="\/fonts\/Inter-Regular\.woff2"/, "wiser still preloads Inter");
 }
 
 console.log("brand.test.ts: all assertions passed");

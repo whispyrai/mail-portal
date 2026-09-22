@@ -38,3 +38,21 @@ test("Wiser install icons are opaque while favicon and badge preserve transparen
 		assert.equal(metadata.hasAlpha, true, `${filename} must preserve transparency`);
 	}
 });
+
+test("Marquista install icons are opaque at their declared sizes; favicon and badge keep transparency", async () => {
+	const expected = new Map([
+		["marquista-icon-192.png", [192, 192, false]],
+		["marquista-icon-512.png", [512, 512, false]],
+		["marquista-apple-touch-icon.png", [180, 180, false]],
+		["marquista-favicon-32.png", [32, 32, true]],
+		["marquista-badge-96.png", [96, 96, true]],
+	]);
+
+	for (const [filename, [width, height, hasAlpha]] of expected) {
+		const metadata = await sharp(path.join(publicDir, filename)).metadata();
+		assert.equal(metadata.format, "png", `${filename} format`);
+		assert.equal(metadata.width, width, `${filename} width`);
+		assert.equal(metadata.height, height, `${filename} height`);
+		assert.equal(metadata.hasAlpha, hasAlpha, `${filename} alpha`);
+	}
+});

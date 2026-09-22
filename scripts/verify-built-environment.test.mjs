@@ -45,6 +45,25 @@ const identities = {
 		kvId: "c934d803c2f8430d9088f4a5d9f29d55",
 		route: "mail.wiserchat.ai",
 	},
+	marquista: {
+		name: "marquista-mail-portal",
+		domain: "marquista.co",
+		features: [],
+		databaseName: "marquista_mail_portal_users",
+		databaseId: "bccae6f0-05d2-48d6-b05f-309f0fcf6c24",
+		bucket: "marquista-mail-portal",
+		previewBucket: "marquista-mail-portal-preview",
+		rawBucket: "marquista-mail-raw-archive",
+		rawPreviewBucket: "marquista-mail-raw-archive-preview",
+		queue: "marquista-mail-inbound",
+		dlq: "marquista-mail-inbound-dlq",
+		parking: "marquista-mail-inbound-parking",
+		emergencyQueue: "marquista-mail-emergency-forward",
+		emergencyParking: "marquista-mail-emergency-forward-parking",
+		emergencyFrom: "emergency-forward@marquista.co",
+		kvId: "f7f21d5e98ff48fc976b5542c3501adf",
+		route: "mail.marquista.co",
+	},
 };
 
 function validArtifact(brand) {
@@ -199,8 +218,8 @@ async function runFixture(brand, mutate = () => {}) {
 	return { directory, errors, invocation, logFilePath, terminal };
 }
 
-test("accepts the exact Whispyr and Wiser deployment topologies", async () => {
-	for (const brand of ["whispyr", "wiser"]) {
+test("accepts the exact Whispyr, Wiser, and Marquista deployment topologies", async () => {
+	for (const brand of ["whispyr", "wiser", "marquista"]) {
 		const fixture = await runFixture(brand);
 		await fixture.invocation();
 		assert.match(fixture.terminal.at(-1), /isolated and valid/);

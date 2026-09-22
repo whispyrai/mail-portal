@@ -389,6 +389,187 @@
 					]
 				}
 			]
+		},
+		// Marquista Team Mail Portal — isolated runtime for marquista.co, the
+		// production house. Bindings, Durable Object namespaces, data, and secrets
+		// are distinct from Whispyr and Wiser. Zoho history stays in Zoho at
+		// cutover and can be imported later with scripts/import-zoho.mjs.
+		"marquista": {
+			"name": "marquista-mail-portal",
+			"triggers": {
+				"crons": ["* * * * *", "*/5 * * * *", "17 * * * *"]
+			},
+			"vars": {
+				"BRAND": "marquista",
+				"FEATURES": [],
+				"DOMAINS": "marquista.co",
+				"EMAIL_ADDRESSES": [],
+				"INBOUND_QUEUE_NAME": "marquista-mail-inbound",
+				"INBOUND_DLQ_NAME": "marquista-mail-inbound-dlq",
+				"INBOUND_PARKING_NAME": "marquista-mail-inbound-parking",
+				"EMERGENCY_FORWARD_QUEUE_NAME": "marquista-mail-emergency-forward",
+				"EMERGENCY_FORWARD_PARKING_NAME": "marquista-mail-emergency-forward-parking",
+				"EMERGENCY_FORWARD_FROM": "emergency-forward@marquista.co",
+				"EMERGENCY_FORWARD_DESTINATION": "heshamelmahdi@gmail.com",
+				"AWS_REGION": "eu-west-2",
+				"SES_CONFIGURATION_SET": "mail-portal-events",
+				"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"AI_CHEAP_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
+				"AI_STRONG_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+				"AI_COST_ALERT_USD": "25",
+				"AI_COST_REVIEW_USD": "50",
+				"VAPID_SUBJECT": "mailto:hello@marquista.co"
+			},
+			"secrets": {
+				"required": [
+					"AWS_ACCESS_KEY_ID",
+					"AWS_SECRET_ACCESS_KEY",
+					"SES_EVENT_WEBHOOK_SECRET",
+					"CREDENTIAL_RECOVERY_PAYLOAD_KEY_V1",
+					"JWT_SECRET",
+					"ADMIN_BOOTSTRAP_EMAIL",
+					"ACCOUNT_RECOVERY_DIRECTORY",
+					"VAPID_PUBLIC_KEY",
+					"VAPID_PRIVATE_KEY"
+				]
+			},
+			"routes": [
+				{
+					"pattern": "mail.marquista.co",
+					"custom_domain": true
+				}
+			],
+			// The SES event webhook is served on workers.dev, as on Wiser, so zone
+			// security settings (Bot Fight Mode) can never challenge EventBridge.
+			// workersDevRequestDecision (workers/lib/request-security.ts) serves
+			// ONLY that webhook on this hostname; everything else 404s.
+			"workers_dev": true,
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "marquista_mail_portal_users",
+					"database_id": "bccae6f0-05d2-48d6-b05f-309f0fcf6c24",
+					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "marquista-mail-portal",
+					"preview_bucket_name": "marquista-mail-portal-preview"
+				},
+				{
+					"binding": "RAW_MAIL_BUCKET",
+					"bucket_name": "marquista-mail-raw-archive",
+					"preview_bucket_name": "marquista-mail-raw-archive-preview"
+				}
+			],
+			"send_email": [
+				{
+					"name": "EMERGENCY_EMAIL",
+					"destination_address": "heshamelmahdi@gmail.com",
+					"allowed_sender_addresses": ["emergency-forward@marquista.co"]
+				}
+			],
+			// Queue retention is a control-plane setting, not a Wrangler binding
+			// field. All five queues are locked at 14 days and must be verified
+			// separately before deploy.
+			"queues": {
+				"producers": [
+					{ "binding": "INBOUND_QUEUE", "queue": "marquista-mail-inbound" },
+					{ "binding": "EMERGENCY_FORWARD_QUEUE", "queue": "marquista-mail-emergency-forward" }
+				],
+				"consumers": [
+					{
+						"queue": "marquista-mail-inbound",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 1,
+						"dead_letter_queue": "marquista-mail-inbound-dlq"
+					},
+					{
+						"queue": "marquista-mail-inbound-dlq",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 60,
+						"dead_letter_queue": "marquista-mail-inbound-parking"
+					},
+					{
+						"queue": "marquista-mail-inbound-parking",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 100,
+						"retry_delay": 3600
+					},
+					{
+						"queue": "marquista-mail-emergency-forward",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 10,
+						"retry_delay": 300,
+						"dead_letter_queue": "marquista-mail-emergency-forward-parking"
+					},
+					{
+						"queue": "marquista-mail-emergency-forward-parking",
+						"max_batch_size": 1,
+						"max_concurrency": 1,
+						"max_batch_timeout": 5,
+						"max_retries": 100,
+						"retry_delay": 3600
+					}
+				]
+			},
+			"kv_namespaces": [
+				{
+					"binding": "OAUTH_KV",
+					"id": "f7f21d5e98ff48fc976b5542c3501adf"
+				}
+			],
+			"ai": {
+				"binding": "AI"
+			},
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "MAILBOX",
+						"class_name": "MailboxDO"
+					},
+					{
+						"name": "EMAIL_AGENT",
+						"class_name": "EmailAgent"
+					},
+					{
+						"name": "EMAIL_MCP",
+						"class_name": "EmailMCP"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"MailboxDO"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"EmailAgent"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"EmailMCP"
+					]
+				}
+			]
 		}
 	}
 }

@@ -73,7 +73,7 @@ function parseMetadata(path, descriptor, expectedKind) {
 		!/^[a-f0-9]{64}$/.test(metadata.token) ||
 		!Number.isSafeInteger(metadata.pid) ||
 		metadata.pid <= 0 ||
-		!["whispyr", "wiser"].includes(metadata.brand) ||
+		!["whispyr", "wiser", "marquista"].includes(metadata.brand) ||
 		!["build", "verify", "deploy"].includes(metadata.mode) ||
 		!Number.isSafeInteger(metadata.startedAt) ||
 		metadata.startedAt <= 0

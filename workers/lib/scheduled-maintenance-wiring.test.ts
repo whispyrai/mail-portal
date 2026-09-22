@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-test("both isolated environments ship the scheduled maintenance entrypoint", () => {
+test("every isolated environment ships the scheduled maintenance entrypoint", () => {
   const app = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
   const config = readFileSync(
     new URL("../../wrangler.jsonc", import.meta.url),
@@ -16,6 +16,7 @@ test("both isolated environments ship the scheduled maintenance entrypoint", () 
   assert.match(app, /runScheduledMaintenance\(env, controller\)/);
   const exactCronTopology =
     /"crons": \["\* \* \* \* \*", "\*\/5 \* \* \* \*", "17 \* \* \* \*"\]/g;
-  assert.equal(config.match(exactCronTopology)?.length, 3);
+  // The top-level template plus the whispyr, wiser, and marquista envs.
+  assert.equal(config.match(exactCronTopology)?.length, 4);
   assert.match(verifier, /Cron schedules/);
 });

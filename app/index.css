@@ -156,6 +156,55 @@
   --color-kumo-tip-stroke: hsl(70 28% 38% / 0.10);
 }
 
+/* ============================================================
+   Marquista skin — marquista.co's black-and-white identity,
+   Helvetica type (system font, nothing self-hosted). Layered after
+   the Whispyr block like the Wiser skin; gated on
+   data-brand="marquista". Neutral greys replace Whispyr's warm tan.
+   Palette mirrors the Worker pages in workers/routes/brand.ts.
+   ============================================================ */
+:root[data-brand="marquista"] {
+  --font-sans: "Helvetica Neue", Helvetica, Arial, ui-sans-serif, system-ui, sans-serif;
+
+  /* Surfaces — white panels on a near-white neutral canvas. */
+  --color-kumo-surface: #ffffff;
+  --color-kumo-base: #ffffff;
+  --color-kumo-recessed: #fafafa;
+  --color-kumo-elevated: #ffffff;
+  --color-kumo-overlay: #ffffff;
+  --color-kumo-control: #ffffff;
+
+  /* Interaction tint — neutral grey, hover → selected. */
+  --color-kumo-tint: #f4f4f5;
+  --color-kumo-fill: #ececee;
+  --color-kumo-fill-hover: #e4e4e7;
+  --color-kumo-interact: #d9d9dd;
+  --color-kumo-contrast: #0a0a0a;
+
+  /* Brand → black (primary actions). */
+  --color-kumo-brand: #0a0a0a;
+  --color-kumo-brand-hover: #000000;
+
+  /* Hairlines + focus ring. */
+  --color-kumo-line: rgba(10, 10, 10, 0.10);
+  --color-kumo-ring: rgba(10, 10, 10, 0.32);
+
+  /* Text — black ink, zinc greys. */
+  --text-color-kumo-default: #0a0a0a;
+  --text-color-kumo-strong: #27272a;
+  --text-color-kumo-subtle: #71717a;
+  --text-color-kumo-inactive: #a1a1aa;
+  --text-color-kumo-inverse: #ffffff;
+  --text-color-kumo-brand: #0a0a0a;
+  --text-color-kumo-link: #0a0a0a;
+  --color-kumo-info: #27272a;
+  --color-kumo-info-tint: #ececee;
+
+  /* Tooltip surface. */
+  --color-kumo-tip-shadow: rgba(10, 10, 10, 0.12);
+  --color-kumo-tip-stroke: rgba(10, 10, 10, 0.08);
+}
+
 html,
 body {
   margin: 0;
