@@ -121,11 +121,11 @@ export async function handleLogin(c: Ctx) {
   if (!user && c.env.ADMIN_BOOTSTRAP_EMAIL) {
     const total = await countUsers(c.env);
     if (total === 0 && email === c.env.ADMIN_BOOTSTRAP_EMAIL.toLowerCase()) {
-      if (password.length < 12) {
+      if (!password) {
         await throttle.recordSuccess(attempt);
         return c.html(
           renderLogin(brand, {
-            error: "Choose a password of at least 12 characters.",
+            error: "Enter a password.",
             bootstrap: true,
             returnTo,
           }),
