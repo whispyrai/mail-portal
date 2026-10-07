@@ -46,3 +46,37 @@ test("a new message carries only the thread token", () => {
 		References: `<${token}>`,
 	});
 });
+
+test("an oversized first id is dropped before the thread token or newest ids", () => {
+	const oversizedRoot = `${"x".repeat(990)}@mail.example`;
+	const headers = buildThreadingHeaders(
+		"newest@mail.example",
+		[oversizedRoot, "middle@mail.example", "newest@mail.example"],
+		token,
+	);
+	assert.equal(
+		headers.References,
+		`<middle@mail.example> <newest@mail.example> <${token}>`,
+	);
+	assert.ok(`References${headers.References}`.length <= 996);
+});
+
+test("someone else's id that starts with thread- is still a real reply target", () => {
+	const sesId = "0102019a1b2c3d4e-5f6a7b8c-0000-0000-0000-000000000000-000000";
+	const headers = buildThreadingHeaders(
+		sesId,
+		["first@mail.example", "thread-77@other-service.example", token],
+		token,
+	);
+	assert.equal(headers["In-Reply-To"], "<thread-77@other-service.example>");
+});
+
+test("a first id that nearly fills the limit never pushes out the thread token", () => {
+	const longRoot = `${"y".repeat(960)}@mail.example`;
+	const headers = buildThreadingHeaders(
+		"newest@mail.example",
+		[longRoot, "newest@mail.example"],
+		token,
+	);
+	assert.equal(headers.References, `<newest@mail.example> <${token}>`);
+});

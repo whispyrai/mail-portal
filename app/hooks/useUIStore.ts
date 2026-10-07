@@ -75,6 +75,9 @@ function openComposeState(
 	return {
 		isComposing: true,
 		queuedCompose: null,
+		// Any composer that opens supersedes a keyboard reply still waiting on
+		// its thread, which must not fire later when this composer closes.
+		pendingThreadAction: null,
 		_previousEmailId: selectedEmailId,
 		// Keep selectedEmailId when replying/forwarding so the thread stays visible
 		selectedEmailId: isReplyOrForward ? selectedEmailId : null,

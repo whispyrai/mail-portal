@@ -210,11 +210,22 @@ export default function RecipientCombobox({
 			return;
 		}
 		event.preventDefault();
-		addRecipients(`${draft}, ${pasted}`);
+		// Commit exactly what the field would hold after the paste, so pasting
+		// over a selection replaces it rather than keeping it as a recipient.
+		const input = event.currentTarget;
+		const start = input.selectionStart ?? draft.length;
+		const end = input.selectionEnd ?? start;
+		addRecipients(`${draft.slice(0, start)}${pasted}${draft.slice(end)}`);
 	}
 
 	function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
 		if (event.nativeEvent.isComposing) return;
+		// Cmd/Ctrl+Enter always sends. It commits exactly what was typed, before
+		// the send reads the form, and never quietly picks a suggestion instead.
+		if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+			if (draft.trim()) addRecipients(draft, true);
+			return;
+		}
 		const action = applyRecipientComboboxKeyEvent(
 			event,
 			activeIndex,
@@ -243,11 +254,6 @@ export default function RecipientCombobox({
 		switch (event.key) {
 			case "Enter":
 				// Never an implicit form submit: Enter finishes the address.
-				// Cmd/Ctrl+Enter still sends, with the address included.
-				if (event.metaKey || event.ctrlKey) {
-					if (draft.trim()) addRecipients(draft, true);
-					return;
-				}
 				event.preventDefault();
 				if (draft.trim()) addRecipients(draft);
 				return;

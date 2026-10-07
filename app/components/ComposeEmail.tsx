@@ -276,23 +276,26 @@ export default function ComposeEmail() {
     hasAttachmentIssue,
   } = useComposeForm(mailboxId, folder);
   const recipientValues = useMemo(() => ({ to, cc, bcc }), [to, cc, bcc]);
-  // Cc and Bcc open on demand, and stay open once they hold anyone so a field
-  // never vanishes from under the writer while they edit it.
-  const [showCc, setShowCc] = useState(false);
-  const [showBcc, setShowBcc] = useState(false);
+  // Cc and Bcc open on demand. A field that holds anyone is always shown, so
+  // no recipient is ever hidden, and it stays open once it has held someone so
+  // it never vanishes from under the writer who empties it.
+  const [openedCc, setOpenedCc] = useState(false);
+  const [openedBcc, setOpenedBcc] = useState(false);
   useEffect(() => {
-    setShowCc(false);
-    setShowBcc(false);
+    setOpenedCc(false);
+    setOpenedBcc(false);
   }, [composeOptions]);
   useEffect(() => {
-    if (cc.trim()) setShowCc(true);
+    if (cc.trim()) setOpenedCc(true);
   }, [cc]);
   useEffect(() => {
-    if (bcc.trim()) setShowBcc(true);
+    if (bcc.trim()) setOpenedBcc(true);
   }, [bcc]);
+  const showCc = openedCc || Boolean(cc.trim());
+  const showBcc = openedBcc || Boolean(bcc.trim());
   const revealRecipientField = (field: "cc" | "bcc") => {
-    if (field === "cc") setShowCc(true);
-    else setShowBcc(true);
+    if (field === "cc") setOpenedCc(true);
+    else setOpenedBcc(true);
     window.requestAnimationFrame(() =>
       document.getElementById(`compose-${field}`)?.focus(),
     );

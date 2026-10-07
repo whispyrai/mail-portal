@@ -45,7 +45,12 @@ export function prefixedSubject(
 	return `${prefix}: ${base}`;
 }
 
-const HTML_TAG = /<(?:[a-z][a-z0-9]*\b[^>]*|\/[a-z][a-z0-9]*\s*)>/i;
+/**
+ * Real markup, by tag name. A plain-text mail full of `<alice@example.com>`
+ * or `<https://example.com>` must not be mistaken for HTML and stripped.
+ */
+const HTML_TAG =
+	/<\/?(?:html|head|body|div|p|br|span|font|a|b|i|u|em|strong|table|tbody|thead|tr|td|th|ul|ol|li|img|h[1-6]|blockquote|pre|center|section|article|header|footer|style|meta|title|hr)(?=[\s/>])[^<>]*>/i;
 
 /**
  * The original as readable text: paragraphs, line breaks, list items and link

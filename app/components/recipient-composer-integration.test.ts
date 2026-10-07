@@ -40,8 +40,8 @@ test("compose mounts the accessible mailbox-scoped recipient combobox for To, Cc
 	// Cc and Bcc open separately and stay open once they hold anyone.
 	assert.match(compose, /\{!showCc && \(/);
 	assert.match(compose, /\{!showBcc && \(/);
-	assert.match(compose, /if \(cc\.trim\(\)\) setShowCc\(true\)/);
-	assert.match(compose, /if \(bcc\.trim\(\)\) setShowBcc\(true\)/);
+	assert.match(compose, /if \(cc\.trim\(\)\) setOpenedCc\(true\)/);
+	assert.match(compose, /if \(bcc\.trim\(\)\) setOpenedBcc\(true\)/);
 });
 
 test("initial editor normalization does not steal focus from the To field", () => {

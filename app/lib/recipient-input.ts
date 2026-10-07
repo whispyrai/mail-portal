@@ -7,6 +7,7 @@ import {
 	normalizedAddress,
 	parseRecipientText,
 	RECIPIENT_FIELDS,
+	recipientSeparatorPositions,
 	sendableRecipients,
 	type RecipientField,
 	type RecipientFieldValues,
@@ -14,30 +15,19 @@ import {
 
 /**
  * Split typed text at its last separator: everything before it is finished
- * and becomes recipients, the rest is still being typed. Separators inside a
- * quoted name or an angle-bracket address do not count.
+ * and becomes recipients, the rest is still being typed. A comma inside a
+ * quoted name, an angle-bracket address or a comment does not count.
  */
 export function splitFinishedRecipients(text: string): {
 	finished: string;
 	pending: string;
 } {
-	let quoted = false;
-	let bracketed = false;
-	let lastSeparator = -1;
-	for (let index = 0; index < text.length; index += 1) {
-		const character = text[index]!;
-		if (character === '"') quoted = !quoted;
-		else if (!quoted && character === "<") bracketed = true;
-		else if (!quoted && character === ">") bracketed = false;
-		else if (!quoted && !bracketed && /[,;\r\n]/.test(character)) {
-			lastSeparator = index;
-		}
-	}
-	return lastSeparator < 0
+	const last = recipientSeparatorPositions(text).at(-1);
+	return last === undefined
 		? { finished: "", pending: text }
 		: {
-				finished: text.slice(0, lastSeparator),
-				pending: text.slice(lastSeparator + 1).trimStart(),
+				finished: text.slice(0, last),
+				pending: text.slice(last + 1).trimStart(),
 			};
 }
 

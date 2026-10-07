@@ -41,6 +41,8 @@ interface EmailPanelToolbarProps {
 	/** Absent when nobody but the sender would get the reply. */
 	onReplyAll?: () => void;
 	onForward: () => void;
+	/** False while the conversation loads and its newest message is unknown. */
+	canReply: boolean;
 	canForward: boolean;
 	forwardUnavailableReason: string;
 	onAiDraft: () => void;
@@ -71,6 +73,7 @@ export default function EmailPanelToolbar({
 	onReply,
 	onReplyAll,
 	onForward,
+	canReply,
 	canForward,
 	forwardUnavailableReason,
 	onAiDraft,
@@ -132,8 +135,9 @@ export default function EmailPanelToolbar({
 						size="sm"
 						icon={<ArrowBendUpLeftIcon size={18} />}
 						onClick={onReply}
+						disabled={!canReply}
 						aria-keyshortcuts="R"
-						title="Reply (R)"
+						title={canReply ? "Reply (R)" : "Loading conversation"}
 						className="shrink-0"
 					>
 						<span className="max-sm:sr-only">Reply</span>
@@ -144,8 +148,9 @@ export default function EmailPanelToolbar({
 							size="sm"
 							icon={<ArrowBendDoubleUpLeftIcon size={18} />}
 							onClick={onReplyAll}
+							disabled={!canReply}
 							aria-keyshortcuts="A"
-							title="Reply all (A)"
+							title={canReply ? "Reply all (A)" : "Loading conversation"}
 							className="shrink-0"
 						>
 							<span className="max-sm:sr-only">Reply all</span>

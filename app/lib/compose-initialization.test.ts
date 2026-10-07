@@ -205,3 +205,20 @@ test("reply and forward prefixes are absorbed instead of stacked", () => {
 	assert.equal(subjectOf("FW: Budget", "forward"), "Fwd: Budget");
 	assert.equal(subjectOf("Budget", "forward"), "Fwd: Budget");
 });
+
+test("forward keeps angle-bracketed addresses and links in plain-text mail", () => {
+	const fields = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: {
+				...original,
+				body: "Contact <alice@example.com> or <b@x.com>.\nDocs: <https://example.com/docs>",
+			},
+		},
+	});
+
+	assert.match(
+		fields.body,
+		/Contact &lt;alice@example\.com&gt; or &lt;b@x\.com&gt;\.<br>Docs: &lt;https:\/\/example\.com\/docs&gt;/,
+	);
+});

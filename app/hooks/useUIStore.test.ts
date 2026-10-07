@@ -182,3 +182,17 @@ test("a keyboard reply waits for its conversation and is dropped if the reader m
 	useUIStore.getState().closePanel();
 	assert.equal(useUIStore.getState().pendingThreadAction, null);
 });
+
+test("opening any composer cancels a keyboard reply still waiting on its thread", () => {
+	clearComposeRecovery();
+	useUIStore.setState({
+		selectedEmailId: null,
+		isComposing: false,
+		pendingThreadAction: null,
+	});
+	useUIStore.getState().requestThreadAction({ emailId: "email-1", action: "reply" });
+	useUIStore.getState().startCompose({ mode: "new", originalEmail: null });
+	assert.equal(useUIStore.getState().pendingThreadAction, null);
+	useUIStore.getState().closeCompose();
+	assert.equal(useUIStore.getState().pendingThreadAction, null);
+});

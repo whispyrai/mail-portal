@@ -68,6 +68,16 @@ test("typed and pasted text becomes one recipient per address", () => {
 		],
 	);
 	assert.deepEqual(parseRecipientText(" a@x.com , , b@y.com "), ["a@x.com", "b@y.com"]);
+	// A comma inside a comment does not split, and no address beside a
+	// bracketed one is ever dropped.
+	assert.deepEqual(
+		parseRecipientText("Ada (Sales, EMEA) <ada@example.com>, Bob <bob@example.com> carol@example.com"),
+		["ada@example.com", "bob@example.com", "carol@example.com"],
+	);
+	assert.deepEqual(
+		parseRecipientText('"Smith \\"Jr\\", Bob" <bob@example.com>'),
+		["bob@example.com"],
+	);
 	// Text with no address is kept so the writer sees it and can fix it.
 	assert.deepEqual(parseRecipientText("bob, Grace Hopper"), ["bob", "Grace Hopper"]);
 });
@@ -80,6 +90,14 @@ test("only text before the last separator is finished", () => {
 	assert.deepEqual(splitFinishedRecipients('"Hamilton, Marg'), {
 		finished: "",
 		pending: '"Hamilton, Marg',
+	});
+	assert.deepEqual(splitFinishedRecipients('"Smith \\"Jr\\", Bob" <b'), {
+		finished: "",
+		pending: '"Smith \\"Jr\\", Bob" <b',
+	});
+	assert.deepEqual(splitFinishedRecipients("Ada (Sales, EMEA"), {
+		finished: "",
+		pending: "Ada (Sales, EMEA",
 	});
 	assert.deepEqual(splitFinishedRecipients("ada@calculus.example;"), {
 		finished: "ada@calculus.example",

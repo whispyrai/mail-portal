@@ -143,14 +143,22 @@ export function buildThreadingHeaders(
 	const inReplyTo = replyTarget && isMessageId(replyTarget)
 		? replyTarget
 		: originalMsgId
-			? ids.filter((id) => extractThreadTokens([id], null).length === 0).at(-1)
+			? ids.filter((id) => !isOwnThreadToken(id, threadToken)).at(-1)
 			: undefined;
 	if (inReplyTo) headers["In-Reply-To"] = `<${inReplyTo}>`;
 	const refs = threadToken
 		? [...ids.filter((id) => id !== threadToken), threadToken]
 		: ids;
-	if (refs.length > 0) headers["References"] = fitReferences(refs);
+	const referencesHeader = fitReferences(refs);
+	if (referencesHeader) headers["References"] = referencesHeader;
 	return headers;
+}
+
+/** Our own thread token, as opposed to someone else's id that starts with `thread-`. */
+function isOwnThreadToken(id: string, threadToken: string | undefined): boolean {
+	if (!threadToken) return false;
+	const ownDomain = threadToken.slice(threadToken.lastIndexOf("@"));
+	return id.endsWith(ownDomain) && extractThreadTokens([id], null).length > 0;
 }
 
 /** SES rejects a custom header whose name and value exceed 996 characters. */
@@ -167,19 +175,23 @@ function isMessageId(value: string): boolean {
 
 /**
  * A long thread's full chain outgrows the SES header limit and the whole send
- * fails, so keep what RFC 5322 asks to keep: the first message and the newest
- * ones (the thread token is always last), dropping from the middle.
+ * fails, so keep what RFC 5322 asks to keep and drop from the middle: the
+ * first message, when it fits beside the thread token, then the newest ids
+ * back from the token (always last, so never dropped). Nothing longer than
+ * the limit is ever returned.
  */
 function fitReferences(ids: string[]): string {
 	const render = (list: string[]) => list.map((id) => `<${id}>`).join(" ");
 	if (render(ids).length <= MAX_REFERENCES_LENGTH) return render(ids);
-	const [root, ...rest] = ids;
+	const root = ids[0]!;
+	const keepsRoot = render([root, ids.at(-1)!]).length <= MAX_REFERENCES_LENGTH;
 	const newest: string[] = [];
-	for (const id of rest.reverse()) {
-		if (render([root!, id, ...newest]).length > MAX_REFERENCES_LENGTH) break;
+	for (const id of ids.slice(1).reverse()) {
+		const candidate = keepsRoot ? [root, id, ...newest] : [id, ...newest];
+		if (render(candidate).length > MAX_REFERENCES_LENGTH) break;
 		newest.unshift(id);
 	}
-	return render([root!, ...newest]);
+	return render(keepsRoot ? [root, ...newest] : newest);
 }
 
 // ── Draft-follows-in_reply_to ──────────────────────────────────────

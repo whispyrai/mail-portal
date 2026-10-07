@@ -51,15 +51,22 @@ test("each finished address is a removable, editable chip showing what is sent",
 });
 
 test("Enter, separators, paste and leaving the field all commit the address", () => {
-	// Enter never submits the form; Cmd/Ctrl+Enter commits synchronously so the
-	// send it triggers includes the address.
+	// Cmd/Ctrl+Enter is handled before suggestions: it commits exactly what
+	// was typed, synchronously, and lets the send shortcut run.
 	assert.match(
 		source,
-		/case "Enter":[\s\S]*?if \(event\.metaKey \|\| event\.ctrlKey\) \{[\s\S]*?addRecipients\(draft, true\)[\s\S]*?event\.preventDefault\(\);/,
+		/if \(event\.key === "Enter" && \(event\.metaKey \|\| event\.ctrlKey\)\) \{\s*if \(draft\.trim\(\)\) addRecipients\(draft, true\);\s*return;\s*\}\s*const action = applyRecipientComboboxKeyEvent\(/,
 	);
 	assert.match(source, /if \(flush\) flushSync\(apply\)/);
+	// Plain Enter never submits the form.
+	assert.match(source, /case "Enter":\s*\/\/[^\n]*\n\s*event\.preventDefault\(\);/);
 	assert.match(source, /splitFinishedRecipients\(text\)/);
 	assert.match(source, /onPaste=\{handlePaste\}/);
+	// Pasting over a selection replaces it.
+	assert.match(
+		source,
+		/addRecipients\(`\$\{draft\.slice\(0, start\)\}\$\{pasted\}\$\{draft\.slice\(end\)\}`\)/,
+	);
 	assert.match(source, /onBlur=\{\(\) => \{\s*if \(draft\.trim\(\)\) addRecipients\(draft\);/);
 	// Backspace marks the last chip before removing it.
 	assert.match(source, /setSelectedChip\(chips\.length - 1\)/);

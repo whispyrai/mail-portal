@@ -18,7 +18,7 @@ test("Reply, Reply all and Forward are labelled where people look for them", () 
 	// The end of the conversation offers the same three, as large buttons.
 	assert.match(
 		panel,
-		/showsReplyActions && !isInlineComposing && \([\s\S]*?Reply\s*<\/Button>[\s\S]*?Reply all\s*<\/Button>[\s\S]*?Forward\s*<\/Button>/,
+		/showsReplyActions && conversationLoaded && !isInlineComposing && \([\s\S]*?Reply\s*<\/Button>[\s\S]*?Reply all\s*<\/Button>[\s\S]*?Forward\s*<\/Button>/,
 	);
 });
 
@@ -28,9 +28,17 @@ test("Reply all appears only when someone besides the sender would get it", () =
 	assert.match(panel, /\{latestHasOthers && \(/);
 });
 
-test("replies need no message body, so they never wait for one", () => {
-	assert.doesNotMatch(panel, /canReply/);
-	assert.doesNotMatch(toolbar, /canReply|replyUnavailableReason/);
+test("replies wait for the conversation, never for a message body", () => {
+	assert.match(panel, /const conversationLoaded = !email\.thread_id \|\| threadRepliesFetched;/);
+	assert.match(panel, /canReply=\{conversationLoaded\}/);
+	assert.match(panel, /showsReplyActions && conversationLoaded && !isInlineComposing/);
+	assert.match(toolbar, /disabled=\{!canReply\}/);
+	assert.doesNotMatch(toolbar, /replyUnavailableReason/);
+});
+
+test("a populated Cc or Bcc field is never hidden", () => {
+	assert.match(compose, /const showCc = openedCc \|\| Boolean\(cc\.trim\(\)\);/);
+	assert.match(compose, /const showBcc = openedBcc \|\| Boolean\(bcc\.trim\(\)\);/);
 });
 
 test("each message can be answered on its own and shows everyone it went to", () => {

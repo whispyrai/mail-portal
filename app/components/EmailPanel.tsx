@@ -306,9 +306,15 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		const complete = withCompleteBody(message);
 		if (complete) startCompose({ mode: "forward", originalEmail: complete });
 	};
+	// Until the whole conversation is here, the newest message is unknown, so
+	// Reply, Reply all and Forward wait rather than answer the wrong one.
+	const conversationLoaded = !email.thread_id || threadRepliesFetched;
 	const latest = latestMessage ?? email;
 	const latestHasOthers = replyAddressesDiffer(latest);
-	const canForwardLatest = withCompleteBody(latest) !== null;
+	const canForwardLatest = conversationLoaded && withCompleteBody(latest) !== null;
+	const latestUnavailableReason = conversationLoaded
+		? bodyUnavailableReason(latest)
+		: "Loading conversation";
 	const showsReplyActions = !isDraftFolder && !isOutboxFolder;
 	const canAnswer = (message: Email, isDraft: boolean) =>
 		showsReplyActions && !isDraft && message.folder_id !== Folders.OUTBOX;
@@ -609,8 +615,9 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				onReply={() => replyTo(latest, false)}
 				onReplyAll={latestHasOthers ? () => replyTo(latest, true) : undefined}
 				onForward={() => forward(latest)}
+				canReply={conversationLoaded}
 				canForward={canForwardLatest}
-				forwardUnavailableReason={bodyUnavailableReason(latest)}
+				forwardUnavailableReason={latestUnavailableReason}
 				onAiDraft={handleAiDraft}
 				onToggleStar={toggleStar}
 				onToggleRead={() => {
@@ -702,7 +709,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 							/>
 						);
 					})}
-				{showsReplyActions && !isInlineComposing && (
+				{showsReplyActions && conversationLoaded && !isInlineComposing && (
 					<div className="flex flex-wrap gap-2 border-t border-kumo-line px-4 py-4 md:px-6">
 						<Button
 							variant="secondary"
@@ -728,7 +735,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 							className="min-h-11"
 							onClick={() => forward(latest)}
 							disabled={!canForwardLatest}
-							title={canForwardLatest ? undefined : bodyUnavailableReason(latest)}
+							title={canForwardLatest ? undefined : latestUnavailableReason}
 						>
 							Forward
 						</Button>
