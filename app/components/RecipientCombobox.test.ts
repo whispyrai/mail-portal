@@ -75,7 +75,11 @@ test("Enter, separators, paste and leaving the field all commit the address", ()
 test("an address already in another field is not duplicated, and the writer is told", () => {
 	assert.match(source, /if \(other === field\) continue;/);
 	assert.match(source, /is already in \$\{elsewhere\.get\(normalizedAddress\(duplicate\)\)\}\./);
-	assert.match(source, /\{notice && \(\s*<p className="mt-1 text-xs text-kumo-subtle">\{notice\}<\/p>/);
+	// Announced too, so a screen reader hears who was left out of a mixed paste.
+	assert.match(
+		source,
+		/\{notice && \(\s*<p role="status" aria-live="polite" className="mt-1 text-xs text-kumo-subtle">\s*\{notice\}\s*<\/p>/,
+	);
 });
 
 test("a typed address is never swapped for a suggestion once it has an @", () => {

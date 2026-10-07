@@ -440,7 +440,9 @@ export default function RecipientCombobox({
 				/>
 			</div>
 			{notice && (
-				<p className="mt-1 text-xs text-kumo-subtle">{notice}</p>
+				<p role="status" aria-live="polite" className="mt-1 text-xs text-kumo-subtle">
+					{notice}
+				</p>
 			)}
 			{invalidChips.length > 0 && (
 				<p id={problemId} className="mt-1 text-xs font-medium text-kumo-danger">
