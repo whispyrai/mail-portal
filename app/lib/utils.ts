@@ -35,16 +35,6 @@ export function formatBytes(bytes: number, decimals = 1): string {
 }
 
 /**
- * Split a comma-separated email field into individual addresses.
- */
-export function splitEmailList(value?: string | null): string[] {
-	return (value || "")
-		.split(",")
-		.map((entry) => entry.trim())
-		.filter(Boolean);
-}
-
-/**
  * Convert a list of addresses into the API payload format.
  */
 export function toEmailListValue(addresses: string[]): string | string[] | undefined {

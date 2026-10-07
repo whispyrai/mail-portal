@@ -441,8 +441,14 @@ export default function EmailListRoute() {
 		mailboxId: string;
 		folder: string;
 	}>();
-	const { selectedEmailId, selectEmail, closePanel, startCompose, mailDensity } =
-		useUIStore();
+	const {
+		selectedEmailId,
+		selectEmail,
+		closePanel,
+		startCompose,
+		requestThreadAction,
+		mailDensity,
+	} = useUIStore();
 	const isCompact = mailDensity === "compact";
 	const [page, setPage] = useState(1);
 	const [keyboardTargetId, setKeyboardTargetId] = useState<string | null>(null);
@@ -1000,9 +1006,10 @@ export default function EmailListRoute() {
 					handleRowClick(target);
 					return;
 				case "reply":
+				case "reply-all":
+				case "forward":
 					if (!isOutbox && folder !== Folders.DRAFT) {
-						selectEmail(target.id);
-						startCompose({ mode: "reply", originalEmail: target });
+						requestThreadAction({ emailId: target.id, action: command });
 					}
 					return;
 				case "archive":
@@ -1096,9 +1103,9 @@ export default function EmailListRoute() {
 		keyboardTargetId,
 		mailboxId,
 		moveEmail,
+		requestThreadAction,
 		selectEmail,
 		selectedEmailId,
-		startCompose,
 		setConversationRead,
 		trashConversation,
 		unsnooze,

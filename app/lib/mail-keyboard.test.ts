@@ -60,6 +60,8 @@ test("maps primary mail navigation and triage shortcuts", () => {
 	assert.deepEqual(shortcut("c"), { command: "compose" });
 	assert.deepEqual(shortcut("/"), { command: "focus-search" });
 	assert.deepEqual(shortcut("r"), { command: "reply" });
+	assert.deepEqual(shortcut("a"), { command: "reply-all" });
+	assert.deepEqual(shortcut("f"), { command: "forward" });
 	assert.deepEqual(shortcut("e"), { command: "archive" });
 	assert.deepEqual(shortcut("#"), { command: "trash" });
 	assert.deepEqual(shortcut("u"), { command: "toggle-unread" });

@@ -17,10 +17,13 @@ test("recipient combobox exposes the complete accessible listbox contract", () =
 		/aria-live="polite"/,
 		/htmlFor=\{id\}/,
 		/autoFocus=\{autoFocus\}/,
-		/required=\{required\}/,
+		/aria-required=\{required \|\| undefined\}/,
 		/min-h-11/,
 	]) assert.match(source, contract);
 	assert.doesNotMatch(source, /autoComplete="off"/);
+	// Recipients live in chips, so a native `required` on the empty text input
+	// would block sending a message that already has recipients.
+	assert.doesNotMatch(source, /\srequired=\{required\}/);
 });
 
 test("recipient combobox handles keyboard, mouse, async, and clearing states", () => {
@@ -32,9 +35,32 @@ test("recipient combobox handles keyboard, mouse, async, and clearing states", (
 	assert.match(source, /No matching recipients/);
 	assert.match(source, /setAnnouncement/);
 	assert.match(source, /mailboxId, field/);
+	assert.match(source, /token\.length > 0 \|\| suggestions\.length > 0/);
+	assert.doesNotMatch(source, /displayName|fullName|contactName/);
+});
+
+test("each finished address is a removable, editable chip showing what is sent", () => {
+	assert.match(source, /role="list" aria-label=\{`\$\{label\} recipients`\}/);
+	assert.match(source, /role="listitem"/);
+	assert.match(source, /aria-label=\{`Remove \$\{address\}`\}/);
+	assert.match(source, /onClick=\{\(\) => editChip\(index\)\}/);
+	assert.match(source, /onClick=\{\(\) => removeChip\(index\)\}/);
+	// Invalid text stays visible as a chip that says what is wrong with it.
+	assert.match(source, /is not a valid email address/);
+	assert.match(source, /aria-invalid=\{invalidChips\.length > 0 \|\| undefined\}/);
+});
+
+test("Enter, separators, paste and leaving the field all commit the address", () => {
+	// Enter never submits the form; Cmd/Ctrl+Enter commits synchronously so the
+	// send it triggers includes the address.
 	assert.match(
 		source,
-		/segment\.token\.length > 0 \|\| suggestions\.length > 0/,
+		/case "Enter":[\s\S]*?if \(event\.metaKey \|\| event\.ctrlKey\) \{[\s\S]*?addRecipients\(draft, true\)[\s\S]*?event\.preventDefault\(\);/,
 	);
-	assert.doesNotMatch(source, /displayName|fullName|contactName/);
+	assert.match(source, /if \(flush\) flushSync\(apply\)/);
+	assert.match(source, /splitFinishedRecipients\(text\)/);
+	assert.match(source, /onPaste=\{handlePaste\}/);
+	assert.match(source, /onBlur=\{\(\) => \{\s*if \(draft\.trim\(\)\) addRecipients\(draft\);/);
+	// Backspace marks the last chip before removing it.
+	assert.match(source, /setSelectedChip\(chips\.length - 1\)/);
 });

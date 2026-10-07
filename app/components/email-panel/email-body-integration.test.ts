@@ -12,8 +12,8 @@ test("EmailPanel owns one selected body query and only expanded nonselected quer
 	assert.match(panel, /message\.id !== email\.id[\s\S]*message\.body_external[\s\S]*expandedMessages\.has\(message\.id\)/);
 	assert.match(panel, /useQueries\(\{[\s\S]*activeExternalBodyIds\.map/);
 	assert.doesNotMatch(threadMessage, /useEmailBody|useQuery|useQueries/);
-	// A reply quotes its target, so that body is owned here too, not by a renderer.
-	assert.match(panel, /if \(replyTargetBodyId\) ids\.add\(replyTargetBodyId\)/);
+	// Forward quotes the newest message, so that body is owned here too, not by a renderer.
+	assert.match(panel, /if \(latestBodyId\) ids\.add\(latestBodyId\)/);
 });
 
 test("shared message body never falls back to an external preview and exposes exact recovery", () => {
@@ -30,9 +30,16 @@ test("shared message body gives the opaque renderer only mailbox-scoped inline m
 	assert.doesNotMatch(messageBody, /rewriteInlineImages/);
 });
 
-test("Forward is both disabled and handler-guarded until the selected body is authoritative", () => {
-	assert.match(panel, /if \(!authoritativeSelectedEmail\) return/);
-	assert.match(panel, /originalEmail: authoritativeSelectedEmail/);
+test("Forward is both disabled and handler-guarded until the forwarded body is authoritative", () => {
+	assert.match(
+		panel,
+		/const withCompleteBody = \(message: Email\): Email \| null => \{[\s\S]*?return body === undefined \? null : \{ \.\.\.message, body \};/,
+	);
+	assert.match(
+		panel,
+		/const forward = \(message: Email\) => \{\s*const complete = withCompleteBody\(message\);\s*if \(complete\) startCompose\(\{ mode: "forward", originalEmail: complete \}\);/,
+	);
+	assert.match(panel, /canForward=\{canForwardLatest\}/);
 	assert.match(toolbar, /disabled=\{!canForward\}/);
 	assert.match(toolbar, /Forward unavailable:/);
 });

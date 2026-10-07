@@ -30,6 +30,8 @@ const SHORTCUT_GROUPS: ReadonlyArray<{
 		items: [
 			["C", "Compose"],
 			["R", "Reply"],
+			["A", "Reply all"],
+			["F", "Forward"],
 			["E", "Archive"],
 			["#", "Move to Trash"],
 			["U", "Mark read / unread"],
