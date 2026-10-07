@@ -12,6 +12,7 @@ import type { MailboxDO } from "../durableObject/index.ts";
 import type { EmailFull } from "./schemas.ts";
 import { Folders } from "../../shared/folders.ts";
 export { buildThreadToken, extractThreadToken } from "./thread-token.ts";
+import { extractThreadTokens } from "./thread-token.ts";
 import type { Env } from "../types.ts";
 import { formatQuotedDate } from "../../shared/dates.ts";
 
@@ -135,13 +136,50 @@ export function buildThreadingHeaders(
 	threadToken?: string,
 ): Record<string, string> {
 	const headers: Record<string, string> = {};
-	if (originalMsgId) headers["In-Reply-To"] = `<${originalMsgId}>`;
-	const refs = [...references];
-	if (threadToken) refs.push(threadToken);
-	if (refs.length > 0) {
-		headers["References"] = refs.map((r) => `<${r}>`).join(" ");
-	}
+	const ids = [...new Set(references.map(bareMessageId).filter(isMessageId))];
+	// Mail we sent is stored under SES's own id, which is not the Message-ID
+	// its recipients saw. Answering it answers what it answered instead.
+	const replyTarget = originalMsgId ? bareMessageId(originalMsgId) : null;
+	const inReplyTo = replyTarget && isMessageId(replyTarget)
+		? replyTarget
+		: originalMsgId
+			? ids.filter((id) => extractThreadTokens([id], null).length === 0).at(-1)
+			: undefined;
+	if (inReplyTo) headers["In-Reply-To"] = `<${inReplyTo}>`;
+	const refs = threadToken
+		? [...ids.filter((id) => id !== threadToken), threadToken]
+		: ids;
+	if (refs.length > 0) headers["References"] = fitReferences(refs);
 	return headers;
+}
+
+/** SES rejects a custom header whose name and value exceed 996 characters. */
+const MAX_REFERENCES_LENGTH = 996 - "References".length;
+
+function bareMessageId(value: string): string {
+	return value.trim().replace(/^<|>$/g, "");
+}
+
+/** A Message-ID a recipient can match: `local@domain`. */
+function isMessageId(value: string): boolean {
+	return /^[^\s<>]+@[^\s<>]+$/.test(value);
+}
+
+/**
+ * A long thread's full chain outgrows the SES header limit and the whole send
+ * fails, so keep what RFC 5322 asks to keep: the first message and the newest
+ * ones (the thread token is always last), dropping from the middle.
+ */
+function fitReferences(ids: string[]): string {
+	const render = (list: string[]) => list.map((id) => `<${id}>`).join(" ");
+	if (render(ids).length <= MAX_REFERENCES_LENGTH) return render(ids);
+	const [root, ...rest] = ids;
+	const newest: string[] = [];
+	for (const id of rest.reverse()) {
+		if (render([root!, id, ...newest]).length > MAX_REFERENCES_LENGTH) break;
+		newest.unshift(id);
+	}
+	return render([root!, ...newest]);
 }
 
 // ── Draft-follows-in_reply_to ──────────────────────────────────────
