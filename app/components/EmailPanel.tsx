@@ -2,7 +2,12 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { useKumoToastManager } from "@cloudflare/kumo";
+import { Button, useKumoToastManager } from "@cloudflare/kumo";
+import {
+	ArrowBendDoubleUpLeftIcon,
+	ArrowBendUpLeftIcon,
+	ArrowBendUpRightIcon,
+} from "@phosphor-icons/react";
 import { useQueries } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router";
@@ -18,13 +23,14 @@ import ConversationIntelligenceCard from "~/components/ConversationIntelligenceC
 import ConversationActivity from "~/components/ConversationActivity";
 import SnoozeDialog from "~/components/SnoozeDialog";
 import { FollowUpReminderControl } from "~/components/FollowUpReminderDialog";
-import { splitEmailList, toEmailListValue } from "~/lib/utils";
-import { normalizedAddress } from "~/lib/recipient-input";
+import { htmlToPlainText, toEmailListValue } from "~/lib/utils";
+import { recipientProblem, replyRecipientFields } from "~/lib/recipient-input";
+import { normalizedAddress, sendableRecipients } from "shared/recipient-addresses";
 import { composeSurface, INLINE_COMPOSE_HOST_ID } from "~/lib/compose-surface";
 import { prefixedSubject } from "~/lib/compose-initialization";
 import { evaluateStoredDraftAttachments } from "~/lib/compose-attachment-policy";
 import { planComposeEnqueueResult } from "~/lib/outbound-enqueue-outcome";
-import api from "~/services/api";
+import api, { ApiError } from "~/services/api";
 import { useAiDraftReply, useDeleteEmail, useDiscardDraft, useEmail, useMoveEmail, useOutboundDeliveries, useReplyToEmail, useRestoreEmail, useSaveDraft, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { buildEmailBodyQueryOptions } from "~/queries/email-body";
 import { useFolders } from "~/queries/folders";
@@ -86,6 +92,8 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		composeOptions,
 		selectedEmailId,
 		trackSend,
+		pendingThreadAction,
+		clearThreadAction,
 	} = useUIStore();
 	const isInlineComposing = isComposing &&
 		composeSurface(composeOptions, selectedEmailId) === "inline";
@@ -143,16 +151,26 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		return nonDrafts.at(-1) ?? email;
 	}, [allMessages, draftMessageIds, selfAddress, email]);
 
-	// A reply quotes its target, so that body is fetched even while collapsed.
-	// Depended on by id, not by message, to keep the query set identity stable.
-	const replyTargetBodyId = lastReceivedMessage?.body_external
-		? lastReceivedMessage.id
+	// What Reply, Reply all and Forward answer by default: the newest message in
+	// the conversation, whoever sent it. Drafts and mail still in the Outbox are
+	// not part of the conversation yet.
+	const latestMessage = useMemo(() => {
+		const settled = allMessages.filter(
+			(msg) => !draftMessageIds.has(msg.id) && msg.folder_id !== Folders.OUTBOX,
+		);
+		return settled.at(-1) ?? email;
+	}, [allMessages, draftMessageIds, email]);
+
+	// Forward quotes the newest message, so its body is fetched even while
+	// collapsed. Depended on by id, not by message, to keep the query set stable.
+	const latestBodyId = latestMessage?.body_external
+		? latestMessage.id
 		: undefined;
 	const activeExternalBodyIds = useMemo(() => {
 		if (!email) return [];
 		const ids = new Set<string>();
 		if (email.body_external) ids.add(email.id);
-		if (replyTargetBodyId) ids.add(replyTargetBodyId);
+		if (latestBodyId) ids.add(latestBodyId);
 		for (const message of allMessages) {
 			if (
 				message.id !== email.id &&
@@ -163,7 +181,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 			}
 		}
 		return [...ids];
-	}, [allMessages, email, expandedMessages, replyTargetBodyId]);
+	}, [allMessages, email, expandedMessages, latestBodyId]);
 	const externalBodyQueries = useQueries({
 		queries: mailboxId
 			? activeExternalBodyIds.map((messageId) =>
@@ -180,6 +198,55 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		),
 		[activeExternalBodyIds, externalBodyQueries],
 	);
+
+	// Whether Reply all would reach anyone Reply does not, once per message.
+	const replyAllMailbox = currentMailbox?.email ?? mailboxId ?? "";
+	const reachesOthers = useMemo(() => {
+		const result = new Map<string, boolean>();
+		for (const message of allMessages) {
+			const reply = replyRecipientFields({
+				original: message,
+				mailboxAddress: replyAllMailbox,
+				all: false,
+			});
+			const everyone = replyRecipientFields({
+				original: message,
+				mailboxAddress: replyAllMailbox,
+				all: true,
+			});
+			result.set(message.id, everyone.to !== reply.to || everyone.cc !== "");
+		}
+		return result;
+	}, [allMessages, replyAllMailbox]);
+
+	/** The message with its complete body, or null while that body is loading. */
+	const withCompleteBody = (message: Email): Email | null => {
+		if (!message.body_external) return message;
+		const body = externalBodyQueriesById.get(message.id)?.data;
+		return body === undefined ? null : { ...message, body };
+	};
+
+	// A keyboard Reply, Reply all or Forward from the list lands here and runs
+	// against the same newest message the buttons use, once it has loaded. It
+	// checks after every render and does nothing until a request is waiting.
+	useEffect(() => {
+		if (!pendingThreadAction || pendingThreadAction.emailId !== emailId) return;
+		if (!email || !latestMessage || (email.thread_id && !threadRepliesFetched)) return;
+		const { action } = pendingThreadAction;
+		if (action !== "forward") {
+			clearThreadAction();
+			startCompose({ mode: action, originalEmail: latestMessage });
+			return;
+		}
+		const complete = withCompleteBody(latestMessage);
+		if (complete) {
+			clearThreadAction();
+			startCompose({ mode: "forward", originalEmail: complete });
+		} else if (externalBodyQueriesById.get(latestMessage.id)?.isError) {
+			clearThreadAction();
+			toastManager.add({ title: "This message could not be loaded to forward", variant: "error" });
+		}
+	});
 
 	const currentEmailId = email?.id;
 	const newestMessageId = allMessages.at(-1)?.id;
@@ -242,30 +309,29 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	);
 
 	if (!email) return <EmailPanelSkeleton />;
-	const selectedBodyQuery = externalBodyQueriesById.get(email.id);
-	const selectedBodyIsAuthoritative = !email.body_external || selectedBodyQuery?.data !== undefined;
-	const authoritativeSelectedEmail = selectedBodyIsAuthoritative
-		? {
-				...email,
-				body: email.body_external ? selectedBodyQuery?.data : email.body,
-			}
-		: null;
 
-	// A reply carries the original quoted underneath, so it waits for the same
-	// authoritative body that Forward waits for.
-	const replyTargetBodyQuery = lastReceivedMessage
-		? externalBodyQueriesById.get(lastReceivedMessage.id)
-		: undefined;
-	const authoritativeReplyTarget = lastReceivedMessage &&
-		(!lastReceivedMessage.body_external ||
-			replyTargetBodyQuery?.data !== undefined)
-		? {
-				...lastReceivedMessage,
-				body: lastReceivedMessage.body_external
-					? replyTargetBodyQuery?.data
-					: lastReceivedMessage.body,
-			}
-		: null;
+	const bodyUnavailableReason = (message: Email) =>
+		externalBodyQueriesById.get(message.id)?.isError
+			? "Complete message unavailable"
+			: "Loading complete message";
+	const replyTo = (message: Email, all: boolean) =>
+		startCompose({ mode: all ? "reply-all" : "reply", originalEmail: message });
+	const forward = (message: Email) => {
+		const complete = withCompleteBody(message);
+		if (complete) startCompose({ mode: "forward", originalEmail: complete });
+	};
+	// Until the whole conversation is here, the newest message is unknown, so
+	// Reply, Reply all and Forward wait rather than answer the wrong one.
+	const conversationLoaded = !email.thread_id || threadRepliesFetched;
+	const latest = latestMessage ?? email;
+	const latestHasOthers = reachesOthers.get(latest.id) ?? false;
+	const canForwardLatest = conversationLoaded && withCompleteBody(latest) !== null;
+	const latestUnavailableReason = conversationLoaded
+		? bodyUnavailableReason(latest)
+		: "Loading conversation";
+	const showsReplyActions = !isDraftFolder && !isOutboxFolder;
+	const canAnswer = (message: Email, isDraft: boolean) =>
+		showsReplyActions && !isDraft && message.folder_id !== Folders.OUTBOX;
 
 	const snoozeFolderId = email.folder_id ?? folder ?? Folders.INBOX;
 	const reminderConversationKey = email.thread_id?.trim() || email.id;
@@ -389,10 +455,14 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				if (!draft.draft_version) {
 					throw new Error("Reload this draft before sending it.");
 				}
-				const toRecipients = splitEmailList(draft.recipient);
-				if (toRecipients.length === 0) {
-					throw new Error("Cannot send: no valid recipient set on this draft.");
-				}
+				const draftRecipients = {
+					to: draft.recipient,
+					cc: draft.cc ?? "",
+					bcc: draft.bcc ?? "",
+				};
+				const recipientError = recipientProblem(draftRecipients);
+				if (recipientError) throw new Error(recipientError);
+				const recipients = sendableRecipients(draftRecipients);
 				const attachmentPolicy = evaluateStoredDraftAttachments(
 					draft.id,
 					draft.attachments,
@@ -402,25 +472,32 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				const sendPayload = {
 					source_draft_id: draft.id,
 					source_draft_version: draft.draft_version,
-					to: toEmailListValue(toRecipients),
-					cc: toEmailListValue(splitEmailList(draft.cc)),
-					bcc: toEmailListValue(splitEmailList(draft.bcc)),
+					to: toEmailListValue(recipients.to),
+					cc: toEmailListValue(recipients.cc),
+					bcc: toEmailListValue(recipients.bcc),
 					from,
 					subject: draft.subject || "(no subject)",
 					html: draft.body || "",
-					text: draft.body ? draft.body.replace(/<[^>]*>/g, "").trim() : "",
+					text: draft.body ? htmlToPlainText(draft.body) : "",
 					attachments: attachmentPolicy.refs,
 				};
 				const emailData = {
 					...sendPayload,
 					idempotency_key: draftSendIdentityRef.current.keyFor(sendPayload),
 				};
-				const originalEmail = draft.in_reply_to
-					? allMessages.find((msg) => msg.id === draft.in_reply_to)
-					: undefined;
-				const result = originalEmail
-					? await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData })
-					: await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+				// A reply draft goes through the reply route whether or not its thread
+				// has loaded here; the server resolves the original. Only an original
+				// that no longer exists sends it as a new message.
+				const sendAsNew = () =>
+					sendEmailMut.mutateAsync({ mailboxId, email: emailData });
+				const result = draft.in_reply_to
+					? await replyMut
+							.mutateAsync({ mailboxId, emailId: draft.in_reply_to, email: emailData })
+							.catch((error: unknown) => {
+								if (error instanceof ApiError && error.status === 404) return sendAsNew();
+								throw error;
+							})
+					: await sendAsNew();
 				return { result, attachmentPolicy };
 			};
 
@@ -549,35 +626,12 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				onBack={closePanel}
 				onSendDraft={() => handleSendDraft()}
 				onEditDraft={() => handleEditDraft()}
-					onReply={() => {
-						if (!authoritativeReplyTarget) return;
-						startCompose({
-							mode: "reply",
-							originalEmail: authoritativeReplyTarget,
-						});
-					}}
-					onReplyAll={() => {
-						if (!authoritativeReplyTarget) return;
-						startCompose({
-							mode: "reply-all",
-							originalEmail: authoritativeReplyTarget,
-						});
-					}}
-					canReply={Boolean(authoritativeReplyTarget)}
-					replyUnavailableReason={replyTargetBodyQuery?.isError
-						? "Complete message unavailable"
-						: "Loading complete message"}
-					onForward={() => {
-						if (!authoritativeSelectedEmail) return;
-						startCompose({
-							mode: "forward",
-							originalEmail: authoritativeSelectedEmail,
-						});
-					}}
-					canForward={Boolean(authoritativeSelectedEmail)}
-					forwardUnavailableReason={selectedBodyQuery?.isError
-						? "Complete message unavailable"
-						: "Loading complete message"}
+				onReply={() => replyTo(latest, false)}
+				onReplyAll={latestHasOthers ? () => replyTo(latest, true) : undefined}
+				onForward={() => forward(latest)}
+				canReply={conversationLoaded}
+				canForward={canForwardLatest}
+				forwardUnavailableReason={latestUnavailableReason}
 				onAiDraft={handleAiDraft}
 				onToggleStar={toggleStar}
 				onToggleRead={() => {
@@ -656,6 +710,12 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 								onEditDraft={isDraft ? () => handleEditDraft(msg) : undefined}
 								onDeleteDraft={isDraft ? () => handleDeleteDraft(msg) : undefined}
 								onViewSource={() => setSourceViewEmail(msg)}
+								onReply={canAnswer(msg, isDraft) ? () => replyTo(msg, false) : undefined}
+								onReplyAll={canAnswer(msg, isDraft) && reachesOthers.get(msg.id)
+									? () => replyTo(msg, true)
+									: undefined}
+								onForward={canAnswer(msg, isDraft) ? () => forward(msg) : undefined}
+								forwardUnavailableReason={withCompleteBody(msg) ? undefined : bodyUnavailableReason(msg)}
 								onPreviewImage={(url, filename) =>
 									setPreviewImage({ url, filename })
 								}
@@ -663,6 +723,38 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 							/>
 						);
 					})}
+				{showsReplyActions && conversationLoaded && !isInlineComposing && (
+					<div className="flex flex-wrap gap-2 border-t border-kumo-line px-4 py-4 md:px-6">
+						<Button
+							variant="secondary"
+							icon={<ArrowBendUpLeftIcon size={16} />}
+							className="min-h-11"
+							onClick={() => replyTo(latest, false)}
+						>
+							Reply
+						</Button>
+						{latestHasOthers && (
+							<Button
+								variant="secondary"
+								icon={<ArrowBendDoubleUpLeftIcon size={16} />}
+								className="min-h-11"
+								onClick={() => replyTo(latest, true)}
+							>
+								Reply all
+							</Button>
+						)}
+						<Button
+							variant="secondary"
+							icon={<ArrowBendUpRightIcon size={16} />}
+							className="min-h-11"
+							onClick={() => forward(latest)}
+							disabled={!canForwardLatest}
+							title={canForwardLatest ? undefined : latestUnavailableReason}
+						>
+							Forward
+						</Button>
+					</div>
+				)}
 				{/* The one composer instance renders itself in here when it is answering
 				    this thread. Kept unconditional so it exists before compose opens. */}
 				<div id={INLINE_COMPOSE_HOST_ID} />

@@ -2,15 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { RecipientSuggestion } from "../../shared/recipient-suggestions.ts";
 import {
+	isValidRecipientAddress,
+	parseRecipientText,
+	sendableRecipients,
+} from "../../shared/recipient-addresses.ts";
+import {
 	applyRecipientComboboxKeyEvent,
-	activeRecipientSegment,
 	filterRecipientSuggestions,
+	mergeRecipients,
 	nextRecipientComboboxAction,
-	replaceActiveRecipientSegment,
-	replaceActiveRecipientSegmentWithCursor,
-	replyAllRecipientFields,
-	splitRecipientValues,
+	recipientProblem,
+	replyRecipientFields,
+	splitFinishedRecipients,
+	storedHeaderValues,
 } from "./recipient-input.ts";
+
+const mailbox = "team@example.com";
+
+function headers(entries: Record<string, string>): string {
+	return JSON.stringify(
+		Object.entries(entries).map(([key, value]) => ({ key, value })),
+	);
+}
 
 test("Escape consumed by an open popup cannot dismiss its parent dialog", () => {
 	const calls: string[] = [];
@@ -42,49 +55,208 @@ test("Escape consumed by an open popup cannot dismiss its parent dialog", () => 
 	assert.deepEqual(calls, []);
 });
 
-test("cold Reply-All excludes the pinned origin mailbox before mailbox settings hydrate", () => {
+test("typed and pasted text becomes one recipient per address", () => {
 	assert.deepEqual(
-		replyAllRecipientFields({
-			sender: "sender@example.com",
-			to: "Team <team@example.com>, other@example.com",
-			cc: "TEAM@example.com, copy@example.com, sender@example.com",
-			mailboxAddress: "team@example.com",
+		parseRecipientText(
+			'"Hamilton, Margaret" <margaret@apollo.example>; Ken <ken@bell.example>\nrob@bell.example  mailto:dennis@bell.example',
+		),
+		[
+			"margaret@apollo.example",
+			"ken@bell.example",
+			"rob@bell.example",
+			"dennis@bell.example",
+		],
+	);
+	assert.deepEqual(parseRecipientText(" a@x.com , , b@y.com "), ["a@x.com", "b@y.com"]);
+	// A comma inside a comment does not split, and no address beside a
+	// bracketed one is ever dropped.
+	assert.deepEqual(
+		parseRecipientText("Ada (Sales, EMEA) <ada@example.com>, Bob <bob@example.com> carol@example.com"),
+		["ada@example.com", "bob@example.com", "carol@example.com"],
+	);
+	assert.deepEqual(
+		parseRecipientText('"Smith \\"Jr\\", Bob" <bob@example.com>'),
+		["bob@example.com"],
+	);
+	// Text with no address is kept so the writer sees it and can fix it, and so
+	// is a stray word typed beside an address. A display name given the
+	// standard way, quoted or before <address>, is not a recipient.
+	assert.deepEqual(parseRecipientText("bob, Grace Hopper"), ["bob", "Grace Hopper"]);
+	assert.deepEqual(parseRecipientText("alice bob@x.com"), ["alice", "bob@x.com"]);
+	assert.deepEqual(parseRecipientText("Grace Hopper <grace@x.com>"), ["grace@x.com"]);
+	assert.deepEqual(parseRecipientText('"Grace Hopper" grace@x.com'), ["grace@x.com"]);
+});
+
+test("only text before the last separator is finished", () => {
+	assert.deepEqual(splitFinishedRecipients("a@x.com, b@y"), {
+		finished: "a@x.com",
+		pending: "b@y",
+	});
+	assert.deepEqual(splitFinishedRecipients('"Hamilton, Marg'), {
+		finished: "",
+		pending: '"Hamilton, Marg',
+	});
+	assert.deepEqual(splitFinishedRecipients('"Smith \\"Jr\\", Bob" <b'), {
+		finished: "",
+		pending: '"Smith \\"Jr\\", Bob" <b',
+	});
+	assert.deepEqual(splitFinishedRecipients("Ada (Sales, EMEA"), {
+		finished: "",
+		pending: "Ada (Sales, EMEA",
+	});
+	assert.deepEqual(splitFinishedRecipients("ada@calculus.example;"), {
+		finished: "ada@calculus.example",
+		pending: "",
+	});
+});
+
+test("address checks match what the send API accepts", () => {
+	for (const valid of ["a@x.co", "first.last+tag@sub.example.com", "o'neil@example.ie"]) {
+		assert.equal(isValidRecipientAddress(valid), true, valid);
+	}
+	for (const invalid of ["bob", "a@x", "a@@x.com", ".a@x.com", "a..b@x.com", "a@x.com."]) {
+		assert.equal(isValidRecipientAddress(invalid), false, invalid);
+	}
+});
+
+test("a field never holds the same address twice", () => {
+	assert.deepEqual(
+		mergeRecipients(["Ada@Example.com"], ["ada@example.com", "grace@example.com"]),
+		["Ada@Example.com", "grace@example.com"],
+	);
+});
+
+test("a send carries each address once, in the most visible field", () => {
+	assert.deepEqual(
+		sendableRecipients({
+			to: "a@x.com, b@x.com",
+			cc: "B@x.com, c@x.com",
+			bcc: "c@x.com, a@x.com, d@x.com",
+		}),
+		{ to: ["a@x.com", "b@x.com"], cc: ["c@x.com"], bcc: ["d@x.com"] },
+	);
+});
+
+test("recipient problems are reported in words the writer can act on", () => {
+	assert.equal(recipientProblem({ to: "", cc: "", bcc: "" }), "Add at least one recipient.");
+	assert.equal(
+		recipientProblem({ to: "", cc: "a@x.com", bcc: "" }),
+		"Add at least one recipient in To.",
+	);
+	assert.equal(
+		recipientProblem({ to: "a@x.com, bob", cc: "", bcc: "" }),
+		"“bob” is not a valid email address. Fix or remove it before sending.",
+	);
+	const thirty = (prefix: string) =>
+		Array.from({ length: 30 }, (_, index) => `${prefix}${index}@x.com`).join(", ");
+	assert.match(
+		recipientProblem({ to: thirty("to"), cc: thirty("cc"), bcc: "" }) ?? "",
+		/60 recipients[\s\S]*at most 50/,
+	);
+	assert.equal(recipientProblem({ to: thirty("to"), cc: thirty("to"), bcc: "" }), null);
+});
+
+test("Reply answers the sender, or the Reply-To address when one is set", () => {
+	const original = {
+		sender: "noreply@forms.example",
+		recipient: mailbox,
+		raw_headers: headers({
+			from: "Website Forms <noreply@forms.example>",
+			"reply-to": "Customer Person <customer@buyer.example>",
+		}),
+	};
+	assert.deepEqual(
+		replyRecipientFields({ original, mailboxAddress: mailbox, all: false }),
+		{ to: "customer@buyer.example", cc: "" },
+	);
+	assert.deepEqual(
+		replyRecipientFields({
+			original: { ...original, raw_headers: null },
+			mailboxAddress: mailbox,
+			all: false,
+		}),
+		{ to: "noreply@forms.example", cc: "" },
+	);
+});
+
+test("Reply all keeps everyone except the mailbox, Cc staying Cc", () => {
+	assert.deepEqual(
+		replyRecipientFields({
+			original: {
+				sender: "grace@partner.example",
+				recipient: "ada@calculus.example, TEAM@example.com",
+				cc: "linus@kernel.example, team@example.com, grace@partner.example",
+			},
+			mailboxAddress: mailbox,
+			all: true,
 		}),
 		{
-			to: "sender@example.com, other@example.com",
-			cc: "copy@example.com",
-			showCcBcc: true,
+			to: "grace@partner.example, ada@calculus.example",
+			cc: "linus@kernel.example",
 		},
 	);
 });
 
-test("active recipient segment follows the caret without losing free-form values", () => {
-	const value = "First Person <first@example.com>,  ali, final@example.com";
-	assert.deepEqual(activeRecipientSegment(value, value.indexOf("ali") + 2), {
-		start: 33,
-		end: 38,
-		raw: "  ali",
-		token: "ali",
-	});
-	assert.equal(
-		replaceActiveRecipientSegment(value, value.indexOf("ali") + 2, "alice@example.com"),
-		"First Person <first@example.com>, alice@example.com, final@example.com",
+test("Reply all on a message we were only copied on goes to its sender and To", () => {
+	assert.deepEqual(
+		replyRecipientFields({
+			original: {
+				sender: "ken@bell.example",
+				recipient: "rob@bell.example",
+				cc: mailbox,
+			},
+			mailboxAddress: mailbox,
+			all: true,
+		}),
+		{ to: "ken@bell.example, rob@bell.example", cc: "" },
+	);
+});
+
+test("answering our own message goes back to the people it went to", () => {
+	const sent = {
+		sender: mailbox,
+		recipient: "ada@calculus.example, grace@partner.example",
+		cc: "linus@kernel.example",
+	};
+	assert.deepEqual(
+		replyRecipientFields({ original: sent, mailboxAddress: mailbox, all: false }),
+		{ to: "ada@calculus.example, grace@partner.example", cc: "" },
 	);
 	assert.deepEqual(
-		replaceActiveRecipientSegmentWithCursor(
-			value,
-			value.indexOf("ali") + 2,
-			"alice@example.com",
-		),
+		replyRecipientFields({ original: sent, mailboxAddress: mailbox, all: true }),
 		{
-			value: "First Person <first@example.com>, alice@example.com, final@example.com",
-			cursor: 51,
+			to: "ada@calculus.example, grace@partner.example",
+			cc: "linus@kernel.example",
 		},
 	);
-	assert.deepEqual(splitRecipientValues(" first@example.com, , Second@Example.com "), [
-		"first@example.com",
-		"Second@Example.com",
-	]);
+	// Our own message sent only by Cc goes back to those people.
+	assert.deepEqual(
+		replyRecipientFields({
+			original: { sender: mailbox, recipient: "", cc: "linus@kernel.example" },
+			mailboxAddress: mailbox,
+			all: false,
+		}),
+		{ to: "linus@kernel.example", cc: "" },
+	);
+	// A note to self still has somewhere to go.
+	assert.deepEqual(
+		replyRecipientFields({
+			original: { sender: mailbox, recipient: mailbox },
+			mailboxAddress: mailbox,
+			all: true,
+		}),
+		{ to: mailbox, cc: "" },
+	);
+});
+
+test("stored headers are read only from received mail's header list", () => {
+	assert.deepEqual(
+		storedHeaderValues(headers({ "Reply-To": "a@x.com" }), "reply-to"),
+		["a@x.com"],
+	);
+	assert.deepEqual(storedHeaderValues('{"kind":"outbound-snapshot"}', "reply-to"), []);
+	assert.deepEqual(storedHeaderValues("not json", "reply-to"), []);
+	assert.deepEqual(storedHeaderValues(null, "reply-to"), []);
 });
 
 test("suggestions exclude mailbox self and duplicates across every recipient field", () => {
@@ -96,7 +268,7 @@ test("suggestions exclude mailbox self and duplicates across every recipient fie
 	];
 	assert.deepEqual(
 		filterRecipientSuggestions(suggestions, {
-			mailboxAddress: "team@example.com",
+			mailboxAddress: mailbox,
 			to: "Someone <already@example.com>",
 			cc: "Copy@Example.com",
 			bcc: "",

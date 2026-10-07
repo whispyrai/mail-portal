@@ -202,8 +202,6 @@ const comparableDraft = {
 	cc: "copy@example.com",
 	bcc: null,
 	body: "<p>Current body</p>",
-	in_reply_to: "message-1",
-	thread_id: "thread-1",
 	attachments: [{ id: "draft-attachment-1" }],
 };
 
@@ -218,8 +216,10 @@ const comparableSnapshot = {
 	from: "team@example.com",
 	subject: "Quarterly update",
 	html: "<p>Current body</p>",
-	inReplyTo: "message-1",
-	threadId: "thread-1",
+	// What the reply route derives from the draft's link to its original: the
+	// original's RFC Message-ID and thread, never the draft's own ids.
+	inReplyTo: "CAJx9-original@mail.gmail.com",
+	threadId: "842d1ebb28888dda719bc858a075d390",
 	attachmentIds: ["snapshot-attachment-1"],
 	sourceDraftAttachmentIds: ["draft-attachment-1"],
 };
@@ -246,6 +246,28 @@ test("source draft equivalence requires exact content, version, and attachment i
 	assert.equal(
 		sourceDraftMatchesSnapshot(
 			{ ...comparableDraft, draft_version: 4 },
+			comparableSnapshot,
+		),
+		false,
+	);
+});
+
+test("an undone send keeps its source draft instead of adding a recovered copy", () => {
+	assert.equal(
+		sourceDraftMatchesSnapshot(
+			{
+				...comparableDraft,
+				// The composer sends each address once: To wins over Cc.
+				recipient: "One@example.com, two@example.com",
+				cc: "copy@example.com, two@example.com",
+			},
+			comparableSnapshot,
+		),
+		true,
+	);
+	assert.equal(
+		sourceDraftMatchesSnapshot(
+			{ ...comparableDraft, cc: "someone-else@example.com" },
 			comparableSnapshot,
 		),
 		false,

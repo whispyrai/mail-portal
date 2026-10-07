@@ -5,11 +5,11 @@
 import { Button, Tooltip } from "@cloudflare/kumo";
 import { useEffect, useRef, useState } from "react";
 import {
+	ArrowBendDoubleUpLeftIcon,
 	ArrowBendUpLeftIcon,
 	ArrowBendUpRightIcon,
 	ArrowCounterClockwiseIcon,
 	ArrowLeftIcon,
-	ChatCircleIcon,
 	ClockIcon,
 	CodeIcon,
 	EnvelopeOpenIcon,
@@ -34,15 +34,15 @@ interface EmailPanelToolbarProps {
 	isSending: boolean;
 	isDrafting: boolean;
 	moveToFolders: Folder[];
-	lastReceivedMessage?: Email;
 	onBack: () => void;
 	onSendDraft: () => void;
 	onEditDraft: () => void;
 	onReply: () => void;
-	onReplyAll: () => void;
+	/** Absent when nobody but the sender would get the reply. */
+	onReplyAll?: () => void;
 	onForward: () => void;
+	/** False while the conversation loads and its newest message is unknown. */
 	canReply: boolean;
-	replyUnavailableReason: string;
 	canForward: boolean;
 	forwardUnavailableReason: string;
 	onAiDraft: () => void;
@@ -74,7 +74,6 @@ export default function EmailPanelToolbar({
 	onReplyAll,
 	onForward,
 	canReply,
-	replyUnavailableReason,
 	canForward,
 	forwardUnavailableReason,
 	onAiDraft,
@@ -131,56 +130,51 @@ export default function EmailPanelToolbar({
 				</>
 			) : (
 				<>
-					<Tooltip
-						content={canReply ? "Reply" : replyUnavailableReason}
-						side="bottom"
-						asChild
+					<Button
+						variant="ghost"
+						size="sm"
+						icon={<ArrowBendUpLeftIcon size={18} />}
+						onClick={onReply}
+						disabled={!canReply}
+						aria-keyshortcuts="R"
+						title={canReply ? "Reply (R)" : "Loading conversation"}
+						className="shrink-0"
 					>
+						<span className="max-sm:sr-only">Reply</span>
+					</Button>
+					{onReplyAll && (
 						<Button
 							variant="ghost"
-							shape="square"
 							size="sm"
-							icon={<ArrowBendUpLeftIcon size={18} />}
-							onClick={onReply}
-							disabled={!canReply}
-							aria-label={canReply
-								? "Reply"
-								: `Reply unavailable: ${replyUnavailableReason}`}
-						/>
-					</Tooltip>
-					<Tooltip
-						content={canReply ? "Reply All" : replyUnavailableReason}
-						side="bottom"
-						asChild
-					>
-						<Button
-							variant="ghost"
-							shape="square"
-							size="sm"
-							icon={<ChatCircleIcon size={18} />}
+							icon={<ArrowBendDoubleUpLeftIcon size={18} />}
 							onClick={onReplyAll}
 							disabled={!canReply}
-							aria-label={canReply
-								? "Reply All"
-								: `Reply All unavailable: ${replyUnavailableReason}`}
-						/>
-					</Tooltip>
+							aria-keyshortcuts="A"
+							title={canReply ? "Reply all (A)" : "Loading conversation"}
+							className="shrink-0"
+						>
+							<span className="max-sm:sr-only">Reply all</span>
+						</Button>
+					)}
 					<Tooltip
-						content={canForward ? "Forward" : forwardUnavailableReason}
+						content={canForward ? "Forward (F)" : forwardUnavailableReason}
 						side="bottom"
 						asChild
 					>
 						<Button
 							variant="ghost"
-							shape="square"
 							size="sm"
 							icon={<ArrowBendUpRightIcon size={18} />}
 							onClick={onForward}
 							disabled={!canForward}
+							aria-keyshortcuts="F"
 							aria-label={canForward
 								? "Forward"
 								: `Forward unavailable: ${forwardUnavailableReason}`}
-						/>
+							className="shrink-0"
+						>
+							<span className="max-sm:sr-only">Forward</span>
+						</Button>
 					</Tooltip>
 					<div className="h-5 w-px bg-kumo-fill mx-0.5" />
 					<Tooltip content="Draft a reply with AI" side="bottom" asChild>

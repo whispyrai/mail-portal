@@ -7,6 +7,7 @@ import {
 	composeMissingAttachmentFingerprint,
 	shouldWarnMissingAttachment,
 } from "./compose-missing-attachment.ts";
+import { recipientProblem } from "./recipient-input.ts";
 import { validateScheduledDate } from "./send-later.ts";
 
 export interface ComposeDeliverySnapshot {
@@ -29,9 +30,8 @@ export function planComposeSend(input: {
 	confirmedMissingAttachmentFingerprint?: string;
 }): ComposeSendPlan {
 	const { snapshot, scheduledFor, confirmedMissingAttachmentFingerprint } = input;
-	if (!snapshot.to.split(",").some((entry) => entry.trim())) {
-		return { action: "error", message: "Add at least one recipient." };
-	}
+	const recipientError = recipientProblem(snapshot);
+	if (recipientError) return { action: "error", message: recipientError };
 
 	const attachmentPolicy = evaluateComposeAttachments(
 		snapshot.attachments,

@@ -1,21 +1,18 @@
 import type { ComposeOptions } from "../hooks/useUIStore.ts";
-import { replyAllRecipientFields } from "./recipient-input.ts";
+import { replyRecipientFields } from "./recipient-input.ts";
 import {
 	FORWARDED_MESSAGE_MARKER,
 	insertComposeSignature,
 } from "./compose-signature.ts";
-import {
-	escapeHtml,
-	stripHtml,
-} from "./html-text.ts";
+import { escapeHtml } from "./html-text.ts";
 import { formatQuotedDate } from "../../shared/dates.ts";
+import { decodeHtmlEntities } from "../../shared/html-entities.ts";
 import type { MailboxSignature } from "../../shared/mailbox-signature-settings";
 
 export interface InitialComposeFields {
 	to: string;
 	cc: string;
 	bcc: string;
-	showCcBcc: boolean;
 	subject: string;
 	body: string;
 }
@@ -24,7 +21,6 @@ const EMPTY_FIELDS: InitialComposeFields = {
 	to: "",
 	cc: "",
 	bcc: "",
-	showCcBcc: false,
 	subject: "",
 	body: "",
 };
@@ -49,15 +45,87 @@ export function prefixedSubject(
 	return `${prefix}: ${base}`;
 }
 
-function forwardBody(original: NonNullable<ComposeOptions["originalEmail"]>) {
-	const safeSender = escapeHtml(original.sender);
-	const safeSubject = escapeHtml(original.subject);
-	const safeBody = escapeHtml(stripHtml(original.body || "")).replace(
-		/\n/g,
-		"<br>",
-	);
+/**
+ * Real markup, by tag name. A plain-text mail full of `<alice@example.com>`
+ * or `<https://example.com>` must not be mistaken for HTML and stripped.
+ */
+const HTML_TAG =
+	/<\/?(?:html|head|body|div|p|br|span|font|a|b|i|u|em|strong|table|tbody|thead|tr|td|th|ul|ol|li|img|h[1-6]|blockquote|pre|center|section|article|header|footer|style|meta|title|hr)(?=[\s/>])[^<>]*>/i;
 
-	return `<p><br></p><div ${FORWARDED_MESSAGE_MARKER} style="border: 1px solid #ddd; padding: 1em; background-color: #f9f9f9; margin: 1em 0;"><strong>Forwarded message:</strong><br><strong>From:</strong> ${safeSender}<br><strong>Date:</strong> ${formatQuotedDate(original.date)}<br><strong>Subject:</strong> ${safeSubject}<br><br>${safeBody}</div>`;
+/**
+ * The original as readable text: paragraphs, line breaks, list items, table
+ * cells and link targets survive, markup and styling do not. Plain-text mail
+ * is taken as written, spacing and indentation included, so a literal "<" in
+ * it is never mistaken for a tag.
+ */
+function quotedText(body: string): string {
+	const text = HTML_TAG.test(body)
+		? decodeHtmlEntities(
+				body
+					// HTML ignores runs of whitespace in its source, except in <pre>.
+					.split(/(<pre\b[^>]*>[\s\S]*?<\/pre\s*>)/i)
+					.map((piece, index) => (index % 2 === 1 ? piece : piece.replace(/\s+/g, " ")))
+					.join("")
+					.replace(/<(style|script|head|title)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+					.replace(/<!--[\s\S]*?-->/g, "")
+					.replace(
+						/<a\b[^>]*\bhref\s*=\s*["']((?:https?:|mailto:)[^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi,
+						(_match, href: string, label: string) => {
+							const visible = label.replace(/<[^>]*>/g, "").trim();
+							const target = href.replace(/^mailto:/i, "");
+							return visible && visible !== target && visible !== href
+								? `${visible} (${target})`
+								: target;
+						},
+					)
+					.replace(/<br\s*\/?>/gi, "\n")
+					.replace(/<li\b[^>]*>/gi, "\n• ")
+					.replace(/<\/t[dh]\s*>/gi, " ")
+					.replace(/<\/tr\s*>/gi, "\n")
+					.replace(/<\/(?:p|div|h[1-6]|table|blockquote|pre|ul|ol|section|article|header|footer)\s*>/gi, "\n\n")
+					.replace(/<[^>]*>/g, ""),
+			).replace(/^ (?! )/gm, "")
+		: body;
+	return text
+		.replace(/\r\n?/g, "\n")
+		.replace(/[^\S\n]+$/gm, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.replace(/^\n+|\n+$/g, "");
+}
+
+/** Paragraphs and lines as HTML, keeping indentation and runs of spaces visible. */
+function quotedHtml(text: string): string {
+	return text
+		.split("\n\n")
+		.map((paragraph) =>
+			`<p>${escapeHtml(paragraph)
+				.replace(/^ +| {2,}/gm, (run) => "\u00a0".repeat(run.length))
+				.replace(/\n/g, "<br>")}</p>`,
+		)
+		.join("");
+}
+
+function namedAddress(name: string | null | undefined, address: string): string {
+	const cleanName = name?.trim().replace(/^"(.*)"$/, "$1").trim();
+	return cleanName && cleanName.toLowerCase() !== address.toLowerCase()
+		? `${cleanName} <${address}>`
+		: address;
+}
+
+function forwardBody(original: NonNullable<ComposeOptions["originalEmail"]>) {
+	const header = [
+		["From", namedAddress(original.sender_name, original.sender)],
+		["Date", formatQuotedDate(original.date)],
+		["Subject", original.subject],
+		["To", original.recipient],
+		["Cc", original.cc],
+	]
+		.filter(([, value]) => value?.trim())
+		.map(([label, value]) => `<strong>${label}:</strong> ${escapeHtml(value!.trim())}`)
+		.join("<br>");
+	const body = quotedText(original.body || "");
+
+	return `<p><br></p><div ${FORWARDED_MESSAGE_MARKER} style="border: 1px solid #ddd; padding: 1em; background-color: #f9f9f9; margin: 1em 0;"><p><strong>---------- Forwarded message ----------</strong><br>${header}</p>${body ? quotedHtml(body) : ""}</div>`;
 }
 
 function withSignature(
@@ -95,7 +163,6 @@ export function buildInitialComposeFields(input: {
 			to: draft.recipient || "",
 			cc: draft.cc || "",
 			bcc: draft.bcc || "",
-			showCcBcc: Boolean(draft.cc || draft.bcc),
 			subject: draft.subject || "",
 			body: draft.body || "",
 		};
@@ -109,26 +176,16 @@ export function buildInitialComposeFields(input: {
 		};
 	}
 
-	if (mode === "reply") {
+	if (mode === "reply" || mode === "reply-all") {
 		return {
 			...EMPTY_FIELDS,
-			to: original.sender,
-			subject: prefixedSubject(original.subject, "Re"),
-			body: blankBody("reply", signature),
-		};
-	}
-
-	if (mode === "reply-all") {
-		return {
-			...EMPTY_FIELDS,
-			...replyAllRecipientFields({
-				sender: original.sender,
-				to: original.recipient,
-				cc: original.cc,
+			...replyRecipientFields({
+				original,
 				mailboxAddress: mailboxEmail ?? "",
+				all: mode === "reply-all",
 			}),
 			subject: prefixedSubject(original.subject, "Re"),
-			body: blankBody("reply-all", signature),
+			body: blankBody(mode, signature),
 		};
 	}
 

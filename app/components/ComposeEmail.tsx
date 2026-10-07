@@ -51,6 +51,15 @@ import {
   consumeComposeFileTransfer,
   transferContainsFiles,
 } from "~/lib/compose-file-transfer";
+import {
+  mergeRecipients,
+  replyRecipientFields,
+  serializeRecipients,
+} from "~/lib/recipient-input";
+import {
+  normalizedAddress,
+  parseRecipientText,
+} from "../../shared/recipient-addresses";
 import RichTextEditor from "./RichTextEditor";
 import ComposeAttachments from "./ComposeAttachments";
 import RecipientCombobox from "./RecipientCombobox";
@@ -228,8 +237,6 @@ export default function ComposeEmail() {
     setCc,
     bcc,
     setBcc,
-    showCcBcc,
-    setShowCcBcc,
     subject,
     setSubject,
     body,
@@ -268,7 +275,91 @@ export default function ComposeEmail() {
     isUploading,
     hasAttachmentIssue,
   } = useComposeForm(mailboxId, folder);
-  const recipientValues = { to, cc, bcc };
+  const recipientValues = useMemo(() => ({ to, cc, bcc }), [to, cc, bcc]);
+  // Cc and Bcc open on demand. A field that holds anyone is always shown, so
+  // no recipient is ever hidden, and it stays open once it has held someone so
+  // it never vanishes from under the writer who empties it.
+  const [openedCc, setOpenedCc] = useState(false);
+  const [openedBcc, setOpenedBcc] = useState(false);
+  useEffect(() => {
+    setOpenedCc(false);
+    setOpenedBcc(false);
+  }, [composeOptions]);
+  useEffect(() => {
+    if (cc.trim()) setOpenedCc(true);
+  }, [cc]);
+  useEffect(() => {
+    if (bcc.trim()) setOpenedBcc(true);
+  }, [bcc]);
+  const showCc = openedCc || Boolean(cc.trim());
+  const showBcc = openedBcc || Boolean(bcc.trim());
+  const revealRecipientField = (field: "cc" | "bcc") => {
+    if (field === "cc") setOpenedCc(true);
+    else setOpenedBcc(true);
+    window.requestAnimationFrame(() =>
+      document.getElementById(`compose-${field}`)?.focus(),
+    );
+  };
+
+  // A plain reply on a conversation with other people offers to bring them
+  // all in, so choosing Reply first is never a dead end.
+  const replyAllOffer = useMemo(() => {
+    const original = composeOptions.originalEmail;
+    if (composeOptions.mode !== "reply" || !original || !originMailboxId) {
+      return null;
+    }
+    const reply = replyRecipientFields({
+      original,
+      mailboxAddress: originMailboxId,
+      all: false,
+    });
+    const everyone = replyRecipientFields({
+      original,
+      mailboxAddress: originMailboxId,
+      all: true,
+    });
+    const replyAddresses = new Set(
+      parseRecipientText(reply.to).map(normalizedAddress),
+    );
+    const others = [
+      ...parseRecipientText(everyone.to),
+      ...parseRecipientText(everyone.cc),
+    ].filter((address) => !replyAddresses.has(normalizedAddress(address)));
+    if (others.length === 0) return null;
+    const present = new Set(
+      parseRecipientText(`${to}, ${cc}, ${bcc}`).map(normalizedAddress),
+    );
+    return {
+      everyone,
+      missing: others.filter(
+        (address) => !present.has(normalizedAddress(address)),
+      ),
+    };
+  }, [bcc, cc, composeOptions, originMailboxId, to]);
+  const addEveryoneOnThread = () => {
+    if (!replyAllOffer) return;
+    const nextTo = mergeRecipients(
+      parseRecipientText(to),
+      parseRecipientText(replyAllOffer.everyone.to),
+    );
+    const nextCc = mergeRecipients(
+      nextTo,
+      mergeRecipients(
+        parseRecipientText(cc),
+        parseRecipientText(replyAllOffer.everyone.cc),
+      ),
+    ).slice(nextTo.length);
+    setTo(serializeRecipients(nextTo));
+    setCc(serializeRecipients(nextCc));
+  };
+  const title =
+    replyAllOffer && replyAllOffer.missing.length === 0 && !composeOptions.draftEmail
+      ? "Reply All"
+      : formTitle;
+  const focusBody = () =>
+    composeFormRef.current
+      ?.querySelector<HTMLElement>('[contenteditable="true"]')
+      ?.focus();
   const navigationBlocker = useBlocker(isComposing && hasUnconfirmedWork);
   const handledBlockedNavigationRef = useRef(false);
   const handledQueuedComposeRef = useRef(false);
@@ -478,7 +569,7 @@ export default function ComposeEmail() {
         variant={variant}
         inlineHost={inlineHost}
         open={isComposing}
-        title={formTitle}
+        title={title}
         status={draftStatusLabel}
         onRequestClose={() => void requestClose()}
         closeDisabled={isSending || isResolvingClose}
@@ -538,33 +629,42 @@ export default function ComposeEmail() {
               )}
 
               {/* Recipients */}
-              <div className="flex min-w-0 items-end gap-2 sm:gap-3">
-                <div className="flex-1">
+              <div className="flex min-w-0 items-start gap-1 sm:gap-2">
+                <div className="min-w-0 flex-1">
                   <RecipientCombobox
                     id="compose-to"
                     label="To"
                     field="to"
                     mailboxId={originMailboxId ?? ""}
                     recipients={recipientValues}
-                    placeholder="recipient@example.com, another@example.com"
+                    placeholder="Add recipients"
                     value={to}
                     autoFocus={!focusesBody}
                     onChange={setTo}
                     required
                   />
                 </div>
-                {!showCcBcc && (
+                {!showCc && (
                   <button
                     type="button"
-                    onClick={() => setShowCcBcc(true)}
-                    className="min-h-11 shrink-0 rounded px-2 text-sm text-kumo-link hover:underline font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
+                    onClick={() => revealRecipientField("cc")}
+                    className="mt-[1.375rem] min-h-11 shrink-0 rounded px-2 text-sm font-medium text-kumo-link hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
                   >
-                    Cc / Bcc
+                    Cc
+                  </button>
+                )}
+                {!showBcc && (
+                  <button
+                    type="button"
+                    onClick={() => revealRecipientField("bcc")}
+                    className="mt-[1.375rem] min-h-11 shrink-0 rounded px-2 text-sm font-medium text-kumo-link hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-brand"
+                  >
+                    Bcc
                   </button>
                 )}
               </div>
 
-              {showCcBcc && (
+              {showCc && (
                 <RecipientCombobox
                   id="compose-cc"
                   label="Cc"
@@ -573,10 +673,10 @@ export default function ComposeEmail() {
                   recipients={recipientValues}
                   value={cc}
                   onChange={setCc}
-                  placeholder="Separate multiple addresses with commas"
+                  placeholder="Add Cc recipients"
                 />
               )}
-              {showCcBcc && (
+              {showBcc && (
                 <RecipientCombobox
                   id="compose-bcc"
                   label="Bcc"
@@ -585,8 +685,27 @@ export default function ComposeEmail() {
                   recipients={recipientValues}
                   value={bcc}
                   onChange={setBcc}
-                  placeholder="Separate multiple addresses with commas"
+                  placeholder="Add Bcc recipients"
                 />
+              )}
+
+              {replyAllOffer && replyAllOffer.missing.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-kumo-line bg-kumo-recessed px-3 py-2 text-sm text-kumo-default">
+                  <span title={replyAllOffer.missing.join(", ")}>
+                    {replyAllOffer.missing.length === 1
+                      ? `${replyAllOffer.missing[0]} is also on this conversation and won’t get this reply.`
+                      : `${replyAllOffer.missing.length} other people on this conversation won’t get this reply.`}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="min-h-11"
+                    onClick={addEveryoneOnThread}
+                  >
+                    Reply all instead
+                  </Button>
+                </div>
               )}
 
               <Input
@@ -595,6 +714,19 @@ export default function ComposeEmail() {
                 placeholder="What’s this about?"
                 value={subject}
                 onChange={(e) => setSubject(e.target.value)}
+                onKeyDown={(event) => {
+                  // Enter moves on to the message; only Send sends.
+                  if (
+                    event.key !== "Enter" ||
+                    event.metaKey ||
+                    event.ctrlKey ||
+                    event.nativeEvent.isComposing
+                  ) {
+                    return;
+                  }
+                  event.preventDefault();
+                  focusBody();
+                }}
                 required
               />
 

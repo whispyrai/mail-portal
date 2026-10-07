@@ -7,6 +7,7 @@ import {
 } from "./attachments.ts";
 import { safeAttachmentStorageFilename } from "../../shared/attachment-filename.ts";
 import { contentIdForDisposition } from "../../shared/content-id.ts";
+import { sendableRecipients } from "../../shared/recipient-addresses.ts";
 
 export type CancelledSnapshotAttachment = {
 	id: string;
@@ -30,16 +31,11 @@ type ComparableSourceDraft = {
 	cc: string | null;
 	bcc: string | null;
 	body: string | null;
-	in_reply_to: string | null;
-	thread_id: string | null;
 	attachments: Array<{ id: string }>;
 };
 
-function addressList(value: string | null): string[] {
-	return (value ?? "")
-		.split(",")
-		.map((address) => address.trim().toLowerCase())
-		.filter(Boolean);
+function lowercase(addresses: readonly string[]): string[] {
+	return addresses.map((address) => address.toLowerCase());
 }
 
 function sameList(left: readonly string[], right: readonly string[]): boolean {
@@ -47,7 +43,13 @@ function sameList(left: readonly string[], right: readonly string[]): boolean {
 		left.every((value, index) => value === right[index]);
 }
 
-/** True only when retaining the current source draft loses no snapshot state. */
+/**
+ * True only when retaining the current source draft loses no snapshot state.
+ * Threading is not compared: the draft keeps its link to the message it
+ * answers, and the snapshot's In-Reply-To, References and thread id are
+ * re-derived from that same link on the next send. Recipients are compared
+ * as the composer sends them, one per address across To, Cc and Bcc.
+ */
 export function sourceDraftMatchesSnapshot(
 	draft: ComparableSourceDraft | null,
 	snapshot: OutboundMessageSnapshot,
@@ -61,15 +63,18 @@ export function sourceDraftMatchesSnapshot(
 	) {
 		return false;
 	}
+	const recipients = sendableRecipients({
+		to: draft.recipient ?? "",
+		cc: draft.cc ?? "",
+		bcc: draft.bcc ?? "",
+	});
 	return (
 		(draft.subject ?? "") === snapshot.subject &&
 		(draft.sender ?? "").toLowerCase() === snapshot.from.toLowerCase() &&
-		sameList(addressList(draft.recipient), snapshot.to.map((value) => value.toLowerCase())) &&
-		sameList(addressList(draft.cc), snapshot.cc.map((value) => value.toLowerCase())) &&
-		sameList(addressList(draft.bcc), snapshot.bcc.map((value) => value.toLowerCase())) &&
+		sameList(lowercase(recipients.to), lowercase(snapshot.to)) &&
+		sameList(lowercase(recipients.cc), lowercase(snapshot.cc)) &&
+		sameList(lowercase(recipients.bcc), lowercase(snapshot.bcc)) &&
 		(draft.body ?? "") === (snapshot.html ?? snapshot.text ?? "") &&
-		(draft.in_reply_to ?? undefined) === snapshot.inReplyTo &&
-		(draft.thread_id ?? "") === snapshot.threadId &&
 		sameList(
 			draft.attachments.map((attachment) => attachment.id).sort(),
 			[...snapshot.sourceDraftAttachmentIds].sort(),

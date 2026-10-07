@@ -39,7 +39,6 @@ test("draft content remains authoritative over signatures and mode defaults", ()
 		to: "draft@example.com",
 		cc: "copy@example.com",
 		bcc: "blind@example.com",
-		showCcBcc: true,
 		subject: "Existing draft",
 		body: "<p>Exact draft body</p>",
 	});
@@ -85,7 +84,7 @@ test("reply-all excludes the mailbox and inserts one marked signature", () => {
 		signature: { enabled: true, text: "Team\nSupport" },
 	});
 
-	assert.equal(fields.to, "Sender <sender@example.com>, colleague@example.com");
+	assert.equal(fields.to, "sender@example.com, colleague@example.com");
 	assert.equal(fields.cc, "copy@example.com");
 	assert.equal(fields.subject, "Re: Quarterly <update>");
 	assert.match(fields.body, /data-mail-signature="v1"/);
@@ -104,6 +103,46 @@ test("forward escapes original metadata and keeps the signature before the forwa
 	assert.doesNotMatch(fields.body, /<strong>team<\/strong>/);
 });
 
+test("forward quotes the original readably: who it was to, its lines and its links", () => {
+	const fields = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: {
+				...original,
+				sender: "legal@northwind.example",
+				sender_name: "Northwind Legal",
+				body: '<style>p{color:red}</style><p>Hi team,</p><p>Line one<br>Line two &amp; more</p><ul><li>First</li><li>Second</li></ul><p><a href="https://example.com/contract">the contract</a></p>',
+			},
+		},
+	});
+
+	assert.match(fields.body, /---------- Forwarded message ----------/);
+	assert.match(fields.body, /<strong>From:<\/strong> Northwind Legal &lt;legal@northwind\.example&gt;/);
+	assert.match(fields.body, /<strong>To:<\/strong> team@example\.com, colleague@example\.com/);
+	assert.match(fields.body, /<strong>Cc:<\/strong> copy@example\.com/);
+	assert.match(fields.body, /<p>Hi team,<\/p><p>Line one<br>Line two &amp; more<\/p>/);
+	assert.match(fields.body, /• First<br>• Second/);
+	assert.match(fields.body, /the contract \(https:\/\/example\.com\/contract\)/);
+	assert.doesNotMatch(fields.body, /color:red/);
+});
+
+test("forward keeps a plain-text original's line breaks and literal angle brackets", () => {
+	const fields = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: {
+				...original,
+				body: "Name: Customer Person\nMessage: 3 < 5 and 7 > 2\n\nThanks",
+			},
+		},
+	});
+
+	assert.match(
+		fields.body,
+		/<p>Name: Customer Person<br>Message: 3 &lt; 5 and 7 &gt; 2<\/p><p>Thanks<\/p>/,
+	);
+});
+
 test("a reply quotes nothing: the thread above the composer already holds it", () => {
 	const fields = buildInitialComposeFields({
 		composeOptions: { mode: "reply", originalEmail: original },
@@ -114,7 +153,7 @@ test("a reply quotes nothing: the thread above the composer already holds it", (
 	assert.doesNotMatch(fields.body, /data-mail-quoted-reply/);
 	assert.doesNotMatch(fields.body, /wrote:/);
 	// Recipient and subject are still derived from the original.
-	assert.equal(fields.to, "Sender <sender@example.com>");
+	assert.equal(fields.to, "sender@example.com");
 	assert.equal(fields.subject, "Re: Quarterly <update>");
 });
 
@@ -125,7 +164,7 @@ test("reply-all quotes nothing either and keeps every other recipient", () => {
 	});
 
 	assert.doesNotMatch(fields.body, /data-mail-quoted-reply/);
-	assert.equal(fields.to, "Sender <sender@example.com>, colleague@example.com");
+	assert.equal(fields.to, "sender@example.com, colleague@example.com");
 	assert.equal(fields.cc, "copy@example.com");
 });
 
@@ -165,4 +204,43 @@ test("reply and forward prefixes are absorbed instead of stacked", () => {
 	assert.equal(subjectOf("Fwd: Budget", "forward"), "Fwd: Budget");
 	assert.equal(subjectOf("FW: Budget", "forward"), "Fwd: Budget");
 	assert.equal(subjectOf("Budget", "forward"), "Fwd: Budget");
+});
+
+test("forward keeps angle-bracketed addresses and links in plain-text mail", () => {
+	const fields = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: {
+				...original,
+				body: "Contact <alice@example.com> or <b@x.com>.\nDocs: <https://example.com/docs>",
+			},
+		},
+	});
+
+	assert.match(
+		fields.body,
+		/Contact &lt;alice@example\.com&gt; or &lt;b@x\.com&gt;\.<br>Docs: &lt;https:\/\/example\.com\/docs&gt;/,
+	);
+});
+
+test("forward keeps table cells apart and plain-text spacing intact", () => {
+	const table = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: {
+				...original,
+				body: "<table><tr><td>Name</td><td>Value</td></tr><tr><td>Plan</td><td>Pro</td></tr></table><pre>  indented\n    code</pre>",
+			},
+		},
+	});
+	assert.match(table.body, /Name Value<br>Plan Pro/);
+	assert.match(table.body, /\u00a0\u00a0indented<br>\u00a0\u00a0\u00a0\u00a0code/);
+
+	const plain = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: { ...original, body: "Item    Qty\n  - apples   3" },
+		},
+	});
+	assert.match(plain.body, /Item\u00a0\u00a0\u00a0\u00a0Qty<br>\u00a0\u00a0- apples\u00a0\u00a0\u00a03/);
 });

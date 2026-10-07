@@ -3,9 +3,11 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
 	filterRecipientSuggestions,
+	mergeRecipients,
 	nextRecipientComboboxAction,
-	replaceActiveRecipientSegment,
+	serializeRecipients,
 } from "../lib/recipient-input.ts";
+import { parseRecipientText } from "../../shared/recipient-addresses.ts";
 import { recipientSuggestionKeys } from "../queries/recipient-suggestions.ts";
 
 const compose = readFileSync(
@@ -32,11 +34,14 @@ test("compose mounts the accessible mailbox-scoped recipient combobox for To, Cc
 			),
 		);
 	}
-	assert.match(compose, /const recipientValues = \{ to, cc, bcc \}/);
+	assert.match(compose, /const recipientValues = useMemo\(\(\) => \(\{ to, cc, bcc \}\)/);
 	assert.equal((compose.match(/recipients=\{recipientValues\}/g) ?? []).length, 3);
 	assert.match(compose, /field="to"[\s\S]*?autoFocus[\s\S]*?required/);
-	assert.match(compose, /!showCcBcc/);
-	assert.equal((compose.match(/showCcBcc &&/g) ?? []).length >= 2, true);
+	// Cc and Bcc open separately and stay open once they hold anyone.
+	assert.match(compose, /\{!showCc && \(/);
+	assert.match(compose, /\{!showBcc && \(/);
+	assert.match(compose, /if \(cc\.trim\(\)\) setOpenedCc\(true\)/);
+	assert.match(compose, /if \(bcc\.trim\(\)\) setOpenedBcc\(true\)/);
 });
 
 test("initial editor normalization does not steal focus from the To field", () => {
@@ -62,13 +67,12 @@ test("compose recipient behavior preserves free-form input and isolates mailbox 
 		{ ...recipients, mailboxAddress: "team-a@example.com" },
 	);
 	assert.deepEqual(suggestions.map(({ address }) => address), ["alice@example.com"]);
+	// Accepting a suggestion adds it as one more recipient of the field.
 	assert.equal(
-		replaceActiveRecipientSegment(
-			recipients.to,
-			recipients.to.length,
-			"alice@example.com",
+		serializeRecipients(
+			mergeRecipients(parseRecipientText(recipients.to), ["alice@example.com"]),
 		),
-		"First Person <first@example.com>, alice@example.com",
+		"first@example.com, ali, alice@example.com",
 	);
 	assert.deepEqual(nextRecipientComboboxAction("Tab", 0, 1, true), {
 		kind: "accept",

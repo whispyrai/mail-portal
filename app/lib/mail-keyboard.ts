@@ -6,6 +6,8 @@ export type MailCommand =
 	| "compose"
 	| "focus-search"
 	| "reply"
+	| "reply-all"
+	| "forward"
 	| "archive"
 	| "trash"
 	| "toggle-unread"
@@ -55,6 +57,8 @@ const DIRECT_COMMANDS: Readonly<Record<string, MailCommand>> = {
 	c: "compose",
 	"/": "focus-search",
 	r: "reply",
+	a: "reply-all",
+	f: "forward",
 	e: "archive",
 	"#": "trash",
 	u: "toggle-unread",

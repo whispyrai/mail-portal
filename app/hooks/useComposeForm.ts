@@ -12,10 +12,11 @@ import {
   useState,
 } from "react";
 import {
+  getNonInlineAttachments,
   htmlToPlainText,
-  splitEmailList,
   toEmailListValue,
 } from "~/lib/utils";
+import { sendableRecipients } from "../../shared/recipient-addresses";
 import {
   useDiscardDraft,
   useForwardEmail,
@@ -139,7 +140,6 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
   const [to, setTo] = useState("");
   const [cc, setCc] = useState("");
   const [bcc, setBcc] = useState("");
-  const [showCcBcc, setShowCcBcc] = useState(false);
   const [subject, setSubject] = useState("");
   const [body, setBodyState] = useState("");
   const [canInsertSignature, setCanInsertSignature] = useState(false);
@@ -291,7 +291,6 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 					to: recovery.to,
 					cc: recovery.cc,
 					bcc: recovery.bcc,
-					showCcBcc: Boolean(recovery.cc || recovery.bcc),
 					subject: recovery.subject,
 					body: recovery.body,
 				}
@@ -310,7 +309,6 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
     setTo(initialFields.to);
     setCc(initialFields.cc);
     setBcc(initialFields.bcc);
-    setShowCcBcc(initialFields.showCcBcc);
     setSubject(initialFields.subject);
     setBodyState(initialFields.body);
     bodyUserDirtyRef.current = Boolean(recovery || composeOptions.draftEmail);
@@ -330,13 +328,24 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
       attachmentRefs:
         initialAttachmentPolicy?.ok ? initialAttachmentPolicy.refs : [],
     };
+    // A forward carries the original's files the way every mail client does;
+    // each one is a removable chip that references the stored copy.
+    const forwardedOriginal =
+      !recovery &&
+      !composeOptions.draftEmail &&
+      composeOptions.mode === "forward"
+        ? composeOptions.originalEmail
+        : null;
+    const seededAttachments = forwardedOriginal
+      ? getNonInlineAttachments(forwardedOriginal.attachments)
+      : composeOptions.draftEmail?.attachments ?? [];
     initializationFingerprintRef.current = composeDraftFingerprint({
       to: initialFields.to,
       cc: initialFields.cc,
       bcc: initialFields.bcc,
       subject: initialFields.subject,
       body: initialFields.body,
-      attachments: (composeOptions.draftEmail?.attachments ?? []).map(
+      attachments: seededAttachments.map(
         (attachment) => ({
           filename: attachment.filename,
           mimetype: attachment.mimetype,
@@ -370,13 +379,15 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 
 		if (recovery) {
 			restoreAttachments(recovery.attachments);
+		} else if (composeOptions.draftEmail?.id) {
+			hydrateFromDraft(
+				composeOptions.draftEmail.id,
+				composeOptions.draftEmail.attachments,
+			);
+		} else if (forwardedOriginal && seededAttachments.length > 0) {
+			hydrateFromDraft(forwardedOriginal.id, seededAttachments);
 		} else {
-	    const draftToHydrate = composeOptions.draftEmail;
-	    if (draftToHydrate?.id) {
-	      hydrateFromDraft(draftToHydrate.id, draftToHydrate.attachments);
-	    } else {
-	      resetAttachments();
-	    }
+			resetAttachments();
 		}
   }, [
     applyLifecycleEvent,
@@ -533,6 +544,9 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
             savedAttachmentPolicy.refs,
           ]),
         });
+        // A forward starts its own conversation. Linking its draft to the
+        // forwarded message would reopen and send it as a reply in that thread.
+        const answers = composeOptions.mode !== "forward";
         const draftRequest = {
           mailboxId: composeMailboxId,
           draft: {
@@ -541,14 +555,16 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
             bcc: savedSnapshot.bcc || undefined,
             subject: savedSnapshot.subject,
             body: savedSnapshot.body,
-            in_reply_to:
-              composeOptions.originalEmail?.id ||
-              composeOptions.draftEmail?.in_reply_to ||
-              undefined,
-            thread_id:
-              composeOptions.originalEmail?.thread_id ||
-              composeOptions.draftEmail?.thread_id ||
-              undefined,
+            in_reply_to: answers
+              ? composeOptions.originalEmail?.id ||
+                composeOptions.draftEmail?.in_reply_to ||
+                undefined
+              : undefined,
+            thread_id: answers
+              ? composeOptions.originalEmail?.thread_id ||
+                composeOptions.draftEmail?.thread_id ||
+                undefined
+              : undefined,
             draft_id: identity?.id,
             draft_version: identity?.version,
             draft_create_key: identity ? undefined : draftCreateKeyRef.current,
@@ -872,12 +888,13 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
 				draft: ConfirmedDraft,
 			): Promise<OutboundEnqueueResponse> => {
 				const finalSnapshot = snapshotRef.current;
+				const recipients = sendableRecipients(finalSnapshot);
 				const sendPayload = {
 					source_draft_id: draft.identity?.id,
 					source_draft_version: draft.identity?.version,
-					to: toEmailListValue(splitEmailList(finalSnapshot.to)),
-					cc: toEmailListValue(splitEmailList(finalSnapshot.cc)),
-					bcc: toEmailListValue(splitEmailList(finalSnapshot.bcc)),
+					to: toEmailListValue(recipients.to),
+					cc: toEmailListValue(recipients.cc),
+					bcc: toEmailListValue(recipients.bcc),
 					from,
 					subject: finalSnapshot.subject,
 					html: finalSnapshot.body,
@@ -1020,8 +1037,6 @@ export function useComposeForm(mailboxId?: string, _folder?: string) {
     setCc,
     bcc,
     setBcc,
-    showCcBcc,
-    setShowCcBcc,
     subject,
     setSubject,
     body,

@@ -157,3 +157,42 @@ test("persisted UI preferences are keyed to the portal, not to one brand", () =>
 	assert.match(source, /AGENT_PANEL_STORAGE_KEY = "mail-portal\.agent-panel-open"/);
 	assert.doesNotMatch(source, /whispyr|wiser/i);
 });
+
+test("a keyboard reply waits for its conversation and is dropped if the reader moves on", () => {
+	useUIStore.setState({
+		selectedEmailId: null,
+		isComposing: false,
+		pendingThreadAction: null,
+	});
+	const store = useUIStore.getState();
+	store.requestThreadAction({ emailId: "email-1", action: "reply-all" });
+	assert.equal(useUIStore.getState().selectedEmailId, "email-1");
+	assert.deepEqual(useUIStore.getState().pendingThreadAction, {
+		emailId: "email-1",
+		action: "reply-all",
+	});
+
+	useUIStore.getState().selectEmail("email-1");
+	assert.notEqual(useUIStore.getState().pendingThreadAction, null);
+
+	useUIStore.getState().selectEmail("email-2");
+	assert.equal(useUIStore.getState().pendingThreadAction, null);
+
+	useUIStore.getState().requestThreadAction({ emailId: "email-2", action: "forward" });
+	useUIStore.getState().closePanel();
+	assert.equal(useUIStore.getState().pendingThreadAction, null);
+});
+
+test("opening any composer cancels a keyboard reply still waiting on its thread", () => {
+	clearComposeRecovery();
+	useUIStore.setState({
+		selectedEmailId: null,
+		isComposing: false,
+		pendingThreadAction: null,
+	});
+	useUIStore.getState().requestThreadAction({ emailId: "email-1", action: "reply" });
+	useUIStore.getState().startCompose({ mode: "new", originalEmail: null });
+	assert.equal(useUIStore.getState().pendingThreadAction, null);
+	useUIStore.getState().closeCompose();
+	assert.equal(useUIStore.getState().pendingThreadAction, null);
+});

@@ -12,6 +12,7 @@ import type { MailboxDO } from "../durableObject/index.ts";
 import type { EmailFull } from "./schemas.ts";
 import { Folders } from "../../shared/folders.ts";
 export { buildThreadToken, extractThreadToken } from "./thread-token.ts";
+import { extractThreadTokens } from "./thread-token.ts";
 import type { Env } from "../types.ts";
 import { formatQuotedDate } from "../../shared/dates.ts";
 
@@ -135,13 +136,71 @@ export function buildThreadingHeaders(
 	threadToken?: string,
 ): Record<string, string> {
 	const headers: Record<string, string> = {};
-	if (originalMsgId) headers["In-Reply-To"] = `<${originalMsgId}>`;
-	const refs = [...references];
-	if (threadToken) refs.push(threadToken);
-	if (refs.length > 0) {
-		headers["References"] = refs.map((r) => `<${r}>`).join(" ");
+	const ids = [...new Set(references.map(bareMessageId).filter(isMessageId))];
+	// Mail we sent is stored under SES's own id, which is not the Message-ID
+	// its recipients saw. Answering it answers what it answered instead.
+	const replyTarget = originalMsgId ? bareMessageId(originalMsgId) : null;
+	const inReplyTo = replyTarget && isMessageId(replyTarget)
+		? replyTarget
+		: originalMsgId
+			? ids.filter((id) => !isOwnThreadToken(id, threadToken)).at(-1)
+			: undefined;
+	// The same SES header limit applies; an id too long to send is left out
+	// rather than failing the whole message.
+	if (inReplyTo && fitsHeader("In-Reply-To", `<${inReplyTo}>`)) {
+		headers["In-Reply-To"] = `<${inReplyTo}>`;
 	}
+	const refs = threadToken
+		? [...ids.filter((id) => id !== threadToken), threadToken]
+		: ids;
+	const referencesHeader = fitReferences(refs);
+	if (referencesHeader) headers["References"] = referencesHeader;
 	return headers;
+}
+
+/** Our own thread token, as opposed to someone else's id that starts with `thread-`. */
+function isOwnThreadToken(id: string, threadToken: string | undefined): boolean {
+	if (!threadToken) return false;
+	const ownDomain = threadToken.slice(threadToken.lastIndexOf("@"));
+	return id.endsWith(ownDomain) && extractThreadTokens([id], null).length > 0;
+}
+
+/** SES rejects a custom header whose name and value exceed 996 characters. */
+const MAX_HEADER_LENGTH = 996;
+const MAX_REFERENCES_LENGTH = MAX_HEADER_LENGTH - "References".length;
+
+function fitsHeader(name: string, value: string): boolean {
+	return name.length + value.length <= MAX_HEADER_LENGTH;
+}
+
+function bareMessageId(value: string): string {
+	return value.trim().replace(/^<|>$/g, "");
+}
+
+/** A Message-ID a recipient can match: `local@domain`. */
+function isMessageId(value: string): boolean {
+	return /^[^\s<>]+@[^\s<>]+$/.test(value);
+}
+
+/**
+ * A long thread's full chain outgrows the SES header limit and the whole send
+ * fails, so keep what RFC 5322 asks to keep and drop from the middle: the
+ * first message, when it fits beside the thread token, then the newest ids
+ * back from the token (always last, so never dropped). Nothing longer than
+ * the limit is ever returned.
+ */
+function fitReferences(ids: string[]): string {
+	const render = (list: string[]) => list.map((id) => `<${id}>`).join(" ");
+	if (render(ids).length <= MAX_REFERENCES_LENGTH) return render(ids);
+	const root = ids[0]!;
+	const keepsRoot = render([root, ids.at(-1)!]).length <= MAX_REFERENCES_LENGTH;
+	const newest: string[] = [];
+	for (const id of ids.slice(1).reverse()) {
+		const candidate = keepsRoot ? [root, id, ...newest] : [id, ...newest];
+		if (render(candidate).length > MAX_REFERENCES_LENGTH) break;
+		newest.unshift(id);
+	}
+	return render(keepsRoot ? [root, ...newest] : newest);
 }
 
 // ── Draft-follows-in_reply_to ──────────────────────────────────────

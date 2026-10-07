@@ -50,7 +50,7 @@ test("missing attachment confirmation revalidates one fingerprint through the sa
 	assert.match(delivery, /composeMissingAttachmentFingerprint/);
 	assert.match(
 		delivery,
-		/snapshot\.to\.split[\s\S]*?evaluateComposeAttachments[\s\S]*?shouldWarnMissingAttachment/,
+		/recipientProblem\(snapshot\)[\s\S]*?evaluateComposeAttachments[\s\S]*?shouldWarnMissingAttachment/,
 	);
 	assert.match(form, /pendingMissingAttachment/);
 	assert.match(

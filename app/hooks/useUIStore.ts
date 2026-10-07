@@ -31,6 +31,12 @@ export type PendingSend = {
 	canUndo: boolean;
 };
 
+/** A reply or forward asked for from the list, answered once its thread loads. */
+export type ThreadAction = {
+	emailId: string;
+	action: "reply" | "reply-all" | "forward";
+};
+
 export interface ComposeOptions {
 	mode: ComposeMode;
 	/** Optional truthful recipient seed for a new message. */
@@ -69,6 +75,9 @@ function openComposeState(
 	return {
 		isComposing: true,
 		queuedCompose: null,
+		// Any composer that opens supersedes a keyboard reply still waiting on
+		// its thread, which must not fire later when this composer closes.
+		pendingThreadAction: null,
 		_previousEmailId: selectedEmailId,
 		// Keep selectedEmailId when replying/forwarding so the thread stays visible
 		selectedEmailId: isReplyOrForward ? selectedEmailId : null,
@@ -94,6 +103,12 @@ interface UIState {
 	queuedCompose: ComposeOptions | null;
 	applyQueuedCompose: () => void;
 	cancelQueuedCompose: () => void;
+
+	// Keyboard replies resolve their target in the open conversation, exactly as
+	// its buttons do, because a list row lacks the Cc and Reply-To they need.
+	pendingThreadAction: ThreadAction | null;
+	requestThreadAction: (action: ThreadAction) => void;
+	clearThreadAction: () => void;
 
 	// Accepted sends still waiting on a provider outcome. Held here, outside the
 	// composer, because the composer unmounts the moment a send is accepted.
@@ -156,6 +171,7 @@ export const useUIStore = create<UIState>((set, get) => ({
 	_previousEmailId: null,
 	composeOptions: { mode: "new", originalEmail: null },
 	queuedCompose: null,
+	pendingThreadAction: null,
 	pendingSends: [],
 	isSidebarOpen: false,
 	// Start collapsed so the panel never hides content on first paint. The real
@@ -167,7 +183,16 @@ export const useUIStore = create<UIState>((set, get) => ({
 	conversationIntelligenceExpanded:
 		DEFAULT_WORKSPACE_PREFERENCES.conversationIntelligenceExpanded,
 
-	selectEmail: (id) => set({ selectedEmailId: id }),
+	// Opening anything else drops a keyboard reply still waiting on its thread,
+	// so it can never fire later on a conversation the reader left.
+	selectEmail: (id) =>
+		set((state) => ({
+			selectedEmailId: id,
+			pendingThreadAction:
+				state.pendingThreadAction?.emailId === id
+					? state.pendingThreadAction
+					: null,
+		})),
 
 	startCompose: (options) =>
 		set((state) => {
@@ -191,6 +216,11 @@ export const useUIStore = create<UIState>((set, get) => ({
 
 	cancelQueuedCompose: () => set({ queuedCompose: null }),
 
+	requestThreadAction: (action) =>
+		set({ selectedEmailId: action.emailId, pendingThreadAction: action }),
+
+	clearThreadAction: () => set({ pendingThreadAction: null }),
+
 	trackSend: (send) =>
 		set((state) =>
 			state.pendingSends.some((held) => held.deliveryId === send.deliveryId)
@@ -208,9 +238,10 @@ export const useUIStore = create<UIState>((set, get) => ({
 	closePanel: () =>
 		set((state) =>
 			state.isComposing
-				? { selectedEmailId: null }
+				? { selectedEmailId: null, pendingThreadAction: null }
 				: {
 						selectedEmailId: null,
+						pendingThreadAction: null,
 						isComposing: false,
 						_previousEmailId: null,
 						composeOptions: { mode: "new" as const, originalEmail: null },
