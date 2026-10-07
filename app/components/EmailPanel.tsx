@@ -199,6 +199,26 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		[activeExternalBodyIds, externalBodyQueries],
 	);
 
+	// Whether Reply all would reach anyone Reply does not, once per message.
+	const replyAllMailbox = currentMailbox?.email ?? mailboxId ?? "";
+	const reachesOthers = useMemo(() => {
+		const result = new Map<string, boolean>();
+		for (const message of allMessages) {
+			const reply = replyRecipientFields({
+				original: message,
+				mailboxAddress: replyAllMailbox,
+				all: false,
+			});
+			const everyone = replyRecipientFields({
+				original: message,
+				mailboxAddress: replyAllMailbox,
+				all: true,
+			});
+			result.set(message.id, everyone.to !== reply.to || everyone.cc !== "");
+		}
+		return result;
+	}, [allMessages, replyAllMailbox]);
+
 	/** The message with its complete body, or null while that body is loading. */
 	const withCompleteBody = (message: Email): Email | null => {
 		if (!message.body_external) return message;
@@ -294,12 +314,6 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 		externalBodyQueriesById.get(message.id)?.isError
 			? "Complete message unavailable"
 			: "Loading complete message";
-	const replyAddressesDiffer = (message: Email) => {
-		const mailboxAddress = currentMailbox?.email ?? mailboxId ?? "";
-		const reply = replyRecipientFields({ original: message, mailboxAddress, all: false });
-		const everyone = replyRecipientFields({ original: message, mailboxAddress, all: true });
-		return everyone.to !== reply.to || everyone.cc !== "";
-	};
 	const replyTo = (message: Email, all: boolean) =>
 		startCompose({ mode: all ? "reply-all" : "reply", originalEmail: message });
 	const forward = (message: Email) => {
@@ -310,7 +324,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 	// Reply, Reply all and Forward wait rather than answer the wrong one.
 	const conversationLoaded = !email.thread_id || threadRepliesFetched;
 	const latest = latestMessage ?? email;
-	const latestHasOthers = replyAddressesDiffer(latest);
+	const latestHasOthers = reachesOthers.get(latest.id) ?? false;
 	const canForwardLatest = conversationLoaded && withCompleteBody(latest) !== null;
 	const latestUnavailableReason = conversationLoaded
 		? bodyUnavailableReason(latest)
@@ -697,7 +711,7 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 								onDeleteDraft={isDraft ? () => handleDeleteDraft(msg) : undefined}
 								onViewSource={() => setSourceViewEmail(msg)}
 								onReply={canAnswer(msg, isDraft) ? () => replyTo(msg, false) : undefined}
-								onReplyAll={canAnswer(msg, isDraft) && replyAddressesDiffer(msg)
+								onReplyAll={canAnswer(msg, isDraft) && reachesOthers.get(msg.id)
 									? () => replyTo(msg, true)
 									: undefined}
 								onForward={canAnswer(msg, isDraft) ? () => forward(msg) : undefined}

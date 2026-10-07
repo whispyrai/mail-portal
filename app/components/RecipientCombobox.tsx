@@ -13,7 +13,9 @@ import {
 import { flushSync } from "react-dom";
 import {
 	isValidRecipientAddress,
+	normalizedAddress,
 	parseRecipientText,
+	RECIPIENT_FIELDS,
 	type RecipientField,
 	type RecipientFieldValues,
 } from "../../shared/recipient-addresses.ts";
@@ -25,6 +27,12 @@ import {
 	splitFinishedRecipients,
 } from "../lib/recipient-input.ts";
 import { useRecipientSuggestions } from "../queries/recipient-suggestions.ts";
+
+const FIELD_LABELS: Record<RecipientField, string> = {
+	to: "To",
+	cc: "Cc",
+	bcc: "Bcc",
+};
 
 export type RecipientComboboxProps = {
 	id: string;
@@ -78,6 +86,8 @@ export default function RecipientCombobox({
 	const [selectedChip, setSelectedChip] = useState(-1);
 	const [activeIndex, setActiveIndex] = useState(-1);
 	const [announcement, setAnnouncement] = useState("");
+	// Said on screen, not only to screen readers: why an address did not appear.
+	const [notice, setNotice] = useState("");
 	const [dismissed, setDismissed] = useState(false);
 	const token = draft.trim().toLowerCase();
 	const query = useRecipientSuggestions(
@@ -101,16 +111,16 @@ export default function RecipientCombobox({
 		!dismissed &&
 		(token.length > 0 || suggestions.length > 0);
 	const activeSuggestion = activeIndex >= 0 ? suggestions[activeIndex] : undefined;
-	// A half-typed name picks its best match on Enter; a complete address is
-	// taken exactly as typed.
-	const preselectsSuggestion =
-		token.length > 0 && !isValidRecipientAddress(draft.trim());
+	// A half-typed name picks its best match on Enter. Once there is an "@" the
+	// writer is typing an address, which is taken exactly as typed.
+	const preselectsSuggestion = token.length > 0 && !token.includes("@");
 
 	useEffect(() => {
 		setActiveIndex(-1);
 		setAnnouncement("");
 		setDismissed(false);
 		setDraft("");
+		setNotice("");
 		setSelectedChip(-1);
 	}, [mailboxId, field]);
 
@@ -148,12 +158,34 @@ export default function RecipientCombobox({
 	 * sends in the same keystroke: Cmd/Ctrl+Enter reads the form right after.
 	 */
 	function addRecipients(text: string, flush = false) {
-		const additions = parseRecipientText(text);
 		setDraft("");
 		setSelectedChip(-1);
 		setActiveIndex(-1);
-		if (additions.length === 0) return;
-		const next = mergeRecipients(chips, additions);
+		// An address already in another field stays there: each address is
+		// sent once, so a second chip would show a recipient the headers lack.
+		const elsewhere = new Map<string, string>();
+		for (const other of RECIPIENT_FIELDS) {
+			if (other === field) continue;
+			for (const address of parseRecipientText(recipients[other])) {
+				elsewhere.set(normalizedAddress(address), FIELD_LABELS[other]);
+			}
+		}
+		const additions = parseRecipientText(text);
+		const duplicate = additions.find((address) =>
+			elsewhere.has(normalizedAddress(address)),
+		);
+		const duplicateNotice = duplicate
+			? `${duplicate} is already in ${elsewhere.get(normalizedAddress(duplicate))}.`
+			: "";
+		setNotice(duplicateNotice);
+		const fresh = additions.filter(
+			(address) => !elsewhere.has(normalizedAddress(address)),
+		);
+		if (fresh.length === 0) {
+			if (duplicateNotice) setAnnouncement(duplicateNotice);
+			return;
+		}
+		const next = mergeRecipients(chips, fresh);
 		const apply = () => onChange(serializeRecipients(next));
 		if (flush) flushSync(apply);
 		else apply();
@@ -189,6 +221,7 @@ export default function RecipientCombobox({
 	function handleChange(event: ChangeEvent<HTMLInputElement>) {
 		const text = event.target.value;
 		setSelectedChip(-1);
+		setNotice("");
 		const { finished, pending } = splitFinishedRecipients(text);
 		if (finished.trim()) {
 			addRecipients(finished);
@@ -406,6 +439,9 @@ export default function RecipientCombobox({
 					}`}
 				/>
 			</div>
+			{notice && (
+				<p className="mt-1 text-xs text-kumo-subtle">{notice}</p>
+			)}
 			{invalidChips.length > 0 && (
 				<p id={problemId} className="mt-1 text-xs font-medium text-kumo-danger">
 					{invalidChips.length === 1

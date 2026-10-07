@@ -80,3 +80,10 @@ test("a first id that nearly fills the limit never pushes out the thread token",
 	);
 	assert.equal(headers.References, `<newest@mail.example> <${token}>`);
 });
+
+test("an In-Reply-To too long for SES is left out instead of failing the send", () => {
+	const longId = `${"z".repeat(990)}@mail.example`;
+	const headers = buildThreadingHeaders(longId, [longId], token);
+	assert.equal(headers["In-Reply-To"], undefined);
+	assert.equal(headers.References, `<${token}>`);
+});

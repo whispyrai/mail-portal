@@ -93,3 +93,15 @@ test("a forward carries the original's files as removable attachments", () => {
 	// Counted in the starting fingerprint, so opening Forward is not an edit.
 	assert.match(composeForm, /attachments: seededAttachments\.map\(/);
 });
+
+test("a keyboard reply is dropped when the reader leaves the folder", () => {
+	assert.match(
+		list,
+		/useEffect\(\s*\(\) => \(\) => clearThreadAction\(\),\s*\[clearThreadAction, folder, mailboxId\],\s*\)/,
+	);
+});
+
+test("whether Reply all reaches anyone else is worked out once per message", () => {
+	assert.match(panel, /const reachesOthers = useMemo\(/);
+	assert.match(panel, /const latestHasOthers = reachesOthers\.get\(latest\.id\) \?\? false;/);
+});

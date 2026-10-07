@@ -145,7 +145,14 @@ export function replyRecipientFields(input: {
 	const fromSelf = isSelf(original.sender);
 
 	const sender = parseRecipientText(original.sender);
-	const primary = fromSelf ? originalTo : replyTo.length > 0 ? replyTo : sender;
+	// Our own message goes back to its To list, or to its Cc list when it was
+	// addressed only by Cc.
+	const ownRecipients = originalTo.length > 0 ? originalTo : originalCc;
+	const primary = fromSelf
+		? ownRecipients
+		: replyTo.length > 0
+			? replyTo
+			: sender;
 	const toCandidates = all && !fromSelf ? [...primary, ...originalTo] : primary;
 	let to = mergeRecipients([], toCandidates.filter((address) => !isSelf(address)));
 	let cc = all

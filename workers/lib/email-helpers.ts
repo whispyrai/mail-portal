@@ -145,7 +145,11 @@ export function buildThreadingHeaders(
 		: originalMsgId
 			? ids.filter((id) => !isOwnThreadToken(id, threadToken)).at(-1)
 			: undefined;
-	if (inReplyTo) headers["In-Reply-To"] = `<${inReplyTo}>`;
+	// The same SES header limit applies; an id too long to send is left out
+	// rather than failing the whole message.
+	if (inReplyTo && fitsHeader("In-Reply-To", `<${inReplyTo}>`)) {
+		headers["In-Reply-To"] = `<${inReplyTo}>`;
+	}
 	const refs = threadToken
 		? [...ids.filter((id) => id !== threadToken), threadToken]
 		: ids;
@@ -162,7 +166,12 @@ function isOwnThreadToken(id: string, threadToken: string | undefined): boolean 
 }
 
 /** SES rejects a custom header whose name and value exceed 996 characters. */
-const MAX_REFERENCES_LENGTH = 996 - "References".length;
+const MAX_HEADER_LENGTH = 996;
+const MAX_REFERENCES_LENGTH = MAX_HEADER_LENGTH - "References".length;
+
+function fitsHeader(name: string, value: string): boolean {
+	return name.length + value.length <= MAX_HEADER_LENGTH;
+}
 
 function bareMessageId(value: string): string {
 	return value.trim().replace(/^<|>$/g, "");

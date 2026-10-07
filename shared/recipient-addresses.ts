@@ -90,28 +90,35 @@ function withoutNamesAndComments(part: string): string {
 
 /**
  * Every address in what a person typed or pasted, or in an address header,
- * in the order written. Display names, comments and `mailto:` are dropped, so
+ * in the order written. `mailto:` and comments are dropped, and so is a
+ * display name given the standard way, quoted or before `<address>`:
  * `"Hamilton, Margaret" <m@x.com>; a@y.com b@z.com` gives three addresses and
- * so does `Alice <a@x.com> b@y.com c@z.com`. A piece that holds no address at
- * all is kept as typed, so the composer can show it as a recipient that needs
- * fixing instead of silently losing it.
+ * so does `Alice <a@x.com> b@y.com c@z.com`. Anything else that is not an
+ * address is kept as typed (`bob`, or `alice` in `alice bob@x.com`), so the
+ * composer shows it as a recipient to fix instead of silently losing it.
  */
 export function parseRecipientText(text: string): string[] {
-	const addresses: string[] = [];
+	const recipients: string[] = [];
 	for (const part of splitAddressList(text)) {
-		const found = [
-			...withoutNamesAndComments(part).matchAll(/<([^<>]*)>|[^\s<>]+/g),
-		].flatMap((match) => {
+		const visible = withoutNamesAndComments(part);
+		const namesAddress = /<[^<>]*>/.test(visible) || /"/.test(part);
+		const addresses: string[] = [];
+		const otherWords: string[] = [];
+		for (const match of visible.matchAll(/<([^<>]*)>|[^\s<>]+/g)) {
 			if (match[1] !== undefined) {
 				const address = withoutMailto(match[1]);
-				return address ? [address] : [];
+				if (address) addresses.push(address);
+				continue;
 			}
 			const word = withoutMailto(match[0]).replace(/^["']+|["']+$/g, "");
-			return word.includes("@") ? [word] : [];
-		});
-		addresses.push(...(found.length > 0 ? found : [part]));
+			if (word.includes("@")) addresses.push(word);
+			else if (word) otherWords.push(word);
+		}
+		if (addresses.length === 0) recipients.push(part);
+		else if (namesAddress || otherWords.length === 0) recipients.push(...addresses);
+		else recipients.push(otherWords.join(" "), ...addresses);
 	}
-	return addresses;
+	return recipients;
 }
 
 /**

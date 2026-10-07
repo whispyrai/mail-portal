@@ -447,8 +447,15 @@ export default function EmailListRoute() {
 		closePanel,
 		startCompose,
 		requestThreadAction,
+		clearThreadAction,
 		mailDensity,
 	} = useUIStore();
+	// A keyboard reply still waiting on its thread belongs to this folder; going
+	// anywhere else drops it, so it never opens a composer the reader left behind.
+	useEffect(
+		() => () => clearThreadAction(),
+		[clearThreadAction, folder, mailboxId],
+	);
 	const isCompact = mailDensity === "compact";
 	const [page, setPage] = useState(1);
 	const [keyboardTargetId, setKeyboardTargetId] = useState<string | null>(null);

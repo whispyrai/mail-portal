@@ -53,14 +53,19 @@ const HTML_TAG =
 	/<\/?(?:html|head|body|div|p|br|span|font|a|b|i|u|em|strong|table|tbody|thead|tr|td|th|ul|ol|li|img|h[1-6]|blockquote|pre|center|section|article|header|footer|style|meta|title|hr)(?=[\s/>])[^<>]*>/i;
 
 /**
- * The original as readable text: paragraphs, line breaks, list items and link
- * targets survive, markup and styling do not. Plain-text mail is taken as is,
- * so a literal "<" in it is never mistaken for a tag.
+ * The original as readable text: paragraphs, line breaks, list items, table
+ * cells and link targets survive, markup and styling do not. Plain-text mail
+ * is taken as written, spacing and indentation included, so a literal "<" in
+ * it is never mistaken for a tag.
  */
 function quotedText(body: string): string {
 	const text = HTML_TAG.test(body)
 		? decodeHtmlEntities(
 				body
+					// HTML ignores runs of whitespace in its source, except in <pre>.
+					.split(/(<pre\b[^>]*>[\s\S]*?<\/pre\s*>)/i)
+					.map((piece, index) => (index % 2 === 1 ? piece : piece.replace(/\s+/g, " ")))
+					.join("")
 					.replace(/<(style|script|head|title)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
 					.replace(/<!--[\s\S]*?-->/g, "")
 					.replace(
@@ -75,23 +80,28 @@ function quotedText(body: string): string {
 					)
 					.replace(/<br\s*\/?>/gi, "\n")
 					.replace(/<li\b[^>]*>/gi, "\n• ")
+					.replace(/<\/t[dh]\s*>/gi, " ")
 					.replace(/<\/tr\s*>/gi, "\n")
 					.replace(/<\/(?:p|div|h[1-6]|table|blockquote|pre|ul|ol|section|article|header|footer)\s*>/gi, "\n\n")
 					.replace(/<[^>]*>/g, ""),
-			)
+			).replace(/^ (?! )/gm, "")
 		: body;
 	return text
 		.replace(/\r\n?/g, "\n")
-		.replace(/[^\S\n]+/g, " ")
-		.replace(/ *\n */g, "\n")
+		.replace(/[^\S\n]+$/gm, "")
 		.replace(/\n{3,}/g, "\n\n")
-		.trim();
+		.replace(/^\n+|\n+$/g, "");
 }
 
+/** Paragraphs and lines as HTML, keeping indentation and runs of spaces visible. */
 function quotedHtml(text: string): string {
 	return text
 		.split("\n\n")
-		.map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>")}</p>`)
+		.map((paragraph) =>
+			`<p>${escapeHtml(paragraph)
+				.replace(/^ +| {2,}/gm, (run) => "\u00a0".repeat(run.length))
+				.replace(/\n/g, "<br>")}</p>`,
+		)
 		.join("");
 }
 

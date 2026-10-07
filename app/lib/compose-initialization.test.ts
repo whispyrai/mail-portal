@@ -222,3 +222,25 @@ test("forward keeps angle-bracketed addresses and links in plain-text mail", () 
 		/Contact &lt;alice@example\.com&gt; or &lt;b@x\.com&gt;\.<br>Docs: &lt;https:\/\/example\.com\/docs&gt;/,
 	);
 });
+
+test("forward keeps table cells apart and plain-text spacing intact", () => {
+	const table = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: {
+				...original,
+				body: "<table><tr><td>Name</td><td>Value</td></tr><tr><td>Plan</td><td>Pro</td></tr></table><pre>  indented\n    code</pre>",
+			},
+		},
+	});
+	assert.match(table.body, /Name Value<br>Plan Pro/);
+	assert.match(table.body, /\u00a0\u00a0indented<br>\u00a0\u00a0\u00a0\u00a0code/);
+
+	const plain = buildInitialComposeFields({
+		composeOptions: {
+			mode: "forward",
+			originalEmail: { ...original, body: "Item    Qty\n  - apples   3" },
+		},
+	});
+	assert.match(plain.body, /Item\u00a0\u00a0\u00a0\u00a0Qty<br>\u00a0\u00a0- apples\u00a0\u00a0\u00a03/);
+});

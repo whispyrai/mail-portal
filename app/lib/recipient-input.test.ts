@@ -78,8 +78,13 @@ test("typed and pasted text becomes one recipient per address", () => {
 		parseRecipientText('"Smith \\"Jr\\", Bob" <bob@example.com>'),
 		["bob@example.com"],
 	);
-	// Text with no address is kept so the writer sees it and can fix it.
+	// Text with no address is kept so the writer sees it and can fix it, and so
+	// is a stray word typed beside an address. A display name given the
+	// standard way, quoted or before <address>, is not a recipient.
 	assert.deepEqual(parseRecipientText("bob, Grace Hopper"), ["bob", "Grace Hopper"]);
+	assert.deepEqual(parseRecipientText("alice bob@x.com"), ["alice", "bob@x.com"]);
+	assert.deepEqual(parseRecipientText("Grace Hopper <grace@x.com>"), ["grace@x.com"]);
+	assert.deepEqual(parseRecipientText('"Grace Hopper" grace@x.com'), ["grace@x.com"]);
 });
 
 test("only text before the last separator is finished", () => {
@@ -223,6 +228,15 @@ test("answering our own message goes back to the people it went to", () => {
 			to: "ada@calculus.example, grace@partner.example",
 			cc: "linus@kernel.example",
 		},
+	);
+	// Our own message sent only by Cc goes back to those people.
+	assert.deepEqual(
+		replyRecipientFields({
+			original: { sender: mailbox, recipient: "", cc: "linus@kernel.example" },
+			mailboxAddress: mailbox,
+			all: false,
+		}),
+		{ to: "linus@kernel.example", cc: "" },
 	);
 	// A note to self still has somewhere to go.
 	assert.deepEqual(

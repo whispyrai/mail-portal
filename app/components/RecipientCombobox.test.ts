@@ -71,3 +71,13 @@ test("Enter, separators, paste and leaving the field all commit the address", ()
 	// Backspace marks the last chip before removing it.
 	assert.match(source, /setSelectedChip\(chips\.length - 1\)/);
 });
+
+test("an address already in another field is not duplicated, and the writer is told", () => {
+	assert.match(source, /if \(other === field\) continue;/);
+	assert.match(source, /is already in \$\{elsewhere\.get\(normalizedAddress\(duplicate\)\)\}\./);
+	assert.match(source, /\{notice && \(\s*<p className="mt-1 text-xs text-kumo-subtle">\{notice\}<\/p>/);
+});
+
+test("a typed address is never swapped for a suggestion once it has an @", () => {
+	assert.match(source, /const preselectsSuggestion = token\.length > 0 && !token\.includes\("@"\);/);
+});
