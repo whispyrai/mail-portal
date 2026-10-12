@@ -25,3 +25,17 @@ test("global Today response parser rejects duplicate Mailbox identities and unkn
 	assert.throws(() => parseGlobalTodayResponse({ ...base, complete: false, totals: null, failures: [failure, failure] }), /Mailbox identities must be unique/);
 	assert.throws(() => parseGlobalTodayResponse({ ...base, leaked: "secret" }));
 });
+
+test("global Today response parser accepts more than twelve Mailboxes with their latest mail", () => {
+	const mailboxes = Array.from({ length: 13 }, (_, index) => ({
+		mailboxId: `team-${index}@example.com`,
+		address: `team-${index}@example.com`,
+		type: "SHARED",
+		reminders: [],
+		latestMessage: index === 0 ? null : { messageId: `m-${index}`, conversationKey: `c-${index}`, sender: "a@example.com", subject: "Hello", date: "2026-07-12T10:00:00.000Z" },
+		unreadConversationCount: 0,
+		unreadPreviews: [],
+	}));
+	const parsed = parseGlobalTodayResponse({ ...base, currentMailboxCount: 13, mailboxes });
+	assert.equal(parsed.state === "ready" && parsed.mailboxes.length, 13);
+});
