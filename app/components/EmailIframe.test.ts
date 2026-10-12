@@ -164,12 +164,18 @@ test("a new render clears private content before parsing hostile metadata", () =
 	assert.ok(clearIndex < planIndex);
 });
 
-test("a dropped srcdoc navigation is retried until the frame reports in", () => {
-	assert.match(source, /let frameReported = false/);
-	// Any nonce-bound message proves the real document is live, so a message
-	// stops the retry ladder rather than reloading a healthy frame.
-	assert.match(source, /frameReported = true;\s*clearFrameRetry\(\);/);
+test("a dropped or unrendered srcdoc navigation is retried until the body lays out", () => {
+	assert.match(source, /let frameLaidOut = false/);
+	// Reporting in is not proof: production Chrome ran the script of a document
+	// whose body never laid out. Only a laid-out body stops the retry ladder.
+	assert.match(source, /laidOut: bodyLaidOut\(\)/);
+	assert.match(source, /if \(event\.data\.laidOut === true\) \{\s*frameLaidOut = true;\s*clearFrameRetry\(\);/);
+	assert.match(source, /if \(controller\.signal\.aborted \|\| frameLaidOut\) return;/);
+	// A hidden frame cannot lay out, so it waits rather than burning retries.
+	assert.match(source, /if \(iframe\.getClientRects\(\)\.length === 0\) \{\s*frameRetryTimer = setTimeout/);
 	assert.match(source, /frameRetries >= FRAME_LOAD_MAX_RETRIES/);
+	// The reloaded document must receive its inline images again.
+	assert.match(source, /iframeReady = false;\s*payloadPosted = false;/);
 	// The retry has to reset to the empty string first; re-assigning the
 	// document alone is exactly the navigation the browser dropped, which left
 	// the empty placeholder on screen and blanked every message.
@@ -194,7 +200,7 @@ test("every render reports its outcome once, without message content", () => {
 	assert.match(source, /frameTextLength = event\.data\.textLength;/);
 	// Outcome is derived from whether the real document ever ran and drew text.
 	assert.match(source, /!frameReported\s*\?\s*"never_reported"/);
-	assert.match(source, /sanitizedTextLength > 0 && frameTextLength === 0\s*\?\s*"blank"/);
+	assert.match(source, /\(sanitizedTextLength > 0 && frameTextLength === 0\) \|\|\s*\(!frameLaidOut && iframe\.getClientRects\(\)\.length > 0\)\s*\?\s*"blank"/);
 	// One report after the retry ladder, or when the reader leaves first.
 	assert.match(source, /if \(reportSent \|\| !mailboxId\) return;\s*reportSent = true;/);
 	assert.match(source, /setTimeout\(\(\) => sendReport\("settled"\), MESSAGE_VIEWER_REPORT_MS\)/);

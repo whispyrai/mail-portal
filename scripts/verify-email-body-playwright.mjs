@@ -24,6 +24,7 @@ const replyPreview = "OLDER PREVIEW MUST NEVER REPLACE THE COMPLETE MESSAGE";
 const selectedFullBody = "AUTHORITATIVE SELECTED BODY FOR FORWARDING";
 const replyFullBody = "AUTHORITATIVE OLDER MESSAGE BODY";
 const droppedSrcdocBody = `<p>${"DROPPED SRCDOC RECOVERY BODY ".repeat(240)}</p>`;
+const unrenderedBody = `<p>${"UNRENDERED BODY RECOVERY ".repeat(240)}</p>`;
 const cidContentId = "inline-proof@example.com";
 const cidAttachmentId = "inline-proof";
 const cidSrcsetOnlyContentId = "srcset-only@example.com";
@@ -50,6 +51,7 @@ const cidPng = Buffer.from(
 const emailListOnly = process.argv.includes("--email-list-only");
 const cidOnly = process.argv.includes("--cid-only");
 const viewerLayoutOnly = process.argv.includes("--viewer-layout-only");
+const frameRecoveryOnly = process.argv.includes("--frame-recovery-only");
 
 mkdirSync(artifactDirectory, { recursive: true });
 
@@ -1188,6 +1190,72 @@ async function verifyDroppedSrcdocRecovery({ context, baseUrl, name }) {
 	}
 }
 
+async function verifyUnrenderedBodyRecovery({ context, baseUrl, name }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(15_000);
+	observeBrowser(page, `${name} unrendered-body`);
+	try {
+		// Production Chrome has run the message document's script while its body
+		// never got a layout box: the frame reported in, then sat visible at its
+		// 100px start with nothing drawn until the reader opened another message
+		// and came back. Withhold layout from the first message document and
+		// require the viewer to notice and load it again on its own.
+		await page.addInitScript(() => {
+			if (location.href !== "about:srcdoc") return;
+			new MutationObserver((_, observer) => {
+				if (!document.body) return;
+				observer.disconnect();
+				const policy = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+				const isMessage = policy?.getAttribute("content")?.includes("script-src") ?? false;
+				if (!isMessage || window.name.includes("unrendered-once")) return;
+				window.name += "unrendered-once";
+				document.body.style.display = "none";
+			}).observe(document, { childList: true, subtree: true });
+		});
+		await installMailFixture(page, async ({ route, messageId }) => {
+			await route.fulfill({
+				status: 200,
+				contentType: "text/plain",
+				body: messageId === selectedId ? unrenderedBody : replyFullBody,
+			});
+		});
+		await openConversation(page, baseUrl);
+		await assertAuthoritativeIframe(page, selectedId, unrenderedBody, selectedPreview);
+		const iframe = page
+			.locator(`[data-intelligence-message-id="${selectedId}"]`)
+			.getByTitle("Email content");
+		const iframeHandle = await iframe.elementHandle();
+		assert.ok(iframeHandle);
+		const contentFrame = await iframeHandle.contentFrame();
+		assert.ok(contentFrame);
+		// innerText alone cannot prove this: an unrendered body still returns
+		// its raw text. Require a laid-out body and a frame that grew to it.
+		await pollValue(
+			() => Promise.all([
+				iframe.evaluate((element) => element.getBoundingClientRect().height),
+				contentFrame.evaluate(() => ({
+					laidOut: document.body.getClientRects().length > 0,
+					scrollHeight: document.body.scrollHeight,
+				})),
+			]).then(([frameHeight, content]) => ({ frameHeight, ...content }))
+				// The reload under test replaces the document mid-read.
+				.catch(() => null),
+			(value) => value !== null && value.laidOut && value.scrollHeight > 100 && value.frameHeight >= value.scrollHeight - 1,
+			"unrendered body was reloaded and the frame grew to it",
+		);
+		await page.screenshot({
+			path: join(artifactDirectory, `email-body-${runStamp}-${name}-unrendered-body.png`),
+		});
+		detail(`${name} reloaded a message whose first document never laid out its body`);
+	} catch (error) {
+		await captureDiagnostic(page, name, "unrendered-body", error);
+		throw error;
+	} finally {
+		await page.unrouteAll({ behavior: "ignoreErrors" });
+		await page.close();
+	}
+}
+
 async function verifyCollapseCancellation({ context, baseUrl, name }) {
 	const page = await context.newPage();
 	page.setDefaultTimeout(15_000);
@@ -1322,12 +1390,18 @@ async function verifyViewport({ browser, baseUrl, storageState, name, viewport }
 			await verifyInlineCidRendering({ context, baseUrl, name });
 			return;
 		}
+		if (frameRecoveryOnly) {
+			await verifyDroppedSrcdocRecovery({ context, baseUrl, name });
+			await verifyUnrenderedBodyRecovery({ context, baseUrl, name });
+			return;
+		}
 		await verifyEmailListRetry({ context, baseUrl, name });
 		if (emailListOnly) return;
 		await verifyViewerLayout({ context, baseUrl, name });
 		await verifyInlineCidRendering({ context, baseUrl, name });
 		await verifyDelayedSelected({ context, baseUrl, name });
 		await verifyDroppedSrcdocRecovery({ context, baseUrl, name });
+		await verifyUnrenderedBodyRecovery({ context, baseUrl, name });
 		await verifyCollapseCancellation({ context, baseUrl, name });
 		await verifyRetryRecovery({ context, baseUrl, name });
 	} finally {
@@ -1394,6 +1468,9 @@ async function main() {
 		if (viewerLayoutOnly) {
 			passMessage =
 				"PASS: long single-message mail owns no internal vertical scrollbar and precedes Intelligence and Activity at both widths";
+		} else if (frameRecoveryOnly) {
+			passMessage =
+				"PASS: the viewer reloads a message whose first document was dropped or never laid out, at both widths";
 		} else if (cidOnly) {
 			passMessage =
 				"PASS: CID inline images render through the nonce-bound opaque bridge at both widths";
