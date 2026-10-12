@@ -9,8 +9,6 @@ const query = readFileSync(new URL("../../queries/global-today.ts", import.meta.
 const shell = readFileSync(new URL("./GlobalShell.tsx", import.meta.url), "utf8");
 const routes = readFileSync(new URL("../../routes.ts", import.meta.url), "utf8");
 const home = readFileSync(new URL("../../routes/home.tsx", import.meta.url), "utf8");
-const briefCard = readFileSync(new URL("./GlobalTodayBriefCard.tsx", import.meta.url), "utf8");
-const briefQuery = readFileSync(new URL("../../queries/global-today-brief.ts", import.meta.url), "utf8");
 
 test("global Today is a first-class destination and preserves Mailbox administration", () => {
 	assert.match(routes, /route\("today", "routes\/global-today\.tsx"\)/);
@@ -58,16 +56,15 @@ test("global Today keeps identities compound, reminder actions row-local, and ma
 	assert.doesNotMatch(route, /runModel|provider|useTodayBrief\(/i);
 });
 
-test("global AI guidance is complete-only, compound, explicitly refreshable, and subordinate to Today", () => {
-	assert.match(route, /useGlobalTodayBrief\(timeZone, deterministicTodayIsComplete\)/);
-	assert.match(route, /markGlobalTodayBriefStale/);
-	assert.match(briefQuery, /staleTime: Number\.POSITIVE_INFINITY/);
-	assert.match(briefQuery, /refresh: true/);
-	assert.match(briefCard, /Human review required/);
-	assert.match(briefCard, /Review before acting/);
-	assert.match(briefCard, /onOpenSource\(source\.mailboxId, source\.messageId\)/);
-	assert.match(briefCard, /Source \{sourceIndex \+ 1\} · \{item\.candidate\.mailboxAddress\}/);
-	assert.match(workspace, /<GlobalTodayBriefCard[\s\S]*<section aria-labelledby="attention-now-title">/);
+test("global Today shows no AI summary and never requests one", () => {
+	assert.doesNotMatch(route, /GlobalTodayBrief/);
+	assert.doesNotMatch(workspace, /GlobalTodayBriefCard|aiBrief/);
+});
+
+test("each Mailbox shows its latest Inbox mail, linked to the message", () => {
+	assert.match(workspace, /snapshot\.latestMessage \?/);
+	assert.match(workspace, /\/open\/\$\{encodeURIComponent\(snapshot\.latestMessage\.messageId\)\}/);
+	assert.match(workspace, /No mail in the Inbox yet\./);
 });
 
 test("global Today adapts to mobile without horizontal dependence and stays keyboard reachable", () => {

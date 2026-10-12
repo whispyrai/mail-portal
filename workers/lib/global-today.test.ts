@@ -39,6 +39,7 @@ function dependencies(input: {
 	reminders?: FollowUpReminder[];
 	fail?: Set<string>;
 	revoked?: Set<string>;
+	latestAt?: Record<string, string>;
 } = {}): GlobalTodayDependencies {
 	let rosterRead = 0;
 	const rosters = input.rosters ?? [[mailbox("me@example.com", "PERSONAL"), mailbox("team@example.com")]];
@@ -51,7 +52,9 @@ function dependencies(input: {
 		}),
 		readMailbox: async ({ mailboxId, baselineMessageIds }) => {
 			if (input.fail?.has(mailboxId)) throw new Error("private infrastructure detail");
+			const latestAt = input.latestAt?.[mailboxId];
 			return {
+				latestMessage: latestAt ? { messageId: `latest-${mailboxId}`, conversationKey: "latest", sender: "sender@example.com", subject: "Latest", date: latestAt } : null,
 				unreadConversationCount: mailboxId.startsWith("team") ? 2 : 1,
 				unreadPreviews: [{ messageId: "same-local-id", conversationKey: "same-local-conversation", sender: "sender@example.com", subject: mailboxId, date: "2026-07-12T12:00:00.000Z" }],
 				reminderPreviews: baselineMessageIds.map((id) => ({ baselineMessageId: id, subject: id, counterparty: "person@example.com" })),
@@ -76,6 +79,21 @@ test("global Today orders Personal first, preserves compound collisions, and com
 	assert.equal(result.mailboxes[0]?.unreadPreviews[0]?.messageId, "same-local-id");
 	assert.equal(result.mailboxes[1]?.unreadPreviews[0]?.messageId, "same-local-id");
 	assert.deepEqual(result.totals, { privateRemindersDue: 2, unreadConversations: 3 });
+});
+
+test("global Today orders Mailboxes by their latest Inbox mail, empty Inboxes last", async () => {
+	const result = await buildGlobalToday(dependencies({
+		rosters: [[mailbox("me@example.com", "PERSONAL"), mailbox("quiet@example.com"), mailbox("busy@example.com"), mailbox("team@example.com")]],
+		latestAt: {
+			"me@example.com": "2026-07-11T09:00:00.000Z",
+			"busy@example.com": "2026-07-12T11:30:00.000Z",
+			"team@example.com": "2026-07-12T08:00:00.000Z",
+		},
+	}), { actorUserId: "user-a", day });
+	assert.equal(result.state, "ready");
+	if (result.state !== "ready") return;
+	assert.deepEqual(result.mailboxes.map((row) => row.mailboxId), ["busy@example.com", "team@example.com", "me@example.com", "quiet@example.com"]);
+	assert.equal(result.mailboxes[0]?.latestMessage?.messageId, "latest-busy@example.com");
 });
 
 test("global Today keeps authorized successes, suppresses partial totals, and redacts failures", async () => {

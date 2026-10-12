@@ -52,6 +52,7 @@ const emailListOnly = process.argv.includes("--email-list-only");
 const cidOnly = process.argv.includes("--cid-only");
 const viewerLayoutOnly = process.argv.includes("--viewer-layout-only");
 const frameRecoveryOnly = process.argv.includes("--frame-recovery-only");
+const todayOnly = process.argv.includes("--today-only");
 
 mkdirSync(artifactDirectory, { recursive: true });
 
@@ -1256,6 +1257,36 @@ async function verifyUnrenderedBodyRecovery({ context, baseUrl, name }) {
 	}
 }
 
+async function verifyTodayMailboxOrder({ context, baseUrl, name }) {
+	const page = await context.newPage();
+	page.setDefaultTimeout(15_000);
+	const briefRequests = [];
+	page.on("request", (request) => { if (/today\/brief|today-brief/.test(request.url())) briefRequests.push(request.url()); });
+	const mailboxes = Array.from({ length: 13 }, (_, index) => ({
+		mailboxId: `team-${index}@example.com`, address: `team-${index}@example.com`, type: "SHARED", reminders: [],
+		latestMessage: index === 5 ? null : { messageId: `m-${index}`, conversationKey: `c-${index}`, sender: `sender${index}@example.com`, subject: `Subject ${index}`, date: new Date(Date.UTC(2026, 9, 12, index % 12, 0)).toISOString() },
+		unreadConversationCount: index % 3, unreadPreviews: [],
+	}));
+	const sorted = [...mailboxes].sort((a, b) => (b.latestMessage ? Date.parse(b.latestMessage.date) : -1) - (a.latestMessage ? Date.parse(a.latestMessage.date) : -1));
+	await page.route("**/api/v1/today?*", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+		state: "ready", complete: true, accessChanged: false,
+		day: { timeZone: "UTC", localDate: "2026-10-12", startAt: "2026-10-12T00:00:00.000Z", endAt: "2026-10-13T00:00:00.000Z" },
+		currentMailboxCount: 13, mailboxes: sorted, failures: [], totals: { privateRemindersDue: 0, unreadConversations: 12 }, generatedAt: new Date().toISOString(),
+	}) }));
+	await page.goto(`${baseUrl}/today`, { waitUntil: "domcontentloaded" });
+	await page.getByRole("heading", { name: "Mailbox pulse" }).waitFor();
+	const headings = await page.locator('section[aria-labelledby="mailbox-pulse-title"] h3').allInnerTexts();
+	assert.deepEqual(headings, sorted.map((m) => m.address));
+	assert.equal(headings.at(-1), "team-5@example.com");
+	await page.getByText("No mail in the Inbox yet.").waitFor();
+	await page.getByRole("link", { name: /Latest mail in team-11@example\.com: Subject 11/ }).waitFor();
+	assert.equal(await page.getByText(/AI|Human review required/).count(), 0);
+	await page.screenshot({ path: join(artifactDirectory, `email-body-${runStamp}-${name}-today.png`), fullPage: true });
+	assert.deepEqual(briefRequests, []);
+	detail(`${name} Today: 13 mailboxes sorted by latest mail, no AI summary requested`);
+	await page.close();
+}
+
 async function verifyCollapseCancellation({ context, baseUrl, name }) {
 	const page = await context.newPage();
 	page.setDefaultTimeout(15_000);
@@ -1390,6 +1421,10 @@ async function verifyViewport({ browser, baseUrl, storageState, name, viewport }
 			await verifyInlineCidRendering({ context, baseUrl, name });
 			return;
 		}
+		if (todayOnly) {
+			await verifyTodayMailboxOrder({ context, baseUrl, name });
+			return;
+		}
 		if (frameRecoveryOnly) {
 			await verifyDroppedSrcdocRecovery({ context, baseUrl, name });
 			await verifyUnrenderedBodyRecovery({ context, baseUrl, name });
@@ -1468,6 +1503,9 @@ async function main() {
 		if (viewerLayoutOnly) {
 			passMessage =
 				"PASS: long single-message mail owns no internal vertical scrollbar and precedes Intelligence and Activity at both widths";
+		} else if (todayOnly) {
+			passMessage =
+				"PASS: Today lists 13 Mailboxes newest mail first with each latest message and requests no AI summary, at both widths";
 		} else if (frameRecoveryOnly) {
 			passMessage =
 				"PASS: the viewer reloads a message whose first document was dropped or never laid out, at both widths";

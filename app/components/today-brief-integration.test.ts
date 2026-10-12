@@ -36,14 +36,9 @@ test("Today brief exposes loading, generated, cached, no-attention, stale, budge
 	assert.match(card, /Reminders below remain fully available/);
 });
 
-test("Today loads the mailbox brief only after reminders and keeps deterministic work authoritative", () => {
-	assert.match(route, /useTodayBrief\(mailboxId, timeZone, reminders\.isSuccess\)/);
-	assert.match(query, /\["today-brief", mailboxId, timeZone\]/);
-	assert.match(query, /fetchTodayBrief\(mailboxId!, \{ timeZone \}, fetch, signal\)/);
-	assert.match(route, /invalidateTodayBrief\(queryClient, mailboxId\)/);
-	assert.match(route, /briefIsRefreshing = todayBrief\.isFetching && todayBrief\.isStale/);
-	assert.match(route, /brief=\{briefIsRefreshing \? undefined : todayBrief\.data\}/);
-	assert.match(workspace, /<TodayBriefCard/);
+test("Mailbox Today shows no AI summary and never requests one", () => {
+	assert.doesNotMatch(route, /TodayBrief|todayBrief/);
+	assert.doesNotMatch(workspace, /TodayBriefCard/);
 	assert.match(workspace, /<ReminderSection/);
 	assert.match(workspace, /No personal follow-ups are due right now/);
 });

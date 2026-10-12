@@ -11,8 +11,6 @@ import {
 	XIcon,
 } from "@phosphor-icons/react";
 import { useMemo } from "react";
-import TodayBriefCard from "~/components/TodayBriefCard";
-import type { TodayBriefResponse } from "~/services/today-brief";
 import {
 	groupFollowUpReminders,
 	type FollowUpReminderView,
@@ -39,9 +37,6 @@ export interface TodayMutationFeedback {
 }
 
 interface TodayWorkspaceProps {
-	brief: TodayBriefResponse | undefined;
-	briefIsLoading: boolean;
-	briefError: Error | null;
 	reminders: readonly FollowUpReminderView[];
 	isLoading: boolean;
 	error: Error | null;
@@ -50,10 +45,8 @@ interface TodayWorkspaceProps {
 	mutationFeedback?: TodayMutationFeedback | null;
 	now?: Date;
 	onOpenConversation(reminder: FollowUpReminderView): void;
-	onOpenBriefSource(messageId: string): void;
 	onAction(action: TodayReminderAction): void;
 	onRetry(): void;
-	onRetryBrief(): void;
 	onDismissFeedback(): void;
 }
 
@@ -277,9 +270,6 @@ function ReminderSection({
 }
 
 export default function TodayWorkspace({
-	brief,
-	briefIsLoading,
-	briefError,
 	reminders,
 	isLoading,
 	error,
@@ -288,10 +278,8 @@ export default function TodayWorkspace({
 	mutationFeedback,
 	now = new Date(),
 	onOpenConversation,
-	onOpenBriefSource,
 	onAction,
 	onRetry,
-	onRetryBrief,
 	onDismissFeedback,
 }: TodayWorkspaceProps) {
 	const groups = useMemo(
@@ -364,15 +352,6 @@ export default function TodayWorkspace({
 								/>
 							)}
 						</div>
-					)}
-					{!isLoading && !error && (
-						<TodayBriefCard
-							brief={brief}
-							isLoading={briefIsLoading}
-							error={briefError}
-							onRetry={onRetryBrief}
-							onOpenSource={onOpenBriefSource}
-						/>
 					)}
 					{isLoading ? (
 						<div role="status" className="flex min-h-72 flex-col items-center justify-center gap-3 text-center">

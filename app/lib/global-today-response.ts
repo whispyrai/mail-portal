@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { GlobalTodayResponse } from "../../shared/global-today.ts";
+import { GLOBAL_TODAY_LIMITS, type GlobalTodayResponse } from "../../shared/global-today.ts";
 
 const id = z.string().min(1).max(500);
 const timestamp = z.string().datetime({ offset: true });
@@ -48,14 +48,15 @@ const ready = z.object({
 	currentMailboxCount: z.number().int().nonnegative(),
 	mailboxes: z.array(z.object({
 		...mailboxBase,
-		reminders: z.array(reminder).max(500),
+		reminders: z.array(reminder).max(GLOBAL_TODAY_LIMITS.reminders),
+		latestMessage: unreadPreview.nullable(),
 		unreadConversationCount: z.number().int().nonnegative(),
-		unreadPreviews: z.array(unreadPreview).max(3),
-	}).strict()).max(12),
+		unreadPreviews: z.array(unreadPreview).max(GLOBAL_TODAY_LIMITS.unreadPreviews),
+	}).strict()).max(GLOBAL_TODAY_LIMITS.mailboxes),
 	failures: z.array(z.object({
 		...mailboxBase,
 		reason: z.enum(["timeout", "unavailable"]),
-	}).strict()).max(12),
+	}).strict()).max(GLOBAL_TODAY_LIMITS.mailboxes),
 	totals: z.object({
 		privateRemindersDue: z.number().int().nonnegative(),
 		unreadConversations: z.number().int().nonnegative(),

@@ -1,7 +1,7 @@
 import type { FollowUpReminderView } from "./follow-up-reminders.ts";
 
 export const GLOBAL_TODAY_LIMITS = {
-	mailboxes: 12,
+	mailboxes: 50,
 	concurrency: 4,
 	mailboxTimeoutMs: 2_500,
 	reminders: 500,
@@ -28,6 +28,8 @@ export type GlobalTodayReminderPreview = {
 };
 
 export type GlobalTodayMailboxPulse = {
+	/** The newest Inbox message, read or not; null for an empty Inbox. */
+	latestMessage: GlobalTodayUnreadPreview | null;
 	unreadConversationCount: number;
 	unreadPreviews: GlobalTodayUnreadPreview[];
 	reminderPreviews: GlobalTodayReminderPreview[];
@@ -38,6 +40,7 @@ export type GlobalTodayMailboxSnapshot = {
 	address: string;
 	type: "PERSONAL" | "SHARED";
 	reminders: FollowUpReminderView[];
+	latestMessage: GlobalTodayUnreadPreview | null;
 	unreadConversationCount: number;
 	unreadPreviews: GlobalTodayUnreadPreview[];
 };
@@ -84,6 +87,17 @@ export function globalTodayMailboxOrder(
 ) {
 	if (left.type !== right.type) return left.type === "PERSONAL" ? -1 : 1;
 	return left.address < right.address ? -1 : left.address > right.address ? 1 : 0;
+}
+
+/** Mailbox with the most recent Inbox mail first; empty Inboxes last. */
+export function globalTodayLatestMailOrder(
+	left: Pick<GlobalTodayMailboxSnapshot, "address" | "type" | "latestMessage">,
+	right: Pick<GlobalTodayMailboxSnapshot, "address" | "type" | "latestMessage">,
+) {
+	const leftAt = left.latestMessage ? Date.parse(left.latestMessage.date) : -Infinity;
+	const rightAt = right.latestMessage ? Date.parse(right.latestMessage.date) : -Infinity;
+	if (leftAt !== rightAt) return rightAt > leftAt ? 1 : -1;
+	return globalTodayMailboxOrder(left, right);
 }
 
 export function globalTodayReminderOrder(

@@ -1,6 +1,7 @@
 import type { FollowUpReminder } from "../../shared/follow-up-reminders.ts";
 import {
 	GLOBAL_TODAY_LIMITS,
+	globalTodayLatestMailOrder,
 	globalTodayMailboxOrder,
 	globalTodayReminderOrder,
 	type GlobalTodayMailboxPulse,
@@ -184,6 +185,7 @@ async function runAttempt(
 					const preview = previews.get(reminder.baselineMessageId);
 					return { ...reminder, preview: preview ? { subject: preview.subject, counterparty: preview.counterparty } : null };
 				}),
+				latestMessage: pulse.latestMessage,
 				unreadConversationCount: pulse.unreadConversationCount,
 				unreadPreviews: pulse.unreadPreviews,
 			};
@@ -208,7 +210,7 @@ async function runAttempt(
 			reason: outcome.reason,
 		});
 	}
-	mailboxes.sort(globalTodayMailboxOrder);
+	mailboxes.sort(globalTodayLatestMailOrder);
 	failures.sort(globalTodayMailboxOrder);
 	const complete = !rosterChanged && mailboxes.length === finalRoster.length && failures.length === 0;
 	const endAt = Date.parse(day.endAt);

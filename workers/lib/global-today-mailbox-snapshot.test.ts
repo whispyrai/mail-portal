@@ -45,6 +45,31 @@ test("global Today counts unread Conversations and returns three newest metadata
 	db.close();
 });
 
+test("global Today returns the newest Inbox message whether read or not", () => {
+	const { db, sql } = fixture();
+	const insert = db.prepare("INSERT INTO emails VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+	insert.run("older", "thread-a", "inbox", "Older", "a@example.com", "team@example.com", "2026-07-12T08:00:00.000Z", 0, "secret A");
+	insert.run("newest-read", "thread-b", "inbox", "Newest", "b@example.com", "team@example.com", "2026-07-12T10:00:00.000Z", 1, "secret B");
+	insert.run("sent-later", null, "sent", "Outbound", "team@example.com", "c@example.com", "2026-07-12T11:00:00.000Z", 1, "secret C");
+
+	const result = readGlobalTodayMailboxSnapshot(sql, "team@example.com", []);
+	assert.deepEqual(result.latestMessage, {
+		messageId: "newest-read",
+		conversationKey: "thread-b",
+		sender: "b@example.com",
+		subject: "Newest",
+		date: "2026-07-12T10:00:00.000Z",
+	});
+	assert.equal(JSON.stringify(result).includes("secret"), false);
+	db.close();
+});
+
+test("global Today reports no latest message for an empty Inbox", () => {
+	const { db, sql } = fixture();
+	assert.equal(readGlobalTodayMailboxSnapshot(sql, "team@example.com", []).latestMessage, null);
+	db.close();
+});
+
 test("global Today reminder previews are bounded, eligible, and body-free", () => {
 	const { db, sql } = fixture();
 	const insert = db.prepare("INSERT INTO emails VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -66,6 +91,7 @@ test("global Today applies the same eligibility filters to unread totals and pre
 	const insert = db.prepare("INSERT INTO emails VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
 	insert.run("invalid-date", "invalid-thread", "inbox", "Hidden", "a@example.com", "team@example.com", "not-a-date", 0, "secret");
 	assert.deepEqual(readGlobalTodayMailboxSnapshot(sql, "team@example.com", []), {
+		latestMessage: null,
 		unreadConversationCount: 0,
 		unreadPreviews: [],
 		reminderPreviews: [],

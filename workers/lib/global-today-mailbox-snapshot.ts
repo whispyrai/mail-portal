@@ -50,6 +50,21 @@ export function readGlobalTodayMailboxSnapshot(
 		throw new Error("Global Today Mailbox snapshot input is invalid");
 	}
 
+	const latestRow = [...sql.exec<{
+		conversationKey: string;
+		messageId: string;
+		date: string;
+		sender: string;
+		subject: string;
+	}>(
+		`WITH ${inboxMessagesCte}
+		SELECT conversationKey, id AS messageId, date, sender, subject
+		FROM inbox_messages
+		ORDER BY unixepoch(date) DESC, id DESC
+		LIMIT 1`,
+		Folders.INBOX,
+	)][0];
+
 	const unreadRows = [...sql.exec<{
 		conversationKey: string;
 		messageId: string;
@@ -115,6 +130,13 @@ export function readGlobalTodayMailboxSnapshot(
 	)];
 
 	return {
+		latestMessage: latestRow ? {
+			messageId: latestRow.messageId,
+			conversationKey: latestRow.conversationKey,
+			sender: latestRow.sender || "Unknown sender",
+			subject: latestRow.subject || "(No subject)",
+			date: latestRow.date,
+		} : null,
 		unreadConversationCount: Math.max(0, Number(unreadConversationCount)),
 		unreadPreviews: unreadRows.map((row) => ({
 			messageId: row.messageId,
