@@ -233,12 +233,15 @@ function iframeBridgeScript(
 		}
 	}
 	if (!manifestValid) manifestByCid.clear();
+	function bodyLaidOut() {
+		return document.body.getClientRects().length > 0;
+	}
 	function reportHeight() {
 		var height = Math.max(
 			document.body.scrollHeight,
 			document.documentElement.scrollHeight
 		);
-		if (height > 0) parent.postMessage({ __emailIframeHeight: true, nonce: nonce, height: height }, "*");
+		if (height > 0) parent.postMessage({ __emailIframeHeight: true, nonce: nonce, height: height, laidOut: bodyLaidOut() }, "*");
 	}
 	function revokeObjectUrls() {
 		for (var index = 0; index < activeObjectUrls.length; index += 1) {
@@ -315,7 +318,8 @@ function iframeBridgeScript(
 	parent.postMessage({
 		__emailIframeReady: true,
 		nonce: nonce,
-		textLength: ((document.body && document.body.innerText) || "").length
+		textLength: ((document.body && document.body.innerText) || "").length,
+		laidOut: bodyLaidOut()
 	}, "*");
 	reportHeight();
 	setTimeout(reportHeight, 400);
@@ -375,6 +379,11 @@ export default function EmailIframe({
 		let payloads: InlineImagePayload[] | null = null;
 		let payloadPosted = false;
 		let frameReported = false;
+		// Reporting in is not enough: Chrome has been seen running the document's
+		// script while its body never gets a layout box, leaving a visible frame
+		// stuck at its 100px start with nothing drawn. Only a body that is
+		// actually laid out ends the retry ladder.
+		let frameLaidOut = false;
 		let frameRetryTimer: ReturnType<typeof setTimeout> | null = null;
 		let frameRetries = 0;
 		const renderStartedAt = performance.now();
@@ -521,10 +530,11 @@ export default function EmailIframe({
 				typeof event.data !== "object" ||
 				event.data.nonce !== nonce
 			) return;
-			// Any nonce-bound message proves the real document is live, so a
-			// pending reload retry has done its job and must stop.
 			frameReported = true;
-			clearFrameRetry();
+			if (event.data.laidOut === true) {
+				frameLaidOut = true;
+				clearFrameRetry();
+			}
 			firstReportMs ??= Math.round(performance.now() - renderStartedAt);
 			if (event.data.__emailIframeReady === true) {
 				iframeReady = true;
@@ -619,9 +629,17 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 		iframe.srcdoc = srcdoc;
 
 		const retryFrameLoad = () => {
-			if (controller.signal.aborted || frameReported) return;
+			if (controller.signal.aborted || frameLaidOut) return;
+			// A hidden frame cannot lay out; wait until it is shown.
+			if (iframe.getClientRects().length === 0) {
+				frameRetryTimer = setTimeout(retryFrameLoad, FRAME_LOAD_RETRY_MS);
+				return;
+			}
 			if (frameRetries >= FRAME_LOAD_MAX_RETRIES) return;
 			frameRetries += 1;
+			// The reloaded document asks for its inline images again.
+			iframeReady = false;
+			payloadPosted = false;
 			// The empty-string reset is what reliably forces a new navigation;
 			// assigning the document alone is the assignment that was dropped.
 			iframe.srcdoc = "";
@@ -641,7 +659,8 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 				bodyExternal: bodyExternal ?? false,
 				outcome: !frameReported
 					? "never_reported"
-					: sanitizedTextLength > 0 && frameTextLength === 0
+					: (sanitizedTextLength > 0 && frameTextLength === 0) ||
+						  (!frameLaidOut && iframe.getClientRects().length > 0)
 						? "blank"
 						: "rendered",
 				trigger,
