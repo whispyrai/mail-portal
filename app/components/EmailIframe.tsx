@@ -61,6 +61,15 @@ const FRAME_LOAD_MAX_RETRIES = 4;
 // A reader who leaves sooner still gets a "left" report once the first retry
 // could have run, which keeps instant rerenders out of the logs.
 const MESSAGE_VIEWER_REPORT_MS = 5_000;
+const VIEWPORT_SIZED_PROPERTIES = [
+	"height",
+	"max-height",
+	"min-height",
+	"block-size",
+	"max-block-size",
+	"min-block-size",
+];
+const VIEWPORT_UNIT = /\d(?:[dsl]?v(?:h|w|b|i|min|max))\b/i;
 const EMPTY_EMAIL_IFRAME_DOCUMENT = `<!DOCTYPE html>
 <html>
 <head>
@@ -470,6 +479,19 @@ export default function EmailIframe({
 			}
 		}
 		setHasRemoteImages(togglesRemoteImages);
+		// An auto-sized frame's viewport is the frame itself, so a viewport-relative
+		// height is circular: a 100vh box that scrolls its content pins the frame
+		// at its starting height and the message reads as blank. Let it size to
+		// its content instead.
+		if (autoSize) {
+			for (const element of template.content.querySelectorAll<HTMLElement>("[style]")) {
+				for (const property of VIEWPORT_SIZED_PROPERTIES) {
+					if (VIEWPORT_UNIT.test(element.style.getPropertyValue(property))) {
+						element.style.removeProperty(property);
+					}
+				}
+			}
+		}
 		const sanitizedTextLength = template.content.textContent?.trim().length ?? 0;
 		cleanBody = template.innerHTML;
 		const plannedImages = planReferencedInlineImages(

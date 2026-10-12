@@ -36,10 +36,13 @@ const hostileBody = "SAFE HOSTILE METADATA MESSAGE";
 const viewerLayoutId = "viewer-layout-single";
 const viewerLayoutThreadId = "viewer-layout-thread";
 const viewerLayoutSubject = "Viewer layout regression";
-const viewerLayoutBody = Array.from(
+// Wrapped the way some senders lay out mail: a viewport-tall box that scrolls
+// or clips its own content. In an auto-sized frame the viewport is the frame,
+// so this pinned every such message at the frame's 100px starting height.
+const viewerLayoutBody = `<div style="height: 100vh; overflow-y: auto">${Array.from(
 	{ length: 24 },
 	(_, index) => `<p>Viewer layout line ${index + 1}: the complete message remains readable in conversation scroll order.</p>`,
-).join("");
+).join("")}</div>`;
 const cidPng = Buffer.from(
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 	"base64",
@@ -723,6 +726,13 @@ async function verifyViewerLayout({ context, baseUrl, name }) {
 		assert.ok(
 			geometry.frame.height >= geometry.content.scrollHeight - 1,
 			`email iframe clips the message body: ${JSON.stringify(geometry)}`,
+		);
+		const lastLineBottom = await contentFrame
+			.getByText("Viewer layout line 24", { exact: false })
+			.evaluate((line) => line.getBoundingClientRect().bottom);
+		assert.ok(
+			lastLineBottom <= geometry.frame.height + 1,
+			`last line sits below the visible frame: ${JSON.stringify({ lastLineBottom, geometry })}`,
 		);
 		const intelligence = page.getByRole("button", { name: "Intelligence" });
 		const activity = page.getByRole("button", { name: "Activity" });
