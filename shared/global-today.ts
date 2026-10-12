@@ -1,7 +1,7 @@
 import type { FollowUpReminderView } from "./follow-up-reminders.ts";
 
 export const GLOBAL_TODAY_LIMITS = {
-	mailboxes: 12,
+	mailboxes: 50,
 	concurrency: 4,
 	mailboxTimeoutMs: 2_500,
 	reminders: 500,
